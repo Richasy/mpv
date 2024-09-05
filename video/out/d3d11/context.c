@@ -26,6 +26,7 @@
 #include "video/out/w32_common.h"
 #include "context.h"
 #include "ra_d3d11.h"
+#include "libmpv_swapchain.h"
 
 struct d3d11_opts {
     int feature_level;

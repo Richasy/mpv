@@ -18,6 +18,7 @@
 #include "dr_helper.h"
 #include "vo.h"
 #include "video/mp_image.h"
+#include "video/out/d3d11/libmpv_helper.h"
 #include "sub/osd.h"
 #include "osdep/threads.h"
 #include "osdep/timer.h"
@@ -111,9 +112,17 @@ struct mpv_render_context {
     struct mp_vo_opts *vo_opts;
 };
 
+struct render_backend *get_libmpv_renderer_from_ctx(struct mpv_render_context *ctx)
+{
+    if (!ctx)
+        return NULL;
+    return ctx->renderer;
+}
+
 const struct render_backend_fns *render_backends[] = {
     &render_backend_gpu,
     &render_backend_sw,
+    &render_backend_swapchain,
     NULL
 };
 

@@ -678,8 +678,12 @@ static HRESULT create_swapchain_1_2(ID3D11Device *dev, IDXGIFactory2 *factory,
         desc.BufferCount = 1;
     }
 
-    hr = IDXGIFactory2_CreateSwapChainForHwnd(factory, (IUnknown*)dev,
-        opts->window, &desc, NULL, NULL, &swapchain1);
+    if (opts->d3d11_use_custom_device) {
+		hr = IDXGIFactory2_CreateSwapChainForComposition(factory, (IUnknown*)dev, &desc, NULL, &swapchain1);
+	} else {
+		hr = IDXGIFactory2_CreateSwapChainForHwnd(factory, (IUnknown*)dev,
+			opts->window, &desc, NULL, NULL, &swapchain1);
+	}
     if (FAILED(hr))
         goto done;
     hr = IDXGISwapChain1_QueryInterface(swapchain1, &IID_IDXGISwapChain,
@@ -708,13 +712,17 @@ static HRESULT create_swapchain_1_1(ID3D11Device *dev, IDXGIFactory1 *factory,
             .Height = opts->height ? opts->height : 1,
             .Format = format,
         },
-        .SampleDesc = { .Count = 1 },
+        .SampleDesc = { .Count = 1, .Quality = 0 },
         .BufferUsage = opts->usage,
         .BufferCount = 1,
         .OutputWindow = opts->window,
         .Windowed = TRUE,
         .SwapEffect = DXGI_SWAP_EFFECT_DISCARD,
     };
+
+    if (opts->d3d11_use_custom_device) {
+		desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+	}
 
     return IDXGIFactory1_CreateSwapChain(factory, (IUnknown*)dev, &desc,
                                          swapchain_out);

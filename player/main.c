@@ -273,6 +273,8 @@ struct MPContext *mp_create(void)
         .thread_pool = mp_thread_pool_create(mpctx, 0, 1, 30),
         .stop_play = PT_NEXT_ENTRY,
         .play_dir = 1,
+        .custom_d3d11device = false,
+        .d3d11_device = NULL,
     };
 
     mp_mutex_init(&mpctx->abort_lock);

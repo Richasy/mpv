@@ -157,7 +157,8 @@ static bool resize(struct ra_ctx *ctx)
 
 static bool d3d11_reconfig(struct ra_ctx *ctx)
 {
-    vo_w32_config(ctx->vo);
+    if (!is_custom_device2(ctx))
+		vo_w32_config(ctx->vo);
     return resize(ctx);
 }
 
@@ -410,7 +411,10 @@ static int d3d11_control(struct ra_ctx *ctx, int *events, int request, void *arg
         fullscreen_switch_needed = false;
     }
 
-    ret = vo_w32_control(ctx->vo, events, request, arg);
+	if (!is_custom_device2(ctx))
+		ret = vo_w32_control(ctx->vo, events, request, arg);
+	else
+		ret = d3d11_comp_control(ctx->vo, events, request, arg);
 
     // if entering full screen, handle d3d11 after general windowing stuff
     if (fullscreen_switch_needed && p->vo_opts->fullscreen) {
@@ -437,8 +441,13 @@ static void d3d11_uninit(struct ra_ctx *ctx)
     if (ctx->ra)
         ra_tex_free(ctx->ra, &p->backbuffer);
     SAFE_RELEASE(p->swapchain);
-    vo_w32_uninit(ctx->vo);
-    SAFE_RELEASE(p->device);
+    if (is_custom_device2(ctx)) {
+		vo_w32_uninit(ctx->vo);
+		SAFE_RELEASE(p->device);
+	}
+	else {
+		d3d11_comp_uninit();
+	}
 
     // Destroy the RA last to prevent objects we hold from showing up in D3D's
     // leak checker
@@ -480,8 +489,13 @@ static bool d3d11_init(struct ra_ctx *ctx)
         .max_frame_latency = ctx->vo->opts->swapchain_depth,
         .adapter_name = p->opts->adapter_name,
     };
-    if (!mp_d3d11_create_present_device(ctx->log, &dopts, &p->device))
-        goto error;
+    bool is_custom_d3d11 = is_custom_device(ctx->global);
+	if (is_custom_d3d11) {
+		// use custom d3d11 context
+		bind_device(ctx->global, &p->device);
+	}
+	else if (!mp_d3d11_create_present_device(ctx->log, &dopts, &p->device))
+		goto error;
 
     if (!spirv_compiler_init(ctx))
         goto error;
@@ -489,7 +503,7 @@ static bool d3d11_init(struct ra_ctx *ctx)
     if (!ctx->ra)
         goto error;
 
-    if (!vo_w32_init(ctx->vo))
+    if (!is_custom_d3d11 && !vo_w32_init(ctx->vo))
         goto error;
 
     if (ctx->opts.want_alpha)
@@ -505,7 +519,7 @@ static bool d3d11_init(struct ra_ctx *ctx)
     struct d3d11_swapchain_opts scopts = {
         .window = vo_w32_hwnd(ctx->vo),
         .width = ctx->vo->dwidth,
-        .height = ctx->vo->dheight,
+		.height = ctx->vo->dheight,
         .format = p->opts->output_format,
         .color_space = p->opts->color_space,
         .configured_csp = &p->swapchain_csp,
@@ -514,6 +528,7 @@ static bool d3d11_init(struct ra_ctx *ctx)
         // contention with the window manager when acquiring the backbuffer
         .length = ctx->vo->opts->swapchain_depth + 2,
         .usage = usage,
+        .d3d11_use_custom_device = is_custom_d3d11,
     };
     if (!mp_d3d11_create_swapchain(p->device, ctx->log, &scopts, &p->swapchain))
         goto error;

@@ -464,6 +464,10 @@ typedef struct MPContext {
     //     to true.
     struct demuxer *open_res_demuxer;
     int open_res_error;
+
+    // --- d3d11 interop
+    bool custom_d3d11device;
+    void* d3d11_device;
 } MPContext;
 
 // Contains information about an asynchronous work item, how it can be aborted,

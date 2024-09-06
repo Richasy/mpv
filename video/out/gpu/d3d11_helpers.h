@@ -111,6 +111,8 @@ struct d3d11_swapchain_opts {
     // The BufferUsage value for swapchain surfaces. This should probably
     // contain DXGI_USAGE_RENDER_TARGET_OUTPUT.
     DXGI_USAGE usage;
+
+    bool d3d11_use_custom_device;
 };
 
 bool mp_d3d11_create_swapchain(ID3D11Device *dev, struct mp_log *log,

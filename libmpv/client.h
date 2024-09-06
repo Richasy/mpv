@@ -1900,6 +1900,14 @@ MPV_EXPORT int mpv_hook_continue(mpv_handle *ctx, uint64_t id);
  */
 MPV_EXPORT int mpv_get_wakeup_pipe(mpv_handle *ctx);
 
+MPV_EXPORT void mpv_set_custom_d3d11device(mpv_handle* ctx, ID3D11Device* d3d11device);
+
+MPV_EXPORT IDXGISwapChain* mpv_get_swapchain(mpv_handle* ctx);
+
+MPV_EXPORT void mpv_bind_d3d11_comp_opts(d3d11_comp_opts* opts);
+
+MPV_EXPORT void mpv_invoke_d3d11_resize(void);
+
 #endif
 
 /**

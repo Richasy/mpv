@@ -652,7 +652,7 @@ static HRESULT create_swapchain_1_2(ID3D11Device *dev, IDXGIFactory2 *factory,
         .Width = opts->width ? opts->width : 1,
         .Height = opts->height ? opts->height : 1,
         .Format = format,
-        .SampleDesc = { .Count = 1 },
+        .SampleDesc = { .Count = 1, .Quality = 0 },
         .BufferUsage = opts->usage,
     };
 
@@ -719,10 +719,6 @@ static HRESULT create_swapchain_1_1(ID3D11Device *dev, IDXGIFactory1 *factory,
         .Windowed = TRUE,
         .SwapEffect = DXGI_SWAP_EFFECT_DISCARD,
     };
-
-    if (opts->d3d11_use_custom_device) {
-		desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-	}
 
     return IDXGIFactory1_CreateSwapChain(factory, (IUnknown*)dev, &desc,
                                          swapchain_out);

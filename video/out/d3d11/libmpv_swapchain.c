@@ -37,6 +37,8 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
     {
         return MPV_ERROR_INVALID_PARAMETER;
     }
+    p->w = init_params->w;
+    p->h = init_params->h;
     p->swapchain_out = init_params->swapchain_out;
     return 0;
 }
@@ -62,6 +64,7 @@ static int set_parameter(struct render_backend *ctx, mpv_render_param param)
         return MPV_ERROR_INVALID_PARAMETER;
     }
 
+    MP_TRACE(ctx, "set_parameter: %d x %d\n", update_params->w, update_params->h);
     p->w = update_params->w;
     p->h = update_params->h;
 
@@ -131,6 +134,8 @@ bool resize_update(struct ra_ctx *ctx, int *w_new, int *h_new)
 {
     assert(w_new != NULL);
     assert(h_new != NULL);
+    // log width and height
+    MP_TRACE(ctx, "resize_update: %d x %d\n", *w_new, *h_new);
     struct render_backend *render_ctx = get_libmpv_renderer(ctx);
     struct priv *p = render_ctx->priv;
     if (p && (*w_new != p->w || *h_new != p->h))

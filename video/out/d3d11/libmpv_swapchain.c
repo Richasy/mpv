@@ -89,11 +89,26 @@ static void resize(struct render_backend *ctx, struct mp_rect *src, struct mp_re
 
 static int get_target_size(struct render_backend *ctx, mpv_render_param *params, int *out_w, int *out_h)
 {
+    struct priv *p = ctx->priv;
+    assert(p != NULL);
+    *out_w = p->w;
+    *out_h = p->h;
     return 0;
 }
 
 static int render(struct render_backend *ctx, mpv_render_param *params, struct vo_frame *frame)
 {
+    struct priv *p = ctx->priv;
+    assert(p != NULL);
+    if (p->swapchain_out)
+    {
+        IDXGISwapChain **p_swapchain = p->swapchain_out;
+        if (*p_swapchain)
+        {
+            IDXGISwapChain *swapchain = *p_swapchain;
+            swapchain->Present(0, 0);
+        }
+    }
     return 0;
 }
 

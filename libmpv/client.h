@@ -26,6 +26,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// include header file that include ID3D11Device and IDXGISwapChain
+#include <d3d11.h>
+#include <dxgi.h>
+#include <custom_helper.h>
+
 #ifdef _WIN32
 #define MPV_EXPORT __declspec(dllexport)
 #define MPV_SELECTANY __declspec(selectany)

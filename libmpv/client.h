@@ -2035,6 +2035,14 @@ MPV_DEFINE_SYM_PTR(mpv_hook_continue)
 #define mpv_hook_continue pfn_mpv_hook_continue
 MPV_DEFINE_SYM_PTR(mpv_get_wakeup_pipe)
 #define mpv_get_wakeup_pipe pfn_mpv_get_wakeup_pipe
+MPV_DEFINE_SYM_PTR(mpv_set_custom_d3d11device)
+#define mpv_set_custom_d3d11device pfn_mpv_set_custom_d3d11device
+MPV_DEFINE_SYM_PTR(mpv_get_swapchain)
+#define mpv_get_swapchain pfn_mpv_get_swapchain
+MPV_DEFINE_SYM_PTR(mpv_bind_d3d11_comp_opts)
+#define mpv_bind_d3d11_comp_opts pfn_mpv_bind_d3d11_comp_opts
+MPV_DEFINE_SYM_PTR(mpv_invoke_d3d11_resize)
+#define mpv_invoke_d3d11_resize pfn_mpv_invoke_d3d11_resize
 
 #endif
 

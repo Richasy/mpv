@@ -25,8 +25,6 @@
 
 #include <stddef.h>
 #include <stdint.h>
-
-// include header file that include ID3D11Device and IDXGISwapChain
 #include <d3d11.h>
 #include <dxgi.h>
 #include <custom_helper.h>
@@ -1843,6 +1841,14 @@ MPV_EXPORT int mpv_hook_add(mpv_handle *ctx, uint64_t reply_userdata,
  */
 MPV_EXPORT int mpv_hook_continue(mpv_handle *ctx, uint64_t id);
 
+MPV_EXPORT void mpv_set_custom_d3d11device(mpv_handle* ctx, ID3D11Device* d3d11device);
+
+MPV_EXPORT IDXGISwapChain* mpv_get_swapchain(mpv_handle* ctx);
+
+MPV_EXPORT void mpv_bind_d3d11_comp_opts(d3d11_comp_opts* opts);
+
+MPV_EXPORT void mpv_invoke_d3d11_resize(void);
+
 #if MPV_ENABLE_DEPRECATED
 
 /**
@@ -1904,14 +1910,6 @@ MPV_EXPORT int mpv_hook_continue(mpv_handle *ctx, uint64_t id);
  *         On MS Windows/MinGW, this will always return -1.
  */
 MPV_EXPORT int mpv_get_wakeup_pipe(mpv_handle *ctx);
-
-MPV_EXPORT void mpv_set_custom_d3d11device(mpv_handle* ctx, ID3D11Device* d3d11device);
-
-MPV_EXPORT IDXGISwapChain* mpv_get_swapchain(mpv_handle* ctx);
-
-MPV_EXPORT void mpv_bind_d3d11_comp_opts(d3d11_comp_opts* opts);
-
-MPV_EXPORT void mpv_invoke_d3d11_resize(void);
 
 #endif
 
@@ -2033,8 +2031,6 @@ MPV_DEFINE_SYM_PTR(mpv_hook_add)
 #define mpv_hook_add pfn_mpv_hook_add
 MPV_DEFINE_SYM_PTR(mpv_hook_continue)
 #define mpv_hook_continue pfn_mpv_hook_continue
-MPV_DEFINE_SYM_PTR(mpv_get_wakeup_pipe)
-#define mpv_get_wakeup_pipe pfn_mpv_get_wakeup_pipe
 MPV_DEFINE_SYM_PTR(mpv_set_custom_d3d11device)
 #define mpv_set_custom_d3d11device pfn_mpv_set_custom_d3d11device
 MPV_DEFINE_SYM_PTR(mpv_get_swapchain)
@@ -2043,6 +2039,8 @@ MPV_DEFINE_SYM_PTR(mpv_bind_d3d11_comp_opts)
 #define mpv_bind_d3d11_comp_opts pfn_mpv_bind_d3d11_comp_opts
 MPV_DEFINE_SYM_PTR(mpv_invoke_d3d11_resize)
 #define mpv_invoke_d3d11_resize pfn_mpv_invoke_d3d11_resize
+MPV_DEFINE_SYM_PTR(mpv_get_wakeup_pipe)
+#define mpv_get_wakeup_pipe pfn_mpv_get_wakeup_pipe
 
 #endif
 

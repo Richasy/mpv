@@ -1,14 +1,6 @@
 name: libmpv
 
 on:
-  push:
-    branches:
-      - master
-      - ci
-      - libmpv-ci
-      - 'release/**'
-  pull_request:
-    branches: [master]
   workflow_dispatch:
 
 concurrency:
@@ -27,103 +19,22 @@ jobs:
           - arch: aarch64
             name: arm64
     env:
-      PROGRAMS_DIR: /home/richasy/programs
       WINBUILD_DIR: /home/richasy/programs/mpv-winbuild-cmake
       CLANG_ROOT: /home/richasy/programs/clang_root
       SRC_PACKAGES: /home/richasy/programs/src_packages
       RUSTUP_LOC: /home/richasy/programs/clang_root/install_rustup
       OUTPUT_DIR: /home/richasy/programs/libmpv-output
+      BUILD_DIR: /home/richasy/programs/build_${{ matrix.arch }}
+      TARGET_ARCH: ${{ matrix.arch }}
+      MPV_REPO: https://github.com/Richasy/mpv.git
+      MPV_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: mpv-src
 
       - name: Ensure PATH includes local bin
         run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Patch mpv.cmake to use checked-out source
+      - name: Build libmpv for ${{ matrix.name }}
         run: |
-          MPV_CMAKE="$WINBUILD_DIR/packages/mpv.cmake"
-          if [ -f "$MPV_CMAKE.orig" ]; then
-            cp "$MPV_CMAKE.orig" "$MPV_CMAKE"
-          else
-            cp "$MPV_CMAKE" "$MPV_CMAKE.orig"
-          fi
-          sed -i 's|GIT_REPOSITORY https://github.com/mpv-player/mpv.git|GIT_REPOSITORY https://github.com/Richasy/mpv.git|' "$MPV_CMAKE"
-          sed -i '/GIT_REPOSITORY https:\/\/github.com\/Richasy\/mpv.git/a\    GIT_TAG ${{ github.sha }}' "$MPV_CMAKE"
-
-      - name: Configure CMake for ${{ matrix.name }}
-        run: |
-          BUILD_DIR="$PROGRAMS_DIR/build_${{ matrix.arch }}"
-          MINGW_PREFIX="$BUILD_DIR/${{ matrix.arch }}-w64-mingw32"
-          cmake \
-            -DTARGET_ARCH=${{ matrix.arch }}-w64-mingw32 \
-            -DCOMPILER_TOOLCHAIN=clang \
-            -DCMAKE_INSTALL_PREFIX="$CLANG_ROOT" \
-            -DMINGW_INSTALL_PREFIX="$MINGW_PREFIX" \
-            -DSINGLE_SOURCE_LOCATION="$SRC_PACKAGES" \
-            -DRUSTUP_LOCATION="$RUSTUP_LOC" \
-            -DENABLE_CCACHE=ON \
-            -G Ninja --fresh \
-            -B "$BUILD_DIR" \
-            -S "$WINBUILD_DIR"
-
-      - name: Download sources
-        run: |
-          ninja -C "$PROGRAMS_DIR/build_${{ matrix.arch }}" download || true
-
-      - name: Build LLVM toolchain
-        run: |
-          if [ ! -f "$CLANG_ROOT/.llvm_built" ]; then
-            ninja -C "$PROGRAMS_DIR/build_${{ matrix.arch }}" llvm
-            touch "$CLANG_ROOT/.llvm_built"
-          else
-            echo "LLVM already built, skipping."
-          fi
-
-      - name: Build Rust toolchain
-        run: |
-          ninja -C "$PROGRAMS_DIR/build_${{ matrix.arch }}" rustup || true
-
-      - name: Build Clang target for ${{ matrix.name }}
-        run: |
-          ninja -C "$PROGRAMS_DIR/build_${{ matrix.arch }}" llvm-clang
-
-      - name: Build mpv for ${{ matrix.name }}
-        run: |
-          ninja -C "$PROGRAMS_DIR/build_${{ matrix.arch }}" mpv
-
-      - name: Collect artifacts to SMB share
-        run: |
-          ARCH="${{ matrix.arch }}"
-          BUILD_DIR="$PROGRAMS_DIR/build_${ARCH}"
-          ARCH_OUTPUT="$OUTPUT_DIR/$ARCH"
-          mkdir -p "$ARCH_OUTPUT/include/mpv"
-
-          # Find and copy libmpv-2.dll
-          MPV_DEV_DIR=$(find "$BUILD_DIR" -path "*/mpv-dev*" -type d 2>/dev/null | head -1)
-          if [ -n "$MPV_DEV_DIR" ] && [ -f "$MPV_DEV_DIR/libmpv-2.dll" ]; then
-            cp "$MPV_DEV_DIR/libmpv-2.dll" "$ARCH_OUTPUT/"
-            cp "$MPV_DEV_DIR/libmpv.dll.a" "$ARCH_OUTPUT/" 2>/dev/null || true
-          else
-            # Fallback: search build directory
-            DLL_PATH=$(find "$BUILD_DIR" -name "libmpv-2.dll" -type f 2>/dev/null | head -1)
-            if [ -n "$DLL_PATH" ]; then
-              cp "$DLL_PATH" "$ARCH_OUTPUT/"
-              cp "$(dirname "$DLL_PATH")/libmpv.dll.a" "$ARCH_OUTPUT/" 2>/dev/null || true
-            else
-              echo "::error::libmpv-2.dll not found for $ARCH"
-              exit 1
-            fi
-          fi
-
-          # Copy headers
-          MPV_SRC="$GITHUB_WORKSPACE/mpv-src"
-          cp "$MPV_SRC/include/mpv/client.h" "$ARCH_OUTPUT/include/mpv/"
-          cp "$MPV_SRC/include/mpv/stream_cb.h" "$ARCH_OUTPUT/include/mpv/"
-          cp "$MPV_SRC/include/mpv/render.h" "$ARCH_OUTPUT/include/mpv/"
-          cp "$MPV_SRC/include/mpv/render_gl.h" "$ARCH_OUTPUT/include/mpv/"
-
-          echo "Artifacts for $ARCH:"
-          ls -lh "$ARCH_OUTPUT/"
-          ls -lh "$ARCH_OUTPUT/include/mpv/"
+          export MPV_SRC_DIR="$GITHUB_WORKSPACE"
+          bash ci/build-libmpv.sh all

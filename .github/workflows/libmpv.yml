@@ -27,7 +27,6 @@ jobs:
           - target: aarch64-pc-windows-msvc
             arch: arm64
     env:
-      VS: "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community"
       CC: "ccache clang"
       CXX: "ccache clang++"
       CC_LD: "lld-link"
@@ -83,8 +82,9 @@ jobs:
                                                              $_ -ne 'C:\Program Files\CMake\bin' -and `
                                                              $_ -ne 'C:\Strawberry\c\bin' }) -join ';'
           $env:PATH += ';C:\Program Files\NASM'
-          Import-Module "$env:VS\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
-          Enter-VsDevShell -VsInstallPath $env:VS -SkipAutomaticLocation -DevCmdArguments "-arch=${{ matrix.arch }} -host_arch=x64"
+          $VS = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Import-Module "$VS\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $VS -SkipAutomaticLocation -DevCmdArguments "-arch=${{ matrix.arch }} -host_arch=x64"
           ./ci/build-libmpv.ps1
 
       - name: Print build log

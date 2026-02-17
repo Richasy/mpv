@@ -287,12 +287,10 @@ clone-recursive = true
 # Key differences from build-win32.ps1:
 # - No top-level -Ddefault_library (defaults to shared) so library('mpv') produces libmpv-2.dll
 # - Each meson subproject explicitly set to default_library=static
-# - --prefer-static ensures dependency() prefers static libs
 # - -Dlibmpv=true -Dcplayer=false (inverse of build-win32.ps1)
 # - cmake subprojects already have BUILD_SHARED_LIBS=OFF in their wrappers
 meson setup build `
     --wrap-mode=forcefallback `
-    --prefer-static `
     -Dc_args="-I$amfExtractPath" `
     -Dlibmpv=true `
     -Dcplayer=false `

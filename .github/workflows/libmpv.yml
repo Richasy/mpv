@@ -1,0 +1,40 @@
+name: libmpv
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: [self-hosted, Linux, X64]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            name: x64
+          - arch: aarch64
+            name: arm64
+    env:
+      WINBUILD_DIR: /home/richasy/programs/mpv-winbuild-cmake
+      CLANG_ROOT: /home/richasy/programs/clang_root
+      SRC_PACKAGES: /home/richasy/programs/src_packages
+      RUSTUP_LOC: /home/richasy/programs/clang_root/install_rustup
+      OUTPUT_DIR: /home/richasy/programs/libmpv-output
+      BUILD_DIR: /home/richasy/programs/build_${{ matrix.arch }}
+      TARGET_ARCH: ${{ matrix.arch }}
+      MPV_REPO: https://github.com/Richasy/mpv.git
+      MPV_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure PATH includes local bin
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Build libmpv for ${{ matrix.name }}
+        run: |
+          export MPV_SRC_DIR="$GITHUB_WORKSPACE"
+          bash ci/build-libmpv.sh all

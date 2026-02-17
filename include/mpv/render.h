@@ -422,6 +422,22 @@ typedef enum mpv_render_param_type {
      * See MPV_RENDER_PARAM_SW_STRIDE for alignment requirements.
      */
     MPV_RENDER_PARAM_SW_POINTER = 20,
+    /**
+     * D3D11 initialization parameters. Valid for mpv_render_context_create().
+     * Type: mpv_d3d11_init_params*
+     *
+     * The caller provides their own ID3D11Device. mpv does not take ownership
+     * of the device; the caller must keep it alive for the lifetime of the
+     * render context.
+     */
+    MPV_RENDER_PARAM_D3D11_INIT_PARAMS = 21,
+    /**
+     * D3D11 render target. Valid for mpv_render_context_render().
+     * Type: mpv_d3d11_fbo*
+     *
+     * The caller provides an ID3D11Texture2D that mpv will render into.
+     */
+    MPV_RENDER_PARAM_D3D11_FBO = 22,
 } mpv_render_param_type;
 
 /**
@@ -468,6 +484,8 @@ typedef struct mpv_render_param {
 #define MPV_RENDER_API_TYPE_OPENGL "opengl"
 // See section "Software renderer"
 #define MPV_RENDER_API_TYPE_SW "sw"
+// See render_d3d11.h
+#define MPV_RENDER_API_TYPE_D3D11 "d3d11"
 
 /**
  * Flags used in mpv_render_frame_info.flags. Each value represents a bit in it.

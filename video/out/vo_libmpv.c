@@ -112,6 +112,7 @@ struct mpv_render_context {
 };
 
 const struct render_backend_fns *render_backends[] = {
+    &render_backend_gpu_next,
     &render_backend_gpu,
     &render_backend_sw,
     NULL
@@ -364,8 +365,8 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
                                 1.0, &src, &dst, &osd);
 
             ctx->renderer->fns->resize(ctx->renderer, &src, &dst, &osd);
+            ctx->need_resize = false;
         }
-        ctx->need_resize = false;
     }
 
     if (ctx->need_reconfig)

@@ -258,6 +258,7 @@ sources = files(
     'video/out/placebo/utils.c',
     'video/out/vo_gpu_next.c',
     'video/out/gpu_next/context.c',
+    'video/out/gpu_next/libmpv_gpu_next.c',
 
     ## osdep
     'osdep/io.c',
@@ -1039,7 +1040,8 @@ d3d11 = get_option('d3d11').require(
 features += {'d3d11': d3d11.allowed()}
 if features['d3d11']
     sources += files('video/out/d3d11/context.c',
-                     'video/out/d3d11/ra_d3d11.c')
+                     'video/out/d3d11/ra_d3d11.c',
+                     'video/out/d3d11/libmpv_d3d11.c')
 endif
 
 wayland = {
@@ -1804,7 +1806,7 @@ minor = client_h_define.split('|')[1].strip('() ')
 client_api_version = major + '.' + minor + '.0'
 
 libmpv = library('mpv', sources, dependencies: dependencies, gnu_symbol_visibility: 'hidden',
-                 include_directories: incdir_public,
+                 include_directories: incdir_public, name_prefix: 'lib',
                  link_args: cc.get_supported_link_arguments(['-Wl,-Bsymbolic']),
                  version: client_api_version, install: get_option('libmpv'),
                  build_by_default: get_option('libmpv'))

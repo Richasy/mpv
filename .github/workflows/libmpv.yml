@@ -61,10 +61,10 @@ jobs:
         run: |
           python -m pip install meson==1.9.2 ninja
           if (-not (Get-Command ccache -ErrorAction SilentlyContinue)) {
-            choco install ccache -y
+            winget install ccache --accept-source-agreements --accept-package-agreements
           }
           if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
-            choco install nasm -y
+            winget install nasm --accept-source-agreements --accept-package-agreements
           }
           rustup default nightly
 

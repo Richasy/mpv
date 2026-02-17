@@ -113,6 +113,17 @@ build() {
         -B "$BUILD_DIR" \
         -S "$WINBUILD_DIR"
 
+    # Force mpv re-fetch by clearing its stamp files
+    log "Clearing mpv stamp files to force re-fetch..."
+    rm -f "$BUILD_DIR/packages/mpv-prefix/src/mpv-stamp/mpv-gitclone-lastrun.txt"
+    rm -f "$BUILD_DIR/packages/mpv-prefix/src/mpv-stamp/mpv-download"
+    rm -f "$BUILD_DIR/packages/mpv-prefix/src/mpv-stamp/mpv-patch"
+    rm -f "$BUILD_DIR/packages/mpv-prefix/src/mpv-stamp/mpv-update"
+    rm -f "$BUILD_DIR/packages/mpv-prefix/src/mpv-stamp/mpv-configure"
+    rm -f "$BUILD_DIR/packages/mpv-prefix/src/mpv-stamp/mpv-build"
+    rm -f "$BUILD_DIR/packages/mpv-prefix/src/mpv-stamp/mpv-install"
+    rm -rf "$BUILD_DIR/mpv-dev-"* 2>/dev/null || true
+
     # Download sources
     log "Downloading sources..."
     ninja -C "$BUILD_DIR" download || true

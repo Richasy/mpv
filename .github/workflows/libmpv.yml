@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - ci
+      - libmpv-ci
       - 'release/**'
   pull_request:
     branches: [master]

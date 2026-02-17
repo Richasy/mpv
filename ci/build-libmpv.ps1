@@ -1,3 +1,8 @@
+param(
+    [ValidateSet("x64", "arm64")]
+    [string]$Arch = "x64"
+)
+
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $true
 Set-StrictMode -Version Latest
@@ -289,7 +294,28 @@ clone-recursive = true
 # - Each meson subproject explicitly set to default_library=static
 # - -Dlibmpv=true -Dcplayer=false (inverse of build-win32.ps1)
 # - cmake subprojects already have BUILD_SHARED_LIBS=OFF in their wrappers
+
+$crossFileArg = @()
+if ($Arch -eq "arm64") {
+    $crossFile = "cross-arm64.txt"
+    Set-Content -Path $crossFile -Value @"
+[built-in options]
+c_args = ['--target=aarch64-pc-windows-msvc']
+cpp_args = ['--target=aarch64-pc-windows-msvc']
+c_link_args = ['--target=aarch64-pc-windows-msvc']
+cpp_link_args = ['--target=aarch64-pc-windows-msvc']
+
+[host_machine]
+system = 'windows'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'
+"@
+    $crossFileArg = @("--cross-file=$crossFile")
+}
+
 meson setup build `
+    @crossFileArg `
     --wrap-mode=forcefallback `
     -Dc_args="-I$amfExtractPath" `
     -Dlibmpv=true `

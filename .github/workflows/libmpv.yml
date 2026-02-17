@@ -85,7 +85,7 @@ jobs:
           $VS = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
           Import-Module "$VS\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
           Enter-VsDevShell -VsInstallPath $VS -SkipAutomaticLocation -DevCmdArguments "-arch=${{ matrix.arch }} -host_arch=x64"
-          ./ci/build-libmpv.ps1
+          ./ci/build-libmpv.ps1 -Arch ${{ matrix.arch }}
 
       - name: Print build log
         if: ${{ failure() && steps.build.outcome == 'failure' }}

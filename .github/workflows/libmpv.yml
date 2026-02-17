@@ -17,93 +17,113 @@ concurrency:
 
 jobs:
   build:
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: [self-hosted, Linux, X64]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-pc-windows-msvc
-            arch: x64
-          - target: aarch64-pc-windows-msvc
-            arch: arm64
+          - arch: x86_64
+            name: x64
+          - arch: aarch64
+            name: arm64
     env:
-      CC: "ccache clang"
-      CXX: "ccache clang++"
-      CC_LD: "lld-link"
-      CXX_LD: "lld-link"
-      RUST_LD: "lld-link"
-      WINDRES: "llvm-rc"
-      CCACHE_BASEDIR: ${{ github.workspace }}
-      CCACHE_DIR: "${{ github.workspace }}\\.ccache"
-      CCACHE_MAXSIZE: 500M
+      PROGRAMS_DIR: /home/richasy/programs
+      WINBUILD_DIR: /home/richasy/programs/mpv-winbuild-cmake
+      CLANG_ROOT: /home/richasy/programs/clang_root
+      SRC_PACKAGES: /home/richasy/programs/src_packages
+      RUSTUP_LOC: /home/richasy/programs/clang_root/install_rustup
+      OUTPUT_DIR: /home/richasy/programs/libmpv-output
     steps:
-      - name: Disable autocrlf
-        run: |
-          git config --global core.autocrlf false
-          git config --global core.eol lf
-
-      - uses: actions/checkout@v6
-
-      - name: Get time
-        id: get_time
-        run: |
-          "timestamp=$((Get-Date).Ticks)" >> $env:GITHUB_OUTPUT
-
-      - name: Restore cache
-        uses: actions/cache/restore@v4
+      - uses: actions/checkout@v4
         with:
-          path: ${{ env.CCACHE_DIR }}
-          key: libmpv-${{ matrix.target }}-${{ steps.get_time.outputs.timestamp }}
-          restore-keys: libmpv-${{ matrix.target }}-
+          path: mpv-src
 
-      - name: Install dependencies
+      - name: Ensure PATH includes local bin
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Patch mpv.cmake to use checked-out source
         run: |
-          python -m pip install meson==1.9.2 ninja
-          if (-not (Get-Command ccache -ErrorAction SilentlyContinue)) {
-            winget install ccache --accept-source-agreements --accept-package-agreements
-          }
-          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
-            winget install nasm --accept-source-agreements --accept-package-agreements
-          }
-          rustup default nightly
+          MPV_CMAKE="$WINBUILD_DIR/packages/mpv.cmake"
+          if [ -f "$MPV_CMAKE.orig" ]; then
+            cp "$MPV_CMAKE.orig" "$MPV_CMAKE"
+          else
+            cp "$MPV_CMAKE" "$MPV_CMAKE.orig"
+          fi
+          sed -i 's|GIT_REPOSITORY https://github.com/mpv-player/mpv.git|GIT_REPOSITORY https://github.com/Richasy/mpv.git|' "$MPV_CMAKE"
+          sed -i '/GIT_REPOSITORY https:\/\/github.com\/Richasy\/mpv.git/a\    GIT_TAG ${{ github.sha }}' "$MPV_CMAKE"
 
-      - name: Update Meson WrapDB
+      - name: Configure CMake for ${{ matrix.name }}
         run: |
-          meson wrap update-db
-          meson wrap install expat
-          meson wrap install harfbuzz
-          meson wrap install libpng
-          meson wrap install zlib
+          BUILD_DIR="$PROGRAMS_DIR/build_${{ matrix.arch }}"
+          MINGW_PREFIX="$BUILD_DIR/${{ matrix.arch }}-w64-mingw32"
+          cmake \
+            -DTARGET_ARCH=${{ matrix.arch }}-w64-mingw32 \
+            -DCOMPILER_TOOLCHAIN=clang \
+            -DCMAKE_INSTALL_PREFIX="$CLANG_ROOT" \
+            -DMINGW_INSTALL_PREFIX="$MINGW_PREFIX" \
+            -DSINGLE_SOURCE_LOCATION="$SRC_PACKAGES" \
+            -DRUSTUP_LOCATION="$RUSTUP_LOC" \
+            -DENABLE_CCACHE=ON \
+            -G Ninja --fresh \
+            -B "$BUILD_DIR" \
+            -S "$WINBUILD_DIR"
 
-      - name: Build
-        id: build
+      - name: Download sources
         run: |
-          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -ne 'C:\Program Files\LLVM\bin' -and `
-                                                             $_ -ne 'C:\Program Files\CMake\bin' -and `
-                                                             $_ -ne 'C:\Strawberry\c\bin' }) -join ';'
-          $env:PATH += ';C:\Program Files\NASM'
-          $VS = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-          Import-Module "$VS\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
-          Enter-VsDevShell -VsInstallPath $VS -SkipAutomaticLocation -DevCmdArguments "-arch=${{ matrix.arch }} -host_arch=x64"
-          ./ci/build-libmpv.ps1 -Arch ${{ matrix.arch }}
+          ninja -C "$PROGRAMS_DIR/build_${{ matrix.arch }}" download || true
 
-      - name: Print build log
-        if: ${{ failure() && steps.build.outcome == 'failure' }}
+      - name: Build LLVM toolchain
         run: |
-          cat ./build/meson-logs/meson-log.txt
+          if [ ! -f "$CLANG_ROOT/.llvm_built" ]; then
+            ninja -C "$PROGRAMS_DIR/build_${{ matrix.arch }}" llvm
+            touch "$CLANG_ROOT/.llvm_built"
+          else
+            echo "LLVM already built, skipping."
+          fi
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v5
-        with:
-          name: libmpv-${{ matrix.target }}
-          path: |
-            build/libmpv-2.dll
-            build/libmpv.lib
-            include/mpv/*.h
+      - name: Build Rust toolchain
+        run: |
+          ninja -C "$PROGRAMS_DIR/build_${{ matrix.arch }}" rustup || true
 
-      - name: Save Cache
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: libmpv-${{ matrix.target }}-${{ steps.get_time.outputs.timestamp }}
+      - name: Build Clang target for ${{ matrix.name }}
+        run: |
+          ninja -C "$PROGRAMS_DIR/build_${{ matrix.arch }}" llvm-clang
+
+      - name: Build mpv for ${{ matrix.name }}
+        run: |
+          ninja -C "$PROGRAMS_DIR/build_${{ matrix.arch }}" mpv
+
+      - name: Collect artifacts to SMB share
+        run: |
+          ARCH="${{ matrix.arch }}"
+          BUILD_DIR="$PROGRAMS_DIR/build_${ARCH}"
+          ARCH_OUTPUT="$OUTPUT_DIR/$ARCH"
+          mkdir -p "$ARCH_OUTPUT/include/mpv"
+
+          # Find and copy libmpv-2.dll
+          MPV_DEV_DIR=$(find "$BUILD_DIR" -path "*/mpv-dev*" -type d 2>/dev/null | head -1)
+          if [ -n "$MPV_DEV_DIR" ] && [ -f "$MPV_DEV_DIR/libmpv-2.dll" ]; then
+            cp "$MPV_DEV_DIR/libmpv-2.dll" "$ARCH_OUTPUT/"
+            cp "$MPV_DEV_DIR/libmpv.dll.a" "$ARCH_OUTPUT/" 2>/dev/null || true
+          else
+            # Fallback: search build directory
+            DLL_PATH=$(find "$BUILD_DIR" -name "libmpv-2.dll" -type f 2>/dev/null | head -1)
+            if [ -n "$DLL_PATH" ]; then
+              cp "$DLL_PATH" "$ARCH_OUTPUT/"
+              cp "$(dirname "$DLL_PATH")/libmpv.dll.a" "$ARCH_OUTPUT/" 2>/dev/null || true
+            else
+              echo "::error::libmpv-2.dll not found for $ARCH"
+              exit 1
+            fi
+          fi
+
+          # Copy headers
+          MPV_SRC="$GITHUB_WORKSPACE/mpv-src"
+          cp "$MPV_SRC/include/mpv/client.h" "$ARCH_OUTPUT/include/mpv/"
+          cp "$MPV_SRC/include/mpv/stream_cb.h" "$ARCH_OUTPUT/include/mpv/"
+          cp "$MPV_SRC/include/mpv/render.h" "$ARCH_OUTPUT/include/mpv/"
+          cp "$MPV_SRC/include/mpv/render_gl.h" "$ARCH_OUTPUT/include/mpv/"
+
+          echo "Artifacts for $ARCH:"
+          ls -lh "$ARCH_OUTPUT/"
+          ls -lh "$ARCH_OUTPUT/include/mpv/"

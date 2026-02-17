@@ -1801,7 +1801,7 @@ minor = client_h_define.split('|')[1].strip('() ')
 client_api_version = major + '.' + minor + '.0'
 
 libmpv = library('mpv', sources, dependencies: dependencies, gnu_symbol_visibility: 'hidden',
-                 include_directories: incdir_public,
+                 include_directories: incdir_public, name_prefix: 'lib',
                  link_args: cc.get_supported_link_arguments(['-Wl,-Bsymbolic']),
                  version: client_api_version, install: get_option('libmpv'),
                  build_by_default: get_option('libmpv'))

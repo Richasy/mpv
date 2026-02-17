@@ -23,7 +23,7 @@ if (-not (Test-Path "$amfExtractPath/AMF")) {
     New-Item -Path $amfExtractPath -ItemType Directory -Force | Out-Null
     tar -xzf $amfArchive --strip-components=1 -C $amfExtractPath
 }
-$amfExtractPath = Resolve-Path $amfExtractPath
+$amfExtractPath = (Resolve-Path $amfExtractPath) -replace '\\', '/'
 
 # Wrap shaderc to run git-sync-deps and patch unsupported generator expression
 if (-not (Test-Path "$subprojects/shaderc_cmake")) {
@@ -333,6 +333,7 @@ meson setup build `
     -Dexpat:default_library=static `
     -Dluajit:default_library=static `
     -Dmujs:default_library=static `
+    -Duchardet:default_library=static `
     -Dffmpeg:gpl=enabled `
     -Dffmpeg:tests=disabled `
     -Dffmpeg:programs=disabled `

@@ -365,8 +365,8 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
                                 1.0, &src, &dst, &osd);
 
             ctx->renderer->fns->resize(ctx->renderer, &src, &dst, &osd);
+            ctx->need_resize = false;
         }
-        ctx->need_resize = false;
     }
 
     if (ctx->need_reconfig)

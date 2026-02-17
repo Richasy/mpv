@@ -79,5 +79,6 @@ struct render_backend_fns {
     void (*destroy)(struct render_backend *ctx);
 };
 
+extern const struct render_backend_fns render_backend_gpu_next;
 extern const struct render_backend_fns render_backend_gpu;
 extern const struct render_backend_fns render_backend_sw;

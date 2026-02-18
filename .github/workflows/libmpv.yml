@@ -19,7 +19,6 @@ jobs:
           - arch: aarch64
             name: arm64
     env:
-      WINBUILD_DIR: /home/richasy/programs/mpv-winbuild-cmake
       CLANG_ROOT: /home/richasy/programs/clang_root
       SRC_PACKAGES: /home/richasy/programs/src_packages
       RUSTUP_LOC: /home/richasy/programs/clang_root/install_rustup

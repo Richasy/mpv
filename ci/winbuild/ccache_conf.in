@@ -1,0 +1,4 @@
+cache_dir = "@CCACHE_DIR@"
+max_size = @CCACHE_MAXSIZE@
+sloppiness = locale,time_macros
+compiler_check = none

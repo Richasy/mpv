@@ -6,7 +6,6 @@ set -e
 # Uses mpv-winbuild-cmake with Clang toolchain
 #
 # Required environment variables:
-#   WINBUILD_DIR  - path to mpv-winbuild-cmake checkout
 #   BUILD_DIR     - path to build directory (per-arch)
 #   CLANG_ROOT    - path to clang/LLVM install prefix
 #   SRC_PACKAGES  - path to shared source package cache
@@ -33,7 +32,6 @@ warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 # Validate required env vars
-: "${WINBUILD_DIR:?WINBUILD_DIR is required}"
 : "${BUILD_DIR:?BUILD_DIR is required}"
 : "${CLANG_ROOT:?CLANG_ROOT is required}"
 : "${SRC_PACKAGES:?SRC_PACKAGES is required}"
@@ -41,8 +39,11 @@ err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 : "${OUTPUT_DIR:?OUTPUT_DIR is required}"
 : "${TARGET_ARCH:?TARGET_ARCH is required (x86_64 or aarch64)}"
 
+# Auto-detect WINBUILD_DIR from script location
+WINBUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/winbuild"
+
 MPV_REPO="${MPV_REPO:-https://github.com/Richasy/mpv.git}"
-MPV_COMMIT="${MPV_COMMIT:-libmpv-ci}"
+MPV_COMMIT="${MPV_COMMIT:-master}"
 
 # =============================================================================
 # Install prerequisites (run with --install-deps)
@@ -82,8 +83,8 @@ patch_mpv_cmake() {
 
     cp "$mpv_cmake.orig" "$mpv_cmake"
 
-    sed -i "s|GIT_REPOSITORY https://github.com/mpv-player/mpv.git|GIT_REPOSITORY ${MPV_REPO}|" "$mpv_cmake"
-    sed -i "/GIT_REPOSITORY ${MPV_REPO//\//\\/}/a\\    GIT_TAG ${MPV_COMMIT}" "$mpv_cmake"
+    sed -i "s|GIT_REPOSITORY https://github.com/Richasy/mpv.git|GIT_REPOSITORY ${MPV_REPO}|" "$mpv_cmake"
+    sed -i "s|GIT_TAG master|GIT_TAG ${MPV_COMMIT}|" "$mpv_cmake"
 
     log "mpv.cmake patched successfully"
 }
@@ -234,7 +235,7 @@ main() {
             echo "  --collect       Collect artifacts to OUTPUT_DIR"
             echo "  all             Patch, build, and collect (default)"
             echo ""
-            echo "Required env vars: WINBUILD_DIR, BUILD_DIR, CLANG_ROOT,"
+            echo "Required env vars: BUILD_DIR, CLANG_ROOT,"
             echo "  SRC_PACKAGES, RUSTUP_LOC, OUTPUT_DIR, TARGET_ARCH"
             exit 1
             ;;

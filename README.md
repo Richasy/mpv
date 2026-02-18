@@ -22,7 +22,7 @@ This fork is based on [mpv-player/mpv](https://github.com/mpv-player/mpv). For g
 
 ## Compilation
 
-This fork uses [mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake) for cross-compiling `libmpv-2.dll` from Linux using the Clang/LLVM MinGW toolchain.
+This fork uses a bundled copy of [mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake) (under `ci/winbuild/`) for cross-compiling `libmpv-2.dll` from Linux using the Clang/LLVM MinGW toolchain.
 
 ### Prerequisites
 
@@ -32,14 +32,11 @@ A Linux host (Ubuntu 24.04 recommended) with the build script's dependencies ins
 bash ci/build-libmpv.sh --install-deps
 ```
 
-A clone of [mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake) on the build machine.
-
 ### Building
 
 The build is driven by `ci/build-libmpv.sh`, which takes its configuration via environment variables:
 
 ```bash
-export WINBUILD_DIR=/path/to/mpv-winbuild-cmake
 export BUILD_DIR=/path/to/build_x86_64
 export CLANG_ROOT=/path/to/clang_root
 export SRC_PACKAGES=/path/to/src_packages

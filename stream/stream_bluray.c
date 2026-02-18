@@ -101,6 +101,8 @@ struct bluray_priv_s {
 
     struct mp_bluray_opts *opts;
     struct m_config_cache *opts_cache;
+
+    stream_t *iso_stream;  // HTTP stream for remote ISO playback
 };
 
 inline static int play_playlist(struct bluray_priv_s *priv, int playlist)
@@ -113,6 +115,22 @@ inline static int play_title(struct bluray_priv_s *priv, int title)
     return bd_select_title(priv->bd, title);
 }
 
+static int bluray_read_blocks(void *handle, void *buf, int lba, int num_blocks)
+{
+    stream_t *iso_stream = handle;
+    int64_t offset = (int64_t)lba * 2048;
+    int size = num_blocks * 2048;
+
+    if (!stream_seek(iso_stream, offset))
+        return -1;
+
+    int read = stream_read(iso_stream, buf, size);
+    if (read < size)
+        return -1;
+
+    return num_blocks;
+}
+
 static void bluray_stream_close(stream_t *s)
 {
     struct bluray_priv_s *priv = s->priv;
@@ -123,6 +141,8 @@ static void bluray_stream_close(stream_t *s)
         bd_free_title_info(priv->title_info);
     if (priv->bd)
         bd_close(priv->bd);
+    if (priv->iso_stream)
+        free_stream(priv->iso_stream);
 }
 
 static void handle_event(stream_t *s, const BD_EVENT *ev)
@@ -436,13 +456,31 @@ static int bluray_stream_open_internal(stream_t *s)
         bd_set_debug_mask(0);
 
     /* open device */
-    char *device_tmp = mp_get_user_path(NULL, s->global, device);
-    BLURAY *bd = bd_open(device_tmp, NULL);
-    talloc_free(device_tmp);
-    if (!bd) {
-        MP_ERR(s, "Couldn't open Blu-ray device: %s\n", device);
-        ret = STREAM_UNSUPPORTED;
-        goto err;
+    BLURAY *bd;
+    if (strncmp(device, "http://", 7) == 0 || strncmp(device, "https://", 8) == 0) {
+        b->iso_stream = stream_create(device, STREAM_READ, s->cancel, s->global);
+        if (!b->iso_stream || !b->iso_stream->seekable) {
+            MP_ERR(s, "Cannot open or seek in remote ISO: %s\n", device);
+            ret = STREAM_UNSUPPORTED;
+            goto err;
+        }
+        bd = bd_init();
+        if (!bd || !bd_open_stream(bd, b->iso_stream, bluray_read_blocks)) {
+            MP_ERR(s, "Couldn't open Blu-ray stream from: %s\n", device);
+            if (bd)
+                bd_close(bd);
+            ret = STREAM_UNSUPPORTED;
+            goto err;
+        }
+    } else {
+        char *device_tmp = mp_get_user_path(NULL, s->global, device);
+        bd = bd_open(device_tmp, NULL);
+        talloc_free(device_tmp);
+        if (!bd) {
+            MP_ERR(s, "Couldn't open Blu-ray device: %s\n", device);
+            ret = STREAM_UNSUPPORTED;
+            goto err;
+        }
     }
     b->bd = bd;
 

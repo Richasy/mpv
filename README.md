@@ -6,6 +6,15 @@ This is a fork of [mpv](https://github.com/mpv-player/mpv) with modifications to
 
 The primary change is adding a custom `vo=d3d11` video output that renders to a shared D3D11 texture, enabling mpv to be embedded into XAML (WinUI 3 / UWP) applications as a render source. This allows building media player applications with native Windows UI frameworks while leveraging mpv's powerful decoding and playback capabilities.
 
+Additionally, this fork adds support for **Blu-ray ISO playback over HTTP**. By leveraging libbluray's `bd_open_stream()` API with a custom block-read callback backed by mpv's HTTP stream layer, Blu-ray ISO files hosted on remote servers (e.g. cloud storage, NAS with HTTP access) can be played directly:
+
+```bash
+mpv bd:// --bluray-device=https://example.com/movie.iso
+mpv bd://0 --bluray-device=https://example.com/movie.iso
+```
+
+The HTTP server must support `Range` requests for seeking to work (most servers do: nginx, Apache, S3, cloud storage).
+
 The fork is maintained as a `libmpv` build target — it produces `libmpv-2.dll` for Windows x64 and arm64.
 
 * [Compilation](#compilation)

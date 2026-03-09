@@ -47,12 +47,16 @@ jobs:
             curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
           fi
 
+      - name: Generate timestamp
+        id: timestamp
+        run: echo "ts=$(date -u +'%Y%m%d_%H%M%S')" >> $GITHUB_OUTPUT
+
       - name: Upload Build Artifacts to Azure
         run: |
           az storage blob upload-batch \
             --account-name "${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}" \
             --destination github-actions-artifacts \
-            --destination-path "${{ github.event.repository.name }}/${{ github.sha }}/${{ matrix.name }}" \
+            --destination-path "${{ github.event.repository.name }}/${{ steps.timestamp.outputs.ts }}/${{ matrix.name }}" \
             --source "$OUTPUT_DIR/${{ matrix.arch }}" \
             --overwrite true \
             --connection-string "${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}"

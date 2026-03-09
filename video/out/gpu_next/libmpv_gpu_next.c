@@ -349,7 +349,8 @@ static int get_target_size(struct render_backend *ctx, mpv_render_param *params,
     struct priv *p = ctx->priv;
     pl_tex tex;
     int w, h;
-    int err = p->context->fns->wrap_fbo(p->context, params, &tex, &w, &h);
+    struct pl_color_space csp;
+    int err = p->context->fns->wrap_fbo(p->context, params, &tex, &w, &h, &csp);
     if (err < 0)
         return err;
     *out_w = w;
@@ -366,7 +367,8 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     // Wrap the caller's render target
     pl_tex fbo;
     int fbo_w, fbo_h;
-    int err = p->context->fns->wrap_fbo(p->context, params, &fbo, &fbo_w, &fbo_h);
+    struct pl_color_space fbo_csp;
+    int err = p->context->fns->wrap_fbo(p->context, params, &fbo, &fbo_w, &fbo_h, &fbo_csp);
     if (err < 0)
         return err;
 
@@ -435,7 +437,7 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
             .components = fbo->params.format->num_components,
             .component_mapping = {0, 1, 2, 3},
         },
-        .color = pl_color_space_srgb,
+        .color = fbo_csp,
     };
 
     // Apply target colorspace overrides from options

@@ -49,9 +49,9 @@ struct libmpv_gpu_next_context_fns {
 
     // Wrap the render target from params into a pl_tex.
     // The returned pl_tex is valid until the next wrap_fbo or done_frame call.
-    // Also outputs the target dimensions.
+    // Also outputs the target dimensions and color space.
     int (*wrap_fbo)(struct libmpv_gpu_next_context *ctx, mpv_render_param *params,
-                    pl_tex *out, int *w, int *h);
+                    pl_tex *out, int *w, int *h, struct pl_color_space *out_csp);
 
     // Called after rendering is complete for a frame.
     // For D3D11 this is a no-op (caller manages Present).

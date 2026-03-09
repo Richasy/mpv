@@ -24,11 +24,37 @@
 #include "video/out/placebo/utils.h"
 
 #include <d3d11.h>
+#include <dxgi1_2.h>
 
 struct priv {
     pl_d3d11 d3d11;
     pl_tex wrapped_tex;
 };
+
+// Convert DXGI_COLOR_SPACE_TYPE to pl_color_space for the render target.
+// Mirrors the logic in d3d11_helpers.c:d3d11_get_mp_csp() which is static.
+static struct pl_color_space dxgi_csp_to_pl(int dxgi_csp)
+{
+    switch (dxgi_csp) {
+    case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
+        return (struct pl_color_space) {
+            .transfer  = PL_COLOR_TRC_LINEAR,
+            .primaries = PL_COLOR_PRIM_UNKNOWN,
+        };
+    case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
+        return (struct pl_color_space) {
+            .transfer  = PL_COLOR_TRC_PQ,
+            .primaries = PL_COLOR_PRIM_BT_2020,
+        };
+    case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020:
+        return (struct pl_color_space) {
+            .transfer  = PL_COLOR_TRC_UNKNOWN,
+            .primaries = PL_COLOR_PRIM_BT_2020,
+        };
+    default: // including DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 (0)
+        return pl_color_space_srgb;
+    }
+}
 
 static int init(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
 {
@@ -61,7 +87,7 @@ static int init(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
 }
 
 static int wrap_fbo(struct libmpv_gpu_next_context *ctx, mpv_render_param *params,
-                    pl_tex *out, int *w, int *h)
+                    pl_tex *out, int *w, int *h, struct pl_color_space *out_csp)
 {
     struct priv *p = ctx->priv;
 
@@ -89,6 +115,7 @@ static int wrap_fbo(struct libmpv_gpu_next_context *ctx, mpv_render_param *param
     *out = p->wrapped_tex;
     *w = fbo->w;
     *h = fbo->h;
+    *out_csp = dxgi_csp_to_pl(fbo->color_space);
     return 0;
 }
 

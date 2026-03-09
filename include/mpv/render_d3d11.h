@@ -86,6 +86,20 @@ typedef struct mpv_d3d11_fbo {
      * Set to 0 for auto-detection from the texture's actual format.
      */
     int format;
+    /**
+     * DXGI_COLOR_SPACE_TYPE of the render target's swapchain.
+     * This tells mpv the color space of the output surface so it can
+     * perform correct color conversion and tone mapping.
+     *
+     * Set to 0 (DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) for standard sRGB
+     * output. This is the default and preserves backward compatibility.
+     *
+     * Common values:
+     *   0  - sRGB (SDR, default)
+     *   12 - scRGB linear (DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, for HDR)
+     *   12 - Typically used with DXGI_FORMAT_R16G16B16A16_FLOAT swapchains
+     */
+    int color_space;
 } mpv_d3d11_fbo;
 
 #ifdef __cplusplus

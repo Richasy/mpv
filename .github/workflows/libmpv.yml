@@ -37,3 +37,22 @@ jobs:
         run: |
           export MPV_SRC_DIR="$GITHUB_WORKSPACE"
           bash ci/build-libmpv.sh all
+
+      - name: Install Azure CLI
+        run: |
+          if command -v az &>/dev/null; then
+            echo "Azure CLI is already installed."
+          else
+            echo "Installing Azure CLI..."
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+
+      - name: Upload Build Artifacts to Azure
+        run: |
+          az storage blob upload-batch \
+            --account-name "${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}" \
+            --destination github-actions-artifacts \
+            --destination-path "${{ github.event.repository.name }}/${{ github.sha }}/${{ matrix.name }}" \
+            --source "$OUTPUT_DIR/${{ matrix.arch }}" \
+            --overwrite true \
+            --connection-string "${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}"

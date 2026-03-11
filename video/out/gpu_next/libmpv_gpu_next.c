@@ -29,6 +29,8 @@
 #include "video/out/gpu/hwdec.h"
 #include "video/out/gpu/video.h"
 #include "video/out/placebo/utils.h"
+#include "sub/osd.h"
+#include "sub/draw_bmp.h"
 
 #include "libmpv_gpu_next.h"
 
@@ -38,6 +40,21 @@ static const struct libmpv_gpu_next_context_fns *context_backends[] = {
 #endif
     NULL
 };
+
+// --- OSD overlay structures (from vo_gpu_next.c) ---
+
+struct osd_entry {
+    pl_tex tex;
+    struct pl_overlay_part *parts;
+    int num_parts;
+};
+
+struct overlay_state {
+    struct osd_entry entries[MAX_OSD_PARTS];
+    struct pl_overlay overlays[MAX_OSD_PARTS];
+};
+
+// ---
 
 struct frame_priv {
     struct render_backend *ctx;
@@ -52,6 +69,13 @@ struct priv {
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
+
+    // OSD rendering state
+    struct overlay_state osd_overlay;
+    pl_fmt osd_fmt[SUBBITMAP_COUNT];
+    pl_tex *sub_tex;
+    int num_sub_tex;
+    struct osd_state *osd;  // pointer to vo->osd, valid only during render
 
     uint64_t last_id;
     double last_pts;
@@ -247,6 +271,100 @@ static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
     }
 }
 
+// --- OSD overlay rendering (simplified from vo_gpu_next.c) ---
+
+static void update_overlays(struct render_backend *ctx,
+                            struct osd_state *osd_src,
+                            struct mp_osd_res res,
+                            double pts,
+                            struct overlay_state *state,
+                            struct pl_frame *frame)
+{
+    struct priv *p = ctx->priv;
+    struct sub_bitmap_list *subs = osd_render(osd_src, res, pts, 0,
+                                              mp_draw_sub_formats);
+
+    frame->overlays = state->overlays;
+    frame->num_overlays = 0;
+
+    for (int n = 0; n < subs->num_items; n++) {
+        const struct sub_bitmaps *item = subs->items[n];
+        if (!item->num_parts || !item->packed)
+            continue;
+        struct osd_entry *entry = &state->entries[item->render_index];
+        pl_fmt tex_fmt = p->osd_fmt[item->format];
+        if (!tex_fmt)
+            continue;
+        if (!entry->tex)
+            MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
+        bool ok = pl_tex_recreate(p->gpu, &entry->tex, &(struct pl_tex_params) {
+            .format = tex_fmt,
+            .w = MPMAX(item->packed_w, entry->tex ? entry->tex->params.w : 0),
+            .h = MPMAX(item->packed_h, entry->tex ? entry->tex->params.h : 0),
+            .host_writable = true,
+            .sampleable = true,
+        });
+        if (!ok) {
+            MP_ERR(ctx, "Failed recreating OSD texture!\n");
+            break;
+        }
+        ok = pl_tex_upload(p->gpu, &(struct pl_tex_transfer_params) {
+            .tex        = entry->tex,
+            .rc         = { .x1 = item->packed_w, .y1 = item->packed_h, },
+            .row_pitch  = item->packed->stride[0],
+            .ptr        = item->packed->planes[0],
+        });
+        if (!ok) {
+            MP_ERR(ctx, "Failed uploading OSD texture!\n");
+            break;
+        }
+
+        entry->num_parts = 0;
+        for (int i = 0; i < item->num_parts; i++) {
+            const struct sub_bitmap *b = &item->parts[i];
+            if (b->dw == 0 || b->dh == 0)
+                continue;
+            uint32_t c = b->libass.color;
+            struct pl_overlay_part part = {
+                .src = { b->src_x, b->src_y, b->src_x + b->w, b->src_y + b->h },
+                .dst = { b->x, b->y, b->x + b->dw, b->y + b->dh },
+                .color = {
+                    (c >> 24) / 255.0f,
+                    ((c >> 16) & 0xFF) / 255.0f,
+                    ((c >> 8) & 0xFF) / 255.0f,
+                    (255 - (c & 0xFF)) / 255.0f,
+                }
+            };
+            MP_TARRAY_APPEND(p, entry->parts, entry->num_parts, part);
+        }
+
+        struct pl_overlay *ol = &state->overlays[frame->num_overlays++];
+        *ol = (struct pl_overlay) {
+            .tex = entry->tex,
+            .parts = entry->parts,
+            .num_parts = entry->num_parts,
+            .color = {
+                .primaries = PL_COLOR_PRIM_BT_709,
+                .transfer = PL_COLOR_TRC_SRGB,
+            },
+            .coords = PL_OVERLAY_COORDS_DST_FRAME,
+        };
+
+        switch (item->format) {
+        case SUBBITMAP_BGRA:
+            ol->mode = PL_OVERLAY_NORMAL;
+            ol->repr.alpha = PL_ALPHA_PREMULTIPLIED;
+            break;
+        case SUBBITMAP_LIBASS:
+            ol->mode = PL_OVERLAY_MONOCHROME;
+            ol->repr.alpha = PL_ALPHA_INDEPENDENT;
+            break;
+        }
+    }
+
+    talloc_free(subs);
+}
+
 // --- render_backend_fns implementation ---
 
 static int init(struct render_backend *ctx, mpv_render_param *params)
@@ -284,6 +402,10 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
     p->pars = pl_options_alloc(p->context->pllog);
     p->video_eq = mp_csp_equalizer_create(p, ctx->global);
     p->opts_cache = m_config_cache_alloc(p, ctx->global, &gl_video_conf);
+
+    // Initialize OSD texture formats
+    p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
+    p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
 
     ctx->hwdec_devs = hwdec_devices_create();
     ctx->driver_caps = VO_CAP_ROTATE90 | VO_CAP_VFLIP;
@@ -331,6 +453,9 @@ static void update_external(struct render_backend *ctx, struct vo *vo)
         p->src = src;
         p->dst = dst;
         p->osd_res = osd;
+        p->osd = vo->osd;
+    } else {
+        p->osd = NULL;
     }
 }
 
@@ -448,6 +573,13 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     if (opts->target_peak)
         target.color.hdr.max_luma = opts->target_peak;
 
+    // Render OSD/subtitle overlays onto target frame
+    if (p->osd) {
+        double pts = frame->current ? frame->current->pts : 0;
+        update_overlays(ctx, p->osd, p->osd_res, pts,
+                        &p->osd_overlay, &target);
+    }
+
     // Apply crop
     apply_crop(&target, p->dst, fbo_w, fbo_h);
 
@@ -543,6 +675,13 @@ static void destroy(struct render_backend *ctx)
         return;
 
     pl_queue_destroy(&p->queue);
+
+    // Free OSD textures
+    for (int i = 0; i < MP_ARRAY_SIZE(p->osd_overlay.entries); i++)
+        pl_tex_destroy(p->gpu, &p->osd_overlay.entries[i].tex);
+    for (int i = 0; i < p->num_sub_tex; i++)
+        pl_tex_destroy(p->gpu, &p->sub_tex[i]);
+
     pl_renderer_destroy(&p->rr);
     pl_options_free(&p->pars);
 

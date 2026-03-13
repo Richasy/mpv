@@ -21,8 +21,8 @@ ExternalProject_Add(mpv
         libplacebo
         spirv-cross
         subrandr
-    GIT_REPOSITORY file:///home/richasy/programs/mpv
-    GIT_TAG libmpv-ci
+    GIT_REPOSITORY https://github.com/Richasy/mpv.git
+    GIT_TAG master
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--filter=tree:0"
     UPDATE_COMMAND ""

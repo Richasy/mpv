@@ -15,7 +15,7 @@ set -e
 #
 # Optional environment variables:
 #   MPV_REPO      - mpv git repository URL (default: https://github.com/Richasy/mpv.git)
-#   MPV_COMMIT    - mpv git commit/branch/tag (default: libmpv-ci)
+#   MPV_COMMIT    - mpv git commit/branch/tag (default: master)
 #   MPV_SRC_DIR   - path to mpv source (for copying headers)
 # =============================================================================
 
@@ -100,6 +100,18 @@ build() {
     log "Building libmpv for $ARCH"
     log "=========================================="
 
+    # IMPORTANT: Remove mpv source cache BEFORE cmake configure.
+    # custom_steps.cmake's force_rebuild_git() checks if(EXISTS source_dir/.git)
+    # at configure time. If the source dir exists, it generates a check-git step
+    # that fakes the download stamp, causing ExternalProject to skip git clone.
+    # By removing the source dir first, cmake sees no .git and generates a proper
+    # clone step instead.
+    log "Removing mpv source cache and stamp files to force re-clone..."
+    rm -rf "$SRC_PACKAGES/mpv" 2>/dev/null || true
+    rm -rf "$BUILD_DIR/packages/mpv-prefix/src/mpv-stamp" 2>/dev/null || true
+    rm -rf "$BUILD_DIR/packages/mpv-prefix/src/mpv-build" 2>/dev/null || true
+    rm -rf "$BUILD_DIR/mpv-dev-"* 2>/dev/null || true
+
     # Configure CMake
     log "Configuring CMake for $ARCH..."
     cmake \
@@ -113,17 +125,6 @@ build() {
         -G Ninja --fresh \
         -B "$BUILD_DIR" \
         -S "$WINBUILD_DIR"
-
-    # Force mpv re-fetch by clearing its stamp files
-    log "Clearing mpv stamp files to force re-fetch..."
-    rm -f "$BUILD_DIR/packages/mpv-prefix/src/mpv-stamp/mpv-gitclone-lastrun.txt"
-    rm -f "$BUILD_DIR/packages/mpv-prefix/src/mpv-stamp/mpv-download"
-    rm -f "$BUILD_DIR/packages/mpv-prefix/src/mpv-stamp/mpv-patch"
-    rm -f "$BUILD_DIR/packages/mpv-prefix/src/mpv-stamp/mpv-update"
-    rm -f "$BUILD_DIR/packages/mpv-prefix/src/mpv-stamp/mpv-configure"
-    rm -f "$BUILD_DIR/packages/mpv-prefix/src/mpv-stamp/mpv-build"
-    rm -f "$BUILD_DIR/packages/mpv-prefix/src/mpv-stamp/mpv-install"
-    rm -rf "$BUILD_DIR/mpv-dev-"* 2>/dev/null || true
 
     # Download sources
     log "Downloading sources..."

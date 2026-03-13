@@ -2565,6 +2565,58 @@ Subtitles
     Specify the position of secondary subtitles on the screen. This is similar
     to ``--sub-pos`` but for secondary subtitles.
 
+``--sub-stack-layout=<none|bottom|top|split>``
+    Control how primary and secondary subtitles are arranged when both are
+    visible. By default, mpv renders primary subtitles at the bottom and
+    secondary subtitles at the top, independently. This option provides
+    alternative stacking layouts to reduce visual clutter.
+
+    ``none``
+        Default behavior. Primary subtitle at bottom, secondary at top.
+        Each subtitle's position is controlled independently by ``--sub-pos``
+        and ``--secondary-sub-pos``.
+
+    ``bottom``
+        Both subtitles are stacked at the bottom of the screen. The overall
+        position is controlled by ``--sub-stack-margin``, and the spacing
+        between the two subtitles is controlled by ``--sub-stack-gap``. The
+        stacking order (which subtitle is closer to the screen edge) is
+        controlled by ``--sub-stack-order``.
+
+    ``top``
+        Both subtitles are stacked at the top of the screen. Uses the same
+        ``--sub-stack-margin``, ``--sub-stack-gap``, and ``--sub-stack-order``
+        controls as ``bottom``.
+
+    ``split``
+        Primary subtitle at bottom, secondary subtitle at top, with position
+        controlled by their respective ``--sub-pos`` and ``--secondary-sub-pos``
+        settings. This is semantically the same as ``none`` but can be used as
+        a signal for the application layer to indicate intentional split layout.
+
+``--sub-stack-order=<primary-edge|secondary-edge>``
+    When ``--sub-stack-layout`` is ``bottom`` or ``top``, this controls which
+    subtitle is placed closer to the screen edge (bottom for ``bottom`` layout,
+    top for ``top`` layout).
+
+    ``primary-edge``
+        Primary subtitle is closer to the screen edge, secondary subtitle is
+        placed further inward (default).
+
+    ``secondary-edge``
+        Secondary subtitle is closer to the screen edge, primary subtitle is
+        placed further inward.
+
+``--sub-stack-gap=<0-500>``
+    Spacing in pixels between the primary and secondary subtitles when using
+    stacked layouts (``bottom`` or ``top``). Default: 10.
+
+``--sub-stack-margin=<0-150>``
+    Overall margin for the stacked subtitle group, expressed as a percentage
+    similar to ``--sub-pos``. For ``bottom`` layout, 100 means the default
+    bottom position. For ``top`` layout, 100 means the default top position.
+    Default: 100.
+
 ``--sub-speed=<0.1-10.0>``
     Multiply the subtitle event timestamps with the given value. Can be used
     to fix the playback speed for frame-based subtitle formats. Affects text

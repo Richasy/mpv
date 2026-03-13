@@ -85,7 +85,7 @@ struct priv {
     struct m_config_cache *opts_cache;
     struct mp_csp_equalizer_state *video_eq;
 
-    int debug_frame_count;  // for throttling debug output
+
 };
 
 static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
@@ -283,34 +283,21 @@ static void update_overlays(struct render_backend *ctx,
                             struct pl_frame *frame)
 {
     struct priv *p = ctx->priv;
-    bool dbg = p->debug_frame_count <= 10;
-
-    if (dbg)
-        MP_WARN(ctx, "[SUB-DEBUG] update_overlays called: osd_res=%dx%d, pts=%.3f\n",
-                res.w, res.h, pts);
 
     struct sub_bitmap_list *subs = osd_render(osd_src, res, pts, 0,
                                               mp_draw_sub_formats);
-
-    if (dbg)
-        MP_WARN(ctx, "[SUB-DEBUG] osd_render returned %d items\n", subs->num_items);
 
     frame->overlays = state->overlays;
     frame->num_overlays = 0;
 
     for (int n = 0; n < subs->num_items; n++) {
         const struct sub_bitmaps *item = subs->items[n];
-        if (dbg)
-            MP_WARN(ctx, "[SUB-DEBUG] item[%d]: format=%d, num_parts=%d, packed=%p, render_index=%d\n",
-                    n, item->format, item->num_parts, item->packed, item->render_index);
         if (!item->num_parts || !item->packed)
             continue;
         struct osd_entry *entry = &state->entries[item->render_index];
         pl_fmt tex_fmt = p->osd_fmt[item->format];
-        if (!tex_fmt) {
-            MP_WARN(ctx, "[SUB-DEBUG] osd_fmt[%d] is NULL, skipping!\n", item->format);
+        if (!tex_fmt)
             continue;
-        }
         if (!entry->tex)
             MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
         bool ok = pl_tex_recreate(p->gpu, &entry->tex, &(struct pl_tex_params) {
@@ -354,10 +341,6 @@ static void update_overlays(struct render_backend *ctx,
             MP_TARRAY_APPEND(p, entry->parts, entry->num_parts, part);
         }
 
-        if (dbg)
-            MP_WARN(ctx, "[SUB-DEBUG] item[%d]: tex upload ok, packed=%dx%d, overlay_parts=%d\n",
-                    n, item->packed_w, item->packed_h, entry->num_parts);
-
         struct pl_overlay *ol = &state->overlays[frame->num_overlays++];
         *ol = (struct pl_overlay) {
             .tex = entry->tex,
@@ -381,10 +364,6 @@ static void update_overlays(struct render_backend *ctx,
             break;
         }
     }
-
-    if (dbg)
-        MP_WARN(ctx, "[SUB-DEBUG] update_overlays done: %d overlays on frame\n",
-                frame->num_overlays);
 
     talloc_free(subs);
 }
@@ -430,9 +409,6 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
     // Initialize OSD texture formats
     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
     p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
-
-    MP_WARN(ctx, "[SUB-DEBUG] init: osd_fmt[LIBASS]=%p, osd_fmt[BGRA]=%p\n",
-            (void *)p->osd_fmt[SUBBITMAP_LIBASS], (void *)p->osd_fmt[SUBBITMAP_BGRA]);
 
     ctx->hwdec_devs = hwdec_devices_create();
     ctx->driver_caps = VO_CAP_ROTATE90 | VO_CAP_VFLIP;
@@ -481,13 +457,7 @@ static void update_external(struct render_backend *ctx, struct vo *vo)
         p->dst = dst;
         p->osd_res = osd;
         p->osd = vo->osd;
-        MP_WARN(ctx, "[SUB-DEBUG] update_external: vo=%p, osd=%p, osd_res=%dx%d, "
-                "src=(%d,%d)-(%d,%d), dst=(%d,%d)-(%d,%d)\n",
-                (void *)vo, (void *)p->osd, osd.w, osd.h,
-                src.x0, src.y0, src.x1, src.y1,
-                dst.x0, dst.y0, dst.x1, dst.y1);
     } else {
-        MP_WARN(ctx, "[SUB-DEBUG] update_external: vo=NULL, clearing osd\n");
         p->osd = NULL;
     }
 }
@@ -499,9 +469,6 @@ static void resize(struct render_backend *ctx, struct mp_rect *src,
     p->src = *src;
     p->dst = *dst;
     p->osd_res = *osd;
-    MP_WARN(ctx, "[SUB-DEBUG] resize: osd_res=%dx%d, src=(%d,%d)-(%d,%d), dst=(%d,%d)-(%d,%d)\n",
-            osd->w, osd->h, src->x0, src->y0, src->x1, src->y1,
-            dst->x0, dst->y0, dst->x1, dst->y1);
 }
 
 static int get_target_size(struct render_backend *ctx, mpv_render_param *params,
@@ -610,22 +577,10 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
         target.color.hdr.max_luma = opts->target_peak;
 
     // Render OSD/subtitle overlays onto target frame
-    p->debug_frame_count++;
     if (p->osd) {
         double pts = frame->current ? frame->current->pts : 0;
-        if (p->debug_frame_count <= 10) {
-            MP_WARN(ctx, "[SUB-DEBUG] render #%d: calling update_overlays, osd=%p, osd_res=%dx%d, pts=%.3f\n",
-                    p->debug_frame_count, (void *)p->osd, p->osd_res.w, p->osd_res.h, pts);
-        }
         update_overlays(ctx, p->osd, p->osd_res, pts,
                         &p->osd_overlay, &target);
-        if (p->debug_frame_count <= 10) {
-            MP_WARN(ctx, "[SUB-DEBUG] render #%d: after update_overlays, target.num_overlays=%d\n",
-                    p->debug_frame_count, target.num_overlays);
-        }
-    } else {
-        if (p->debug_frame_count <= 10)
-            MP_WARN(ctx, "[SUB-DEBUG] render #%d: p->osd is NULL, skipping OSD\n", p->debug_frame_count);
     }
 
     // Apply crop

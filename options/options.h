@@ -136,12 +136,30 @@ struct mp_subtitle_opts {
     char **sub_avopts;
 };
 
+// Sub stack layout modes for dual subtitles.
+enum sub_stack_layout {
+    SUB_STACK_NONE = 0,     // default: primary bottom, secondary top, independent
+    SUB_STACK_BOTTOM,       // both stacked at bottom
+    SUB_STACK_TOP,          // both stacked at top
+    SUB_STACK_SPLIT,        // primary bottom, secondary top, unified margin control
+};
+
+// Sub stack order for stacked layouts.
+enum sub_stack_order {
+    SUB_STACK_ORDER_PRIMARY_BOTTOM = 0, // primary closer to edge, secondary above/below
+    SUB_STACK_ORDER_SECONDARY_BOTTOM,   // secondary closer to edge, primary above/below
+};
+
 // Options for both primary and secondary subs.
 struct mp_subtitle_shared_opts {
     float sub_delay[2];
     float sub_pos[2];
     bool sub_visibility[2];
     int ass_style_override[2];
+    int sub_stack_layout;       // enum sub_stack_layout
+    int sub_stack_order;        // enum sub_stack_order
+    int sub_stack_gap;          // pixels between stacked subs
+    float sub_stack_margin;     // overall margin for stacked layout (0-150)
 };
 
 struct mp_osd_render_opts {

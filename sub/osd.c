@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <limits.h>
 
 #include <libavutil/common.h>
 
@@ -162,6 +163,7 @@ struct osd_state *osd_create(struct mpv_global *global)
     struct osd_state *osd = talloc_zero(NULL, struct osd_state);
     *osd = (struct osd_state) {
         .opts_cache = m_config_cache_alloc(osd, global, &mp_osd_render_sub_opts),
+        .sub_shared_opts_cache = m_config_cache_alloc(osd, global, &mp_subtitle_shared_sub_opts),
         .global = global,
         .log = mp_log_new(osd, global->log, "osd"),
         .force_video_pts = MP_NOPTS_VALUE,
@@ -169,6 +171,7 @@ struct osd_state *osd_create(struct mpv_global *global)
     };
     mp_mutex_init(&osd->lock);
     osd->opts = osd->opts_cache->opts;
+    osd->sub_shared_opts = osd->sub_shared_opts_cache->opts;
 
     for (int n = 0; n < MAX_OSD_PARTS; n++) {
         struct osd_object *obj = talloc(osd, struct osd_object);
@@ -355,6 +358,169 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
     return res;
 }
 
+// Compute the bounding box (min_y, max_y+h) of a sub_bitmaps.
+static void get_sub_bbox_y(struct sub_bitmaps *imgs, int *out_top, int *out_bottom)
+{
+    int top = INT_MAX, bottom = INT_MIN;
+    for (int i = 0; i < imgs->num_parts; i++) {
+        struct sub_bitmap *p = &imgs->parts[i];
+        if (p->y < top)
+            top = p->y;
+        int pb = p->y + p->dh;
+        if (pb > bottom)
+            bottom = pb;
+    }
+    *out_top = top;
+    *out_bottom = bottom;
+}
+
+// Apply subtitle stacking layout to reposition primary and secondary subtitle
+// bitmaps so they don't overlap and are arranged according to the chosen layout.
+static void apply_sub_stack_layout(struct osd_state *osd,
+                                   struct sub_bitmap_list *list,
+                                   struct mp_osd_res res)
+{
+    m_config_cache_update(osd->sub_shared_opts_cache);
+    struct mp_subtitle_shared_opts *shared = osd->sub_shared_opts;
+
+    int layout = shared->sub_stack_layout;
+    if (layout == SUB_STACK_NONE)
+        return;
+
+    // Find primary (OSDTYPE_SUB) and secondary (OSDTYPE_SUB2) bitmaps.
+    struct sub_bitmaps *primary = NULL, *secondary = NULL;
+    for (int i = 0; i < list->num_items; i++) {
+        if (list->items[i]->render_index == OSDTYPE_SUB)
+            primary = list->items[i];
+        else if (list->items[i]->render_index == OSDTYPE_SUB2)
+            secondary = list->items[i];
+    }
+
+    // Need both subtitles for stacking to have any effect.
+    if (!primary || !secondary ||
+        primary->num_parts == 0 || secondary->num_parts == 0)
+    {
+        // Even with only one subtitle visible, apply margin positioning
+        // so its position matches the stacking layout expectation.
+        struct sub_bitmaps *solo = NULL;
+        if (primary && primary->num_parts > 0)
+            solo = primary;
+        else if (secondary && secondary->num_parts > 0)
+            solo = secondary;
+
+        if (!solo)
+            return;
+
+        float margin = shared->sub_stack_margin;
+
+        if (layout == SUB_STACK_BOTTOM) {
+            if (solo == secondary) {
+                // Secondary is rendered at sub_pos[1] (default 0 = top).
+                // Move it to primary's sub_pos[0] position (default 100 = bottom).
+                float pri_pos = shared->sub_pos[0];
+                float sec_pos = shared->sub_pos[1];
+                int dy = (int)((pri_pos - sec_pos) / 100.0f * res.h);
+                for (int i = 0; i < solo->num_parts; i++)
+                    solo->parts[i].y += dy;
+            }
+            // primary alone: already at its sub-pos default position
+        } else if (layout == SUB_STACK_TOP) {
+            int solo_top, solo_bottom;
+            get_sub_bbox_y(solo, &solo_top, &solo_bottom);
+            float sub_pos = shared->sub_pos[0];
+            int mirror_offset = (int)((100.0f - sub_pos) / 100.0f * res.h);
+            int target_top = res.mt + mirror_offset;
+            int dy = target_top - solo_top;
+            for (int i = 0; i < solo->num_parts; i++)
+                solo->parts[i].y += dy;
+        } else if (layout == SUB_STACK_SPLIT) {
+            // Split: secondary alone goes to top, mirroring primary's sub-pos.
+            // sub_pos 100 = default bottom edge, so top mirror offset = (100 - sub_pos) / 100 * h
+            if (solo == secondary) {
+                float sub_pos = shared->sub_pos[0];
+                int solo_top, solo_bottom;
+                get_sub_bbox_y(solo, &solo_top, &solo_bottom);
+                int mirror_offset = (int)((100.0f - sub_pos) / 100.0f * res.h);
+                int target_top = res.mt + mirror_offset;
+                int dy = target_top - solo_top;
+                for (int i = 0; i < solo->num_parts; i++)
+                    solo->parts[i].y += dy;
+            }
+            // primary alone stays at its sub-pos position (already rendered)
+        }
+        return;
+    }
+
+    int gap = shared->sub_stack_gap;
+    int order = shared->sub_stack_order;
+
+    // Determine which subtitle is the "edge" one (closer to screen edge)
+    // and which is the "inner" one.
+    struct sub_bitmaps *edge_sub = (order == SUB_STACK_ORDER_PRIMARY_BOTTOM)
+                                    ? primary : secondary;
+    struct sub_bitmaps *inner_sub = (order == SUB_STACK_ORDER_PRIMARY_BOTTOM)
+                                    ? secondary : primary;
+
+    int edge_top, edge_bottom, inner_top, inner_bottom;
+    get_sub_bbox_y(edge_sub, &edge_top, &edge_bottom);
+    get_sub_bbox_y(inner_sub, &inner_top, &inner_bottom);
+    int inner_height = inner_bottom - inner_top;
+
+    if (layout == SUB_STACK_BOTTOM) {
+        // Bottom stacking: edge sub stays at bottom, inner sub placed above it.
+        // Apply margin: shift edge sub so its bottom aligns with margin position.
+        float margin = shared->sub_stack_margin;
+        // margin 100 = default bottom position (no shift).
+        // margin < 100 = push upward, margin > 100 = push downward.
+        int margin_shift = (int)((margin - 100.0f) / 100.0f * res.h);
+        for (int i = 0; i < edge_sub->num_parts; i++)
+            edge_sub->parts[i].y += margin_shift;
+        edge_top += margin_shift;
+        edge_bottom += margin_shift;
+
+        // Place inner sub above the edge sub.
+        int target_inner_bottom = edge_top - gap;
+        int dy = target_inner_bottom - inner_bottom;
+        for (int i = 0; i < inner_sub->num_parts; i++)
+            inner_sub->parts[i].y += dy;
+
+    } else if (layout == SUB_STACK_TOP) {
+        // Top stacking: edge sub at top, inner sub placed below it.
+        // Mirror the primary sub-pos to position at top.
+        // sub_pos 100 = default bottom, so mirror offset = (100 - sub_pos) / 100 * h
+        float sub_pos = shared->sub_pos[0];
+        int mirror_offset = (int)((100.0f - sub_pos) / 100.0f * res.h);
+
+        // Position edge subtitle at the top area.
+        int target_edge_top = res.mt + mirror_offset;
+        int dy_edge = target_edge_top - edge_top;
+        for (int i = 0; i < edge_sub->num_parts; i++)
+            edge_sub->parts[i].y += dy_edge;
+        edge_top += dy_edge;
+        edge_bottom += dy_edge;
+
+        // Place inner sub below the edge sub.
+        int target_inner_top = edge_bottom + gap;
+        int dy_inner = target_inner_top - inner_top;
+        for (int i = 0; i < inner_sub->num_parts; i++)
+            inner_sub->parts[i].y += dy_inner;
+
+    } else if (layout == SUB_STACK_SPLIT) {
+        // Split: primary stays at its sub-pos position (already rendered),
+        // secondary moves to top, mirroring primary's distance from bottom.
+        // sub_pos 100 = default bottom edge, so mirror offset = (100 - sub_pos) / 100 * h
+        float sub_pos = shared->sub_pos[0];
+        int mirror_offset = (int)((100.0f - sub_pos) / 100.0f * res.h);
+
+        int sec_top, sec_bottom;
+        get_sub_bbox_y(secondary, &sec_top, &sec_bottom);
+        int target_top = res.mt + mirror_offset;
+        int dy = target_top - sec_top;
+        for (int i = 0; i < secondary->num_parts; i++)
+            secondary->parts[i].y += dy;
+    }
+}
+
 // Render OSD to a list of bitmap and return it. The returned object is
 // refcounted. Typically you should hold it only for a short time, and then
 // release it.
@@ -414,6 +580,8 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
 
         talloc_free(imgs);
     }
+
+    apply_sub_stack_layout(osd, list, res);
 
     double elapsed = MP_TIME_NS_TO_MS(mp_time_ns() - start_time);
     bool slow = elapsed > 5;

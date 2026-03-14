@@ -350,12 +350,24 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
             return err;
         }
 
+        // Proactively check if VO options changed since last render.
+        // In libmpv mode, the dispatch callback (VOCTRL_SET_PANSCAN) that
+        // sets need_resize may not have been processed yet by the time we
+        // render. Checking the cache here ensures we always pick up changes
+        // to panscan, keepaspect, video-aspect-override, etc.
+        if (ctx->vo && m_config_cache_update(ctx->vo_opts_cache))
+            ctx->need_resize = true;
+
         if (ctx->vo && (ctx->vp_w != vp_w || ctx->vp_h != vp_h ||
                         ctx->need_resize))
         {
             ctx->vp_w = vp_w;
             ctx->vp_h = vp_h;
 
+            // Ensure vo_opts reflects the latest config state.
+            // This may be a no-op if the proactive check above already
+            // updated the cache, but is needed when need_resize was set
+            // via VOCTRL_SET_PANSCAN or other paths.
             m_config_cache_update(ctx->vo_opts_cache);
 
             struct mp_rect src, dst;
@@ -623,6 +635,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
     case VOCTRL_UPDATE_RENDER_OPTS:
         mp_mutex_lock(&ctx->lock);
         ctx->need_update_external = true;
+        ctx->need_resize = true;
         mp_mutex_unlock(&ctx->lock);
         vo->want_redraw = true;
         return VO_TRUE;

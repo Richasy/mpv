@@ -456,12 +456,11 @@ static void update_external(struct render_backend *ctx, struct vo *vo)
 {
     struct priv *p = ctx->priv;
     if (vo) {
-        struct mp_rect src, dst;
-        struct mp_osd_res osd;
-        vo_get_src_dst_rects(vo, &src, &dst, &osd);
-        p->src = src;
-        p->dst = dst;
-        p->osd_res = osd;
+        // Only update the OSD pointer here. Do NOT recalculate src/dst rects
+        // via vo_get_src_dst_rects(), because in libmpv mode the VO does not
+        // know the actual viewport size (it's passed by the external render
+        // call). The correct src/dst are set by resize(), which is called
+        // from mpv_render_context_render() with the real FBO dimensions.
         p->osd = vo->osd;
     } else {
         p->osd = NULL;

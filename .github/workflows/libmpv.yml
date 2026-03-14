@@ -2,22 +2,45 @@ name: libmpv
 
 on:
   workflow_dispatch:
+    inputs:
+      build_x64:
+        description: 'Build x64'
+        type: boolean
+        default: true
+      build_arm64:
+        description: 'Build ARM64'
+        type: boolean
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          entries=()
+          if [ "${{ inputs.build_x64 }}" = "true" ]; then
+            entries+=('{"arch":"x86_64","name":"x64"}')
+          fi
+          if [ "${{ inputs.build_arm64 }}" = "true" ]; then
+            entries+=('{"arch":"aarch64","name":"arm64"}')
+          fi
+          matrix="{\"include\":[$(IFS=,; echo "${entries[*]}")]}"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: prepare
+    if: needs.prepare.outputs.matrix != '{"include":[]}'
     runs-on: [self-hosted, Linux, X64]
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            name: x64
-          - arch: aarch64
-            name: arm64
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
       CLANG_ROOT: /home/richasy/programs/clang_root
       SRC_PACKAGES: /home/richasy/programs/src_packages

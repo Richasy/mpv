@@ -24,6 +24,7 @@
 #include "options/m_config.h"
 #include "options/options.h"
 #include "video/fmt-conversion.h"
+#include "video/img_format.h"
 #include "video/mp_image.h"
 #include "video/out/libmpv.h"
 #include "video/out/gpu/hwdec.h"
@@ -657,10 +658,158 @@ static struct mp_image *get_image(struct render_backend *ctx, int imgfmt,
 static void screenshot(struct render_backend *ctx, struct vo_frame *frame,
                        struct voctrl_screenshot *args)
 {
-    // Not implemented for libmpv gpu-next mode.
-    (void)ctx;
-    (void)frame;
+    struct priv *p = ctx->priv;
+    pl_gpu gpu = p->gpu;
+    pl_tex fbo = NULL;
     args->res = NULL;
+
+    if (!frame || !frame->current)
+        return;
+
+    // Update options
+    m_config_cache_update(p->opts_cache);
+
+    pl_options pars = p->pars;
+    struct pl_render_params params = pars->params;
+    params.info_callback = NULL;
+    params.skip_caching_single_frame = true;
+    params.preserve_mixing_cache = false;
+    params.frame_mixer = NULL;
+
+    struct pl_peak_detect_params peak_params;
+    if (params.peak_detect_params) {
+        peak_params = *params.peak_detect_params;
+        params.peak_detect_params = &peak_params;
+        peak_params.allow_delayed = false;
+    }
+
+    // Get the current frame from queue
+    struct pl_frame_mix mix;
+    struct pl_queue_params qparams = *pl_queue_params(
+        .pts = p->last_pts,
+    );
+#if PL_API_VER >= 340
+    qparams.drift_compensation = 0;
+#endif
+    enum pl_queue_status status = pl_queue_update(p->queue, &mix, &qparams);
+    if (status == PL_QUEUE_ERR || !mix.num_frames) {
+        MP_ERR(ctx, "No frames available for screenshot.\n");
+        return;
+    }
+
+    struct pl_frame image = *(struct pl_frame *) mix.frames[0];
+    struct mp_image *mpi = image.user_data;
+    struct mp_rect src = p->src, dst = p->dst;
+    struct mp_osd_res osd = p->osd_res;
+
+    if (!args->scaled) {
+        int w, h;
+        mp_image_params_get_dsize(&mpi->params, &w, &h);
+        if (w < 1 || h < 1)
+            return;
+
+        int src_w = mpi->params.w;
+        int src_h = mpi->params.h;
+        src = (struct mp_rect) {0, 0, src_w, src_h};
+        dst = (struct mp_rect) {0, 0, w, h};
+
+        if (mp_image_crop_valid(&mpi->params))
+            src = mpi->params.crop;
+
+        if (mpi->params.rotate % 180 == 90) {
+            MPSWAP(int, w, h);
+            MPSWAP(int, src_w, src_h);
+        }
+        mp_rect_rotate(&src, src_w, src_h, mpi->params.rotate);
+        mp_rect_rotate(&dst, w, h, mpi->params.rotate);
+
+        osd = (struct mp_osd_res) {
+            .display_par = 1.0,
+            .w = mp_rect_w(dst),
+            .h = mp_rect_h(dst),
+        };
+    }
+
+    // Create offscreen FBO, try high bit depth first
+    int mpfmt;
+    for (int depth = args->high_bit_depth ? 16 : 8; depth; depth -= 8) {
+        mpfmt = (depth == 16) ? IMGFMT_RGBA64 : IMGFMT_RGBA;
+        pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 4, depth, depth,
+                                 PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_HOST_READABLE);
+        if (!fmt)
+            continue;
+
+        fbo = pl_tex_create(gpu, pl_tex_params(
+            .w = osd.w,
+            .h = osd.h,
+            .format = fmt,
+            .blit_dst = true,
+            .renderable = true,
+            .host_readable = true,
+            .storable = fmt->caps & PL_FMT_CAP_STORABLE,
+        ));
+        if (fbo)
+            break;
+    }
+
+    if (!fbo) {
+        MP_ERR(ctx, "Failed creating target FBO for screenshot.\n");
+        return;
+    }
+
+    // Build target frame with sRGB color space for correct tone mapping
+    struct pl_frame target = {
+        .repr = pl_color_repr_rgb,
+        .num_planes = 1,
+        .planes[0] = {
+            .texture = fbo,
+            .components = 4,
+            .component_mapping = {0, 1, 2, 3},
+        },
+    };
+
+    if (args->native_csp) {
+        target.color = image.color;
+    } else {
+        target.color = pl_color_space_srgb;
+    }
+
+    apply_crop(&image, src, mpi->params.w, mpi->params.h);
+    apply_crop(&target, dst, fbo->params.w, fbo->params.h);
+
+    // Render OSD/subtitle overlays
+    if (p->osd && (args->subs || args->osd)) {
+        double pts = mpi->pts;
+        update_overlays(ctx, p->osd, osd, pts, &p->osd_overlay, &target);
+    }
+
+    if (!pl_render_image(p->rr, &image, &target, &params)) {
+        MP_ERR(ctx, "Failed rendering screenshot frame.\n");
+        goto done;
+    }
+
+    args->res = mp_image_alloc(mpfmt, fbo->params.w, fbo->params.h);
+    if (!args->res)
+        goto done;
+
+    args->res->params.color.primaries = target.color.primaries;
+    args->res->params.color.transfer = target.color.transfer;
+    args->res->params.repr.levels = target.repr.levels;
+    args->res->params.color.hdr = target.color.hdr;
+    if (args->scaled)
+        args->res->params.p_w = args->res->params.p_h = 1;
+
+    bool ok = pl_tex_download(gpu, pl_tex_transfer_params(
+        .tex = fbo,
+        .ptr = args->res->planes[0],
+        .row_pitch = args->res->stride[0],
+    ));
+
+    if (!ok)
+        TA_FREEP(&args->res);
+
+done:
+    pl_tex_destroy(gpu, &fbo);
 }
 
 static void perfdata(struct render_backend *ctx,

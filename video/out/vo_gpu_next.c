@@ -83,12 +83,7 @@ struct user_hook {
     const struct pl_hook *hook;
 };
 
-struct user_lut {
-    char *opt;
-    char *path;
-    int type;
-    struct pl_custom_lut *lut;
-};
+#include "gpu_next/gl_next_opts.h"
 
 struct frame_info {
     int count;
@@ -169,23 +164,6 @@ struct priv {
 
 static void update_render_options(struct vo *vo);
 static void update_lut(struct priv *p, struct user_lut *lut);
-
-struct gl_next_opts {
-    bool delayed_peak;
-    int sub_hdr_peak;
-    int image_subs_hdr_peak;
-    int border_background;
-    float background_blur_radius;
-    float corner_rounding;
-    bool inter_preserve;
-    struct user_lut lut;
-    struct user_lut image_lut;
-    struct user_lut target_lut;
-    int target_hint;
-    int target_hint_mode;
-    bool target_hint_strict;
-    char **raw_opts;
-};
 
 const struct m_opt_choice_alternatives lut_types[] = {
     {"auto",        PL_LUT_UNKNOWN},

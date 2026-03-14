@@ -34,6 +34,7 @@
 #include "sub/draw_bmp.h"
 
 #include "libmpv_gpu_next.h"
+#include "gl_next_opts.h"
 
 static const struct libmpv_gpu_next_context_fns *context_backends[] = {
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11)
@@ -84,6 +85,8 @@ struct priv {
 
     pl_options pars;
     struct m_config_cache *opts_cache;
+    struct m_config_cache *next_opts_cache;
+    struct gl_next_opts *next_opts;
     struct mp_csp_equalizer_state *video_eq;
 
 
@@ -406,6 +409,8 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
     p->pars = pl_options_alloc(p->context->pllog);
     p->video_eq = mp_csp_equalizer_create(p, ctx->global);
     p->opts_cache = m_config_cache_alloc(p, ctx->global, &gl_video_conf);
+    p->next_opts_cache = m_config_cache_alloc(p, ctx->global, &gl_next_conf);
+    p->next_opts = p->next_opts_cache->opts;
 
     // Initialize OSD texture formats
     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
@@ -503,6 +508,7 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
 
     // Update options
     m_config_cache_update(p->opts_cache);
+    m_config_cache_update(p->next_opts_cache);
     const struct gl_video_opts *opts = p->opts_cache->opts;
 
     // Build render params
@@ -510,6 +516,24 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     struct pl_render_params rparams = pars->params;
     rparams.skip_caching_single_frame = !frame->still;
     rparams.frame_mixer = NULL; // No interpolation in libmpv mode
+
+    // Apply border background mode from gl_next_opts
+#if PL_API_VER >= 346
+    {
+        static const int map_background_types[] = {
+            [BACKGROUND_NONE]  = PL_CLEAR_SKIP,
+            [BACKGROUND_COLOR] = PL_CLEAR_COLOR,
+            [BACKGROUND_TILES] = PL_CLEAR_TILES,
+#if PL_API_VER >= 355
+            [BACKGROUND_BLUR]  = PL_CLEAR_BLUR,
+#endif
+        };
+        rparams.border = map_background_types[p->next_opts->border_background];
+#if PL_API_VER >= 355
+        rparams.blur_radius = p->next_opts->background_blur_radius;
+#endif
+    }
+#endif
 
     bool can_interpolate = opts->interpolation && frame->display_synced &&
                            !frame->still && frame->num_frames > 1;

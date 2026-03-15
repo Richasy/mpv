@@ -199,6 +199,13 @@ const struct m_sub_options gl_next_conf = {
         {"target-colorspace-hint-strict", OPT_BOOL(target_hint_strict)},
         // No `target-lut-type` because we don't support non-RGB targets
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
+        {"nvidia-vsr", OPT_CHOICE(nvidia_vsr,
+            {"off",     0},
+            {"bicubic", 1},
+            {"low",     2},
+            {"medium",  3},
+            {"high",    4},
+            {"ultra",   5})},
         {0},
     },
     .defaults = &(struct gl_next_opts) {

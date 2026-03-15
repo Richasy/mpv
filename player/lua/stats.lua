@@ -962,6 +962,18 @@ local function add_video_out(s)
         append_property(s, "deinterlace", {prefix="Deinterlacing:"})
     end
 
+    local nvvsr = mp.get_property("nvidia-vsr")
+    if nvvsr and nvvsr ~= "off" then
+        local value = nvvsr:sub(1,1):upper() .. nvvsr:sub(2)
+        if o.use_ass then
+            local reset = o.font_color ~= "" and o.font_color or "FFFFFF"
+            append(s, "", {prefix="NVIDIA VSR:",
+                   suffix="{\\1c&H00CC00&}" .. value .. "{\\1c&H" .. reset .. "&}"})
+        else
+            append(s, value, {prefix="NVIDIA VSR:"})
+        end
+    end
+
     local scale = nil
     if not mp.get_property_native("fullscreen") then
         scale = get_property_cached("current-window-scale")

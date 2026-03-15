@@ -438,7 +438,27 @@ typedef enum mpv_render_param_type {
      * The caller provides an ID3D11Texture2D that mpv will render into.
      */
     MPV_RENDER_PARAM_D3D11_FBO = 22,
+    /**
+     * Query VSR (Video Super Resolution) capabilities from the render context.
+     * Valid for mpv_render_context_get_info().
+     *
+     * Type: mpv_vsr_capabilities*
+     *
+     * The struct is filled with information about which VSR backends are
+     * available at runtime. Fields for unavailable backends are set to 0.
+     */
+    MPV_RENDER_PARAM_VSR_CAPABILITIES = 23,
 } mpv_render_param_type;
+
+/**
+ * Runtime VSR capability information, queried via
+ * MPV_RENDER_PARAM_VSR_CAPABILITIES.
+ */
+typedef struct mpv_vsr_capabilities {
+    int nvidia_vsr;  // 1 if NVIDIA RTX VSR is available, 0 otherwise
+    int amd_vsr;     // reserved for future AMD VSR, always 0
+    int intel_vsr;   // reserved for future Intel VSR, always 0
+} mpv_vsr_capabilities;
 
 /**
  * For backwards compatibility with the old naming of

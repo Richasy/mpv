@@ -491,6 +491,14 @@ int mpv_render_context_get_info(mpv_render_context *ctx,
         res = 0;
         break;
     }
+    case MPV_RENDER_PARAM_VSR_CAPABILITIES: {
+        mpv_vsr_capabilities *caps = param.data;
+        *caps = (mpv_vsr_capabilities){0};
+        if (ctx->renderer && ctx->renderer->fns->get_vsr_capabilities)
+            ctx->renderer->fns->get_vsr_capabilities(ctx->renderer, caps);
+        res = 0;
+        break;
+    }
     default:;
     }
 
@@ -580,36 +588,6 @@ static int query_format(struct vo *vo, int format)
     return ok;
 }
 
-static void run_control_on_render_thread(void *p)
-{
-    void **args = p;
-    struct mpv_render_context *ctx = args[0];
-    int request = (intptr_t)args[1];
-    void *data = args[2];
-    int ret = VO_NOTIMPL;
-
-    switch (request) {
-    case VOCTRL_SCREENSHOT: {
-        mp_mutex_lock(&ctx->lock);
-        struct vo_frame *frame = vo_frame_ref(ctx->cur_frame);
-        mp_mutex_unlock(&ctx->lock);
-        if (frame && ctx->renderer->fns->screenshot)
-            ctx->renderer->fns->screenshot(ctx->renderer, frame, data);
-        talloc_free(frame);
-        break;
-    }
-    case VOCTRL_PERFORMANCE_DATA: {
-        if (ctx->renderer->fns->perfdata) {
-            ctx->renderer->fns->perfdata(ctx->renderer, data);
-            ret = VO_TRUE;
-        }
-        break;
-    }
-    }
-
-    *(int *)args[3] = ret;
-}
-
 static int control(struct vo *vo, uint32_t request, void *data)
 {
     struct vo_priv *p = vo->priv;
@@ -641,17 +619,35 @@ static int control(struct vo *vo, uint32_t request, void *data)
         return VO_TRUE;
     }
 
-    // VOCTRLs to be run on the renderer thread (if possible at all).
-    if (ctx->advanced_control) {
-        switch (request) {
-        case VOCTRL_SCREENSHOT:
-        case VOCTRL_PERFORMANCE_DATA: {
-            int ret;
-            void *args[] = {ctx, (void *)(intptr_t)request, data, &ret};
-            mp_dispatch_run(ctx->dispatch, run_control_on_render_thread, args);
-            return ret;
+    // VOCTRLs that access the renderer directly. These are safe to call
+    // outside the render thread in libmpv mode because the render loop is
+    // driven by the API user (who won't be rendering concurrently with
+    // these control calls). Dispatching them via mp_dispatch_run() risks
+    // deadlock when the render thread is blocked in BLOCK_FOR_TARGET_TIME.
+    switch (request) {
+    case VOCTRL_SCREENSHOT: {
+        mp_mutex_lock(&ctx->lock);
+        struct vo_frame *frame = vo_frame_ref(ctx->cur_frame);
+        mp_mutex_unlock(&ctx->lock);
+        if (frame && ctx->renderer->fns->screenshot)
+            ctx->renderer->fns->screenshot(ctx->renderer, frame, data);
+        talloc_free(frame);
+        return frame ? VO_TRUE : VO_NOTIMPL;
+    }
+    case VOCTRL_PERFORMANCE_DATA:
+        if (ctx->renderer->fns->perfdata) {
+            ctx->renderer->fns->perfdata(ctx->renderer, data);
+            return VO_TRUE;
         }
+        return VO_NOTIMPL;
+    case VOCTRL_GET_VSR_OUTPUT_SIZE:
+        if (ctx->renderer->fns->get_vsr_output_size) {
+            int *wh = data;
+            ctx->renderer->fns->get_vsr_output_size(ctx->renderer,
+                                                     &wh[0], &wh[1]);
+            return VO_TRUE;
         }
+        return VO_NOTIMPL;
     }
 
     int r = VO_NOTIMPL;

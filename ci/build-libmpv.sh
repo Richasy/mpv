@@ -199,6 +199,20 @@ collect() {
     log "Artifacts for $ARCH:"
     ls -lh "$ARCH_OUTPUT/"
     ls -lh "$ARCH_OUTPUT/include/mpv/" 2>/dev/null || true
+
+    # Copy NVIDIA NGX VSR runtime DLL if SDK is available
+    local NGX_SDK="/home/richasy/programs/RTX_Video_SDK"
+    local NGX_VSR_ARCH="x64"
+    if [ "$ARCH" = "aarch64" ]; then
+        NGX_VSR_ARCH="arm64"
+    fi
+    local NGX_VSR_DLL="$NGX_SDK/bin/Windows/$NGX_VSR_ARCH/rel/nvngx_vsr.dll"
+    if [ -f "$NGX_VSR_DLL" ]; then
+        cp "$NGX_VSR_DLL" "$ARCH_OUTPUT/"
+        log "nvngx_vsr.dll copied from $NGX_VSR_DLL"
+    else
+        warn "nvngx_vsr.dll not found at $NGX_VSR_DLL, skipping"
+    fi
 }
 
 # =============================================================================

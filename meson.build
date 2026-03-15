@@ -1044,6 +1044,38 @@ if features['d3d11']
                      'video/out/d3d11/libmpv_d3d11.c')
 endif
 
+# NVIDIA NGX VSR (RTX Video Super Resolution)
+# NGX functions are loaded at runtime via LoadLibrary/_nvngx.dll,
+# so we only need the SDK headers at build time (no library linking).
+ngx_vsr_opt = get_option('ngx-vsr').require(
+    features['d3d11'],
+    error_message: 'ngx-vsr requires d3d11!',
+)
+ngx_vsr_path = get_option('ngx-vsr-path')
+ngx_vsr_found = false
+ngx_vsr_inc = []
+if ngx_vsr_opt.allowed() and ngx_vsr_path != ''
+    ngx_vsr_inc_dir = include_directories(ngx_vsr_path / 'include')
+    ngx_vsr_has_header = cc.has_header('nvsdk_ngx_defs.h',
+        include_directories: ngx_vsr_inc_dir)
+    if ngx_vsr_has_header
+        ngx_vsr_found = true
+        ngx_vsr_inc = [ngx_vsr_inc_dir]
+    endif
+elif ngx_vsr_opt.allowed()
+    ngx_vsr_has_header = cc.has_header('nvsdk_ngx_defs.h', required: false)
+    if ngx_vsr_has_header
+        ngx_vsr_found = true
+    endif
+endif
+features += {'ngx-vsr': ngx_vsr_found}
+if ngx_vsr_found
+    ngx_vsr_dep = declare_dependency(
+        include_directories: ngx_vsr_inc,
+    )
+    dependencies += ngx_vsr_dep
+endif
+
 wayland = {
     'deps': [dependency('wayland-client', version: '>= 1.23.0', required: get_option('wayland')),
              dependency('wayland-cursor', version: '>= 1.23.0', required: get_option('wayland')),

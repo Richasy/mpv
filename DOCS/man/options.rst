@@ -7874,6 +7874,35 @@ them.
 ``--background-blur-radius=<radius>``
     The blur radius (in pixels) to use for ``--border-background=blur``
 
+``--nvidia-vsr=<off|bicubic|low|medium|high|ultra>``
+    Enable NVIDIA RTX Video Super Resolution (VSR) for AI-based upscaling of
+    low-resolution video content to the display resolution. Requires an NVIDIA
+    RTX GPU and compatible driver. ``--vo=gpu-next`` with D3D11 backend only.
+    This uses the NVIDIA NGX SDK instead of the D3D11 VideoProcessor Extension,
+    providing significantly better quality with selectable quality levels:
+
+    ``off``
+        Disable VSR (default).
+    ``bicubic``
+        Use bicubic interpolation (fastest, lowest quality).
+    ``low``
+        Low quality AI upscaling.
+    ``medium``
+        Medium quality AI upscaling.
+    ``high``
+        High quality AI upscaling.
+    ``ultra``
+        Ultra quality AI upscaling (slowest, best quality).
+
+    When enabled, the renderer uses a two-stage pipeline: first rendering the
+    video frame to an intermediate RGBA texture at source resolution, then
+    applying NGX VSR to upscale to the display resolution. OSD and subtitles
+    are rendered after upscaling and are not affected by VSR.
+
+    If VSR is not available on the current system (no RTX GPU, incompatible
+    driver, or SDK not found), the option is silently ignored and normal
+    rendering is used.
+
 ``--opengl-rectangle-textures``
     Force use of rectangle textures (default: no). Normally this shouldn't have
     any advantages over normal textures. Note that hardware decoding overrides

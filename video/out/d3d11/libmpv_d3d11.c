@@ -26,9 +26,241 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 
+// ── NVIDIA NGX VSR via runtime loading ──
+//
+// The NGX SDK ships as an MSVC static library (nvsdk_ngx_d.lib) that embeds
+// /DEFAULTLIB directives for msvcprt/MSVCRT/OLDNAMES, making it incompatible
+// with MinGW cross-compilation. Instead, we define the minimal types and
+// function signatures ourselves and load _nvngx.dll at runtime via
+// LoadLibrary/GetProcAddress.
+#if HAVE_NGX_VSR
+
+#include <nvsdk_ngx_defs.h>
+
+// Opaque types from the NGX SDK
+typedef struct NVSDK_NGX_Handle NVSDK_NGX_Handle;
+
+// ── NVSDK_NGX_Parameter vtable (MSVC C++ ABI) ──
+//
+// The NGX SDK defines NVSDK_NGX_Parameter as a C++ pure-virtual interface.
+// The Parameter_SetUI / Parameter_GetI / Parameter_SetD3d11Resource helper
+// functions are implemented in the MSVC static library (nvsdk_ngx_d.lib),
+// which is incompatible with MinGW. They are NOT exported from _nvngx.dll.
+//
+// Instead, we mirror the vtable layout and call the virtual methods directly
+// through the vptr. The MSVC x64 ABI places the vptr as the first member,
+// and virtual methods use __thiscall (== first arg is `this` on x64).
+//
+// IMPORTANT: MSVC lays out overloaded virtual methods in REVERSE declaration
+// order within each overload group. The header declares Set(ull), Set(float),
+// Set(double), Set(uint), ... but the vtable stores them reversed:
+// Set(void*), Set(D3D12Resource*), Set(ID3D11Resource*), Set(int), ...
+// This was confirmed by disassembling the Parameter_Set*/Get* wrappers in
+// nvsdk_ngx_d.lib.
+
+// On x64, there is only one calling convention; __thiscall is x86-only.
+// The `this` pointer is simply the first argument passed via rcx.
+typedef void (*PFN_NGX_Param_SetUI)(
+    void *thisptr, const char *name, unsigned int value);
+typedef void (*PFN_NGX_Param_SetD3d11Resource)(
+    void *thisptr, const char *name, ID3D11Resource *value);
+typedef NVSDK_NGX_Result (*PFN_NGX_Param_GetI)(
+    const void *thisptr, const char *name, int *out);
+
+typedef struct NVSDK_NGX_Parameter {
+    void **vtbl;
+} NVSDK_NGX_Parameter;
+
+// vtable slot indices
+// NOTE: MSVC lays out overloaded virtual methods in REVERSE declaration order
+// within each overload group. The actual order (confirmed by disassembling
+// nvsdk_ngx_d.lib's Parameter_Set*/Get* wrappers) is:
+//   0: Set(void*)            [+0x00]   8: Get(void**)            [+0x40]
+//   1: Set(ID3D12Resource*)  [+0x08]   9: Get(ID3D12Resource**)  [+0x48]
+//   2: Set(ID3D11Resource*)  [+0x10]  10: Get(ID3D11Resource**)  [+0x50]
+//   3: Set(int)              [+0x18]  11: Get(int*)              [+0x58]
+//   4: Set(unsigned int)     [+0x20]  12: Get(unsigned int*)     [+0x60]
+//   5: Set(double)           [+0x28]  13: Get(double*)           [+0x68]
+//   6: Set(float)            [+0x30]  14: Get(float*)            [+0x70]
+//   7: Set(unsigned long long)[+0x38] 15: Get(unsigned long long*)[+0x78]
+//  16: Reset()               [+0x80]
+#define NGX_VTBL_SET_UI             4
+#define NGX_VTBL_SET_D3D11RESOURCE  2
+#define NGX_VTBL_GET_I             11
+
+static inline void ngx_param_set_ui(NVSDK_NGX_Parameter *p,
+                                     const char *name, unsigned int val)
+{
+    ((PFN_NGX_Param_SetUI)p->vtbl[NGX_VTBL_SET_UI])(p, name, val);
+}
+
+static inline void ngx_param_set_d3d11_resource(NVSDK_NGX_Parameter *p,
+                                                  const char *name,
+                                                  ID3D11Resource *res)
+{
+    ((PFN_NGX_Param_SetD3d11Resource)p->vtbl[NGX_VTBL_SET_D3D11RESOURCE])(
+        p, name, res);
+}
+
+static inline NVSDK_NGX_Result ngx_param_get_i(NVSDK_NGX_Parameter *p,
+                                                 const char *name, int *out)
+{
+    return ((PFN_NGX_Param_GetI)p->vtbl[NGX_VTBL_GET_I])(p, name, out);
+}
+
+// Function pointer types for the NGX D3D11 API
+typedef NVSDK_NGX_Result (*PFN_NGX_D3D11_Init)(
+    unsigned long long InApplicationId, const wchar_t *InApplicationDataPath,
+    ID3D11Device *InDevice, const void *InFeatureInfo,
+    NVSDK_NGX_Version InSDKVersion);
+typedef NVSDK_NGX_Result (*PFN_NGX_D3D11_Shutdown1)(ID3D11Device *InDevice);
+typedef NVSDK_NGX_Result (*PFN_NGX_D3D11_GetCapabilityParameters)(
+    NVSDK_NGX_Parameter **OutParameters);
+typedef NVSDK_NGX_Result (*PFN_NGX_D3D11_DestroyParameters)(
+    NVSDK_NGX_Parameter *InParameters);
+typedef NVSDK_NGX_Result (*PFN_NGX_D3D11_CreateFeature)(
+    ID3D11DeviceContext *InDevCtx, NVSDK_NGX_Feature InFeatureID,
+    NVSDK_NGX_Parameter *InParameters, NVSDK_NGX_Handle **OutHandle);
+typedef NVSDK_NGX_Result (*PFN_NGX_D3D11_ReleaseFeature)(
+    NVSDK_NGX_Handle *InHandle);
+typedef NVSDK_NGX_Result (*PFN_NGX_D3D11_EvaluateFeature)(
+    ID3D11DeviceContext *InDevCtx, const NVSDK_NGX_Handle *InFeatureHandle,
+    const NVSDK_NGX_Parameter *InParameters, void *InCallback);
+
+// Runtime-loaded function pointers (DLL exports only)
+static struct {
+    HMODULE dll;
+    PFN_NGX_D3D11_Init D3D11_Init;
+    PFN_NGX_D3D11_Shutdown1 D3D11_Shutdown1;
+    PFN_NGX_D3D11_GetCapabilityParameters D3D11_GetCapabilityParameters;
+    PFN_NGX_D3D11_DestroyParameters D3D11_DestroyParameters;
+    PFN_NGX_D3D11_CreateFeature D3D11_CreateFeature;
+    PFN_NGX_D3D11_ReleaseFeature D3D11_ReleaseFeature;
+    PFN_NGX_D3D11_EvaluateFeature D3D11_EvaluateFeature;
+} ngx_fn;
+
+static HMODULE ngx_load_dll_from_registry(struct libmpv_gpu_next_context *ctx)
+{
+    HKEY key = NULL;
+    LONG ret = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore",
+        0, KEY_READ, &key);
+    if (ret != ERROR_SUCCESS) {
+        MP_VERBOSE(ctx, "NGX VSR: NGXCore registry key not found.\n");
+        return NULL;
+    }
+
+    wchar_t path[MAX_PATH] = {0};
+    DWORD size = sizeof(path) - sizeof(wchar_t); // leave room for null
+    DWORD type = 0;
+    ret = RegQueryValueExW(key, L"FullPath", NULL, &type, (BYTE *)path, &size);
+    RegCloseKey(key);
+
+    if (ret != ERROR_SUCCESS || type != REG_SZ || path[0] == 0) {
+        MP_VERBOSE(ctx, "NGX VSR: NGXCore FullPath registry value not found.\n");
+        return NULL;
+    }
+
+    // Append \_nvngx.dll to the directory path
+    size_t len = wcslen(path);
+    if (len + 14 >= MAX_PATH) { // 14 = wcslen(L"\\_nvngx.dll") + 1
+        MP_WARN(ctx, "NGX VSR: NGXCore path too long.\n");
+        return NULL;
+    }
+    wcscat(path, L"\\_nvngx.dll");
+
+    MP_VERBOSE(ctx, "NGX VSR: Loading from registry path: %ls\n", path);
+    HMODULE dll = LoadLibraryW(path);
+    if (!dll)
+        MP_VERBOSE(ctx, "NGX VSR: LoadLibrary failed for registry path.\n");
+    return dll;
+}
+
+static bool ngx_load_dll(struct libmpv_gpu_next_context *ctx)
+{
+    if (ngx_fn.dll)
+        return true;
+
+    // Try standard search path first, then registry
+    HMODULE dll = LoadLibraryW(L"_nvngx.dll");
+    if (!dll)
+        dll = ngx_load_dll_from_registry(ctx);
+    if (!dll) {
+        MP_WARN(ctx, "NGX VSR: _nvngx.dll not found, VSR unavailable.\n");
+        return false;
+    }
+
+#define NGX_LOAD(name, sym) do {                                             \
+    ngx_fn.name = (void *)GetProcAddress(dll, sym);                          \
+    if (!ngx_fn.name) {                                                      \
+        MP_WARN(ctx, "NGX VSR: Missing symbol '%s' in _nvngx.dll.\n", sym);  \
+        FreeLibrary(dll);                                                    \
+        memset(&ngx_fn, 0, sizeof(ngx_fn));                                 \
+        return false;                                                        \
+    }                                                                        \
+} while (0)
+
+    NGX_LOAD(D3D11_Init, "NVSDK_NGX_D3D11_Init");
+    NGX_LOAD(D3D11_Shutdown1, "NVSDK_NGX_D3D11_Shutdown1");
+    NGX_LOAD(D3D11_GetCapabilityParameters,
+             "NVSDK_NGX_D3D11_GetCapabilityParameters");
+    NGX_LOAD(D3D11_DestroyParameters, "NVSDK_NGX_D3D11_DestroyParameters");
+    NGX_LOAD(D3D11_CreateFeature, "NVSDK_NGX_D3D11_CreateFeature");
+    NGX_LOAD(D3D11_ReleaseFeature, "NVSDK_NGX_D3D11_ReleaseFeature");
+    NGX_LOAD(D3D11_EvaluateFeature, "NVSDK_NGX_D3D11_EvaluateFeature");
+#undef NGX_LOAD
+
+    ngx_fn.dll = dll;
+    MP_VERBOSE(ctx, "NGX VSR: _nvngx.dll loaded successfully.\n");
+    return true;
+}
+
+// NVSDK_NGX_Feature_VSR = NVSDK_NGX_Feature_Reserved16 = 16
+#define MPV_NGX_FEATURE_VSR ((NVSDK_NGX_Feature)16)
+
+// String parameter keys
+#define MPV_NGX_PARAM_VSR_AVAILABLE   "VSR.Available"
+
+// Parameter keys from nvsdk_ngx_defs.h
+#define MPV_NGX_PARAM_INPUT1     "Input1"
+#define MPV_NGX_PARAM_OUTPUT     "Output"
+#define MPV_NGX_PARAM_RECT_X    "Rect.X"
+#define MPV_NGX_PARAM_RECT_Y    "Rect.Y"
+#define MPV_NGX_PARAM_RECT_W    "Rect.W"
+#define MPV_NGX_PARAM_RECT_H    "Rect.H"
+#define MPV_NGX_PARAM_OUTRECT_X "OutRect.X"
+#define MPV_NGX_PARAM_OUTRECT_Y "OutRect.Y"
+#define MPV_NGX_PARAM_OUTRECT_W "OutRect.W"
+#define MPV_NGX_PARAM_OUTRECT_H "OutRect.H"
+#define MPV_NGX_PARAM_VSR_QUALITY "VSR.QualityLevel"
+
+#define MPV_NGX_FAILED(value) (((value) & 0xFFF00000) == 0xBAD00000)
+
+// App ID for NGX (can be any unique value for the application)
+#define MPV_NGX_APP_ID 0x524F44454C // "RODEL" in hex
+
+#endif // HAVE_NGX_VSR
+
 struct priv {
     pl_d3d11 d3d11;
     pl_tex wrapped_tex;
+
+#if HAVE_NGX_VSR
+    // NGX VSR state
+    ID3D11Device *d3d_device;
+    ID3D11DeviceContext *d3d_ctx;
+    ID3D10Multithread *multithread;
+    bool ngx_initialized;
+    bool ngx_vsr_available;
+    NVSDK_NGX_Parameter *ngx_params;
+    NVSDK_NGX_Handle *ngx_vsr_handle;
+
+    // Cached textures for VSR
+    ID3D11Texture2D *vsr_intermediate_tex;
+    int vsr_intermediate_w, vsr_intermediate_h;
+    ID3D11Texture2D *vsr_output_tex;
+    int vsr_output_w, vsr_output_h;
+#endif
 };
 
 // Convert DXGI_COLOR_SPACE_TYPE to pl_color_space for the render target.
@@ -55,6 +287,230 @@ static struct pl_color_space dxgi_csp_to_pl(int dxgi_csp)
         return pl_color_space_srgb;
     }
 }
+
+// ── NGX VSR implementation ──
+
+#if HAVE_NGX_VSR
+
+static void ngx_vsr_init(struct libmpv_gpu_next_context *ctx, ID3D11Device *device)
+{
+    struct priv *p = ctx->priv;
+    NVSDK_NGX_Result result;
+
+    MP_VERBOSE(ctx, "NGX VSR: Initializing NVIDIA NGX SDK...\n");
+
+    if (!ngx_load_dll(ctx))
+        return;
+
+    // Keep a reference to the device
+    p->d3d_device = device;
+    ID3D11Device_AddRef(p->d3d_device);
+
+    // Initialize NGX
+    result = ngx_fn.D3D11_Init(MPV_NGX_APP_ID, L".", device, NULL,
+                                NVSDK_NGX_Version_API);
+    if (MPV_NGX_FAILED(result)) {
+        MP_WARN(ctx, "NGX VSR: NVSDK_NGX_D3D11_Init failed (0x%x). "
+                "NVIDIA RTX VSR will not be available.\n", (unsigned)result);
+        return;
+    }
+    p->ngx_initialized = true;
+    MP_VERBOSE(ctx, "NGX VSR: SDK initialized successfully.\n");
+
+    // Get capability parameters
+    result = ngx_fn.D3D11_GetCapabilityParameters(&p->ngx_params);
+    if (MPV_NGX_FAILED(result)) {
+        MP_WARN(ctx, "NGX VSR: GetCapabilityParameters failed (0x%x).\n",
+                (unsigned)result);
+        return;
+    }
+    MP_VERBOSE(ctx, "NGX VSR: Got capability parameters.\n");
+
+    // Check if VSR is available
+    int vsr_available = 0;
+    ngx_param_get_i(p->ngx_params, MPV_NGX_PARAM_VSR_AVAILABLE,
+                     &vsr_available);
+    MP_VERBOSE(ctx, "NGX VSR: params=%p, vtbl=%p, VSR.Available=%d\n",
+               (void *)p->ngx_params, (void *)p->ngx_params->vtbl,
+               vsr_available);
+    if (!vsr_available) {
+        MP_WARN(ctx, "NGX VSR: VSR feature is not available on this system. "
+                "Requires NVIDIA RTX GPU with compatible driver.\n");
+        return;
+    }
+    MP_VERBOSE(ctx, "NGX VSR: VSR feature is available.\n");
+
+    // Get device context and set up multithreading
+    ID3D11Device_GetImmediateContext(p->d3d_device, &p->d3d_ctx);
+
+    HRESULT hr = ID3D11DeviceContext_QueryInterface(
+        p->d3d_ctx, &IID_ID3D10Multithread, (void **)&p->multithread);
+    if (SUCCEEDED(hr) && p->multithread) {
+        ID3D10Multithread_SetMultithreadProtected(p->multithread, TRUE);
+        MP_VERBOSE(ctx, "NGX VSR: Multithread protection enabled.\n");
+    }
+
+    // Create VSR feature
+    if (p->multithread)
+        ID3D10Multithread_Enter(p->multithread);
+
+    result = ngx_fn.D3D11_CreateFeature(p->d3d_ctx, MPV_NGX_FEATURE_VSR,
+                                         p->ngx_params, &p->ngx_vsr_handle);
+
+    if (p->multithread)
+        ID3D10Multithread_Leave(p->multithread);
+
+    if (MPV_NGX_FAILED(result)) {
+        MP_WARN(ctx, "NGX VSR: CreateFeature failed (0x%x).\n",
+                (unsigned)result);
+        return;
+    }
+
+    p->ngx_vsr_available = true;
+    MP_INFO(ctx, "NGX VSR: Feature created successfully. "
+            "NVIDIA RTX Video Super Resolution is ready.\n");
+}
+
+static void ngx_vsr_cleanup(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv *p = ctx->priv;
+
+    if (p->vsr_intermediate_tex) {
+        ID3D11Texture2D_Release(p->vsr_intermediate_tex);
+        p->vsr_intermediate_tex = NULL;
+    }
+    if (p->vsr_output_tex) {
+        ID3D11Texture2D_Release(p->vsr_output_tex);
+        p->vsr_output_tex = NULL;
+    }
+
+    if (p->ngx_vsr_handle) {
+        MP_VERBOSE(ctx, "NGX VSR: Releasing VSR feature...\n");
+        ngx_fn.D3D11_ReleaseFeature(p->ngx_vsr_handle);
+        p->ngx_vsr_handle = NULL;
+    }
+
+    if (p->ngx_initialized) {
+        MP_VERBOSE(ctx, "NGX VSR: Shutting down NGX SDK...\n");
+        ngx_fn.D3D11_Shutdown1(p->d3d_device);
+        p->ngx_initialized = false;
+    }
+
+    if (p->ngx_params) {
+        ngx_fn.D3D11_DestroyParameters(p->ngx_params);
+        p->ngx_params = NULL;
+    }
+
+    if (p->multithread) {
+        ID3D10Multithread_Release(p->multithread);
+        p->multithread = NULL;
+    }
+    if (p->d3d_ctx) {
+        ID3D11DeviceContext_Release(p->d3d_ctx);
+        p->d3d_ctx = NULL;
+    }
+    if (p->d3d_device) {
+        ID3D11Device_Release(p->d3d_device);
+        p->d3d_device = NULL;
+    }
+
+    p->ngx_vsr_available = false;
+}
+
+static bool ngx_vsr_available_fn(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv *p = ctx->priv;
+    return p->ngx_vsr_available;
+}
+
+static ID3D11Texture2D *ngx_create_texture_fn(
+    struct libmpv_gpu_next_context *ctx, int w, int h)
+{
+    struct priv *p = ctx->priv;
+    if (!p->d3d_device)
+        return NULL;
+
+    D3D11_TEXTURE2D_DESC desc = {
+        .Width = w,
+        .Height = h,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+        .SampleDesc = { .Count = 1, .Quality = 0 },
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE |
+                     D3D11_BIND_UNORDERED_ACCESS,
+        .CPUAccessFlags = 0,
+        .MiscFlags = 0,
+    };
+
+    ID3D11Texture2D *tex = NULL;
+    HRESULT hr = ID3D11Device_CreateTexture2D(p->d3d_device, &desc, NULL, &tex);
+    if (FAILED(hr)) {
+        MP_ERR(ctx, "NGX VSR: Failed to create %dx%d RGBA8 texture (hr=0x%x).\n",
+               w, h, (unsigned)hr);
+        return NULL;
+    }
+
+    MP_DBG(ctx, "NGX VSR: Created %dx%d RGBA8 texture (UAV).\n", w, h);
+    return tex;
+}
+
+static bool ngx_vsr_process_fn(struct libmpv_gpu_next_context *ctx,
+                                ID3D11Texture2D *input_tex,
+                                int in_w, int in_h,
+                                ID3D11Texture2D *output_tex,
+                                int out_w, int out_h,
+                                int quality)
+{
+    struct priv *p = ctx->priv;
+    if (!p->ngx_vsr_available || !p->ngx_vsr_handle || !p->ngx_params)
+        return false;
+
+    // Clamp quality to valid range [0, 4]
+    if (quality < 0) quality = 0;
+    if (quality > 4) quality = 4;
+
+    MP_DBG(ctx, "NGX VSR: Evaluate %dx%d -> %dx%d, quality=%d\n",
+           in_w, in_h, out_w, out_h, quality);
+
+    // Set parameters for VSR evaluation (reuse same params as CreateFeature,
+    // matching the SDK sample CDx11NGXVSR which uses m_ngxParameters for both)
+    ngx_param_set_d3d11_resource(p->ngx_params, MPV_NGX_PARAM_INPUT1,
+                                  (ID3D11Resource *)input_tex);
+    ngx_param_set_d3d11_resource(p->ngx_params, MPV_NGX_PARAM_OUTPUT,
+                                  (ID3D11Resource *)output_tex);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_RECT_X, 0);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_RECT_Y, 0);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_RECT_W, in_w);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_RECT_H, in_h);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_OUTRECT_X, 0);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_OUTRECT_Y, 0);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_OUTRECT_W, out_w);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_OUTRECT_H, out_h);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_VSR_QUALITY, quality);
+
+    if (p->multithread)
+        ID3D10Multithread_Enter(p->multithread);
+
+    NVSDK_NGX_Result result = ngx_fn.D3D11_EvaluateFeature(
+        p->d3d_ctx, p->ngx_vsr_handle, p->ngx_params, NULL);
+
+    if (p->multithread)
+        ID3D10Multithread_Leave(p->multithread);
+
+    if (MPV_NGX_FAILED(result)) {
+        MP_WARN(ctx, "NGX VSR: EvaluateFeature failed (0x%x).\n",
+                (unsigned)result);
+        return false;
+    }
+
+    return true;
+}
+
+#endif // HAVE_NGX_VSR
+
+// ── Standard backend functions ──
 
 static int init(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
 {
@@ -83,6 +539,11 @@ static int init(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
     }
 
     ctx->gpu = p->d3d11->gpu;
+
+#if HAVE_NGX_VSR
+    ngx_vsr_init(ctx, (ID3D11Device *)d3d_params->device);
+#endif
+
     return 0;
 }
 
@@ -132,6 +593,10 @@ static void destroy(struct libmpv_gpu_next_context *ctx)
     if (!p)
         return;
 
+#if HAVE_NGX_VSR
+    ngx_vsr_cleanup(ctx);
+#endif
+
     if (p->wrapped_tex)
         pl_tex_destroy(ctx->gpu, &p->wrapped_tex);
 
@@ -148,4 +613,9 @@ const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11 = {
     .wrap_fbo = wrap_fbo,
     .done_frame = done_frame,
     .destroy = destroy,
+#if HAVE_NGX_VSR
+    .ngx_vsr_available = ngx_vsr_available_fn,
+    .ngx_create_texture = ngx_create_texture_fn,
+    .ngx_vsr_process = ngx_vsr_process_fn,
+#endif
 };

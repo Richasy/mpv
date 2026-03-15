@@ -23,6 +23,7 @@
 #include <libplacebo/utils/frame_queue.h>
 
 struct pl_tex;
+struct ID3D11Texture2D;
 
 // Context interface for gpu-next libmpv backends (e.g. D3D11).
 // This is similar to libmpv_gpu_context but uses libplacebo directly
@@ -59,6 +60,30 @@ struct libmpv_gpu_next_context_fns {
 
     // Free all resources in ctx->priv.
     void (*destroy)(struct libmpv_gpu_next_context *ctx);
+
+    // --- NVIDIA NGX VSR ---
+
+    // Check if NGX VSR is available on this backend. Returns true if available.
+    bool (*ngx_vsr_available)(struct libmpv_gpu_next_context *ctx);
+
+    // Create an RGBA8 D3D11 texture suitable for NGX VSR input/output.
+    // Flags: BIND_RENDER_TARGET | BIND_SHADER_RESOURCE | BIND_UNORDERED_ACCESS.
+    // Returns the texture via out_tex, or NULL on failure.
+    // The caller must wrap this with pl_d3d11_wrap() for use with libplacebo.
+    struct ID3D11Texture2D *(*ngx_create_texture)(
+        struct libmpv_gpu_next_context *ctx, int w, int h);
+
+    // Run NGX VSR: upscale input_tex to output_tex.
+    // input_tex: RGBA8 texture at source resolution (e.g. 480p)
+    // output_tex: RGBA8 texture at target resolution (e.g. 1080p), must have UAV
+    // quality: 0=bicubic, 1=low, 2=medium, 3=high, 4=ultra
+    // Returns true on success.
+    bool (*ngx_vsr_process)(struct libmpv_gpu_next_context *ctx,
+                            struct ID3D11Texture2D *input_tex,
+                            int in_w, int in_h,
+                            struct ID3D11Texture2D *output_tex,
+                            int out_w, int out_h,
+                            int quality);
 };
 
 extern const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11;

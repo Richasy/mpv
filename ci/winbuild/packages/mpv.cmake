@@ -52,6 +52,8 @@ ExternalProject_Add(mpv
         -Dvulkan=enabled
         -Dsubrandr=enabled
         ${mpv_gl}
+        -Dngx-vsr=enabled
+        -Dngx-vsr-path=/home/richasy/programs/RTX_Video_SDK
         -Dc_args='-Wno-error=int-conversion'
     BUILD_COMMAND ${EXEC} LTO_JOB=1 PDB=1 ninja -C <BINARY_DIR>
     INSTALL_COMMAND ""

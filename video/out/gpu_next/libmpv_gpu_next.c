@@ -36,6 +36,11 @@
 #include "libmpv_gpu_next.h"
 #include "gl_next_opts.h"
 
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
+#include <libplacebo/d3d11.h>
+#include <d3d11.h>
+#endif
+
 static const struct libmpv_gpu_next_context_fns *context_backends[] = {
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11)
     &libmpv_gpu_next_context_d3d11,
@@ -57,6 +62,11 @@ struct overlay_state {
 };
 
 // ---
+
+struct frame_info {
+    int count;
+    struct pl_dispatch_info info[VO_PASS_PERF_MAX];
+};
 
 struct frame_priv {
     struct render_backend *ctx;
@@ -89,6 +99,19 @@ struct priv {
     struct gl_next_opts *next_opts;
     struct mp_csp_equalizer_state *video_eq;
 
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
+    // NGX VSR cached intermediate textures
+    struct ID3D11Texture2D *vsr_intermediate_d3d;   // source-resolution RGBA8
+    pl_tex vsr_intermediate_pl;                      // wrapped pl_tex
+    int vsr_intermediate_w, vsr_intermediate_h;
+    struct ID3D11Texture2D *vsr_output_d3d;         // fbo-resolution RGBA8 (UAV)
+    pl_tex vsr_output_pl;
+    int vsr_output_w, vsr_output_h;
+#endif
+
+    // Performance data of last frame
+    struct frame_info perf_fresh;
+    struct frame_info perf_redraw;
 
 };
 
@@ -491,6 +514,24 @@ static int get_target_size(struct render_backend *ctx, mpv_render_param *params,
     return 0;
 }
 
+static void info_callback(void *priv, const struct pl_render_info *info)
+{
+    struct render_backend *ctx = priv;
+    struct priv *p = ctx->priv;
+    if (info->index >= VO_PASS_PERF_MAX)
+        return; // silently ignore clipped passes
+
+    struct frame_info *frame;
+    switch (info->stage) {
+    case PL_RENDER_STAGE_FRAME: frame = &p->perf_fresh; break;
+    case PL_RENDER_STAGE_BLEND: frame = &p->perf_redraw; break;
+    default: abort();
+    }
+
+    frame->count = info->index + 1;
+    pl_dispatch_info_move(&frame->info[info->index], info->pass);
+}
+
 static int render(struct render_backend *ctx, mpv_render_param *params,
                   struct vo_frame *frame)
 {
@@ -515,6 +556,8 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     struct pl_render_params rparams = pars->params;
     rparams.skip_caching_single_frame = !frame->still;
     rparams.frame_mixer = NULL; // No interpolation in libmpv mode
+    rparams.info_callback = info_callback;
+    rparams.info_priv = ctx;
 
     // Apply border background mode from gl_next_opts
 #if PL_API_VER >= 346
@@ -649,6 +692,201 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     }
 
     // Render
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
+    int nvidia_vsr_quality = p->next_opts->nvidia_vsr;
+    bool use_ngx_vsr = nvidia_vsr_quality > 0 &&
+                        p->context->fns->ngx_vsr_available &&
+                        p->context->fns->ngx_vsr_available(p->context) &&
+                        frame->current && mix.num_frames > 0;
+
+    if (use_ngx_vsr) {
+        // Map option value (1-5) to NGX quality (0-4: bicubic/low/medium/high/ultra)
+        int ngx_quality = nvidia_vsr_quality - 1;
+
+        // Get source video dimensions from the first frame in the mix
+        struct pl_frame *first_frame = (struct pl_frame *) mix.frames[0];
+        struct mp_image *src_mpi = first_frame->user_data;
+        int src_w = src_mpi->params.w;
+        int src_h = src_mpi->params.h;
+
+        // Use the destination rect (aspect-ratio-correct video area within FBO)
+        // instead of fbo_w/fbo_h to avoid stretching the video to fill the
+        // entire window when the aspect ratios don't match.
+        int dst_w = p->dst.x1 - p->dst.x0;
+        int dst_h = p->dst.y1 - p->dst.y0;
+        if (dst_w <= 0 || dst_h <= 0) {
+            dst_w = fbo_w;
+            dst_h = fbo_h;
+        }
+
+        // Skip VSR if source is same size or larger than destination
+        if (src_w >= dst_w && src_h >= dst_h) {
+            MP_DBG(ctx, "NGX VSR: Source %dx%d >= dst %dx%d, skipping VSR.\n",
+                   src_w, src_h, dst_w, dst_h);
+            use_ngx_vsr = false;
+        }
+
+        if (use_ngx_vsr) {
+            MP_DBG(ctx, "NGX VSR: Two-stage render %dx%d -> %dx%d (quality=%d)\n",
+                   src_w, src_h, dst_w, dst_h, ngx_quality);
+
+            // --- Stage 1: Render video to intermediate RGBA8 texture at source resolution ---
+
+            // Ensure intermediate D3D11 texture exists and matches source dimensions
+            if (!p->vsr_intermediate_d3d ||
+                p->vsr_intermediate_w != src_w || p->vsr_intermediate_h != src_h)
+            {
+                // Release old textures
+                if (p->vsr_intermediate_pl)
+                    pl_tex_destroy(gpu, &p->vsr_intermediate_pl);
+                if (p->vsr_intermediate_d3d) {
+                    ID3D11Texture2D_Release(p->vsr_intermediate_d3d);
+                    p->vsr_intermediate_d3d = NULL;
+                }
+
+                p->vsr_intermediate_d3d =
+                    p->context->fns->ngx_create_texture(p->context, src_w, src_h);
+                if (p->vsr_intermediate_d3d) {
+                    p->vsr_intermediate_pl = pl_d3d11_wrap(gpu, pl_d3d11_wrap_params(
+                        .tex = (ID3D11Resource *)p->vsr_intermediate_d3d,
+                        .w = src_w,
+                        .h = src_h,
+                    ));
+                    p->vsr_intermediate_w = src_w;
+                    p->vsr_intermediate_h = src_h;
+                }
+
+                if (!p->vsr_intermediate_pl) {
+                    MP_WARN(ctx, "NGX VSR: Failed to create intermediate texture.\n");
+                    use_ngx_vsr = false;
+                }
+            }
+
+            // Ensure output D3D11 texture (UAV) matches dst dimensions (aspect-correct)
+            if (use_ngx_vsr &&
+                (!p->vsr_output_d3d ||
+                 p->vsr_output_w != dst_w || p->vsr_output_h != dst_h))
+            {
+                if (p->vsr_output_pl)
+                    pl_tex_destroy(gpu, &p->vsr_output_pl);
+                if (p->vsr_output_d3d) {
+                    ID3D11Texture2D_Release(p->vsr_output_d3d);
+                    p->vsr_output_d3d = NULL;
+                }
+
+                p->vsr_output_d3d =
+                    p->context->fns->ngx_create_texture(p->context, dst_w, dst_h);
+                if (p->vsr_output_d3d) {
+                    p->vsr_output_pl = pl_d3d11_wrap(gpu, pl_d3d11_wrap_params(
+                        .tex = (ID3D11Resource *)p->vsr_output_d3d,
+                        .w = dst_w,
+                        .h = dst_h,
+                    ));
+                    p->vsr_output_w = dst_w;
+                    p->vsr_output_h = dst_h;
+                }
+
+                if (!p->vsr_output_pl) {
+                    MP_WARN(ctx, "NGX VSR: Failed to create output texture.\n");
+                    use_ngx_vsr = false;
+                }
+            }
+        }
+
+        if (use_ngx_vsr) {
+            // Build intermediate target at source resolution (no OSD)
+            struct pl_frame intermediate_target = {
+                .repr = pl_color_repr_rgb,
+                .num_planes = 1,
+                .planes[0] = {
+                    .texture = p->vsr_intermediate_pl,
+                    .components = p->vsr_intermediate_pl->params.format->num_components,
+                    .component_mapping = {0, 1, 2, 3},
+                },
+                .color = pl_color_space_srgb,
+            };
+
+            // Apply crop for source -> intermediate (fills entire texture)
+            intermediate_target.crop = (struct pl_rect2df) {
+                .x0 = 0, .y0 = 0,
+                .x1 = src_w, .y1 = src_h,
+            };
+
+            // Render video only (no OSD) to intermediate texture
+            struct pl_render_params no_osd_params = rparams;
+            if (!pl_render_image_mix(p->rr, &mix, &intermediate_target, &no_osd_params)) {
+                MP_ERR(ctx, "NGX VSR: Failed rendering to intermediate texture!\n");
+                goto done;
+            }
+
+            // Flush GPU to ensure intermediate texture is complete
+            pl_gpu_flush(gpu);
+
+            // --- Stage 2: NGX VSR upscale intermediate -> output ---
+            bool vsr_ok = p->context->fns->ngx_vsr_process(
+                p->context,
+                p->vsr_intermediate_d3d, src_w, src_h,
+                p->vsr_output_d3d, dst_w, dst_h,
+                ngx_quality);
+
+            if (!vsr_ok) {
+                MP_WARN(ctx, "NGX VSR: Evaluate failed, falling back to normal render.\n");
+                // Fall back: render normally
+                if (!pl_render_image_mix(p->rr, &mix, &target, &rparams)) {
+                    MP_ERR(ctx, "Failed rendering frame!\n");
+                    goto done;
+                }
+                valid = true;
+                goto done;
+            }
+
+            // --- Stage 3: Blit VSR output to FBO, then composite OSD ---
+
+            // Clear FBO to black first (for letterbox/pillarbox areas)
+            pl_tex_clear(gpu, fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });
+
+            // Blit the VSR output into the aspect-correct destination rect
+            pl_tex_blit(gpu, pl_tex_blit_params(
+                .src = p->vsr_output_pl,
+                .dst = fbo,
+                .src_rc = { .x0 = 0, .y0 = 0, .x1 = dst_w, .y1 = dst_h },
+                .dst_rc = { .x0 = p->dst.x0, .y0 = p->dst.y0,
+                            .x1 = p->dst.x1, .y1 = p->dst.y1 },
+            ));
+
+            // Composite OSD overlays on top of the blitted VSR output.
+            // Use a separate pl_render_image call with PL_CLEAR_SKIP to
+            // preserve the already-blitted video content. The VSR output
+            // is passed as "image" so libplacebo can resolve DST_FRAME
+            // overlay coordinates correctly.
+            if (target.num_overlays > 0) {
+                struct pl_frame vsr_image = {
+                    .repr = pl_color_repr_rgb,
+                    .num_planes = 1,
+                    .planes[0] = {
+                        .texture = p->vsr_output_pl,
+                        .components = p->vsr_output_pl->params.format->num_components,
+                        .component_mapping = {0, 1, 2, 3},
+                    },
+                    .color = pl_color_space_srgb,
+                    .crop = {
+                        .x0 = 0, .y0 = 0,
+                        .x1 = dst_w, .y1 = dst_h,
+                    },
+                };
+
+                struct pl_render_params osd_params = rparams;
+                osd_params.background = PL_CLEAR_SKIP;
+                osd_params.border = PL_CLEAR_SKIP;
+                pl_render_image(p->rr, &vsr_image, &target, &osd_params);
+            }
+
+            valid = true;
+            goto done;
+        }
+    }
+#endif // HAVE_D3D11 && PL_HAVE_D3D11 && HAVE_NGX_VSR
+
     if (!pl_render_image_mix(p->rr, &mix, &target, &rparams)) {
         MP_ERR(ctx, "Failed rendering frame!\n");
         goto done;
@@ -725,26 +963,46 @@ static void screenshot(struct render_backend *ctx, struct vo_frame *frame,
     struct mp_rect src = p->src, dst = p->dst;
     struct mp_osd_res osd = p->osd_res;
 
+    // Check if VSR output is available for this screenshot
+    bool use_vsr_output = false;
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
+    if (p->vsr_output_pl && p->vsr_output_w > 0 && p->vsr_output_h > 0)
+        use_vsr_output = true;
+#endif
+
     if (!args->scaled) {
         int w, h;
-        mp_image_params_get_dsize(&mpi->params, &w, &h);
+
+        if (use_vsr_output) {
+            // Use VSR output dimensions for unscaled screenshot
+            w = p->vsr_output_w;
+            h = p->vsr_output_h;
+        } else {
+            mp_image_params_get_dsize(&mpi->params, &w, &h);
+        }
+
         if (w < 1 || h < 1)
             return;
 
-        int src_w = mpi->params.w;
-        int src_h = mpi->params.h;
-        src = (struct mp_rect) {0, 0, src_w, src_h};
-        dst = (struct mp_rect) {0, 0, w, h};
+        if (!use_vsr_output) {
+            int src_w = mpi->params.w;
+            int src_h = mpi->params.h;
+            src = (struct mp_rect) {0, 0, src_w, src_h};
+            dst = (struct mp_rect) {0, 0, w, h};
 
-        if (mp_image_crop_valid(&mpi->params))
-            src = mpi->params.crop;
+            if (mp_image_crop_valid(&mpi->params))
+                src = mpi->params.crop;
 
-        if (mpi->params.rotate % 180 == 90) {
-            MPSWAP(int, w, h);
-            MPSWAP(int, src_w, src_h);
+            if (mpi->params.rotate % 180 == 90) {
+                MPSWAP(int, w, h);
+                MPSWAP(int, src_w, src_h);
+            }
+            mp_rect_rotate(&src, src_w, src_h, mpi->params.rotate);
+            mp_rect_rotate(&dst, w, h, mpi->params.rotate);
+        } else {
+            src = (struct mp_rect) {0, 0, w, h};
+            dst = (struct mp_rect) {0, 0, w, h};
         }
-        mp_rect_rotate(&src, src_w, src_h, mpi->params.rotate);
-        mp_rect_rotate(&dst, w, h, mpi->params.rotate);
 
         osd = (struct mp_osd_res) {
             .display_par = 1.0,
@@ -800,6 +1058,27 @@ static void screenshot(struct render_backend *ctx, struct vo_frame *frame,
     apply_crop(&image, src, mpi->params.w, mpi->params.h);
     apply_crop(&target, dst, fbo->params.w, fbo->params.h);
 
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
+    // If VSR output is available, use it as the image source instead of the
+    // original decoded frame. This preserves the VSR upscale effect in
+    // screenshots by feeding the cached VSR texture through pl_render_image.
+    if (use_vsr_output) {
+        image = (struct pl_frame){
+            .repr = pl_color_repr_rgb,
+            .num_planes = 1,
+            .planes[0] = {
+                .texture = p->vsr_output_pl,
+                .components = p->vsr_output_pl->params.format->num_components,
+                .component_mapping = {0, 1, 2, 3},
+            },
+            .color = pl_color_space_srgb,
+            .crop = { .x0 = 0, .y0 = 0,
+                      .x1 = p->vsr_output_w, .y1 = p->vsr_output_h },
+        };
+        target.color = pl_color_space_srgb;
+    }
+#endif
+
     // Render OSD/subtitle overlays
     if (p->osd && (args->subs || args->osd)) {
         double pts = mpi->pts;
@@ -835,12 +1114,36 @@ done:
     pl_tex_destroy(gpu, &fbo);
 }
 
+static inline void copy_frame_info_to_mp(struct frame_info *pl,
+                                         struct mp_frame_perf *mp)
+{
+    mp_assert(pl->count <= VO_PASS_PERF_MAX);
+    mp->count = MPMIN(pl->count, VO_PASS_PERF_MAX);
+
+    for (int i = 0; i < mp->count; ++i) {
+        const struct pl_dispatch_info *pass = &pl->info[i];
+
+        mp_assert(pass->num_samples <= MP_ARRAY_SIZE(pass->samples));
+
+        struct mp_pass_perf *perf = &mp->perf[i];
+        perf->count = MPMIN(pass->num_samples, VO_PERF_SAMPLE_COUNT);
+        memcpy(perf->samples, pass->samples, perf->count * sizeof(pass->samples[0]));
+        perf->last = pass->last;
+        perf->peak = pass->peak;
+        perf->avg = pass->average;
+
+        strncpy(mp->desc[i], pass->shader->description, sizeof(mp->desc[i]) - 1);
+        mp->desc[i][sizeof(mp->desc[i]) - 1] = '\0';
+    }
+}
+
 static void perfdata(struct render_backend *ctx,
                      struct voctrl_performance_data *out)
 {
-    // Not implemented for libmpv gpu-next mode.
-    (void)ctx;
-    memset(out, 0, sizeof(*out));
+    struct priv *p = ctx->priv;
+    *out = (struct voctrl_performance_data){0};
+    copy_frame_info_to_mp(&p->perf_fresh, &out->fresh);
+    copy_frame_info_to_mp(&p->perf_redraw, &out->redraw);
 }
 
 static void destroy(struct render_backend *ctx)
@@ -857,7 +1160,29 @@ static void destroy(struct render_backend *ctx)
     for (int i = 0; i < p->num_sub_tex; i++)
         pl_tex_destroy(p->gpu, &p->sub_tex[i]);
 
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
+    // Free VSR cached textures
+    if (p->vsr_intermediate_pl)
+        pl_tex_destroy(p->gpu, &p->vsr_intermediate_pl);
+    if (p->vsr_intermediate_d3d) {
+        ID3D11Texture2D_Release(p->vsr_intermediate_d3d);
+        p->vsr_intermediate_d3d = NULL;
+    }
+    if (p->vsr_output_pl)
+        pl_tex_destroy(p->gpu, &p->vsr_output_pl);
+    if (p->vsr_output_d3d) {
+        ID3D11Texture2D_Release(p->vsr_output_d3d);
+        p->vsr_output_d3d = NULL;
+    }
+#endif
+
     pl_renderer_destroy(&p->rr);
+
+    for (int i = 0; i < VO_PASS_PERF_MAX; ++i) {
+        pl_shader_info_deref(&p->perf_fresh.info[i].shader);
+        pl_shader_info_deref(&p->perf_redraw.info[i].shader);
+    }
+
     pl_options_free(&p->pars);
 
     hwdec_devices_destroy(ctx->hwdec_devs);
@@ -867,6 +1192,30 @@ static void destroy(struct render_backend *ctx)
         talloc_free(p->context->priv);
         talloc_free(p->context);
     }
+}
+
+static void get_vsr_capabilities(struct render_backend *ctx,
+                                  struct mpv_vsr_capabilities *out)
+{
+    struct priv *p = ctx->priv;
+    (void)p;
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
+    if (p->context && p->context->fns->ngx_vsr_available)
+        out->nvidia_vsr = p->context->fns->ngx_vsr_available(p->context) ? 1 : 0;
+#endif
+}
+
+static void get_vsr_output_size(struct render_backend *ctx, int *w, int *h)
+{
+    *w = 0;
+    *h = 0;
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
+    struct priv *p = ctx->priv;
+    if (p->vsr_output_pl && p->vsr_output_w > 0 && p->vsr_output_h > 0) {
+        *w = p->vsr_output_w;
+        *h = p->vsr_output_h;
+    }
+#endif
 }
 
 const struct render_backend_fns render_backend_gpu_next = {
@@ -882,5 +1231,7 @@ const struct render_backend_fns render_backend_gpu_next = {
     .get_image = get_image,
     .screenshot = screenshot,
     .perfdata = perfdata,
+    .get_vsr_capabilities = get_vsr_capabilities,
+    .get_vsr_output_size = get_vsr_output_size,
     .destroy = destroy,
 };

@@ -2905,6 +2905,25 @@ static int mp_property_focused(void *ctx, struct m_property *prop,
     return m_property_bool_ro(action, arg, focused);
 }
 
+static int mp_property_vsr_output_size(void *ctx, struct m_property *prop,
+                                       int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    struct vo *vo = mpctx->video_out;
+    if (!vo)
+        return M_PROPERTY_UNAVAILABLE;
+    int wh[2];
+    if (vo_control(vo, VOCTRL_GET_VSR_OUTPUT_SIZE, &wh) <= 0)
+        return M_PROPERTY_UNAVAILABLE;
+    if (wh[0] <= 0 || wh[1] <= 0)
+        return M_PROPERTY_UNAVAILABLE;
+    if (strcmp(prop->name, "vsr-output-width") == 0) {
+        return m_property_int_ro(action, arg, wh[0]);
+    } else {
+        return m_property_int_ro(action, arg, wh[1]);
+    }
+}
+
 static int mp_property_display_names(void *ctx, struct m_property *prop,
                                      int action, void *arg)
 {
@@ -4625,6 +4644,8 @@ static const struct m_property mp_properties_base[] = {
     {"sub-bitrate", mp_property_packet_bitrate, .priv = (void *)&(const int){STREAM_SUB}},
 
     {"focused", mp_property_focused},
+    {"vsr-output-width", mp_property_vsr_output_size},
+    {"vsr-output-height", mp_property_vsr_output_size},
     {"display-names", mp_property_display_names},
     {"display-fps", mp_property_display_fps},
     {"estimated-display-fps", mp_property_estimated_display_fps},

@@ -42,6 +42,7 @@ struct gl_next_opts {
     int target_hint_mode;
     bool target_hint_strict;
     char **raw_opts;
+    int nvidia_vsr;            // 0=off, 1=bicubic, 2=low, 3=medium, 4=high, 5=ultra
 };
 
 #endif

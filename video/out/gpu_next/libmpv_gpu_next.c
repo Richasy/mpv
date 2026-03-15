@@ -1133,6 +1133,27 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     if (vsr_done && !use_ngx_truehdr) {
         pl_tex_clear(gpu, fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });
 
+        // Pick the correct output texture depending on which VSR engine ran
+        pl_tex vsr_tex = NULL;
+        int vsr_w = 0, vsr_h = 0;
+#if HAVE_NGX_VSR
+        if (p->vsr_output_pl && p->vsr_output_w > 0) {
+            vsr_tex = p->vsr_output_pl;
+            vsr_w = p->vsr_output_w;
+            vsr_h = p->vsr_output_h;
+        }
+#endif
+        if (!vsr_tex && p->fsr_output_pl && p->fsr_output_w > 0) {
+            vsr_tex = p->fsr_output_pl;
+            vsr_w = p->fsr_output_w;
+            vsr_h = p->fsr_output_h;
+        }
+
+        if (!vsr_tex) {
+            MP_WARN(ctx, "VSR output texture unavailable, falling back.\n");
+            goto normal_render;
+        }
+
         // Use pl_render_image instead of pl_tex_blit to handle format
         // differences (e.g. RGBA8 VSR output → FP16 HDR FBO) and
         // composite OSD overlays in a single pass.
@@ -1140,13 +1161,13 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
             .repr = pl_color_repr_rgb,
             .num_planes = 1,
             .planes[0] = {
-                .texture = p->vsr_output_pl,
-                .components = p->vsr_output_pl->params.format->num_components,
+                .texture = vsr_tex,
+                .components = vsr_tex->params.format->num_components,
                 .component_mapping = {0, 1, 2, 3},
             },
             .color = pl_color_space_srgb,
             .crop = { .x0 = 0, .y0 = 0,
-                      .x1 = vsr_dst_w, .y1 = vsr_dst_h },
+                      .x1 = vsr_w, .y1 = vsr_h },
         };
 
         struct pl_render_params vsr_params = rparams;
@@ -1159,6 +1180,7 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     }
 #endif // HAVE_D3D11 && PL_HAVE_D3D11 && HAVE_NGX_VSR
 
+normal_render:
     if (!pl_render_image_mix(p->rr, &mix, &target, &rparams)) {
         MP_ERR(ctx, "Failed rendering frame!\n");
         goto done;

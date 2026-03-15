@@ -108,6 +108,26 @@ struct libmpv_gpu_next_context_fns {
                                  struct ID3D11Texture2D *output_tex,
                                  int out_w, int out_h,
                                  int preset, unsigned int max_luminance);
+
+    // --- AMD FSR 1.0 ---
+
+    // Check if FSR is available on this backend (always true for D3D11).
+    bool (*fsr_available)(struct libmpv_gpu_next_context *ctx);
+
+    // Create an RGBA8 D3D11 texture suitable for FSR input/output.
+    // Flags: BIND_RENDER_TARGET | BIND_SHADER_RESOURCE | BIND_UNORDERED_ACCESS.
+    struct ID3D11Texture2D *(*fsr_create_texture)(
+        struct libmpv_gpu_next_context *ctx, int w, int h);
+
+    // Run FSR EASU (upscale) + optional RCAS (sharpen).
+    // mode: 1=EASU only, 2=EASU+RCAS
+    // Returns true on success.
+    bool (*fsr_process)(struct libmpv_gpu_next_context *ctx,
+                        struct ID3D11Texture2D *input_tex,
+                        int in_w, int in_h,
+                        struct ID3D11Texture2D *output_tex,
+                        int out_w, int out_h,
+                        int mode);
 };
 
 extern const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11;

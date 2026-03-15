@@ -1076,6 +1076,11 @@ if ngx_vsr_found
     dependencies += ngx_vsr_dep
 endif
 
+# AMD FSR 1.0 (FidelityFX Super Resolution)
+# Pure compute shader implementation — no vendor SDK required.
+# Shaders are precompiled to DXBC bytecode (no runtime d3dcompiler needed).
+features += {'amd-fsr': features['d3d11']}
+
 wayland = {
     'deps': [dependency('wayland-client', version: '>= 1.23.0', required: get_option('wayland')),
              dependency('wayland-cursor', version: '>= 1.23.0', required: get_option('wayland')),

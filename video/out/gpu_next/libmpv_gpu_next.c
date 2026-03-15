@@ -116,6 +116,16 @@ struct priv {
     int truehdr_w, truehdr_h;
 #endif
 
+    // AMD FSR 1.0 cached textures
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    struct ID3D11Texture2D *fsr_intermediate_d3d;   // source-resolution RGBA8
+    pl_tex fsr_intermediate_pl;
+    int fsr_intermediate_w, fsr_intermediate_h;
+    struct ID3D11Texture2D *fsr_output_d3d;         // fbo-resolution RGBA8
+    pl_tex fsr_output_pl;
+    int fsr_output_w, fsr_output_h;
+#endif
+
     // Performance data of last frame
     struct frame_info perf_fresh;
     struct frame_info perf_redraw;
@@ -843,6 +853,135 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
         }
     }
 
+    // --- AMD FSR stage: spatial upscaling (any D3D11 GPU) ---
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    int amd_fsr_mode = p->next_opts->amd_fsr;
+    bool use_fsr = !vsr_done && amd_fsr_mode > 0 &&
+                   p->context->fns->fsr_available &&
+                   p->context->fns->fsr_available(p->context) &&
+                   frame->current && mix.num_frames > 0;
+
+    if (use_fsr) {
+        struct pl_frame *first_frame = (struct pl_frame *) mix.frames[0];
+        struct mp_image *src_mpi = first_frame->user_data;
+        int src_w = src_mpi->params.w;
+        int src_h = src_mpi->params.h;
+
+        int dst_w = p->dst.x1 - p->dst.x0;
+        int dst_h = p->dst.y1 - p->dst.y0;
+        if (dst_w <= 0 || dst_h <= 0) {
+            dst_w = fbo_w;
+            dst_h = fbo_h;
+        }
+
+        if (src_w >= dst_w && src_h >= dst_h) {
+            MP_DBG(ctx, "FSR: Source %dx%d >= dst %dx%d, skipping.\n",
+                   src_w, src_h, dst_w, dst_h);
+            use_fsr = false;
+        }
+
+        if (use_fsr) {
+            MP_DBG(ctx, "FSR: Two-stage render %dx%d -> %dx%d (mode=%d)\n",
+                   src_w, src_h, dst_w, dst_h, amd_fsr_mode);
+
+            // Ensure intermediate texture at source resolution
+            if (!p->fsr_intermediate_d3d ||
+                p->fsr_intermediate_w != src_w || p->fsr_intermediate_h != src_h)
+            {
+                if (p->fsr_intermediate_pl)
+                    pl_tex_destroy(gpu, &p->fsr_intermediate_pl);
+                if (p->fsr_intermediate_d3d) {
+                    ID3D11Texture2D_Release(p->fsr_intermediate_d3d);
+                    p->fsr_intermediate_d3d = NULL;
+                }
+
+                p->fsr_intermediate_d3d =
+                    p->context->fns->fsr_create_texture(p->context, src_w, src_h);
+                if (p->fsr_intermediate_d3d) {
+                    p->fsr_intermediate_pl = pl_d3d11_wrap(gpu, pl_d3d11_wrap_params(
+                        .tex = (ID3D11Resource *)p->fsr_intermediate_d3d,
+                        .w = src_w,
+                        .h = src_h,
+                    ));
+                    p->fsr_intermediate_w = src_w;
+                    p->fsr_intermediate_h = src_h;
+                }
+
+                if (!p->fsr_intermediate_pl) {
+                    MP_WARN(ctx, "FSR: Failed to create intermediate texture.\n");
+                    use_fsr = false;
+                }
+            }
+
+            // Ensure output texture at destination resolution
+            if (use_fsr &&
+                (!p->fsr_output_d3d ||
+                 p->fsr_output_w != dst_w || p->fsr_output_h != dst_h))
+            {
+                if (p->fsr_output_pl)
+                    pl_tex_destroy(gpu, &p->fsr_output_pl);
+                if (p->fsr_output_d3d) {
+                    ID3D11Texture2D_Release(p->fsr_output_d3d);
+                    p->fsr_output_d3d = NULL;
+                }
+
+                p->fsr_output_d3d =
+                    p->context->fns->fsr_create_texture(p->context, dst_w, dst_h);
+                if (p->fsr_output_d3d) {
+                    p->fsr_output_pl = pl_d3d11_wrap(gpu, pl_d3d11_wrap_params(
+                        .tex = (ID3D11Resource *)p->fsr_output_d3d,
+                        .w = dst_w,
+                        .h = dst_h,
+                    ));
+                    p->fsr_output_w = dst_w;
+                    p->fsr_output_h = dst_h;
+                }
+
+                if (!p->fsr_output_pl) {
+                    MP_WARN(ctx, "FSR: Failed to create output texture.\n");
+                    use_fsr = false;
+                }
+            }
+        }
+
+        if (use_fsr) {
+            struct pl_frame intermediate_target = {
+                .repr = pl_color_repr_rgb,
+                .num_planes = 1,
+                .planes[0] = {
+                    .texture = p->fsr_intermediate_pl,
+                    .components = p->fsr_intermediate_pl->params.format->num_components,
+                    .component_mapping = {0, 1, 2, 3},
+                },
+                .color = pl_color_space_srgb,
+                .crop = { .x0 = 0, .y0 = 0, .x1 = src_w, .y1 = src_h },
+            };
+
+            struct pl_render_params no_osd_params = rparams;
+            if (!pl_render_image_mix(p->rr, &mix, &intermediate_target, &no_osd_params)) {
+                MP_ERR(ctx, "FSR: Failed rendering to intermediate texture!\n");
+                goto done;
+            }
+            pl_gpu_flush(gpu);
+
+            bool fsr_ok = p->context->fns->fsr_process(
+                p->context,
+                p->fsr_intermediate_d3d, src_w, src_h,
+                p->fsr_output_d3d, dst_w, dst_h,
+                amd_fsr_mode);
+
+            if (!fsr_ok) {
+                MP_WARN(ctx, "FSR: Processing failed, falling back.\n");
+                use_fsr = false;
+            } else {
+                vsr_done = true;
+                vsr_dst_w = dst_w;
+                vsr_dst_h = dst_h;
+            }
+        }
+    }
+#endif // HAVE_D3D11 && PL_HAVE_D3D11
+
     // --- TrueHDR stage: SDR → HDR conversion ---
     if (use_ngx_truehdr) {
         int hdr_w = p->dst.x1 - p->dst.x0;
@@ -916,6 +1055,16 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
                 need_sdr_render = false;
                 MP_DBG(ctx, "NGX TrueHDR: Using VSR output as SDR input (mode B).\n");
             }
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+            else if (vsr_done && p->fsr_output_pl &&
+                     p->fsr_output_w == hdr_w && p->fsr_output_h == hdr_h)
+            {
+                // Mode B (FSR): chain FSR → TrueHDR
+                sdr_input_d3d = p->fsr_output_d3d;
+                need_sdr_render = false;
+                MP_DBG(ctx, "NGX TrueHDR: Using FSR output as SDR input (mode B).\n");
+            }
+#endif
 
             if (need_sdr_render) {
                 // Mode A: Render video to SDR RGBA8 input texture
@@ -1092,14 +1241,30 @@ static void screenshot(struct render_backend *ctx, struct vo_frame *frame,
     if (p->vsr_output_pl && p->vsr_output_w > 0 && p->vsr_output_h > 0)
         use_vsr_output = true;
 #endif
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    if (!use_vsr_output && p->fsr_output_pl &&
+        p->fsr_output_w > 0 && p->fsr_output_h > 0)
+        use_vsr_output = true;
+#endif
 
     if (!args->scaled) {
         int w, h;
 
         if (use_vsr_output) {
-            // Use VSR output dimensions for unscaled screenshot
-            w = p->vsr_output_w;
-            h = p->vsr_output_h;
+            // Use upscale output dimensions for unscaled screenshot
+            w = 0; h = 0;
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
+            if (p->vsr_output_w > 0) {
+                w = p->vsr_output_w;
+                h = p->vsr_output_h;
+            }
+#endif
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+            if (w == 0 && p->fsr_output_w > 0) {
+                w = p->fsr_output_w;
+                h = p->fsr_output_h;
+            }
+#endif
         } else {
             mp_image_params_get_dsize(&mpi->params, &w, &h);
         }
@@ -1181,24 +1346,40 @@ static void screenshot(struct render_backend *ctx, struct vo_frame *frame,
     apply_crop(&image, src, mpi->params.w, mpi->params.h);
     apply_crop(&target, dst, fbo->params.w, fbo->params.h);
 
-#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
-    // If VSR output is available, use it as the image source instead of the
-    // original decoded frame. This preserves the VSR upscale effect in
-    // screenshots by feeding the cached VSR texture through pl_render_image.
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    // If upscale output (VSR or FSR) is available, use it as the image source
+    // instead of the original decoded frame. This preserves the upscale effect
+    // in screenshots by feeding the cached texture through pl_render_image.
     if (use_vsr_output) {
-        image = (struct pl_frame){
-            .repr = pl_color_repr_rgb,
-            .num_planes = 1,
-            .planes[0] = {
-                .texture = p->vsr_output_pl,
-                .components = p->vsr_output_pl->params.format->num_components,
-                .component_mapping = {0, 1, 2, 3},
-            },
-            .color = pl_color_space_srgb,
-            .crop = { .x0 = 0, .y0 = 0,
-                      .x1 = p->vsr_output_w, .y1 = p->vsr_output_h },
-        };
-        target.color = pl_color_space_srgb;
+        pl_tex vsr_tex = NULL;
+        int vsr_w = 0, vsr_h = 0;
+#if HAVE_NGX_VSR
+        if (p->vsr_output_pl && p->vsr_output_w > 0) {
+            vsr_tex = p->vsr_output_pl;
+            vsr_w = p->vsr_output_w;
+            vsr_h = p->vsr_output_h;
+        }
+#endif
+        if (!vsr_tex && p->fsr_output_pl && p->fsr_output_w > 0) {
+            vsr_tex = p->fsr_output_pl;
+            vsr_w = p->fsr_output_w;
+            vsr_h = p->fsr_output_h;
+        }
+        if (vsr_tex) {
+            image = (struct pl_frame){
+                .repr = pl_color_repr_rgb,
+                .num_planes = 1,
+                .planes[0] = {
+                    .texture = vsr_tex,
+                    .components = vsr_tex->params.format->num_components,
+                    .component_mapping = {0, 1, 2, 3},
+                },
+                .color = pl_color_space_srgb,
+                .crop = { .x0 = 0, .y0 = 0,
+                          .x1 = vsr_w, .y1 = vsr_h },
+            };
+            target.color = pl_color_space_srgb;
+        }
     }
 #endif
 
@@ -1298,6 +1479,20 @@ static void destroy(struct render_backend *ctx)
         p->vsr_output_d3d = NULL;
     }
 
+    // Free FSR cached textures
+    if (p->fsr_intermediate_pl)
+        pl_tex_destroy(p->gpu, &p->fsr_intermediate_pl);
+    if (p->fsr_intermediate_d3d) {
+        ID3D11Texture2D_Release(p->fsr_intermediate_d3d);
+        p->fsr_intermediate_d3d = NULL;
+    }
+    if (p->fsr_output_pl)
+        pl_tex_destroy(p->gpu, &p->fsr_output_pl);
+    if (p->fsr_output_d3d) {
+        ID3D11Texture2D_Release(p->fsr_output_d3d);
+        p->fsr_output_d3d = NULL;
+    }
+
     // Free TrueHDR cached textures
     if (p->truehdr_input_pl)
         pl_tex_destroy(p->gpu, &p->truehdr_input_pl);
@@ -1340,6 +1535,12 @@ static void get_vsr_capabilities(struct render_backend *ctx,
     if (p->context && p->context->fns->ngx_vsr_available)
         out->nvidia_vsr = p->context->fns->ngx_vsr_available(p->context) ? 1 : 0;
 #endif
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    if (p->context && p->context->fns->fsr_available)
+        out->amd_vsr = p->context->fns->fsr_available(p->context) ? 1 : 0;
+#endif
+    MP_VERBOSE(ctx, "VSR capabilities: nvidia=%d, amd=%d\n",
+               out->nvidia_vsr, out->amd_vsr);
 }
 
 static void get_vsr_output_size(struct render_backend *ctx, int *w, int *h)
@@ -1351,6 +1552,18 @@ static void get_vsr_output_size(struct render_backend *ctx, int *w, int *h)
     if (p->vsr_output_pl && p->vsr_output_w > 0 && p->vsr_output_h > 0) {
         *w = p->vsr_output_w;
         *h = p->vsr_output_h;
+    }
+#endif
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    {
+#if !(HAVE_NGX_VSR)
+        struct priv *p = ctx->priv;
+#endif
+        if (*w == 0 && *h == 0 &&
+            p->fsr_output_pl && p->fsr_output_w > 0 && p->fsr_output_h > 0) {
+            *w = p->fsr_output_w;
+            *h = p->fsr_output_h;
+        }
     }
 #endif
 }

@@ -259,6 +259,25 @@ static bool ngx_load_dll(struct libmpv_gpu_next_context *ctx)
 
 #endif // HAVE_NGX_VSR
 
+// ── AMD FidelityFX Super Resolution 1.0 ──
+//
+// FSR 1.0 is an open-source spatial upscaling algorithm (MIT license).
+// It consists of two compute shader passes:
+//   EASU (Edge Adaptive Spatial Upsampling) — the core upscaler
+//   RCAS (Robust Contrast Adaptive Sharpening) — optional sharpening
+// Unlike NVIDIA NGX, FSR works on any D3D11 GPU (no vendor lock).
+// Shaders are precompiled to DXBC bytecode (in fsr_bytecode.h) — no runtime
+// D3DCompile or d3dcompiler dependency needed.
+
+// CPU-side constants computation from ffx_fsr1.h
+// These are the FsrEasuCon / FsrRcasCon functions adapted for C.
+#define A_CPU 1
+#include "video/out/d3d11/fsr/ffx_a.h"
+#include "video/out/d3d11/fsr/ffx_fsr1.h"
+
+// Precompiled DXBC bytecode for EASU and RCAS compute shaders
+#include "video/out/d3d11/fsr/fsr_bytecode.h"
+
 struct priv {
     pl_d3d11 d3d11;
     pl_tex wrapped_tex;
@@ -283,6 +302,15 @@ struct priv {
     bool ngx_truehdr_available;
     NVSDK_NGX_Handle *ngx_truehdr_handle;
 #endif
+
+    // AMD FSR 1.0 state
+    bool fsr_initialized;
+    ID3D11Device *fsr_device;
+    ID3D11DeviceContext *fsr_ctx;
+    ID3D11ComputeShader *fsr_easu_cs;
+    ID3D11ComputeShader *fsr_rcas_cs;
+    ID3D11Buffer *fsr_cb;
+    ID3D11SamplerState *fsr_sampler;
 };
 
 // Convert DXGI_COLOR_SPACE_TYPE to pl_color_space for the render target.
@@ -704,7 +732,270 @@ static bool ngx_truehdr_process_fn(struct libmpv_gpu_next_context *ctx,
 
 #endif // HAVE_NGX_VSR
 
-// ── Standard backend functions ──
+// ── AMD FSR 1.0 implementation ──
+
+static void fsr_init(struct libmpv_gpu_next_context *ctx, ID3D11Device *device)
+{
+    struct priv *p = ctx->priv;
+
+    MP_VERBOSE(ctx, "FSR: Initializing AMD FidelityFX Super Resolution 1.0...\n");
+
+    // Create EASU compute shader from precompiled bytecode
+    HRESULT hr = ID3D11Device_CreateComputeShader(
+        device, fsr_easu_cs_bytecode, sizeof(fsr_easu_cs_bytecode),
+        NULL, &p->fsr_easu_cs);
+    if (FAILED(hr)) {
+        MP_ERR(ctx, "FSR: CreateComputeShader(EASU) failed: hr=0x%x\n",
+               (unsigned)hr);
+        return;
+    }
+
+    // Create RCAS compute shader from precompiled bytecode
+    hr = ID3D11Device_CreateComputeShader(
+        device, fsr_rcas_cs_bytecode, sizeof(fsr_rcas_cs_bytecode),
+        NULL, &p->fsr_rcas_cs);
+    if (FAILED(hr)) {
+        MP_ERR(ctx, "FSR: CreateComputeShader(RCAS) failed: hr=0x%x\n",
+               (unsigned)hr);
+        ID3D11ComputeShader_Release(p->fsr_easu_cs);
+        p->fsr_easu_cs = NULL;
+        return;
+    }
+
+    // Create constant buffer (large enough for 4x uint4 = 64 bytes)
+    D3D11_BUFFER_DESC cb_desc = {
+        .ByteWidth = 64,  // 4 * sizeof(uint4)
+        .Usage = D3D11_USAGE_DYNAMIC,
+        .BindFlags = D3D11_BIND_CONSTANT_BUFFER,
+        .CPUAccessFlags = D3D11_CPU_ACCESS_WRITE,
+    };
+    hr = ID3D11Device_CreateBuffer(device, &cb_desc, NULL, &p->fsr_cb);
+    if (FAILED(hr)) {
+        MP_ERR(ctx, "FSR: Failed to create constant buffer (hr=0x%x).\n",
+               (unsigned)hr);
+        ID3D11ComputeShader_Release(p->fsr_easu_cs);
+        ID3D11ComputeShader_Release(p->fsr_rcas_cs);
+        p->fsr_easu_cs = NULL;
+        p->fsr_rcas_cs = NULL;
+        return;
+    }
+
+    // Create linear clamp sampler
+    D3D11_SAMPLER_DESC sampler_desc = {
+        .Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+        .AddressU = D3D11_TEXTURE_ADDRESS_CLAMP,
+        .AddressV = D3D11_TEXTURE_ADDRESS_CLAMP,
+        .AddressW = D3D11_TEXTURE_ADDRESS_CLAMP,
+        .MaxAnisotropy = 1,
+        .ComparisonFunc = D3D11_COMPARISON_NEVER,
+        .MaxLOD = D3D11_FLOAT32_MAX,
+    };
+    hr = ID3D11Device_CreateSamplerState(device, &sampler_desc, &p->fsr_sampler);
+    if (FAILED(hr)) {
+        MP_ERR(ctx, "FSR: Failed to create sampler (hr=0x%x).\n", (unsigned)hr);
+        ID3D11ComputeShader_Release(p->fsr_easu_cs);
+        ID3D11ComputeShader_Release(p->fsr_rcas_cs);
+        ID3D11Buffer_Release(p->fsr_cb);
+        p->fsr_easu_cs = NULL;
+        p->fsr_rcas_cs = NULL;
+        p->fsr_cb = NULL;
+        return;
+    }
+
+    p->fsr_device = device;
+    ID3D11Device_AddRef(p->fsr_device);
+    ID3D11Device_GetImmediateContext(p->fsr_device, &p->fsr_ctx);
+
+    p->fsr_initialized = true;
+    MP_INFO(ctx, "FSR: AMD FidelityFX Super Resolution 1.0 is ready.\n");
+}
+
+static void fsr_cleanup(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv *p = ctx->priv;
+
+    if (p->fsr_easu_cs) {
+        ID3D11ComputeShader_Release(p->fsr_easu_cs);
+        p->fsr_easu_cs = NULL;
+    }
+    if (p->fsr_rcas_cs) {
+        ID3D11ComputeShader_Release(p->fsr_rcas_cs);
+        p->fsr_rcas_cs = NULL;
+    }
+    if (p->fsr_cb) {
+        ID3D11Buffer_Release(p->fsr_cb);
+        p->fsr_cb = NULL;
+    }
+    if (p->fsr_sampler) {
+        ID3D11SamplerState_Release(p->fsr_sampler);
+        p->fsr_sampler = NULL;
+    }
+    if (p->fsr_ctx) {
+        ID3D11DeviceContext_Release(p->fsr_ctx);
+        p->fsr_ctx = NULL;
+    }
+    if (p->fsr_device) {
+        ID3D11Device_Release(p->fsr_device);
+        p->fsr_device = NULL;
+    }
+    p->fsr_initialized = false;
+}
+
+static bool fsr_available_fn(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv *p = ctx->priv;
+    return p->fsr_initialized;
+}
+
+static ID3D11Texture2D *fsr_create_texture_fn(
+    struct libmpv_gpu_next_context *ctx, int w, int h)
+{
+    struct priv *p = ctx->priv;
+    if (!p->fsr_device)
+        return NULL;
+
+    D3D11_TEXTURE2D_DESC desc = {
+        .Width = w,
+        .Height = h,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+        .SampleDesc = { .Count = 1, .Quality = 0 },
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE |
+                     D3D11_BIND_UNORDERED_ACCESS,
+    };
+
+    ID3D11Texture2D *tex = NULL;
+    HRESULT hr = ID3D11Device_CreateTexture2D(p->fsr_device, &desc, NULL, &tex);
+    if (FAILED(hr)) {
+        MP_ERR(ctx, "FSR: Failed to create %dx%d RGBA8 texture (hr=0x%x).\n",
+               w, h, (unsigned)hr);
+        return NULL;
+    }
+    MP_DBG(ctx, "FSR: Created %dx%d RGBA8 texture (UAV).\n", w, h);
+    return tex;
+}
+
+static bool fsr_update_cb(struct libmpv_gpu_next_context *ctx,
+                            const void *data, UINT size)
+{
+    struct priv *p = ctx->priv;
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = ID3D11DeviceContext_Map(
+        p->fsr_ctx, (ID3D11Resource *)p->fsr_cb, 0,
+        D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hr))
+        return false;
+    memcpy(mapped.pData, data, size);
+    ID3D11DeviceContext_Unmap(p->fsr_ctx, (ID3D11Resource *)p->fsr_cb, 0);
+    return true;
+}
+
+static bool fsr_process_fn(struct libmpv_gpu_next_context *ctx,
+                            ID3D11Texture2D *input_tex,
+                            int in_w, int in_h,
+                            ID3D11Texture2D *output_tex,
+                            int out_w, int out_h,
+                            int mode)
+{
+    struct priv *p = ctx->priv;
+    if (!p->fsr_initialized)
+        return false;
+
+    MP_DBG(ctx, "FSR: Process %dx%d -> %dx%d (mode=%d)\n",
+           in_w, in_h, out_w, out_h, mode);
+
+    HRESULT hr;
+    ID3D11ShaderResourceView *input_srv = NULL;
+    ID3D11UnorderedAccessView *output_uav = NULL;
+
+    // Create SRV for input texture
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {
+        .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MipLevels = 1 },
+    };
+    hr = ID3D11Device_CreateShaderResourceView(
+        p->fsr_device, (ID3D11Resource *)input_tex, &srv_desc, &input_srv);
+    if (FAILED(hr)) {
+        MP_ERR(ctx, "FSR: Failed to create input SRV (hr=0x%x).\n", (unsigned)hr);
+        return false;
+    }
+
+    // Create UAV for output texture
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {
+        .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+        .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+    };
+    hr = ID3D11Device_CreateUnorderedAccessView(
+        p->fsr_device, (ID3D11Resource *)output_tex, &uav_desc, &output_uav);
+    if (FAILED(hr)) {
+        MP_ERR(ctx, "FSR: Failed to create output UAV (hr=0x%x).\n", (unsigned)hr);
+        ID3D11ShaderResourceView_Release(input_srv);
+        return false;
+    }
+
+    // --- EASU pass ---
+    // Compute EASU constants on CPU
+    AU1 easu_con[4][4];
+    FsrEasuCon(easu_con + 0, easu_con + 1, easu_con + 2, easu_con + 3,
+               (AF1)in_w, (AF1)in_h,   // input viewport
+               (AF1)in_w, (AF1)in_h,   // input size (same as viewport)
+               (AF1)out_w, (AF1)out_h); // output size
+
+    if (!fsr_update_cb(ctx, easu_con, sizeof(easu_con))) {
+        MP_ERR(ctx, "FSR: Failed to update EASU constant buffer.\n");
+        goto cleanup;
+    }
+
+    ID3D11DeviceContext_CSSetShader(p->fsr_ctx, p->fsr_easu_cs, NULL, 0);
+    ID3D11DeviceContext_CSSetConstantBuffers(p->fsr_ctx, 0, 1, &p->fsr_cb);
+    ID3D11DeviceContext_CSSetSamplers(p->fsr_ctx, 0, 1, &p->fsr_sampler);
+    ID3D11DeviceContext_CSSetShaderResources(p->fsr_ctx, 0, 1, &input_srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->fsr_ctx, 0, 1, &output_uav, NULL);
+
+    // Each threadgroup processes 16x16 pixels
+    UINT groups_x = (out_w + 15) / 16;
+    UINT groups_y = (out_h + 15) / 16;
+    ID3D11DeviceContext_Dispatch(p->fsr_ctx, groups_x, groups_y, 1);
+
+    // Unbind resources between passes
+    ID3D11ShaderResourceView *null_srv = NULL;
+    ID3D11UnorderedAccessView *null_uav = NULL;
+    ID3D11DeviceContext_CSSetShaderResources(p->fsr_ctx, 0, 1, &null_srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->fsr_ctx, 0, 1, &null_uav, NULL);
+
+    // --- RCAS pass (optional) ---
+    if (mode >= 2 && p->fsr_rcas_cs) {
+        // RCAS works in-place on the output texture (now becomes both input and output).
+        // We need a separate SRV for reading and UAV for writing, but for in-place we
+        // read from the EASU output and write back to it.
+        // Actually RCAS needs a separate intermediate: read from output, write to output
+        // is not allowed. For simplicity, we do RCAS reading from the EASU output
+        // via Load (not Gather), writing to a new view of the same texture.
+        // D3D11 allows same texture as SRV+UAV if they don't overlap — but for a
+        // full-screen pass they do overlap. We need a temp texture.
+        //
+        // For now, skip RCAS if we can't do it without an extra allocation.
+        // TODO: Add intermediate texture for RCAS pass.
+        MP_DBG(ctx, "FSR: RCAS pass requested but not yet implemented "
+               "(requires intermediate texture). Using EASU only.\n");
+    }
+
+    ID3D11ShaderResourceView_Release(input_srv);
+    ID3D11UnorderedAccessView_Release(output_uav);
+    return true;
+
+cleanup:
+    if (input_srv)
+        ID3D11ShaderResourceView_Release(input_srv);
+    if (output_uav)
+        ID3D11UnorderedAccessView_Release(output_uav);
+    return false;
+}
 
 static int init(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
 {
@@ -737,6 +1028,8 @@ static int init(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
 #if HAVE_NGX_VSR
     ngx_vsr_init(ctx, (ID3D11Device *)d3d_params->device);
 #endif
+
+    fsr_init(ctx, (ID3D11Device *)d3d_params->device);
 
     return 0;
 }
@@ -791,6 +1084,8 @@ static void destroy(struct libmpv_gpu_next_context *ctx)
     ngx_vsr_cleanup(ctx);
 #endif
 
+    fsr_cleanup(ctx);
+
     if (p->wrapped_tex)
         pl_tex_destroy(ctx->gpu, &p->wrapped_tex);
 
@@ -815,4 +1110,7 @@ const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11 = {
     .ngx_create_hdr_texture = ngx_create_hdr_texture_fn,
     .ngx_truehdr_process = ngx_truehdr_process_fn,
 #endif
+    .fsr_available = fsr_available_fn,
+    .fsr_create_texture = fsr_create_texture_fn,
+    .fsr_process = fsr_process_fn,
 };

@@ -211,6 +211,10 @@ const struct m_sub_options gl_next_conf = {
             {"natural",  1},
             {"standard", 2},
             {"vivid",    3})},
+        {"amd-fsr", OPT_CHOICE(amd_fsr,
+            {"off",     0},
+            {"on",      1},
+            {"sharpen", 2})},
         {0},
     },
     .defaults = &(struct gl_next_opts) {

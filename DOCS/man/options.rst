@@ -7903,6 +7903,52 @@ them.
     driver, or SDK not found), the option is silently ignored and normal
     rendering is used.
 
+    NVIDIA VSR and AMD FSR are mutually exclusive — enabling one will
+    automatically disable the other.
+
+``--nvidia-truehdr=<off|natural|standard|vivid>``
+    Enable NVIDIA RTX TrueHDR for SDR-to-HDR conversion. Requires an NVIDIA
+    RTX GPU, compatible driver, and an HDR-capable display with HDR mode
+    enabled. ``--vo=gpu-next`` with D3D11 backend only.
+
+    ``off``
+        Disable TrueHDR (default).
+    ``natural``
+        Natural tone mapping with reduced contrast and saturation.
+    ``standard``
+        Standard tone mapping (balanced).
+    ``vivid``
+        Vivid tone mapping with enhanced contrast and saturation.
+
+    TrueHDR converts SDR video content to HDR10 using NVIDIA's AI-based
+    tone mapping. The output uses the PQ transfer function with BT.2020
+    primaries. The swapchain is automatically switched to HDR mode when
+    TrueHDR is active.
+
+    If TrueHDR is not available on the current system, the option is
+    silently ignored.
+
+``--amd-fsr=<off|on|sharpen>``
+    Enable AMD FidelityFX Super Resolution (FSR) 1.0 for spatial upscaling
+    of low-resolution video content. Unlike NVIDIA VSR, FSR is a pure
+    compute shader implementation that works on any D3D11-capable GPU
+    (NVIDIA, AMD, Intel). ``--vo=gpu-next`` with D3D11 backend only.
+
+    ``off``
+        Disable FSR (default).
+    ``on``
+        Enable EASU (Edge Adaptive Spatial Upsampling) for upscaling.
+    ``sharpen``
+        Enable EASU upscaling followed by RCAS (Robust Contrast Adaptive
+        Sharpening) for additional detail enhancement.
+
+    FSR only activates when the source video resolution is lower than the
+    display/window resolution. When the source is already at or above the
+    target resolution, the option has no effect.
+
+    NVIDIA VSR and AMD FSR are mutually exclusive — enabling one will
+    automatically disable the other.
+
 ``--opengl-rectangle-textures``
     Force use of rectangle textures (default: no). Normally this shouldn't have
     any advantages over normal textures. Note that hardware decoding overrides

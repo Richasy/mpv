@@ -81,6 +81,9 @@ struct render_backend_fns {
     // Query VSR output size. Optional; if NULL or VSR inactive, w/h are 0.
     void (*get_vsr_output_size)(struct render_backend *ctx,
                                 int *w, int *h);
+    // Query TrueHDR capabilities. Optional; if NULL, all fields default to 0.
+    void (*get_truehdr_capabilities)(struct render_backend *ctx,
+                                     struct mpv_truehdr_capabilities *out);
     // Free all data in ctx->priv.
     void (*destroy)(struct render_backend *ctx);
 };

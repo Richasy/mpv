@@ -206,6 +206,11 @@ const struct m_sub_options gl_next_conf = {
             {"medium",  3},
             {"high",    4},
             {"ultra",   5})},
+        {"nvidia-truehdr", OPT_CHOICE(nvidia_truehdr,
+            {"off",      0},
+            {"natural",  1},
+            {"standard", 2},
+            {"vivid",    3})},
         {0},
     },
     .defaults = &(struct gl_next_opts) {

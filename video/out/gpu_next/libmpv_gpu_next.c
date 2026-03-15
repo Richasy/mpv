@@ -107,6 +107,13 @@ struct priv {
     struct ID3D11Texture2D *vsr_output_d3d;         // fbo-resolution RGBA8 (UAV)
     pl_tex vsr_output_pl;
     int vsr_output_w, vsr_output_h;
+
+    // NGX TrueHDR cached textures
+    struct ID3D11Texture2D *truehdr_input_d3d;      // RGBA8 SDR (target resolution)
+    pl_tex truehdr_input_pl;
+    struct ID3D11Texture2D *truehdr_output_d3d;     // R10G10B10A2 HDR
+    pl_tex truehdr_output_pl;
+    int truehdr_w, truehdr_h;
 #endif
 
     // Performance data of last frame
@@ -692,26 +699,36 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     }
 
     // Render
+    //
+    // NGX pipeline: VSR (optional) → TrueHDR (optional) → FBO
+    // Both features can work independently or chained together.
+    // When both are active: video → VSR upscale → TrueHDR SDR→HDR → FBO
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
     int nvidia_vsr_quality = p->next_opts->nvidia_vsr;
+    int nvidia_truehdr_preset = p->next_opts->nvidia_truehdr;
+
     bool use_ngx_vsr = nvidia_vsr_quality > 0 &&
                         p->context->fns->ngx_vsr_available &&
                         p->context->fns->ngx_vsr_available(p->context) &&
                         frame->current && mix.num_frames > 0;
 
+    bool use_ngx_truehdr = nvidia_truehdr_preset > 0 &&
+                            p->context->fns->ngx_truehdr_available &&
+                            p->context->fns->ngx_truehdr_available(p->context) &&
+                            frame->current && mix.num_frames > 0;
+
+    // --- VSR stage: upscale source → destination resolution ---
+    bool vsr_done = false;
+    int vsr_dst_w = 0, vsr_dst_h = 0;
+
     if (use_ngx_vsr) {
-        // Map option value (1-5) to NGX quality (0-4: bicubic/low/medium/high/ultra)
         int ngx_quality = nvidia_vsr_quality - 1;
 
-        // Get source video dimensions from the first frame in the mix
         struct pl_frame *first_frame = (struct pl_frame *) mix.frames[0];
         struct mp_image *src_mpi = first_frame->user_data;
         int src_w = src_mpi->params.w;
         int src_h = src_mpi->params.h;
 
-        // Use the destination rect (aspect-ratio-correct video area within FBO)
-        // instead of fbo_w/fbo_h to avoid stretching the video to fill the
-        // entire window when the aspect ratios don't match.
         int dst_w = p->dst.x1 - p->dst.x0;
         int dst_h = p->dst.y1 - p->dst.y0;
         if (dst_w <= 0 || dst_h <= 0) {
@@ -719,7 +736,6 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
             dst_h = fbo_h;
         }
 
-        // Skip VSR if source is same size or larger than destination
         if (src_w >= dst_w && src_h >= dst_h) {
             MP_DBG(ctx, "NGX VSR: Source %dx%d >= dst %dx%d, skipping VSR.\n",
                    src_w, src_h, dst_w, dst_h);
@@ -730,13 +746,10 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
             MP_DBG(ctx, "NGX VSR: Two-stage render %dx%d -> %dx%d (quality=%d)\n",
                    src_w, src_h, dst_w, dst_h, ngx_quality);
 
-            // --- Stage 1: Render video to intermediate RGBA8 texture at source resolution ---
-
-            // Ensure intermediate D3D11 texture exists and matches source dimensions
+            // Ensure intermediate texture at source resolution
             if (!p->vsr_intermediate_d3d ||
                 p->vsr_intermediate_w != src_w || p->vsr_intermediate_h != src_h)
             {
-                // Release old textures
                 if (p->vsr_intermediate_pl)
                     pl_tex_destroy(gpu, &p->vsr_intermediate_pl);
                 if (p->vsr_intermediate_d3d) {
@@ -762,7 +775,7 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
                 }
             }
 
-            // Ensure output D3D11 texture (UAV) matches dst dimensions (aspect-correct)
+            // Ensure output texture at destination resolution
             if (use_ngx_vsr &&
                 (!p->vsr_output_d3d ||
                  p->vsr_output_w != dst_w || p->vsr_output_h != dst_h))
@@ -794,7 +807,6 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
         }
 
         if (use_ngx_vsr) {
-            // Build intermediate target at source resolution (no OSD)
             struct pl_frame intermediate_target = {
                 .repr = pl_color_repr_rgb,
                 .num_planes = 1,
@@ -804,25 +816,16 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
                     .component_mapping = {0, 1, 2, 3},
                 },
                 .color = pl_color_space_srgb,
+                .crop = { .x0 = 0, .y0 = 0, .x1 = src_w, .y1 = src_h },
             };
 
-            // Apply crop for source -> intermediate (fills entire texture)
-            intermediate_target.crop = (struct pl_rect2df) {
-                .x0 = 0, .y0 = 0,
-                .x1 = src_w, .y1 = src_h,
-            };
-
-            // Render video only (no OSD) to intermediate texture
             struct pl_render_params no_osd_params = rparams;
             if (!pl_render_image_mix(p->rr, &mix, &intermediate_target, &no_osd_params)) {
                 MP_ERR(ctx, "NGX VSR: Failed rendering to intermediate texture!\n");
                 goto done;
             }
-
-            // Flush GPU to ensure intermediate texture is complete
             pl_gpu_flush(gpu);
 
-            // --- Stage 2: NGX VSR upscale intermediate -> output ---
             bool vsr_ok = p->context->fns->ngx_vsr_process(
                 p->context,
                 p->vsr_intermediate_d3d, src_w, src_h,
@@ -830,60 +833,180 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
                 ngx_quality);
 
             if (!vsr_ok) {
-                MP_WARN(ctx, "NGX VSR: Evaluate failed, falling back to normal render.\n");
-                // Fall back: render normally
-                if (!pl_render_image_mix(p->rr, &mix, &target, &rparams)) {
-                    MP_ERR(ctx, "Failed rendering frame!\n");
-                    goto done;
-                }
-                valid = true;
-                goto done;
+                MP_WARN(ctx, "NGX VSR: Evaluate failed, falling back.\n");
+                use_ngx_vsr = false;
+            } else {
+                vsr_done = true;
+                vsr_dst_w = dst_w;
+                vsr_dst_h = dst_h;
+            }
+        }
+    }
+
+    // --- TrueHDR stage: SDR → HDR conversion ---
+    if (use_ngx_truehdr) {
+        int hdr_w = p->dst.x1 - p->dst.x0;
+        int hdr_h = p->dst.y1 - p->dst.y0;
+        if (hdr_w <= 0 || hdr_h <= 0) {
+            hdr_w = fbo_w;
+            hdr_h = fbo_h;
+        }
+
+        MP_DBG(ctx, "NGX TrueHDR: Processing %dx%d (preset=%d)\n",
+               hdr_w, hdr_h, nvidia_truehdr_preset);
+
+        // Ensure TrueHDR textures match dimensions
+        if (!p->truehdr_input_d3d ||
+            p->truehdr_w != hdr_w || p->truehdr_h != hdr_h)
+        {
+            if (p->truehdr_input_pl)
+                pl_tex_destroy(gpu, &p->truehdr_input_pl);
+            if (p->truehdr_input_d3d) {
+                ID3D11Texture2D_Release(p->truehdr_input_d3d);
+                p->truehdr_input_d3d = NULL;
+            }
+            if (p->truehdr_output_pl)
+                pl_tex_destroy(gpu, &p->truehdr_output_pl);
+            if (p->truehdr_output_d3d) {
+                ID3D11Texture2D_Release(p->truehdr_output_d3d);
+                p->truehdr_output_d3d = NULL;
             }
 
-            // --- Stage 3: Blit VSR output to FBO, then composite OSD ---
+            p->truehdr_input_d3d =
+                p->context->fns->ngx_create_texture(p->context, hdr_w, hdr_h);
+            if (p->truehdr_input_d3d) {
+                p->truehdr_input_pl = pl_d3d11_wrap(gpu, pl_d3d11_wrap_params(
+                    .tex = (ID3D11Resource *)p->truehdr_input_d3d,
+                    .w = hdr_w,
+                    .h = hdr_h,
+                ));
+            }
 
-            // Clear FBO to black first (for letterbox/pillarbox areas)
-            pl_tex_clear(gpu, fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });
+            if (p->truehdr_input_pl) {
+                p->truehdr_output_d3d =
+                    p->context->fns->ngx_create_hdr_texture(p->context, hdr_w, hdr_h);
+                if (p->truehdr_output_d3d) {
+                    p->truehdr_output_pl = pl_d3d11_wrap(gpu, pl_d3d11_wrap_params(
+                        .tex = (ID3D11Resource *)p->truehdr_output_d3d,
+                        .w = hdr_w,
+                        .h = hdr_h,
+                    ));
+                }
+            }
 
-            // Blit the VSR output into the aspect-correct destination rect
-            pl_tex_blit(gpu, pl_tex_blit_params(
-                .src = p->vsr_output_pl,
-                .dst = fbo,
-                .src_rc = { .x0 = 0, .y0 = 0, .x1 = dst_w, .y1 = dst_h },
-                .dst_rc = { .x0 = p->dst.x0, .y0 = p->dst.y0,
-                            .x1 = p->dst.x1, .y1 = p->dst.y1 },
-            ));
+            if (!p->truehdr_input_pl || !p->truehdr_output_pl) {
+                MP_WARN(ctx, "NGX TrueHDR: Failed to create textures.\n");
+                use_ngx_truehdr = false;
+            } else {
+                p->truehdr_w = hdr_w;
+                p->truehdr_h = hdr_h;
+            }
+        }
 
-            // Composite OSD overlays on top of the blitted VSR output.
-            // Use a separate pl_render_image call with PL_CLEAR_SKIP to
-            // preserve the already-blitted video content. The VSR output
-            // is passed as "image" so libplacebo can resolve DST_FRAME
-            // overlay coordinates correctly.
-            if (target.num_overlays > 0) {
-                struct pl_frame vsr_image = {
+        if (use_ngx_truehdr) {
+            // Determine SDR input: VSR output (mode B) or render from scratch (mode A)
+            ID3D11Texture2D *sdr_input_d3d = NULL;
+            bool need_sdr_render = true;
+
+            if (vsr_done && p->vsr_output_pl &&
+                p->vsr_output_w == hdr_w && p->vsr_output_h == hdr_h)
+            {
+                // Mode B: chain VSR → TrueHDR (VSR output is RGBA8 SDR at dst resolution)
+                sdr_input_d3d = p->vsr_output_d3d;
+                need_sdr_render = false;
+                MP_DBG(ctx, "NGX TrueHDR: Using VSR output as SDR input (mode B).\n");
+            }
+
+            if (need_sdr_render) {
+                // Mode A: Render video to SDR RGBA8 input texture
+                struct pl_frame truehdr_sdr_target = {
                     .repr = pl_color_repr_rgb,
                     .num_planes = 1,
                     .planes[0] = {
-                        .texture = p->vsr_output_pl,
-                        .components = p->vsr_output_pl->params.format->num_components,
+                        .texture = p->truehdr_input_pl,
+                        .components = p->truehdr_input_pl->params.format->num_components,
                         .component_mapping = {0, 1, 2, 3},
                     },
                     .color = pl_color_space_srgb,
-                    .crop = {
-                        .x0 = 0, .y0 = 0,
-                        .x1 = dst_w, .y1 = dst_h,
-                    },
+                    .crop = { .x0 = 0, .y0 = 0, .x1 = hdr_w, .y1 = hdr_h },
                 };
 
-                struct pl_render_params osd_params = rparams;
-                osd_params.background = PL_CLEAR_SKIP;
-                osd_params.border = PL_CLEAR_SKIP;
-                pl_render_image(p->rr, &vsr_image, &target, &osd_params);
+                struct pl_render_params no_osd_params = rparams;
+                if (!pl_render_image_mix(p->rr, &mix, &truehdr_sdr_target, &no_osd_params)) {
+                    MP_ERR(ctx, "NGX TrueHDR: Failed rendering to SDR input texture!\n");
+                    goto done;
+                }
+                pl_gpu_flush(gpu);
+
+                sdr_input_d3d = p->truehdr_input_d3d;
             }
 
-            valid = true;
-            goto done;
+            bool truehdr_ok = p->context->fns->ngx_truehdr_process(
+                p->context,
+                sdr_input_d3d, hdr_w, hdr_h,
+                p->truehdr_output_d3d, hdr_w, hdr_h,
+                nvidia_truehdr_preset, 0);
+
+            if (!truehdr_ok) {
+                MP_WARN(ctx, "NGX TrueHDR: Evaluate failed, falling back.\n");
+                use_ngx_truehdr = false;
+                // If VSR succeeded alone, still output that below
+            } else {
+                // Render TrueHDR FP16 output to FBO via pl_render_image.
+                // Set hdr_image.color = target.color for passthrough (the SDK
+                // already produced final scRGB-linear HDR pixels).
+                pl_tex_clear(gpu, fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });
+
+                struct pl_frame hdr_image = {
+                    .repr = pl_color_repr_rgb,
+                    .num_planes = 1,
+                    .planes[0] = {
+                        .texture = p->truehdr_output_pl,
+                        .components = p->truehdr_output_pl->params.format->num_components,
+                        .component_mapping = {0, 1, 2, 3},
+                    },
+                    .color = target.color,
+                    .crop = { .x0 = 0, .y0 = 0, .x1 = hdr_w, .y1 = hdr_h },
+                };
+
+                struct pl_render_params hdr_params = rparams;
+                hdr_params.background = PL_CLEAR_SKIP;
+                hdr_params.border = PL_CLEAR_SKIP;
+                pl_render_image(p->rr, &hdr_image, &target, &hdr_params);
+
+                valid = true;
+                goto done;
+            }
         }
+    }
+
+    // --- VSR-only output (no TrueHDR, or TrueHDR failed) ---
+    if (vsr_done && !use_ngx_truehdr) {
+        pl_tex_clear(gpu, fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });
+
+        // Use pl_render_image instead of pl_tex_blit to handle format
+        // differences (e.g. RGBA8 VSR output → FP16 HDR FBO) and
+        // composite OSD overlays in a single pass.
+        struct pl_frame vsr_image = {
+            .repr = pl_color_repr_rgb,
+            .num_planes = 1,
+            .planes[0] = {
+                .texture = p->vsr_output_pl,
+                .components = p->vsr_output_pl->params.format->num_components,
+                .component_mapping = {0, 1, 2, 3},
+            },
+            .color = pl_color_space_srgb,
+            .crop = { .x0 = 0, .y0 = 0,
+                      .x1 = vsr_dst_w, .y1 = vsr_dst_h },
+        };
+
+        struct pl_render_params vsr_params = rparams;
+        vsr_params.background = PL_CLEAR_SKIP;
+        vsr_params.border = PL_CLEAR_SKIP;
+        pl_render_image(p->rr, &vsr_image, &target, &vsr_params);
+
+        valid = true;
+        goto done;
     }
 #endif // HAVE_D3D11 && PL_HAVE_D3D11 && HAVE_NGX_VSR
 
@@ -1174,6 +1297,20 @@ static void destroy(struct render_backend *ctx)
         ID3D11Texture2D_Release(p->vsr_output_d3d);
         p->vsr_output_d3d = NULL;
     }
+
+    // Free TrueHDR cached textures
+    if (p->truehdr_input_pl)
+        pl_tex_destroy(p->gpu, &p->truehdr_input_pl);
+    if (p->truehdr_input_d3d) {
+        ID3D11Texture2D_Release(p->truehdr_input_d3d);
+        p->truehdr_input_d3d = NULL;
+    }
+    if (p->truehdr_output_pl)
+        pl_tex_destroy(p->gpu, &p->truehdr_output_pl);
+    if (p->truehdr_output_d3d) {
+        ID3D11Texture2D_Release(p->truehdr_output_d3d);
+        p->truehdr_output_d3d = NULL;
+    }
 #endif
 
     pl_renderer_destroy(&p->rr);
@@ -1218,6 +1355,17 @@ static void get_vsr_output_size(struct render_backend *ctx, int *w, int *h)
 #endif
 }
 
+static void get_truehdr_capabilities(struct render_backend *ctx,
+                                      struct mpv_truehdr_capabilities *out)
+{
+    struct priv *p = ctx->priv;
+    (void)p;
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
+    if (p->context && p->context->fns->ngx_truehdr_available)
+        out->nvidia_truehdr = p->context->fns->ngx_truehdr_available(p->context) ? 1 : 0;
+#endif
+}
+
 const struct render_backend_fns render_backend_gpu_next = {
     .init = init,
     .check_format = check_format,
@@ -1233,5 +1381,6 @@ const struct render_backend_fns render_backend_gpu_next = {
     .perfdata = perfdata,
     .get_vsr_capabilities = get_vsr_capabilities,
     .get_vsr_output_size = get_vsr_output_size,
+    .get_truehdr_capabilities = get_truehdr_capabilities,
     .destroy = destroy,
 };

@@ -84,6 +84,30 @@ struct libmpv_gpu_next_context_fns {
                             struct ID3D11Texture2D *output_tex,
                             int out_w, int out_h,
                             int quality);
+
+    // --- NVIDIA NGX TrueHDR ---
+
+    // Check if NGX TrueHDR is available on this backend. Returns true if available.
+    bool (*ngx_truehdr_available)(struct libmpv_gpu_next_context *ctx);
+
+    // Create an R10G10B10A2 D3D11 texture suitable for HDR output.
+    // Flags: BIND_RENDER_TARGET | BIND_SHADER_RESOURCE | BIND_UNORDERED_ACCESS.
+    // Returns the texture, or NULL on failure.
+    struct ID3D11Texture2D *(*ngx_create_hdr_texture)(
+        struct libmpv_gpu_next_context *ctx, int w, int h);
+
+    // Run NGX TrueHDR: convert SDR input_tex to HDR output_tex.
+    // input_tex: RGBA8 SDR texture
+    // output_tex: R10G10B10A2 HDR texture
+    // preset: 1=natural, 2=standard, 3=vivid
+    // max_luminance: monitor peak nits (0 = use SDK default 1000)
+    // Returns true on success.
+    bool (*ngx_truehdr_process)(struct libmpv_gpu_next_context *ctx,
+                                 struct ID3D11Texture2D *input_tex,
+                                 int in_w, int in_h,
+                                 struct ID3D11Texture2D *output_tex,
+                                 int out_w, int out_h,
+                                 int preset, unsigned int max_luminance);
 };
 
 extern const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11;

@@ -499,6 +499,14 @@ int mpv_render_context_get_info(mpv_render_context *ctx,
         res = 0;
         break;
     }
+    case MPV_RENDER_PARAM_TRUEHDR_CAPABILITIES: {
+        mpv_truehdr_capabilities *caps = param.data;
+        *caps = (mpv_truehdr_capabilities){0};
+        if (ctx->renderer && ctx->renderer->fns->get_truehdr_capabilities)
+            ctx->renderer->fns->get_truehdr_capabilities(ctx->renderer, caps);
+        res = 0;
+        break;
+    }
     default:;
     }
 

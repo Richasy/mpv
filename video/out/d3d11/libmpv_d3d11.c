@@ -234,6 +234,24 @@ static bool ngx_load_dll(struct libmpv_gpu_next_context *ctx)
 #define MPV_NGX_PARAM_OUTRECT_H "OutRect.H"
 #define MPV_NGX_PARAM_VSR_QUALITY "VSR.QualityLevel"
 
+// NVSDK_NGX_Feature_TrueHDR = 14
+#define MPV_NGX_FEATURE_TRUEHDR ((NVSDK_NGX_Feature)14)
+
+// TrueHDR parameter keys
+#define MPV_NGX_PARAM_TRUEHDR_AVAILABLE   "TrueHDR.Available"
+#define MPV_NGX_PARAM_TRUEHDR_IN_LEFT     "TrueHDR.InLeft"
+#define MPV_NGX_PARAM_TRUEHDR_IN_TOP      "TrueHDR.InTop"
+#define MPV_NGX_PARAM_TRUEHDR_IN_RIGHT    "TrueHDR.InRight"
+#define MPV_NGX_PARAM_TRUEHDR_IN_BOTTOM   "TrueHDR.InBottom"
+#define MPV_NGX_PARAM_TRUEHDR_OUT_LEFT    "TrueHDR.OutLeft"
+#define MPV_NGX_PARAM_TRUEHDR_OUT_TOP     "TrueHDR.OutTop"
+#define MPV_NGX_PARAM_TRUEHDR_OUT_RIGHT   "TrueHDR.OutRight"
+#define MPV_NGX_PARAM_TRUEHDR_OUT_BOTTOM  "TrueHDR.OutBottom"
+#define MPV_NGX_PARAM_TRUEHDR_CONTRAST    "TrueHDR.Contrast"
+#define MPV_NGX_PARAM_TRUEHDR_SATURATION  "TrueHDR.Saturation"
+#define MPV_NGX_PARAM_TRUEHDR_MIDDLEGRAY  "TrueHDR.MiddleGray"
+#define MPV_NGX_PARAM_TRUEHDR_MAXLUMINANCE "TrueHDR.MaxLuminance"
+
 #define MPV_NGX_FAILED(value) (((value) & 0xFFF00000) == 0xBAD00000)
 
 // App ID for NGX (can be any unique value for the application)
@@ -260,6 +278,10 @@ struct priv {
     int vsr_intermediate_w, vsr_intermediate_h;
     ID3D11Texture2D *vsr_output_tex;
     int vsr_output_w, vsr_output_h;
+
+    // NGX TrueHDR state
+    bool ngx_truehdr_available;
+    NVSDK_NGX_Handle *ngx_truehdr_handle;
 #endif
 };
 
@@ -369,6 +391,37 @@ static void ngx_vsr_init(struct libmpv_gpu_next_context *ctx, ID3D11Device *devi
     p->ngx_vsr_available = true;
     MP_INFO(ctx, "NGX VSR: Feature created successfully. "
             "NVIDIA RTX Video Super Resolution is ready.\n");
+
+    // ── TrueHDR detection and creation (shares NGX Init and params) ──
+
+    int truehdr_available = 0;
+    ngx_param_get_i(p->ngx_params, MPV_NGX_PARAM_TRUEHDR_AVAILABLE,
+                     &truehdr_available);
+    MP_VERBOSE(ctx, "NGX TrueHDR: TrueHDR.Available=%d\n", truehdr_available);
+    if (!truehdr_available) {
+        MP_VERBOSE(ctx, "NGX TrueHDR: TrueHDR feature is not available on "
+                   "this system.\n");
+        return;
+    }
+
+    if (p->multithread)
+        ID3D10Multithread_Enter(p->multithread);
+
+    result = ngx_fn.D3D11_CreateFeature(p->d3d_ctx, MPV_NGX_FEATURE_TRUEHDR,
+                                         p->ngx_params, &p->ngx_truehdr_handle);
+
+    if (p->multithread)
+        ID3D10Multithread_Leave(p->multithread);
+
+    if (MPV_NGX_FAILED(result)) {
+        MP_WARN(ctx, "NGX TrueHDR: CreateFeature failed (0x%x).\n",
+                (unsigned)result);
+        return;
+    }
+
+    p->ngx_truehdr_available = true;
+    MP_INFO(ctx, "NGX TrueHDR: Feature created successfully. "
+            "NVIDIA RTX TrueHDR is ready.\n");
 }
 
 static void ngx_vsr_cleanup(struct libmpv_gpu_next_context *ctx)
@@ -389,6 +442,13 @@ static void ngx_vsr_cleanup(struct libmpv_gpu_next_context *ctx)
         ngx_fn.D3D11_ReleaseFeature(p->ngx_vsr_handle);
         p->ngx_vsr_handle = NULL;
     }
+
+    if (p->ngx_truehdr_handle) {
+        MP_VERBOSE(ctx, "NGX TrueHDR: Releasing TrueHDR feature...\n");
+        ngx_fn.D3D11_ReleaseFeature(p->ngx_truehdr_handle);
+        p->ngx_truehdr_handle = NULL;
+    }
+    p->ngx_truehdr_available = false;
 
     if (p->ngx_initialized) {
         MP_VERBOSE(ctx, "NGX VSR: Shutting down NGX SDK...\n");
@@ -508,6 +568,140 @@ static bool ngx_vsr_process_fn(struct libmpv_gpu_next_context *ctx,
     return true;
 }
 
+static bool ngx_truehdr_available_fn(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv *p = ctx->priv;
+    return p->ngx_truehdr_available;
+}
+
+static ID3D11Texture2D *ngx_create_hdr_texture_fn(
+    struct libmpv_gpu_next_context *ctx, int w, int h)
+{
+    struct priv *p = ctx->priv;
+    if (!p->d3d_device)
+        return NULL;
+
+    // Use R16G16B16A16_FLOAT so the NGX TrueHDR SDK outputs scRGB linear
+    // values, matching the FBO format used in HDR mode. When the output
+    // texture is FP16, the SDK auto-selects scRGB linear encoding instead
+    // of PQ, which avoids any color space mismatch with the swap chain.
+    D3D11_TEXTURE2D_DESC desc = {
+        .Width = w,
+        .Height = h,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = DXGI_FORMAT_R16G16B16A16_FLOAT,
+        .SampleDesc = { .Count = 1, .Quality = 0 },
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE |
+                     D3D11_BIND_UNORDERED_ACCESS,
+        .CPUAccessFlags = 0,
+        .MiscFlags = 0,
+    };
+
+    ID3D11Texture2D *tex = NULL;
+    HRESULT hr = ID3D11Device_CreateTexture2D(p->d3d_device, &desc, NULL, &tex);
+    if (FAILED(hr)) {
+        MP_ERR(ctx, "NGX TrueHDR: Failed to create %dx%d FP16 texture "
+               "(hr=0x%x).\n", w, h, (unsigned)hr);
+        return NULL;
+    }
+
+    MP_DBG(ctx, "NGX TrueHDR: Created %dx%d FP16 HDR texture (UAV).\n",
+           w, h);
+    return tex;
+}
+
+// Map preset to TrueHDR parameters
+static void truehdr_get_preset_params(int preset, unsigned int *contrast,
+                                       unsigned int *saturation,
+                                       unsigned int *middlegray)
+{
+    switch (preset) {
+    case 1: // natural
+        *contrast = 90;
+        *saturation = 90;
+        *middlegray = 50;
+        break;
+    case 3: // vivid
+        *contrast = 120;
+        *saturation = 130;
+        *middlegray = 45;
+        break;
+    case 2: // standard (default)
+    default:
+        *contrast = 100;
+        *saturation = 100;
+        *middlegray = 50;
+        break;
+    }
+}
+
+static bool ngx_truehdr_process_fn(struct libmpv_gpu_next_context *ctx,
+                                     ID3D11Texture2D *input_tex,
+                                     int in_w, int in_h,
+                                     ID3D11Texture2D *output_tex,
+                                     int out_w, int out_h,
+                                     int preset, unsigned int max_luminance)
+{
+    struct priv *p = ctx->priv;
+    if (!p->ngx_truehdr_available || !p->ngx_truehdr_handle || !p->ngx_params)
+        return false;
+
+    unsigned int contrast, saturation, middlegray;
+    truehdr_get_preset_params(preset, &contrast, &saturation, &middlegray);
+
+    if (max_luminance == 0)
+        max_luminance = 1000; // SDK default
+
+    MP_DBG(ctx, "NGX TrueHDR: Evaluate %dx%d -> %dx%d, preset=%d "
+           "(contrast=%u, saturation=%u, middlegray=%u, maxlum=%u)\n",
+           in_w, in_h, out_w, out_h, preset,
+           contrast, saturation, middlegray, max_luminance);
+
+    // Set input/output textures
+    ngx_param_set_d3d11_resource(p->ngx_params, MPV_NGX_PARAM_INPUT1,
+                                  (ID3D11Resource *)input_tex);
+    ngx_param_set_d3d11_resource(p->ngx_params, MPV_NGX_PARAM_OUTPUT,
+                                  (ID3D11Resource *)output_tex);
+
+    // Set input region
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_TRUEHDR_IN_LEFT, 0);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_TRUEHDR_IN_TOP, 0);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_TRUEHDR_IN_RIGHT, in_w);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_TRUEHDR_IN_BOTTOM, in_h);
+
+    // Set output region
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_TRUEHDR_OUT_LEFT, 0);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_TRUEHDR_OUT_TOP, 0);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_TRUEHDR_OUT_RIGHT, out_w);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_TRUEHDR_OUT_BOTTOM, out_h);
+
+    // Set TrueHDR quality parameters
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_TRUEHDR_CONTRAST, contrast);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_TRUEHDR_SATURATION, saturation);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_TRUEHDR_MIDDLEGRAY, middlegray);
+    ngx_param_set_ui(p->ngx_params, MPV_NGX_PARAM_TRUEHDR_MAXLUMINANCE,
+                     max_luminance);
+
+    if (p->multithread)
+        ID3D10Multithread_Enter(p->multithread);
+
+    NVSDK_NGX_Result result = ngx_fn.D3D11_EvaluateFeature(
+        p->d3d_ctx, p->ngx_truehdr_handle, p->ngx_params, NULL);
+
+    if (p->multithread)
+        ID3D10Multithread_Leave(p->multithread);
+
+    if (MPV_NGX_FAILED(result)) {
+        MP_WARN(ctx, "NGX TrueHDR: EvaluateFeature failed (0x%x).\n",
+                (unsigned)result);
+        return false;
+    }
+
+    return true;
+}
+
 #endif // HAVE_NGX_VSR
 
 // ── Standard backend functions ──
@@ -617,5 +811,8 @@ const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11 = {
     .ngx_vsr_available = ngx_vsr_available_fn,
     .ngx_create_texture = ngx_create_texture_fn,
     .ngx_vsr_process = ngx_vsr_process_fn,
+    .ngx_truehdr_available = ngx_truehdr_available_fn,
+    .ngx_create_hdr_texture = ngx_create_hdr_texture_fn,
+    .ngx_truehdr_process = ngx_truehdr_process_fn,
 #endif
 };

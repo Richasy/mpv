@@ -213,6 +213,15 @@ collect() {
     else
         warn "nvngx_vsr.dll not found at $NGX_VSR_DLL, skipping"
     fi
+
+    # Copy NVIDIA NGX TrueHDR runtime DLL if SDK is available
+    local NGX_TRUEHDR_DLL="$NGX_SDK/bin/Windows/$NGX_VSR_ARCH/rel/nvngx_truehdr.dll"
+    if [ -f "$NGX_TRUEHDR_DLL" ]; then
+        cp "$NGX_TRUEHDR_DLL" "$ARCH_OUTPUT/"
+        log "nvngx_truehdr.dll copied from $NGX_TRUEHDR_DLL"
+    else
+        warn "nvngx_truehdr.dll not found at $NGX_TRUEHDR_DLL, skipping"
+    fi
 }
 
 # =============================================================================

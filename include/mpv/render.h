@@ -448,6 +448,16 @@ typedef enum mpv_render_param_type {
      * available at runtime. Fields for unavailable backends are set to 0.
      */
     MPV_RENDER_PARAM_VSR_CAPABILITIES = 23,
+    /**
+     * Query TrueHDR (SDR-to-HDR) capabilities from the render context.
+     * Valid for mpv_render_context_get_info().
+     *
+     * Type: mpv_truehdr_capabilities*
+     *
+     * The struct is filled with information about whether NVIDIA RTX TrueHDR
+     * is available at runtime. Fields for unavailable backends are set to 0.
+     */
+    MPV_RENDER_PARAM_TRUEHDR_CAPABILITIES = 24,
 } mpv_render_param_type;
 
 /**
@@ -459,6 +469,16 @@ typedef struct mpv_vsr_capabilities {
     int amd_vsr;     // reserved for future AMD VSR, always 0
     int intel_vsr;   // reserved for future Intel VSR, always 0
 } mpv_vsr_capabilities;
+
+/**
+ * Runtime TrueHDR capability information, queried via
+ * MPV_RENDER_PARAM_TRUEHDR_CAPABILITIES.
+ */
+typedef struct mpv_truehdr_capabilities {
+    int nvidia_truehdr;  // 1 if NVIDIA RTX TrueHDR is available, 0 otherwise
+    int reserved1;       // reserved for future use, always 0
+    int reserved2;       // reserved for future use, always 0
+} mpv_truehdr_capabilities;
 
 /**
  * For backwards compatibility with the old naming of

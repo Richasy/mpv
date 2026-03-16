@@ -974,6 +974,18 @@ local function add_video_out(s)
         end
     end
 
+    local amdfsr = mp.get_property("amd-fsr")
+    if amdfsr and amdfsr ~= "off" then
+        local value = amdfsr:sub(1,1):upper() .. amdfsr:sub(2)
+        if o.use_ass then
+            local reset = o.font_color ~= "" and o.font_color or "FFFFFF"
+            append(s, "", {prefix="AMD FSR:",
+                   suffix="{\\1c&H0000FF&}" .. value .. "{\\1c&H" .. reset .. "&}"})
+        else
+            append(s, value, {prefix="AMD FSR:"})
+        end
+    end
+
     local scale = nil
     if not mp.get_property_native("fullscreen") then
         scale = get_property_cached("current-window-scale")

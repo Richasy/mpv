@@ -1,5 +1,5 @@
 diff --git a/src/dispatch.c b/src/dispatch.c
-index a593f25..afc9ac1 100644
+index a593f25..6d0d1c9 100644
 --- a/src/dispatch.c
 +++ b/src/dispatch.c
 @@ -612,6 +612,7 @@ static void generate_shaders(pl_dispatch dp,
@@ -10,7 +10,7 @@ index a593f25..afc9ac1 100644
  
              // Use the pl_shader_va for the name in the fragment shader since
              // the pl_vertex_attrib is already mangled for the vertex shader
-@@ -633,17 +634,61 @@ static void generate_shaders(pl_dispatch dp,
+@@ -633,17 +634,62 @@ static void generate_shaders(pl_dispatch dp,
                      ADD(vert_body, "va_pos += "$"; \n", params->out_off);
                  ADD(vert_body, "gl_Position = vec4(va_pos, 0.0, 1.0); \n");
              } else {
@@ -41,27 +41,28 @@ index a593f25..afc9ac1 100644
 +                        [3] = ".xyz",
 +                    };
 +
-+                    // VS: declare vec4 varying, assign padded value
++                    // Both VS and PS use a vec4 varying with a mangled name
++                    // (_v4_XX). PS then #defines the original name as a
++                    // swizzle of the vec4, so downstream code sees the
++                    // correct type transparently.
 +                    if (has_loc) {
-+                        ADD(vert_head, "layout(location=%d) out vec4 "$";\n",
++                        ADD(vert_head, "layout(location=%d) out vec4 _v4"$";\n",
 +                            va->location, id);
 +                    } else {
-+                        ADD(vert_head, "out vec4 "$";\n", id);
++                        ADD(vert_head, "out vec4 _v4"$";\n", id);
 +                    }
-+                    ADD(vert_body, $" = vec4("$"%s%s;\n", id,
++                    ADD(vert_body, "_v4"$" = vec4("$"%s%s;\n", id,
 +                        sh_ident_unpack(va->name), swizzle[num_comps],
 +                        pad_suffix[num_comps]);
 +
-+                    // PS: declare vec4 varying with mangled name,
-+                    // then alias original type via a #define so that
-+                    // downstream shader code sees the correct type
++                    // PS: same vec4 varying name, then alias
 +                    if (has_loc) {
-+                        ADD(glsl, "layout(location=%d) in vec4 _vary4_"$";\n",
++                        ADD(glsl, "layout(location=%d) in vec4 _v4"$";\n",
 +                            va->location, id);
 +                    } else {
-+                        ADD(glsl, "in vec4 _vary4_"$";\n", id);
++                        ADD(glsl, "in vec4 _v4"$";\n", id);
 +                    }
-+                    ADD(glsl, "#define "$" (_vary4_"$"%s)\n",
++                    ADD(glsl, "#define "$" (_v4"$"%s)\n",
 +                        id, id, swizzle[num_comps]);
                  } else {
 -                    ADD(vert_head, "out %s "$";\n", type, id);

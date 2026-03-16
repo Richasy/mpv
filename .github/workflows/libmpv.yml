@@ -68,39 +68,7 @@ jobs:
           echo "Packaged archive:"
           ls -lh "$OUTPUT_DIR/libmpv-${{ matrix.name }}.7z"
 
-      - name: Install Azure CLI
-        run: |
-          if command -v az &>/dev/null; then
-            echo "Azure CLI is already installed."
-          else
-            echo "Installing Azure CLI..."
-            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-          fi
-
-      - name: Upload to Azure
-        id: azure-upload
-        continue-on-error: true
-        run: |
-          for attempt in 1 2 3; do
-            echo "Azure upload attempt $attempt/3..."
-            if az storage blob upload \
-              --account-name "${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}" \
-              --container-name github-actions-artifacts \
-              --name "${{ github.event.repository.name }}/${{ github.run_id }}/libmpv-${{ matrix.name }}.7z" \
-              --file "$OUTPUT_DIR/libmpv-${{ matrix.name }}.7z" \
-              --overwrite true \
-              --connection-string "${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}"; then
-              echo "Azure upload succeeded on attempt $attempt"
-              exit 0
-            fi
-            echo "Attempt $attempt failed, waiting 10s before retry..."
-            sleep 10
-          done
-          echo "All Azure upload attempts failed"
-          exit 1
-
-      - name: Fallback - Upload to GitHub Artifacts
-        if: steps.azure-upload.outcome == 'failure'
+      - name: Upload to GitHub Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: libmpv-${{ matrix.name }}

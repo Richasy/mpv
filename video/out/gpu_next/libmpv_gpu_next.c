@@ -788,7 +788,8 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
                             frame->current && mix.num_frames > 0;
 
     // --- VSR stage: upscale source → destination resolution ---
-    bool vsr_done = false;
+    bool vsr_done = false;     // true if NGX VSR produced output this frame
+    bool fsr_done = false;     // true if AMD FSR produced output this frame
     int vsr_dst_w = 0, vsr_dst_h = 0;
 
     if (use_ngx_vsr) {
@@ -1034,7 +1035,7 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
                 MP_WARN(ctx, "FSR: Processing failed, falling back.\n");
                 use_fsr = false;
             } else {
-                vsr_done = true;
+                fsr_done = true;
                 vsr_dst_w = dst_w;
                 vsr_dst_h = dst_h;
             }
@@ -1116,7 +1117,7 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
                 MP_DBG(ctx, "NGX TrueHDR: Using VSR output as SDR input (mode B).\n");
             }
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11)
-            else if (vsr_done && p->fsr_output_pl &&
+            else if (fsr_done && p->fsr_output_pl &&
                      p->fsr_output_w == hdr_w && p->fsr_output_h == hdr_h)
             {
                 // Mode B (FSR): chain FSR → TrueHDR
@@ -1189,21 +1190,21 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
         }
     }
 
-    // --- VSR-only output (no TrueHDR, or TrueHDR failed) ---
-    if (vsr_done && !use_ngx_truehdr) {
+    // --- Upscale-only output (no TrueHDR, or TrueHDR failed) ---
+    if ((vsr_done || fsr_done) && !use_ngx_truehdr) {
         pl_tex_clear(gpu, fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });
 
-        // Pick the correct output texture depending on which VSR engine ran
+        // Pick the correct output texture depending on which engine ran THIS frame
         pl_tex vsr_tex = NULL;
         int vsr_w = 0, vsr_h = 0;
 #if HAVE_NGX_VSR
-        if (p->vsr_output_pl && p->vsr_output_w > 0) {
+        if (vsr_done && p->vsr_output_pl && p->vsr_output_w > 0) {
             vsr_tex = p->vsr_output_pl;
             vsr_w = p->vsr_output_w;
             vsr_h = p->vsr_output_h;
         }
 #endif
-        if (!vsr_tex && p->fsr_output_pl && p->fsr_output_w > 0) {
+        if (!vsr_tex && fsr_done && p->fsr_output_pl && p->fsr_output_w > 0) {
             vsr_tex = p->fsr_output_pl;
             vsr_w = p->fsr_output_w;
             vsr_h = p->fsr_output_h;
@@ -1317,16 +1318,26 @@ static void screenshot(struct render_backend *ctx, struct vo_frame *frame,
     struct mp_rect src = p->src, dst = p->dst;
     struct mp_osd_res osd = p->osd_res;
 
-    // Check if VSR output is available for this screenshot
+    // Check if upscale output is available for this screenshot.
+    // Use current option values to determine which engine is active,
+    // not just whether cached textures exist (they may be stale).
     bool use_vsr_output = false;
+    bool screenshot_vsr_active = false;
+    bool screenshot_fsr_active = false;
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
-    if (p->vsr_output_pl && p->vsr_output_w > 0 && p->vsr_output_h > 0)
+    if (p->next_opts->nvidia_vsr > 0 &&
+        p->vsr_output_pl && p->vsr_output_w > 0 && p->vsr_output_h > 0) {
         use_vsr_output = true;
+        screenshot_vsr_active = true;
+    }
 #endif
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11)
-    if (!use_vsr_output && p->fsr_output_pl &&
-        p->fsr_output_w > 0 && p->fsr_output_h > 0)
+    if (!use_vsr_output && p->next_opts->amd_fsr > 0 &&
+        p->fsr_output_pl &&
+        p->fsr_output_w > 0 && p->fsr_output_h > 0) {
         use_vsr_output = true;
+        screenshot_fsr_active = true;
+    }
 #endif
 
     if (!args->scaled) {
@@ -1336,13 +1347,13 @@ static void screenshot(struct render_backend *ctx, struct vo_frame *frame,
             // Use upscale output dimensions for unscaled screenshot
             w = 0; h = 0;
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
-            if (p->vsr_output_w > 0) {
+            if (screenshot_vsr_active && p->vsr_output_w > 0) {
                 w = p->vsr_output_w;
                 h = p->vsr_output_h;
             }
 #endif
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11)
-            if (w == 0 && p->fsr_output_w > 0) {
+            if (w == 0 && screenshot_fsr_active && p->fsr_output_w > 0) {
                 w = p->fsr_output_w;
                 h = p->fsr_output_h;
             }
@@ -1436,13 +1447,13 @@ static void screenshot(struct render_backend *ctx, struct vo_frame *frame,
         pl_tex vsr_tex = NULL;
         int vsr_w = 0, vsr_h = 0;
 #if HAVE_NGX_VSR
-        if (p->vsr_output_pl && p->vsr_output_w > 0) {
+        if (screenshot_vsr_active && p->vsr_output_pl && p->vsr_output_w > 0) {
             vsr_tex = p->vsr_output_pl;
             vsr_w = p->vsr_output_w;
             vsr_h = p->vsr_output_h;
         }
 #endif
-        if (!vsr_tex && p->fsr_output_pl && p->fsr_output_w > 0) {
+        if (!vsr_tex && screenshot_fsr_active && p->fsr_output_pl && p->fsr_output_w > 0) {
             vsr_tex = p->fsr_output_pl;
             vsr_w = p->fsr_output_w;
             vsr_h = p->fsr_output_h;
@@ -1633,23 +1644,19 @@ static void get_vsr_output_size(struct render_backend *ctx, int *w, int *h)
 {
     *w = 0;
     *h = 0;
-#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
     struct priv *p = ctx->priv;
-    if (p->vsr_output_pl && p->vsr_output_w > 0 && p->vsr_output_h > 0) {
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
+    if (p->next_opts->nvidia_vsr > 0 &&
+        p->vsr_output_pl && p->vsr_output_w > 0 && p->vsr_output_h > 0) {
         *w = p->vsr_output_w;
         *h = p->vsr_output_h;
     }
 #endif
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11)
-    {
-#if !(HAVE_NGX_VSR)
-        struct priv *p = ctx->priv;
-#endif
-        if (*w == 0 && *h == 0 &&
-            p->fsr_output_pl && p->fsr_output_w > 0 && p->fsr_output_h > 0) {
-            *w = p->fsr_output_w;
-            *h = p->fsr_output_h;
-        }
+    if (*w == 0 && *h == 0 && p->next_opts->amd_fsr > 0 &&
+        p->fsr_output_pl && p->fsr_output_w > 0 && p->fsr_output_h > 0) {
+        *w = p->fsr_output_w;
+        *h = p->fsr_output_h;
     }
 #endif
 }

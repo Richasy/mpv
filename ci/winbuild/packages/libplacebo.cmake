@@ -14,6 +14,7 @@ ExternalProject_Add(libplacebo
     GIT_CLONE_FLAGS "--filter=tree:0"
     GIT_SUBMODULES ""
     UPDATE_COMMAND ""
+    PATCH_COMMAND bash -c "cd <SOURCE_DIR> && git apply ${CMAKE_CURRENT_SOURCE_DIR}/libplacebo-0001-d3d11-pad-varyings-to-vec4.patch || true"
     CONFIGURE_COMMAND ""
     COMMAND bash -c "rm -rf <SOURCE_DIR>/3rdparty/glad"
     COMMAND bash -c "rm -rf <SOURCE_DIR>/3rdparty/fast_float"

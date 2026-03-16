@@ -1,0 +1,83 @@
+diff --git a/src/dispatch.c b/src/dispatch.c
+index a593f25..afc9ac1 100644
+--- a/src/dispatch.c
++++ b/src/dispatch.c
+@@ -612,6 +612,7 @@ static void generate_shaders(pl_dispatch dp,
+             const struct pl_vertex_attrib *va = &pass_params->vertex_attribs[i];
+             const struct pl_shader_va *sva = &sh->vas.elem[i];
+             const char *type = va->fmt->glsl_type;
++            int num_comps = va->fmt->num_components;
+ 
+             // Use the pl_shader_va for the name in the fragment shader since
+             // the pl_vertex_attrib is already mangled for the vertex shader
+@@ -633,17 +634,61 @@ static void generate_shaders(pl_dispatch dp,
+                     ADD(vert_body, "va_pos += "$"; \n", params->out_off);
+                 ADD(vert_body, "gl_Position = vec4(va_pos, 0.0, 1.0); \n");
+             } else {
+-                // Everything else is just blindly passed through
+-                if (has_loc) {
+-                    ADD(vert_head, "layout(location=%d) out %s "$";\n",
+-                        va->location, type, id);
+-                    ADD(glsl, "layout(location=%d) in %s "$";\n",
+-                        va->location, type, id);
++                // Everything else is just blindly passed through.
++                // On D3D11, SPIRV-Cross generates TEXCOORD semantics for
++                // varyings. If VS outputs e.g. float2 but PS expects float4
++                // on the same TEXCOORD slot, D3D11 reports a linkage error
++                // ("hardware register component mask is not a subset").
++                // To avoid this, always use vec4 for inter-stage varyings
++                // and pad/swizzle as needed.
++                bool need_pad = num_comps >= 1 && num_comps < 4;
++
++                if (need_pad) {
++                    static const char *pad_suffix[] = {
++                        [1] = ", 0.0, 0.0, 0.0)",
++                        [2] = ", 0.0, 0.0)",
++                        [3] = ", 0.0)",
++                    };
++                    static const char *swizzle[] = {
++                        [1] = ".x",
++                        [2] = ".xy",
++                        [3] = ".xyz",
++                    };
++
++                    // VS: declare vec4 varying, assign padded value
++                    if (has_loc) {
++                        ADD(vert_head, "layout(location=%d) out vec4 "$";\n",
++                            va->location, id);
++                    } else {
++                        ADD(vert_head, "out vec4 "$";\n", id);
++                    }
++                    ADD(vert_body, $" = vec4("$"%s%s;\n", id,
++                        sh_ident_unpack(va->name), swizzle[num_comps],
++                        pad_suffix[num_comps]);
++
++                    // PS: declare vec4 varying with mangled name,
++                    // then alias original type via a #define so that
++                    // downstream shader code sees the correct type
++                    if (has_loc) {
++                        ADD(glsl, "layout(location=%d) in vec4 _vary4_"$";\n",
++                            va->location, id);
++                    } else {
++                        ADD(glsl, "in vec4 _vary4_"$";\n", id);
++                    }
++                    ADD(glsl, "#define "$" (_vary4_"$"%s)\n",
++                        id, id, swizzle[num_comps]);
+                 } else {
+-                    ADD(vert_head, "out %s "$";\n", type, id);
+-                    ADD(glsl, "in %s "$";\n", type, id);
++                    if (has_loc) {
++                        ADD(vert_head, "layout(location=%d) out %s "$";\n",
++                            va->location, type, id);
++                        ADD(glsl, "layout(location=%d) in %s "$";\n",
++                            va->location, type, id);
++                    } else {
++                        ADD(vert_head, "out %s "$";\n", type, id);
++                        ADD(glsl, "in %s "$";\n", type, id);
++                    }
++                    ADD(vert_body, $" = "$";\n", id, sh_ident_unpack(va->name));
+                 }
+-                ADD(vert_body, $" = "$";\n", id, sh_ident_unpack(va->name));
+             }
+         }
+ 

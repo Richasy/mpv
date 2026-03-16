@@ -30,6 +30,8 @@
 #include "video/out/gpu/hwdec.h"
 #include "video/out/gpu/video.h"
 #include "video/out/placebo/utils.h"
+#include "options/path.h"
+#include "stream/stream.h"
 #include "sub/osd.h"
 #include "sub/draw_bmp.h"
 
@@ -68,6 +70,11 @@ struct frame_info {
     struct pl_dispatch_info info[VO_PASS_PERF_MAX];
 };
 
+struct user_hook {
+    char *path;
+    const struct pl_hook *hook;
+};
+
 struct frame_priv {
     struct render_backend *ctx;
 };
@@ -98,6 +105,11 @@ struct priv {
     struct m_config_cache *next_opts_cache;
     struct gl_next_opts *next_opts;
     struct mp_csp_equalizer_state *video_eq;
+
+    // User shader hooks
+    struct user_hook *user_hooks;
+    int num_user_hooks;
+    const struct pl_hook **hooks;  // array passed to pars->params.hooks
 
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
     // NGX VSR cached intermediate textures
@@ -412,6 +424,49 @@ static void update_overlays(struct render_backend *ctx,
     talloc_free(subs);
 }
 
+// --- User shader hooks (glsl-shaders support) ---
+
+static const struct pl_hook *load_hook(struct priv *p, const char *path)
+{
+    if (!path || !path[0])
+        return NULL;
+
+    for (int i = 0; i < p->num_user_hooks; i++) {
+        if (strcmp(p->user_hooks[i].path, path) == 0)
+            return p->user_hooks[i].hook;
+    }
+
+    char *fname = mp_get_user_path(NULL, p->context->global, path);
+    bstr shader = stream_read_file(fname, p, p->context->global,
+                                   1000000000); // 1GB
+    talloc_free(fname);
+
+    const struct pl_hook *hook = NULL;
+    if (shader.len)
+        hook = pl_mpv_user_shader_parse(p->gpu, shader.start, shader.len);
+
+    MP_TARRAY_APPEND(p, p->user_hooks, p->num_user_hooks, (struct user_hook) {
+        .path = talloc_strdup(p, path),
+        .hook = hook,
+    });
+
+    return hook;
+}
+
+static void update_user_shaders(struct priv *p)
+{
+    pl_options pars = p->pars;
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+
+    pars->params.num_hooks = 0;
+    const struct pl_hook *hook;
+    for (int i = 0; opts->user_shaders && opts->user_shaders[i]; i++) {
+        if ((hook = load_hook(p, opts->user_shaders[i])))
+            MP_TARRAY_APPEND(p, p->hooks, pars->params.num_hooks, hook);
+    }
+    pars->params.hooks = p->hooks;
+}
+
 // --- render_backend_fns implementation ---
 
 static int init(struct render_backend *ctx, mpv_render_param *params)
@@ -458,6 +513,9 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
 
     ctx->hwdec_devs = hwdec_devices_create();
     ctx->driver_caps = VO_CAP_ROTATE90 | VO_CAP_VFLIP;
+
+    // Load any shaders configured at startup
+    update_user_shaders(p);
     return 0;
 }
 
@@ -564,8 +622,10 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
         return err;
 
     // Update options
-    m_config_cache_update(p->opts_cache);
+    bool changed = m_config_cache_update(p->opts_cache);
     m_config_cache_update(p->next_opts_cache);
+    if (changed)
+        update_user_shaders(p);
     const struct gl_video_opts *opts = p->opts_cache->opts;
 
     // Build render params
@@ -1529,6 +1589,10 @@ static void destroy(struct render_backend *ctx)
         p->truehdr_output_d3d = NULL;
     }
 #endif
+
+    // Free user shader hooks
+    for (int i = 0; i < p->num_user_hooks; i++)
+        pl_mpv_user_shader_destroy(&p->user_hooks[i].hook);
 
     pl_renderer_destroy(&p->rr);
 

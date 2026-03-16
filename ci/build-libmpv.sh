@@ -112,6 +112,12 @@ build() {
     rm -rf "$BUILD_DIR/packages/mpv-prefix/src/mpv-build" 2>/dev/null || true
     rm -rf "$BUILD_DIR/mpv-dev-"* 2>/dev/null || true
 
+    # Force libplacebo re-patch/rebuild by clearing its stamp and build dirs
+    log "Removing libplacebo cache to force re-patch and rebuild..."
+    rm -rf "$SRC_PACKAGES/libplacebo" 2>/dev/null || true
+    rm -rf "$BUILD_DIR/packages/libplacebo-prefix/src/libplacebo-stamp" 2>/dev/null || true
+    rm -rf "$BUILD_DIR/packages/libplacebo-prefix/src/libplacebo-build" 2>/dev/null || true
+
     # Configure CMake
     log "Configuring CMake for $ARCH..."
     cmake \

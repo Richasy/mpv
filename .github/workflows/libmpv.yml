@@ -74,3 +74,13 @@ jobs:
           name: libmpv-${{ matrix.name }}
           path: ${{ env.OUTPUT_DIR }}/libmpv-${{ matrix.name }}.7z
           retention-days: 30
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ matrix.name }}
+          path: |
+            ${{ env.BUILD_DIR }}/packages/mpv-prefix/src/mpv-stamp/*.log
+            ${{ env.BUILD_DIR }}/packages/mpv-prefix/src/mpv-build/meson-logs/*.txt
+          retention-days: 7

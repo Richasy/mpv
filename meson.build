@@ -176,6 +176,8 @@ sources = files(
     'player/scripting.c',
     'player/sub.c',
     'player/video.c',
+    'player/whisper.c',
+    'player/whisper_translate.c',
 
     ## clipboard
     'player/clipboard/clipboard.c',
@@ -519,7 +521,8 @@ if features['win32-desktop']
                           cc.find_library('user32'),
                           cc.find_library('uuid'),
                           cc.find_library('uxtheme'),
-                          cc.find_library('version')]
+                          cc.find_library('version'),
+                          cc.find_library('winhttp')]
     dependencies += win32_desktop_libs
     path_source = files('osdep/path-win.c')
     if not get_option('fuzzers')

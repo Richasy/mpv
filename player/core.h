@@ -209,6 +209,11 @@ struct ao_chain {
 
     bool ao_underrun;   // last known AO state
     bool underrun;      // for cache pause logic
+
+    // Audio filter metadata → OSD subtitle bridge.
+    // When af_sub_meta_key is set, audio frames' AVFrame metadata is checked
+    // for this key. If found with a new value, it is displayed as an OSD overlay.
+    char *af_sub_meta_last_text;
 };
 
 /* Note that playback can be paused, stopped, etc. at any time. While paused,
@@ -473,6 +478,8 @@ typedef struct MPContext {
     int open_res_error;
 
     struct mp_als *als_state; // lazily initialized on first use
+
+    struct whisper_lookahead *whisper_lookahead;
 } MPContext;
 
 // Contains information about an asynchronous work item, how it can be aborted,
@@ -512,6 +519,13 @@ float audio_get_gain(struct MPContext *mpctx);
 void audio_update_volume(struct MPContext *mpctx);
 void reload_audio_output(struct MPContext *mpctx);
 void audio_start_ao(struct MPContext *mpctx);
+
+// whisper.c
+void whisper_lookahead_start(struct MPContext *mpctx, const char *whisper_opts);
+void whisper_lookahead_stop(struct MPContext *mpctx);
+void whisper_lookahead_seek(struct MPContext *mpctx, double pts);
+bool whisper_lookahead_track_selected(struct MPContext *mpctx);
+void whisper_lookahead_set_track_selected(struct MPContext *mpctx, bool val);
 
 // configfiles.c
 void mp_parse_cfgfiles(struct MPContext *mpctx);

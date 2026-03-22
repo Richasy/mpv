@@ -37,6 +37,9 @@
 #include "filters/f_decoder_wrapper.h"
 #include "filters/filter_internal.h"
 
+#include <libavutil/dict.h>
+#include <libavutil/frame.h>
+
 #include "core.h"
 #include "command.h"
 
@@ -736,6 +739,40 @@ static void ao_process(struct mp_filter *f)
             mpctx->delay += samples / real_samplerate;
         ao_c->last_out_pts = mp_aframe_end_pts(af);
         update_throttle(mpctx);
+
+        // Audio filter metadata → subtitle track injection.
+        // When --af-sub-meta is set, check audio frame metadata for the
+        // specified key and inject its value as a real subtitle packet.
+        const char *meta_key = mpctx->opts->af_sub_meta;
+        if (meta_key && meta_key[0]) {
+            AVFrame *avf = mp_aframe_get_raw_avframe(af);
+            if (avf && avf->metadata) {
+                const AVDictionaryEntry *e =
+                    av_dict_get(avf->metadata, meta_key, NULL, 0);
+                const char *text = e ? e->value : NULL;
+                if (text && text[0]) {
+                    bool changed = !ao_c->af_sub_meta_last_text ||
+                                   strcmp(ao_c->af_sub_meta_last_text, text) != 0;
+                    if (changed) {
+                        talloc_free(ao_c->af_sub_meta_last_text);
+                        ao_c->af_sub_meta_last_text = talloc_strdup(ao_c, text);
+
+                        struct track *t = ao_c->track;
+                        if (t && t->stream && t->demuxer) {
+                            size_t len = strlen(text);
+                            struct demux_packet *dp = new_demux_packet_from(
+                                t->demuxer->packet_pool, (void *)text, len);
+                            if (dp) {
+                                dp->pts = mp_aframe_end_pts(af);
+                                dp->duration = 5.0;
+                                dp->sub_duration = 5.0;
+                                demuxer_feed_af_sub(t->stream, dp);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Gapless case: the AO is still playing from previous file. It makes
         // no sense to wait, and in fact the "full queue" event we're waiting

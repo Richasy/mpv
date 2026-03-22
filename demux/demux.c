@@ -438,6 +438,8 @@ struct demux_stream {
 
     // for closed captions (demuxer_feed_caption)
     struct sh_stream *cc;
+    // for af-sub-meta whisper subtitle injection (demuxer_feed_af_sub)
+    struct sh_stream *af_sub;
     bool ignore_eof;        // ignore stream in underrun detection
 };
 
@@ -1275,6 +1277,72 @@ void demuxer_feed_caption(struct sh_stream *stream, demux_packet_t *dp)
 
     mp_mutex_lock(&in->lock);
     struct sh_stream *sh = demuxer_get_cc_track_locked(stream);
+    if (!sh) {
+        mp_mutex_unlock(&in->lock);
+        talloc_free(dp);
+        return;
+    }
+
+    dp->keyframe = true;
+    dp->pts = MP_ADD_PTS(dp->pts, -in->ts_offset);
+    dp->dts = MP_ADD_PTS(dp->dts, -in->ts_offset);
+    dp->stream = sh->index;
+    add_packet_locked(sh, dp);
+    mp_mutex_unlock(&in->lock);
+}
+
+// Get or lazily create a whisper subtitle stream attached to a given
+// audio stream's demuxer, analogous to demuxer_get_cc_track_locked().
+static struct sh_stream *demuxer_get_af_sub_locked(struct sh_stream *stream)
+{
+    struct sh_stream *sh = stream->ds->af_sub;
+
+    if (!sh) {
+        sh = demux_alloc_sh_stream(STREAM_SUB);
+        if (!sh)
+            return NULL;
+        sh->codec->codec = "ass";
+        sh->title = talloc_strdup(sh, "Whisper");
+        sh->default_track = false;
+
+        // Minimal ASS header for whisper subtitle rendering
+        static const char ass_header[] =
+            "[Script Info]\n"
+            "ScriptType: v4.00+\n"
+            "PlayResX: 1920\n"
+            "PlayResY: 1080\n"
+            "WrapStyle: 0\n"
+            "\n"
+            "[V4+ Styles]\n"
+            "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,"
+            "OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,"
+            "ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
+            "Alignment,MarginL,MarginR,MarginV,Encoding\n"
+            "Style: Default,Sans,72,&H00FFFFFF,&H000000FF,"
+            "&H00000000,&H80000000,0,0,0,0,"
+            "100,100,0,0,1,3,1,"
+            "2,20,20,50,1\n"
+            "\n"
+            "[Events]\n"
+            "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n";
+
+        sh->codec->extradata = talloc_memdup(sh, ass_header, sizeof(ass_header) - 1);
+        sh->codec->extradata_size = sizeof(ass_header) - 1;
+
+        stream->ds->af_sub = sh;
+        demux_add_sh_stream_locked(stream->ds->in, sh);
+        sh->ds->ignore_eof = true;
+    }
+
+    return sh;
+}
+
+void demuxer_feed_af_sub(struct sh_stream *stream, demux_packet_t *dp)
+{
+    struct demux_internal *in = stream->ds->in;
+
+    mp_mutex_lock(&in->lock);
+    struct sh_stream *sh = demuxer_get_af_sub_locked(stream);
     if (!sh) {
         mp_mutex_unlock(&in->lock);
         talloc_free(dp);

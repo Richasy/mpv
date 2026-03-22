@@ -253,6 +253,15 @@ typedef struct MPOpts {
     int osd_on_seek;
     bool video_osd;
 
+    // Audio filter metadata key to display as OSD subtitle (e.g. "lavfi.whisper.text").
+    // When set, audio frame metadata matching this key is shown as an OSD overlay.
+    char *af_sub_meta;
+
+    // Whisper lookahead: when set, starts a secondary decode pipeline that runs
+    // whisper ahead of playback to eliminate subtitle latency.
+    // Value is the whisper filter options string (model=...,language=...).
+    char *whisper_lookahead;
+
     bool untimed;
     char *stream_dump;
     bool stop_playback_on_init_failure;

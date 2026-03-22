@@ -333,6 +333,13 @@ static int init(struct sd *sd)
         break;
     }
 
+    MP_INFO(sd, "sd_ass init: codec='%s' is_converted=%d n_styles=%d "
+            "PlayResX=%d PlayResY=%d extradata_size=%d\n",
+            sd->codec->codec, ctx->is_converted,
+            ctx->ass_track->n_styles,
+            ctx->ass_track->PlayResX, ctx->ass_track->PlayResY,
+            sd->codec->extradata_size);
+
     return 0;
 }
 
@@ -388,6 +395,15 @@ static void filter_and_add(struct sd *sd, struct demux_packet *pkt)
     ass_process_chunk(ctx->ass_track, pkt->buffer, pkt->len,
                       llrint(pkt->pts * 1000),
                       llrint(pkt->duration * 1000));
+
+    if (track->n_events != old_n_events) {
+        MP_INFO(sd, "filter_and_add: events %d->%d, pts=%.3f dur=%.3f "
+                "len=%zu data='%.80s'\n",
+                old_n_events, track->n_events,
+                pkt->pts, pkt->duration,
+                (size_t)pkt->len,
+                pkt->buffer ? (const char *)pkt->buffer : "(null)");
+    }
 
     // This bookkeeping only has any practical use for ASS subs
     // over a VO with no video.
@@ -502,6 +518,12 @@ static void decode(struct sd *sd, struct demux_packet *packet)
         // for discarding duplicate (already seen) packets but we check this
         // anyways for our purposes for ASS subtitles.
         packet->seen = check_packet_seen(sd, packet);
+        MP_INFO(sd, "decode native ASS: pts=%.3f dur=%.3f seen=%d "
+                "len=%zu buf='%.80s'\n",
+                packet->pts, packet->duration,
+                (int)packet->seen,
+                (size_t)packet->len,
+                packet->buffer ? (const char *)packet->buffer : "(null)");
         filter_and_add(sd, packet);
     }
 }

@@ -70,6 +70,7 @@ list(APPEND ep
     libplacebo
     libaribcaption
     libsixel
+    whisper
     ffmpeg
     mpv
     mpv-release

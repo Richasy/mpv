@@ -32,7 +32,9 @@ ExternalProject_Add(ffmpeg
         dav1d
         rubberband
         openal-soft
-    GIT_REPOSITORY https://github.com/FFmpeg/FFmpeg.git
+        whisper
+    GIT_REPOSITORY https://github.com/Richasy/FFmpeg.git
+    GIT_TAG master
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--sparse --filter=tree:0"
     GIT_CLONE_POST_COMMAND "sparse-checkout set --no-cone /* !tests/ref/fate"
@@ -79,6 +81,7 @@ ExternalProject_Add(ffmpeg
         ${ffmpeg_cuda}
         --enable-amf
         --enable-openal
+        --enable-whisper
         --enable-opengl
         --disable-doc
         --disable-ffplay

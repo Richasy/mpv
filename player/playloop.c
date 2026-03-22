@@ -399,6 +399,8 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
         }
     }
 
+    whisper_lookahead_seek(mpctx, seek_pts);
+
     if (!(seek.flags & MPSEEK_FLAG_NOFLUSH))
         clear_audio_output_buffers(mpctx);
 
@@ -1265,6 +1267,51 @@ void run_playloop(struct MPContext *mpctx)
     }
 
     update_demuxer_properties(mpctx);
+
+    // Check if whisper-lookahead option changed and start/stop accordingly.
+    // Delay startup until restart_complete is true, so that any initial seek
+    // (resume from saved position, trakt progress, etc.) has already finished
+    // and get_current_time() returns the correct playback position.
+    {
+        const char *wl_opts = mpctx->opts->whisper_lookahead;
+        bool want_active = wl_opts && wl_opts[0] && mpctx->ao_chain;
+        bool is_active = !!mpctx->whisper_lookahead;
+        if (want_active && !is_active && mpctx->restart_complete)
+            whisper_lookahead_start(mpctx, wl_opts);
+        else if (!want_active && is_active)
+            whisper_lookahead_stop(mpctx);
+
+        // Auto-select the Whisper subtitle track once it appears.
+        // demuxer_feed_af_sub() lazily creates a "Whisper" sub track,
+        // but it is not auto-selected. Find it and select it once.
+        // Note: The Rodel Player C# side also polls for this track
+        // via WaitForWhisperTrackAsync and sets SubtitleId. Both paths
+        // are safe because mp_switch_track_n checks t->selected.
+        if (is_active && !whisper_lookahead_track_selected(mpctx)) {
+            for (int n = 0; n < mpctx->num_tracks; n++) {
+                struct track *t = mpctx->tracks[n];
+                if (t->type == STREAM_SUB &&
+                    t->title && strcmp(t->title, "Whisper") == 0)
+                {
+                    if (!t->selected) {
+                        mp_switch_track_n(mpctx, 0, STREAM_SUB, t,
+                                          FLAG_MARK_SELECTION);
+                    }
+                    whisper_lookahead_set_track_selected(mpctx, true);
+                    MP_INFO(mpctx, "whisper lookahead: auto-selected "
+                            "Whisper subtitle track (tid=%d)\n",
+                            t->user_tid);
+                    break;
+                }
+            }
+        }
+
+        // Note: whisper lifecycle is fully controlled by the whisper-lookahead
+        // option. The C# side clears the option to stop whisper. We do NOT
+        // auto-stop when the user switches away from the Whisper track,
+        // because the C# side sets sid=0 then re-enables whisper, which
+        // would race with an auto-stop here that clears the option.
+    }
 
     handle_cursor_autohide(mpctx);
     handle_vo_events(mpctx);

@@ -910,6 +910,10 @@ static const m_option_t mp_opts[] = {
 
     {"video-osd", OPT_BOOL(video_osd), .flags = UPDATE_OSD},
 
+    {"af-sub-meta", OPT_STRING(af_sub_meta)},
+
+    {"whisper-lookahead", OPT_STRING(whisper_lookahead)},
+
     {"idle", OPT_CHOICE(player_idle_mode,
         {"no",   0}, {"once", 1}, {"yes",  2})},
 

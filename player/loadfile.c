@@ -1973,6 +1973,7 @@ terminate_playback:
 
     // time to uninit all, except global stuff:
     reinit_complex_filters(mpctx, true);
+    whisper_lookahead_stop(mpctx);
     uninit_audio_chain(mpctx);
     uninit_video_chain(mpctx);
     uninit_sub_all(mpctx);

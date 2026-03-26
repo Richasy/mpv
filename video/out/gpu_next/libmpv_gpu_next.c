@@ -38,7 +38,7 @@
 #include "libmpv_gpu_next.h"
 #include "gl_next_opts.h"
 
-#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NGX_VSR
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
 #include <libplacebo/d3d11.h>
 #include <d3d11.h>
 #endif
@@ -77,6 +77,7 @@ struct user_hook {
 
 struct frame_priv {
     struct render_backend *ctx;
+    bool is_hwdec;
 };
 
 struct priv {
@@ -233,6 +234,95 @@ static bool format_supported(struct priv *p, int format, bool use_uint)
     return true;
 }
 
+// --- D3D11VA zero-copy hwdec ---
+
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+
+struct d3d11_plane_view {
+    DXGI_FORMAT fmt;
+    int w_div;  // width divisor (1 for luma, 2 for chroma)
+    int h_div;  // height divisor
+};
+
+static bool get_d3d11_plane_views(int hw_subfmt,
+                                   struct d3d11_plane_view views[4],
+                                   int *num_planes)
+{
+    switch (hw_subfmt) {
+    case IMGFMT_NV12:
+        *num_planes = 2;
+        views[0] = (struct d3d11_plane_view){ DXGI_FORMAT_R8_UNORM, 1, 1 };
+        views[1] = (struct d3d11_plane_view){ DXGI_FORMAT_R8G8_UNORM, 2, 2 };
+        return true;
+    case IMGFMT_P010:
+        *num_planes = 2;
+        views[0] = (struct d3d11_plane_view){ DXGI_FORMAT_R16_UNORM, 1, 1 };
+        views[1] = (struct d3d11_plane_view){ DXGI_FORMAT_R16G16_UNORM, 2, 2 };
+        return true;
+    case IMGFMT_BGRA:
+        *num_planes = 1;
+        views[0] = (struct d3d11_plane_view){ DXGI_FORMAT_B8G8R8A8_UNORM, 1, 1 };
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
+{
+    struct mp_image *mpi = frame->user_data;
+    struct frame_priv *fp = mpi->priv;
+    struct priv *p = fp->ctx->priv;
+
+    ID3D11Texture2D *tex = (ID3D11Texture2D *)mpi->planes[0];
+    int subresource = (intptr_t)mpi->planes[1];
+
+    D3D11_TEXTURE2D_DESC desc;
+    ID3D11Texture2D_GetDesc(tex, &desc);
+
+    struct d3d11_plane_view views[4];
+    int num_planes;
+    if (!get_d3d11_plane_views(mpi->params.hw_subfmt, views, &num_planes)) {
+        MP_ERR(fp->ctx, "Unsupported D3D11 hw_subfmt: %s\n",
+               mp_imgfmt_to_name(mpi->params.hw_subfmt));
+        return false;
+    }
+
+    for (int n = 0; n < num_planes; n++) {
+        int plane_w = desc.Width / views[n].w_div;
+        int plane_h = desc.Height / views[n].h_div;
+
+        pl_tex pl = pl_d3d11_wrap(gpu, pl_d3d11_wrap_params(
+            .tex = (ID3D11Resource *)tex,
+            .array_slice = subresource,
+            .fmt = views[n].fmt,
+            .w = plane_w,
+            .h = plane_h,
+        ));
+
+        if (!pl) {
+            MP_ERR(fp->ctx, "Failed to wrap D3D11 hwdec texture plane %d\n", n);
+            for (int i = 0; i < n; i++)
+                pl_tex_destroy(gpu, &frame->planes[i].texture);
+            return false;
+        }
+
+        frame->planes[n].texture = pl;
+    }
+
+    return true;
+}
+
+static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
+{
+    for (int n = 0; n < frame->num_planes; n++) {
+        pl_tex_destroy(gpu, &frame->planes[n].texture);
+        frame->planes[n].texture = NULL;
+    }
+}
+
+#endif // HAVE_D3D11 && PL_HAVE_D3D11
+
 static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src,
                       struct pl_frame *frame)
 {
@@ -240,6 +330,15 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     struct mp_image_params par = mpi->params;
     struct frame_priv *fp = mpi->priv;
     struct priv *p = fp->ctx->priv;
+
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    fp->is_hwdec = (mpi->imgfmt == IMGFMT_D3D11);
+    if (fp->is_hwdec) {
+        // Use the underlying software format for colorspace metadata
+        par.imgfmt = par.hw_subfmt;
+        par.hw_subfmt = 0;
+    }
+#endif
 
     mp_image_params_guess_csp(&par);
 
@@ -254,6 +353,41 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         .user_data = mpi,
     };
 
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    if (fp->is_hwdec) {
+        // D3D11VA zero-copy: use acquire/release callbacks to wrap the
+        // hardware texture directly via pl_d3d11_wrap() per plane.
+        struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(par.imgfmt);
+        frame->acquire = hwdec_acquire;
+        frame->release = hwdec_release;
+        frame->num_planes = desc.num_planes;
+        for (int n = 0; n < frame->num_planes; n++) {
+            struct pl_plane *plane = &frame->planes[n];
+            int *map = plane->component_mapping;
+            for (int c = 0; c < mp_imgfmt_desc_get_num_comps(&desc); c++) {
+                if (desc.comps[c].plane != n)
+                    continue;
+                uint8_t offset = desc.comps[c].offset;
+                int index = plane->components++;
+                while (index > 0 && desc.comps[map[index - 1]].offset > offset) {
+                    map[index] = map[index - 1];
+                    index--;
+                }
+                map[index] = c;
+            }
+        }
+
+        pl_frame_set_chroma_location(frame, par.chroma_location);
+
+        if (mpi->film_grain)
+            pl_film_grain_from_av(&frame->film_grain, (AVFilmGrainParams *)mpi->film_grain->data);
+
+        pl_icc_profile_compute_signature(&frame->profile);
+        return true;
+    }
+#endif
+
+    // Software upload path
     struct pl_plane_data data[4] = {0};
     bool use_uint = false;
     if (!format_supported(p, mpi->imgfmt, false))
@@ -494,6 +628,11 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
     if (!p->context)
         return MPV_ERROR_NOT_IMPLEMENTED;
 
+    // Create hwdec device registry before backend init, so the backend
+    // can register its device for zero-copy hardware decoding.
+    ctx->hwdec_devs = hwdec_devices_create();
+    p->context->hwdec_devs = ctx->hwdec_devs;
+
     int err = p->context->fns->init(p->context, params);
     if (err < 0)
         return err;
@@ -511,7 +650,6 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
     p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
 
-    ctx->hwdec_devs = hwdec_devices_create();
     ctx->driver_caps = VO_CAP_ROTATE90 | VO_CAP_VFLIP;
 
     // Load any shaders configured at startup
@@ -522,6 +660,10 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
 static bool check_format(struct render_backend *ctx, int imgfmt)
 {
     struct priv *p = ctx->priv;
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    if (imgfmt == IMGFMT_D3D11)
+        return true;
+#endif
     return format_supported(p, imgfmt, false) ||
            format_supported(p, imgfmt, true);
 }

@@ -35,6 +35,12 @@ struct libmpv_gpu_next_context {
 
     pl_log pllog;
     pl_gpu gpu;
+
+    // Hardware decoder device registry. Populated by the render backend
+    // before calling fns->init(), so the backend can register its device
+    // for zero-copy hardware decoding (e.g. D3D11VA).
+    struct mp_hwdec_devices *hwdec_devs;
+
     void *priv;
 };
 

@@ -22,6 +22,9 @@
 #include "video/out/gpu_next/libmpv_gpu_next.h"
 #include "video/out/libmpv.h"
 #include "video/out/placebo/utils.h"
+#include "video/d3d.h"
+#include "video/hwdec.h"
+#include "video/img_format.h"
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -281,6 +284,9 @@ static bool ngx_load_dll(struct libmpv_gpu_next_context *ctx)
 struct priv {
     pl_d3d11 d3d11;
     pl_tex wrapped_tex;
+
+    // D3D11VA hwdec device context for zero-copy hardware decoding
+    struct mp_hwdec_ctx hwctx;
 
 #if HAVE_NGX_VSR
     // NGX VSR state
@@ -1025,6 +1031,29 @@ static int init(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
 
     ctx->gpu = p->d3d11->gpu;
 
+    // Register D3D11 device for zero-copy hardware decoding (D3D11VA)
+    if (ctx->hwdec_devs) {
+        static const int subfmts[] = {
+            IMGFMT_NV12,
+            IMGFMT_P010,
+            IMGFMT_BGRA,
+            0
+        };
+        p->hwctx = (struct mp_hwdec_ctx){
+            .driver_name = "d3d11va",
+            .av_device_ref = d3d11_wrap_device_ref(
+                                (ID3D11Device *)d3d_params->device),
+            .supported_formats = subfmts,
+            .hw_imgfmt = IMGFMT_D3D11,
+        };
+        if (p->hwctx.av_device_ref) {
+            hwdec_devices_add(ctx->hwdec_devs, &p->hwctx);
+            MP_VERBOSE(ctx, "Registered D3D11 device for hwdec.\n");
+        } else {
+            MP_WARN(ctx, "Failed to create hwdec device context.\n");
+        }
+    }
+
 #if HAVE_NGX_VSR
     ngx_vsr_init(ctx, (ID3D11Device *)d3d_params->device);
 #endif
@@ -1079,6 +1108,13 @@ static void destroy(struct libmpv_gpu_next_context *ctx)
     struct priv *p = ctx->priv;
     if (!p)
         return;
+
+    // Unregister hwdec device
+    if (p->hwctx.av_device_ref) {
+        if (ctx->hwdec_devs)
+            hwdec_devices_remove(ctx->hwdec_devs, &p->hwctx);
+        av_buffer_unref(&p->hwctx.av_device_ref);
+    }
 
 #if HAVE_NGX_VSR
     ngx_vsr_cleanup(ctx);

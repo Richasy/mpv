@@ -458,6 +458,20 @@ typedef enum mpv_render_param_type {
      * is available at runtime. Fields for unavailable backends are set to 0.
      */
     MPV_RENDER_PARAM_TRUEHDR_CAPABILITIES = 24,
+    /**
+     * Display refresh rate in Hz. Valid for mpv_render_context_render().
+     * Type: double*
+     *
+     * When provided, this enables display-sync video timing modes
+     * (video-sync=display-*). The value should be the monitor's refresh rate
+     * (e.g. 60.0, 120.0, 144.0). If not provided or <= 0, display-sync is
+     * unavailable unless --display-fps-override is set.
+     *
+     * For best results with frame interpolation (--interpolation), also call
+     * mpv_render_context_report_swap() after each buffer swap/present to
+     * provide vsync timing feedback.
+     */
+    MPV_RENDER_PARAM_DISPLAY_FPS = 25,
 } mpv_render_param_type;
 
 /**

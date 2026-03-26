@@ -342,6 +342,12 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
         !GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_SKIP_RENDERING, int, 0);
 
     if (do_render) {
+        // Inject display FPS from host application for display-sync modes
+        double *display_fps = get_mpv_render_param(params,
+                                                   MPV_RENDER_PARAM_DISPLAY_FPS, NULL);
+        if (display_fps && *display_fps > 0 && ctx->vo)
+            vo_set_display_fps(ctx->vo, *display_fps);
+
         int vp_w, vp_h;
         int err = ctx->renderer->fns->get_target_size(ctx->renderer, params,
                                                     &vp_w, &vp_h);

@@ -774,7 +774,6 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     pl_options pars = p->pars;
     struct pl_render_params rparams = pars->params;
     rparams.skip_caching_single_frame = !frame->still;
-    rparams.frame_mixer = NULL; // No interpolation in libmpv mode
     rparams.info_callback = info_callback;
     rparams.info_priv = ctx;
 
@@ -798,6 +797,8 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
 
     bool can_interpolate = opts->interpolation && frame->display_synced &&
                            !frame->still && frame->num_frames > 1;
+    if (!can_interpolate)
+        rparams.frame_mixer = NULL;
     double pts_offset = can_interpolate ? frame->ideal_frame_vsync : 0;
 
     // Handle queue reset

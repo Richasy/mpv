@@ -27,6 +27,7 @@
 #include "video/img_format.h"
 
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <dxgi1_2.h>
 
 // ── NVIDIA NGX VSR via runtime loading ──
@@ -317,6 +318,29 @@ struct priv {
     ID3D11ComputeShader *fsr_rcas_cs;
     ID3D11Buffer *fsr_cb;
     ID3D11SamplerState *fsr_sampler;
+
+#if HAVE_NVOFA
+    // NvOFFRUC frame interpolation state
+    void *fruc_handle;              // NvOFFRUCHandle (opaque pointer)
+    bool fruc_available;
+    bool fruc_session_active;
+    int fruc_width, fruc_height;
+    ID3D11Device *fruc_device;
+    ID3D11DeviceContext *fruc_ctx;
+
+    // 2 render textures (double-buffered input) + 1 interpolate texture
+    ID3D11Texture2D *fruc_render_tex[2];
+    ID3D11Texture2D *fruc_interp_tex;
+    int fruc_render_idx;            // ping-pong index for render textures
+
+    // ID3D11Fence for CUDA-DX synchronization
+    ID3D11Fence *fruc_fence;
+    ID3D11DeviceContext4 *fruc_ctx4;
+    uint64_t fruc_fence_value;
+
+    bool fruc_has_prev_frame;
+    double fruc_last_pts_ms;
+#endif
 };
 
 // Convert DXGI_COLOR_SPACE_TYPE to pl_color_space for the render target.
@@ -1003,6 +1027,483 @@ cleanup:
     return false;
 }
 
+// ── NVIDIA Optical Flow Frame Interpolation (NvOFFRUC) ──
+//
+// NvOFFRUC is a high-level API from the NVIDIA Optical Flow SDK that provides
+// hardware-accelerated frame interpolation using the dedicated optical flow
+// engine on RTX GPUs. It internally handles optical flow estimation, frame
+// warping, and blending — no custom compute shaders needed.
+//
+// Like NGX, we load NvOFFRUC.dll at runtime and define the C-compatible types
+// ourselves (the SDK header is C++).
+
+#if HAVE_NVOFA
+
+// NvOFFRUC type definitions (from NvOFFRUC.h, adapted for C)
+#define NVOFA_MAX_RESOURCE 10
+#define NVOFA_MIN_RESOURCE 3
+
+typedef void *NvOFFRUCHandle_t;
+
+typedef enum {
+    NvOFFRUC_SUCCESS = 0,
+    NvOFFRUC_ERR_NOT_SUPPORTED,
+    NvOFFRUC_ERR_INVALID_PTR,
+    NvOFFRUC_ERR_INVALID_PARAM,
+    NvOFFRUC_ERR_INVALID_HANDLE,
+    NvOFFRUC_ERR_OUT_OF_SYSTEM_MEMORY,
+    NvOFFRUC_ERR_OUT_OF_VIDEO_MEMORY,
+    NvOFFRUC_ERR_OPENCV_NOT_AVAILABLE,
+    NvOFFRUC_ERR_UNIMPLEMENTED,
+    NvOFFRUC_ERR_OF_FAILURE,
+    NvOFFRUC_ERR_DUPLICATE_RESOURCE,
+    NvOFFRUC_ERR_UNREGISTERED_RESOURCE,
+    NvOFFRUC_ERR_INCORRECT_API_SEQUENCE,
+    NvOFFRUC_ERR_WRITE_TODISK_FAILED,
+    NvOFFRUC_ERR_PIPELINE_EXECUTION_FAILURE,
+    NvOFFRUC_ERR_SYNC_WRITE_FAILED,
+    NvOFFRUC_ERR_GENERIC,
+} NvOFFRUC_STATUS_t;
+
+typedef enum {
+    NvOFFRUC_RESOURCE_CUDA = 0,
+    NvOFFRUC_RESOURCE_DX11 = 1,
+} NvOFFRUC_ResourceType_t;
+
+typedef enum {
+    NvOFFRUC_SURFACE_NV12 = 0,
+    NvOFFRUC_SURFACE_ARGB = 1,
+} NvOFFRUC_SurfaceFormat_t;
+
+typedef enum {
+    NvOFFRUC_CUDA_UNDEFINED = -1,
+    NvOFFRUC_CUDA_CU_DEVICE_PTR = 0,
+    NvOFFRUC_CUDA_CU_ARRAY = 1,
+} NvOFFRUC_CUDAResourceType_t;
+
+typedef union {
+    struct {
+        uint64_t uiFenceValueToWaitOn;
+    } FenceWaitValue;
+    struct {
+        uint64_t uiKeyForRenderTextureAcquire;
+        uint64_t uiKeyForInterpTextureAcquire;
+    } MutexAcquireKey;
+} NvOFFRUC_SyncWait_t;
+
+typedef union {
+    struct {
+        uint64_t uiFenceValueToSignalOn;
+    } FenceSignalValue;
+    struct {
+        uint64_t uiKeyForRenderTextureRelease;
+        uint64_t uiKeyForInterpolateRelease;
+    } MutexReleaseKey;
+} NvOFFRUC_SyncSignal_t;
+
+typedef struct {
+    uint32_t uiWidth;
+    uint32_t uiHeight;
+    void *pDevice;
+    NvOFFRUC_ResourceType_t eResourceType;
+    NvOFFRUC_SurfaceFormat_t eSurfaceFormat;
+    NvOFFRUC_CUDAResourceType_t eCUDAResourceType;
+    uint32_t uiReserved[32];
+} NvOFFRUC_CreateParam_t;
+
+typedef struct {
+    void *pFrame;
+    double nTimeStamp;
+    size_t nCuSurfacePitch;
+    bool *bHasFrameRepetitionOccurred;
+    uint32_t uiReserved[32];
+} NvOFFRUC_FrameData_t;
+
+typedef struct {
+    NvOFFRUC_FrameData_t stFrameDataInput;
+    uint32_t bSkipWarp : 1;
+    NvOFFRUC_SyncWait_t uSyncWait;
+    uint32_t uiReserved[32];
+} NvOFFRUC_ProcessInParams_t;
+
+typedef struct {
+    NvOFFRUC_FrameData_t stFrameDataOutput;
+    NvOFFRUC_SyncSignal_t uSyncSignal;
+    uint32_t uiReserved[32];
+} NvOFFRUC_ProcessOutParams_t;
+
+typedef struct {
+    void *pArrResource[NVOFA_MAX_RESOURCE];
+    void *pD3D11FenceObj;
+    uint32_t uiCount;
+} NvOFFRUC_RegisterResourceParam_t;
+
+typedef struct {
+    void *pArrResource[NVOFA_MAX_RESOURCE];
+    uint32_t uiCount;
+} NvOFFRUC_UnregisterResourceParam_t;
+
+// Function pointer types (CALLBACK = __stdcall on Windows)
+typedef NvOFFRUC_STATUS_t (CALLBACK *PFN_NvOFFRUCCreate)(
+    const NvOFFRUC_CreateParam_t *, NvOFFRUCHandle_t *);
+typedef NvOFFRUC_STATUS_t (CALLBACK *PFN_NvOFFRUCRegisterResource)(
+    NvOFFRUCHandle_t, const NvOFFRUC_RegisterResourceParam_t *);
+typedef NvOFFRUC_STATUS_t (CALLBACK *PFN_NvOFFRUCUnregisterResource)(
+    NvOFFRUCHandle_t, const NvOFFRUC_UnregisterResourceParam_t *);
+typedef NvOFFRUC_STATUS_t (CALLBACK *PFN_NvOFFRUCProcess)(
+    NvOFFRUCHandle_t, const NvOFFRUC_ProcessInParams_t *,
+    const NvOFFRUC_ProcessOutParams_t *);
+typedef NvOFFRUC_STATUS_t (CALLBACK *PFN_NvOFFRUCDestroy)(NvOFFRUCHandle_t);
+
+// Runtime-loaded function pointers
+static struct {
+    HMODULE dll;
+    PFN_NvOFFRUCCreate Create;
+    PFN_NvOFFRUCRegisterResource RegisterResource;
+    PFN_NvOFFRUCUnregisterResource UnregisterResource;
+    PFN_NvOFFRUCProcess Process;
+    PFN_NvOFFRUCDestroy Destroy;
+} nvofa_fn;
+
+static bool nvofa_load_dll(struct libmpv_gpu_next_context *ctx)
+{
+    if (nvofa_fn.dll)
+        return true;
+
+    // Try standard search path first
+    HMODULE dll = LoadLibraryW(L"NvOFFRUC.dll");
+
+    // Fall back: load from the same directory as libmpv-2.dll
+    if (!dll) {
+        HMODULE self = NULL;
+        if (GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                (LPCWSTR)nvofa_load_dll, &self) && self)
+        {
+            wchar_t path[MAX_PATH] = {0};
+            DWORD len = GetModuleFileNameW(self, path, MAX_PATH);
+            if (len > 0 && len < MAX_PATH) {
+                // Strip filename, keep directory
+                wchar_t *slash = wcsrchr(path, L'\\');
+                if (slash) {
+                    wchar_t dir[MAX_PATH] = {0};
+                    wcsncpy(dir, path, slash - path + 1);
+
+                    // Add this directory to DLL search path so that
+                    // NvOFFRUC.dll's own dependencies (cudart64_110.dll)
+                    // are also found from the same directory.
+                    AddDllDirectory(dir);
+
+                    *(slash + 1) = 0;
+                    wcscat(path, L"NvOFFRUC.dll");
+                    MP_VERBOSE(ctx, "NVOFA FRUC: Trying %ls\n", path);
+                    dll = LoadLibraryExW(path, NULL,
+                        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+                }
+            }
+        }
+    }
+
+    if (!dll) {
+        MP_VERBOSE(ctx, "NVOFA FRUC: NvOFFRUC.dll not found.\n");
+        return false;
+    }
+
+#define NVOFA_LOAD(field, name) do {                                        \
+    nvofa_fn.field = (void *)GetProcAddress(dll, name);                     \
+    if (!nvofa_fn.field) {                                                  \
+        MP_WARN(ctx, "NVOFA FRUC: Missing symbol '%s'.\n", name);           \
+        FreeLibrary(dll);                                                   \
+        memset(&nvofa_fn, 0, sizeof(nvofa_fn));                             \
+        return false;                                                       \
+    }                                                                       \
+} while (0)
+
+    NVOFA_LOAD(Create, "NvOFFRUCCreate");
+    NVOFA_LOAD(RegisterResource, "NvOFFRUCRegisterResource");
+    NVOFA_LOAD(UnregisterResource, "NvOFFRUCUnregisterResource");
+    NVOFA_LOAD(Process, "NvOFFRUCProcess");
+    NVOFA_LOAD(Destroy, "NvOFFRUCDestroy");
+#undef NVOFA_LOAD
+
+    nvofa_fn.dll = dll;
+    MP_VERBOSE(ctx, "NVOFA FRUC: NvOFFRUC.dll loaded successfully.\n");
+    return true;
+}
+
+static bool nvofa_fruc_available_fn(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv *p = ctx->priv;
+    return p->fruc_available;
+}
+
+static void nvofa_fruc_destroy_fn(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv *p = ctx->priv;
+
+    if (p->fruc_session_active && p->fruc_handle) {
+        NvOFFRUC_UnregisterResourceParam_t unreg = {0};
+        unreg.uiCount = 3;
+        unreg.pArrResource[0] = p->fruc_interp_tex;
+        unreg.pArrResource[1] = p->fruc_render_tex[0];
+        unreg.pArrResource[2] = p->fruc_render_tex[1];
+        nvofa_fn.UnregisterResource(p->fruc_handle, &unreg);
+
+        nvofa_fn.Destroy(p->fruc_handle);
+        p->fruc_handle = NULL;
+        p->fruc_session_active = false;
+    }
+
+    for (int i = 0; i < 2; i++) {
+        if (p->fruc_render_tex[i]) {
+            ID3D11Texture2D_Release(p->fruc_render_tex[i]);
+            p->fruc_render_tex[i] = NULL;
+        }
+    }
+    if (p->fruc_interp_tex) {
+        ID3D11Texture2D_Release(p->fruc_interp_tex);
+        p->fruc_interp_tex = NULL;
+    }
+    if (p->fruc_fence) {
+        ID3D11Fence_Release(p->fruc_fence);
+        p->fruc_fence = NULL;
+    }
+    if (p->fruc_ctx4) {
+        ID3D11DeviceContext4_Release(p->fruc_ctx4);
+        p->fruc_ctx4 = NULL;
+    }
+    p->fruc_fence_value = 0;
+    p->fruc_render_idx = 0;
+    p->fruc_has_prev_frame = false;
+    p->fruc_last_pts_ms = 0;
+    p->fruc_width = 0;
+    p->fruc_height = 0;
+
+    if (p->fruc_ctx) {
+        ID3D11DeviceContext_Release(p->fruc_ctx);
+        p->fruc_ctx = NULL;
+    }
+    if (p->fruc_device) {
+        ID3D11Device_Release(p->fruc_device);
+        p->fruc_device = NULL;
+    }
+}
+
+static bool nvofa_fruc_init_session_fn(struct libmpv_gpu_next_context *ctx,
+                                        int width, int height)
+{
+    struct priv *p = ctx->priv;
+
+    if (p->fruc_session_active)
+        nvofa_fruc_destroy_fn(ctx);
+
+    if (!nvofa_fn.dll || !p->fruc_device)
+        return false;
+
+    if (!p->fruc_ctx)
+        ID3D11Device_GetImmediateContext(p->fruc_device, &p->fruc_ctx);
+
+    // Get ID3D11DeviceContext4 for Fence Signal/Wait
+    HRESULT hr = ID3D11DeviceContext_QueryInterface(p->fruc_ctx,
+        &IID_ID3D11DeviceContext4, (void **)&p->fruc_ctx4);
+    if (FAILED(hr)) {
+        MP_ERR(ctx, "NVOFA FRUC: QueryInterface ID3D11DeviceContext4 failed.\n");
+        return false;
+    }
+
+    // Create ID3D11Fence for CUDA-DX synchronization
+    ID3D11Device5 *dev5 = NULL;
+    hr = ID3D11Device_QueryInterface(p->fruc_device,
+        &IID_ID3D11Device5, (void **)&dev5);
+    if (FAILED(hr) || !dev5) {
+        MP_ERR(ctx, "NVOFA FRUC: QueryInterface ID3D11Device5 failed.\n");
+        return false;
+    }
+    hr = ID3D11Device5_CreateFence(dev5, 0, D3D11_FENCE_FLAG_SHARED,
+        &IID_ID3D11Fence, (void **)&p->fruc_fence);
+    ID3D11Device5_Release(dev5);
+    if (FAILED(hr)) {
+        MP_ERR(ctx, "NVOFA FRUC: CreateFence failed (0x%x).\n", (unsigned)hr);
+        return false;
+    }
+    p->fruc_fence_value = 0;
+
+    // SHARED + SHARED_NTHANDLE textures (Fence path, not KeyedMutex)
+    D3D11_TEXTURE2D_DESC desc = {
+        .Width = width,
+        .Height = height,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+        .SampleDesc = { .Count = 1, .Quality = 0 },
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = 0,
+        .CPUAccessFlags = 0,
+        .MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
+    };
+
+    for (int i = 0; i < 2; i++) {
+        hr = ID3D11Device_CreateTexture2D(
+            p->fruc_device, &desc, NULL, &p->fruc_render_tex[i]);
+        if (FAILED(hr)) {
+            MP_ERR(ctx, "NVOFA FRUC: CreateTexture2D render[%d] failed (0x%x).\n",
+                   i, (unsigned)hr);
+            nvofa_fruc_destroy_fn(ctx);
+            return false;
+        }
+    }
+
+    hr = ID3D11Device_CreateTexture2D(
+        p->fruc_device, &desc, NULL, &p->fruc_interp_tex);
+    if (FAILED(hr)) {
+        MP_ERR(ctx, "NVOFA FRUC: CreateTexture2D interp failed (0x%x).\n",
+               (unsigned)hr);
+        nvofa_fruc_destroy_fn(ctx);
+        return false;
+    }
+
+    // Create NvOFFRUC instance
+    NvOFFRUC_CreateParam_t create_params = {0};
+    create_params.uiWidth = width;
+    create_params.uiHeight = height;
+    create_params.pDevice = p->fruc_device;
+    create_params.eResourceType = NvOFFRUC_RESOURCE_DX11;
+    create_params.eSurfaceFormat = NvOFFRUC_SURFACE_ARGB;
+    create_params.eCUDAResourceType = NvOFFRUC_CUDA_UNDEFINED;
+
+    NvOFFRUC_STATUS_t status = nvofa_fn.Create(&create_params, &p->fruc_handle);
+    if (status != NvOFFRUC_SUCCESS) {
+        MP_ERR(ctx, "NVOFA FRUC: NvOFFRUCCreate failed (status=%d).\n", status);
+        nvofa_fruc_destroy_fn(ctx);
+        return false;
+    }
+
+    // Register: interp first, then renders; pass Fence for sync
+    NvOFFRUC_RegisterResourceParam_t reg = {0};
+    reg.uiCount = 3;
+    reg.pD3D11FenceObj = p->fruc_fence;  // non-NULL → Fence sync path
+    reg.pArrResource[0] = p->fruc_interp_tex;
+    reg.pArrResource[1] = p->fruc_render_tex[0];
+    reg.pArrResource[2] = p->fruc_render_tex[1];
+
+    status = nvofa_fn.RegisterResource(p->fruc_handle, &reg);
+    if (status != NvOFFRUC_SUCCESS) {
+        MP_ERR(ctx, "NVOFA FRUC: RegisterResource failed (status=%d).\n", status);
+        nvofa_fn.Destroy(p->fruc_handle);
+        p->fruc_handle = NULL;
+        nvofa_fruc_destroy_fn(ctx);
+        return false;
+    }
+
+    p->fruc_session_active = true;
+    p->fruc_width = width;
+    p->fruc_height = height;
+    p->fruc_has_prev_frame = false;
+    p->fruc_last_pts_ms = 0;
+    p->fruc_render_idx = 0;
+
+    MP_INFO(ctx, "NVOFA FRUC: Session created (%dx%d, Fence sync). "
+            "NVIDIA Optical Flow frame interpolation is ready.\n",
+            width, height);
+    return true;
+}
+
+static bool nvofa_fruc_feed_frame_fn(struct libmpv_gpu_next_context *ctx,
+                                      ID3D11Texture2D *input_tex,
+                                      double pts_ms)
+{
+    struct priv *p = ctx->priv;
+    if (!p->fruc_session_active || !p->fruc_handle)
+        return false;
+
+    int idx = p->fruc_render_idx;
+
+    // Copy input frame to registered render texture
+    ID3D11DeviceContext_CopyResource(p->fruc_ctx,
+        (ID3D11Resource *)p->fruc_render_tex[idx], (ID3D11Resource *)input_tex);
+
+    // Signal fence after DX copy completes — CUDA will wait on this
+    p->fruc_fence_value++;
+    ID3D11DeviceContext4_Signal(p->fruc_ctx4, p->fruc_fence, p->fruc_fence_value);
+
+    bool frame_repeated = false;
+    NvOFFRUC_ProcessInParams_t in_params = {0};
+    in_params.stFrameDataInput.pFrame = p->fruc_render_tex[idx];
+    in_params.stFrameDataInput.nTimeStamp = pts_ms;
+    in_params.bSkipWarp = 0;
+    // Fence value CUDA should wait on (DX signals this after copy)
+    in_params.uSyncWait.FenceWaitValue.uiFenceValueToWaitOn = p->fruc_fence_value;
+
+    NvOFFRUC_ProcessOutParams_t out_params = {0};
+    out_params.stFrameDataOutput.pFrame = p->fruc_interp_tex;
+    out_params.stFrameDataOutput.nTimeStamp = pts_ms;
+    out_params.stFrameDataOutput.bHasFrameRepetitionOccurred = &frame_repeated;
+    // Fence value CUDA signals after interp is done
+    p->fruc_fence_value++;
+    out_params.uSyncSignal.FenceSignalValue.uiFenceValueToSignalOn = p->fruc_fence_value;
+
+    NvOFFRUC_STATUS_t status = nvofa_fn.Process(
+        p->fruc_handle, &in_params, &out_params);
+
+    if (status != NvOFFRUC_SUCCESS) {
+        MP_WARN(ctx, "NVOFA FRUC: Process failed (status=%d).\n", status);
+        return false;
+    }
+
+    // Advance ping-pong index
+    p->fruc_render_idx = (idx + 1) % 2;
+    p->fruc_last_pts_ms = pts_ms;
+    p->fruc_has_prev_frame = true;
+
+    MP_DBG(ctx, "NVOFA FRUC: Processed frame at %.1f ms "
+               "(repeated=%d, fence=%llu).\n",
+               pts_ms, frame_repeated,
+               (unsigned long long)p->fruc_fence_value);
+    return !frame_repeated;
+}
+
+static bool nvofa_fruc_interpolate_fn(struct libmpv_gpu_next_context *ctx,
+                                       ID3D11Texture2D *output_tex,
+                                       double target_pts_ms)
+{
+    struct priv *p = ctx->priv;
+    if (!p->fruc_session_active || !p->fruc_handle || !p->fruc_has_prev_frame)
+        return false;
+
+    // Wait for CUDA to finish writing the interpolated frame
+    ID3D11DeviceContext4_Wait(p->fruc_ctx4, p->fruc_fence, p->fruc_fence_value);
+
+    // Copy interpolated result to caller's output texture
+    ID3D11DeviceContext_CopyResource(p->fruc_ctx,
+        (ID3D11Resource *)output_tex, (ID3D11Resource *)p->fruc_interp_tex);
+    ID3D11DeviceContext_Flush(p->fruc_ctx);
+
+    MP_DBG(ctx, "NVOFA FRUC: Read interpolated frame at %.1f ms.\n",
+               target_pts_ms);
+    return true;
+}
+
+static void nvofa_fruc_init(struct libmpv_gpu_next_context *ctx,
+                            ID3D11Device *device)
+{
+    struct priv *p = ctx->priv;
+    p->fruc_available = nvofa_load_dll(ctx);
+    if (p->fruc_available) {
+        p->fruc_device = device;
+        ID3D11Device_AddRef(p->fruc_device);
+        MP_VERBOSE(ctx, "NVOFA FRUC: DLL loaded, FRUC available.\n");
+    }
+}
+
+static void nvofa_fruc_cleanup(struct libmpv_gpu_next_context *ctx)
+{
+    nvofa_fruc_destroy_fn(ctx);
+}
+
+#endif // HAVE_NVOFA
+
 static int init(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
 {
     ctx->priv = talloc_zero(NULL, struct priv);
@@ -1056,6 +1557,10 @@ static int init(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
 
 #if HAVE_NGX_VSR
     ngx_vsr_init(ctx, (ID3D11Device *)d3d_params->device);
+#endif
+
+#if HAVE_NVOFA
+    nvofa_fruc_init(ctx, (ID3D11Device *)d3d_params->device);
 #endif
 
     fsr_init(ctx, (ID3D11Device *)d3d_params->device);
@@ -1120,6 +1625,10 @@ static void destroy(struct libmpv_gpu_next_context *ctx)
     ngx_vsr_cleanup(ctx);
 #endif
 
+#if HAVE_NVOFA
+    nvofa_fruc_cleanup(ctx);
+#endif
+
     fsr_cleanup(ctx);
 
     if (p->wrapped_tex)
@@ -1149,4 +1658,11 @@ const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11 = {
     .fsr_available = fsr_available_fn,
     .fsr_create_texture = fsr_create_texture_fn,
     .fsr_process = fsr_process_fn,
+#if HAVE_NVOFA
+    .nvofa_fruc_available = nvofa_fruc_available_fn,
+    .nvofa_fruc_init_session = nvofa_fruc_init_session_fn,
+    .nvofa_fruc_feed_frame = nvofa_fruc_feed_frame_fn,
+    .nvofa_fruc_interpolate = nvofa_fruc_interpolate_fn,
+    .nvofa_fruc_destroy = nvofa_fruc_destroy_fn,
+#endif
 };

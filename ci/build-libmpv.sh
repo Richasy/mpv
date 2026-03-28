@@ -240,6 +240,23 @@ collect() {
     else
         warn "nvngx_truehdr.dll not found at $NGX_TRUEHDR_DLL, skipping"
     fi
+
+    # Copy NVIDIA Optical Flow FRUC runtime DLLs if SDK is available
+    local NVOFA_SDK="/home/richasy/programs/Optical_Flow_SDK_5.0.7"
+    local NVOFA_DLL="$NVOFA_SDK/NvOFFRUC/NvOFFRUCSample/bin/win64/NvOFFRUC.dll"
+    local CUDART_DLL="$NVOFA_SDK/NvOFFRUC/NvOFFRUCSample/bin/win64/cudart64_110.dll"
+    if [ -f "$NVOFA_DLL" ]; then
+        cp "$NVOFA_DLL" "$ARCH_OUTPUT/"
+        log "NvOFFRUC.dll copied from $NVOFA_DLL"
+    else
+        warn "NvOFFRUC.dll not found at $NVOFA_DLL, skipping"
+    fi
+    if [ -f "$CUDART_DLL" ]; then
+        cp "$CUDART_DLL" "$ARCH_OUTPUT/"
+        log "cudart64_110.dll copied from $CUDART_DLL"
+    else
+        warn "cudart64_110.dll not found at $CUDART_DLL, skipping"
+    fi
 }
 
 # =============================================================================

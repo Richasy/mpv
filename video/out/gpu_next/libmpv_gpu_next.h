@@ -134,6 +134,35 @@ struct libmpv_gpu_next_context_fns {
                         struct ID3D11Texture2D *output_tex,
                         int out_w, int out_h,
                         int mode);
+
+    // --- NVIDIA Optical Flow Frame Interpolation (FRUC) ---
+
+    // Check if NVOFA FRUC is available on this backend.
+    bool (*nvofa_fruc_available)(struct libmpv_gpu_next_context *ctx);
+
+    // Initialize FRUC session for given resolution.
+    // Creates internal textures and NvOFFRUC handle.
+    // Must be called when video resolution changes.
+    bool (*nvofa_fruc_init_session)(struct libmpv_gpu_next_context *ctx,
+                                     int width, int height);
+
+    // Feed a source frame to FRUC (updates internal optical flow state).
+    // input_tex: RGBA8 D3D11 texture at source resolution.
+    // pts_ms: frame timestamp in milliseconds.
+    bool (*nvofa_fruc_feed_frame)(struct libmpv_gpu_next_context *ctx,
+                                   struct ID3D11Texture2D *input_tex,
+                                   double pts_ms);
+
+    // Generate an interpolated frame at the given timestamp.
+    // output_tex: RGBA8 D3D11 texture, same resolution as input.
+    // target_pts_ms: desired intermediate timestamp in milliseconds.
+    // Returns true if interpolation succeeded.
+    bool (*nvofa_fruc_interpolate)(struct libmpv_gpu_next_context *ctx,
+                                    struct ID3D11Texture2D *output_tex,
+                                    double target_pts_ms);
+
+    // Destroy FRUC session and release all resources.
+    void (*nvofa_fruc_destroy)(struct libmpv_gpu_next_context *ctx);
 };
 
 extern const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11;

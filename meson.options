@@ -123,6 +123,8 @@ option('win32-smtc', type: 'feature', value: 'auto', description: 'Enable Media 
 option('win32-subsystem', type : 'string', value: 'windows', description : 'Windows subsystem to use for mpv.exe')
 option('ngx-vsr', type: 'feature', value: 'auto', description: 'NVIDIA NGX Video Super Resolution (requires RTX Video SDK)')
 option('ngx-vsr-path', type: 'string', value: '', description: 'Path to NVIDIA RTX Video SDK root directory')
+option('nvofa', type: 'feature', value: 'auto', description: 'NVIDIA Optical Flow Frame Interpolation (requires Optical Flow SDK)')
+option('nvofa-path', type: 'string', value: '', description: 'Path to NVIDIA Optical Flow SDK root directory')
 
 # manpages
 option('html-build', type: 'feature', value: 'disabled', description: 'HTML manual generation')

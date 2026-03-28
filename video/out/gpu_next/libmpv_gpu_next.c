@@ -139,6 +139,19 @@ struct priv {
     int fsr_output_w, fsr_output_h;
 #endif
 
+    // NVIDIA Optical Flow FRUC cached textures
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NVOFA
+    struct ID3D11Texture2D *fruc_render_d3d;     // source-resolution RGBA8 (input)
+    pl_tex fruc_render_pl;
+    struct ID3D11Texture2D *fruc_output_d3d;     // source-resolution RGBA8 (output)
+    pl_tex fruc_output_pl;
+    int fruc_w, fruc_h;
+    bool fruc_active;                             // FRUC session initialized
+    double fruc_prev_pts;                         // previous frame PTS in seconds
+    bool fruc_has_prev;                           // have we fed a previous frame?
+    bool fruc_interp_valid;                       // interpolated frame available in output_d3d?
+#endif
+
     // Performance data of last frame
     struct frame_info perf_fresh;
     struct frame_info perf_redraw;
@@ -913,6 +926,155 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
 
     // Render
     //
+    // FRUC (optional frame interpolation) → VSR (optional) → TrueHDR (optional) → FBO
+    // FRUC generates intermediate frames when display-sync detects a repeated frame.
+
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NVOFA
+    int nvidia_fruc_mode = p->next_opts->nvidia_fruc;
+    bool use_fruc = nvidia_fruc_mode > 0 &&
+                    p->context->fns->nvofa_fruc_available &&
+                    p->context->fns->nvofa_fruc_available(p->context) &&
+                    frame->display_synced &&
+                    frame->current && mix.num_frames > 0;
+
+    if (use_fruc) {
+        struct pl_frame *first_frame = (struct pl_frame *) mix.frames[0];
+        struct mp_image *src_mpi = first_frame->user_data;
+        int src_w = src_mpi->params.w;
+        int src_h = src_mpi->params.h;
+
+        // (Re-)initialize FRUC session when resolution changes
+        if (!p->fruc_active || p->fruc_w != src_w || p->fruc_h != src_h) {
+            // Destroy old textures
+            if (p->fruc_render_pl)
+                pl_tex_destroy(gpu, &p->fruc_render_pl);
+            if (p->fruc_render_d3d) {
+                ID3D11Texture2D_Release(p->fruc_render_d3d);
+                p->fruc_render_d3d = NULL;
+            }
+            if (p->fruc_output_pl)
+                pl_tex_destroy(gpu, &p->fruc_output_pl);
+            if (p->fruc_output_d3d) {
+                ID3D11Texture2D_Release(p->fruc_output_d3d);
+                p->fruc_output_d3d = NULL;
+            }
+
+            // Create render (input) and output textures
+            p->fruc_render_d3d =
+                p->context->fns->fsr_create_texture(p->context, src_w, src_h);
+            if (p->fruc_render_d3d) {
+                p->fruc_render_pl = pl_d3d11_wrap(gpu, pl_d3d11_wrap_params(
+                    .tex = (ID3D11Resource *)p->fruc_render_d3d,
+                    .w = src_w,
+                    .h = src_h,
+                ));
+            }
+
+            p->fruc_output_d3d =
+                p->context->fns->fsr_create_texture(p->context, src_w, src_h);
+            if (p->fruc_output_d3d) {
+                p->fruc_output_pl = pl_d3d11_wrap(gpu, pl_d3d11_wrap_params(
+                    .tex = (ID3D11Resource *)p->fruc_output_d3d,
+                    .w = src_w,
+                    .h = src_h,
+                ));
+            }
+
+            if (!p->fruc_render_pl || !p->fruc_output_pl) {
+                MP_WARN(ctx, "NVOFA FRUC: Failed to create textures.\n");
+                use_fruc = false;
+            } else {
+                bool ok = p->context->fns->nvofa_fruc_init_session(
+                    p->context, src_w, src_h);
+                if (ok) {
+                    p->fruc_w = src_w;
+                    p->fruc_h = src_h;
+                    p->fruc_active = true;
+                    p->fruc_has_prev = false;
+                } else {
+                    use_fruc = false;
+                }
+            }
+        }
+
+        if (use_fruc && p->fruc_active) {
+            double cur_pts = frame->current->pts;
+            double cur_pts_ms = cur_pts * 1000.0;
+            bool is_new_frame = (cur_pts != p->fruc_prev_pts);
+
+            if (is_new_frame) {
+                // New frame: render to RGBA8 and feed to NvOFFRUC
+                struct pl_frame fruc_target = {
+                    .repr = pl_color_repr_rgb,
+                    .num_planes = 1,
+                    .planes[0] = {
+                        .texture = p->fruc_render_pl,
+                        .components = p->fruc_render_pl->params.format->num_components,
+                        .component_mapping = {0, 1, 2, 3},
+                    },
+                    .color = pl_color_space_srgb,
+                    .crop = { .x0 = 0, .y0 = 0, .x1 = src_w, .y1 = src_h },
+                };
+
+                struct pl_render_params fruc_params = rparams;
+                fruc_params.frame_mixer = NULL;
+                if (!pl_render_image_mix(p->rr, &mix, &fruc_target, &fruc_params)) {
+                    MP_ERR(ctx, "NVOFA FRUC: Failed rendering to intermediate.\n");
+                    goto fruc_done;
+                }
+                pl_gpu_flush(gpu);
+
+                // Feed to NvOFFRUC — returns true if interpolation succeeded
+                bool interp_ok = p->context->fns->nvofa_fruc_feed_frame(
+                    p->context, p->fruc_render_d3d, cur_pts_ms);
+
+                if (interp_ok && p->fruc_has_prev) {
+                    // Read interpolated frame from interp texture into output
+                    p->context->fns->nvofa_fruc_interpolate(
+                        p->context, p->fruc_output_d3d, cur_pts_ms);
+                    p->fruc_interp_valid = true;
+                } else {
+                    p->fruc_interp_valid = false;
+                }
+
+                p->fruc_prev_pts = cur_pts;
+                p->fruc_has_prev = true;
+
+                // New frame: fall through to normal rendering path
+            } else if (p->fruc_interp_valid) {
+                // Repeated PTS: display the cached interpolated frame
+                pl_tex_clear(gpu, fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });
+
+                struct pl_frame fruc_image = {
+                    .repr = pl_color_repr_rgb,
+                    .num_planes = 1,
+                    .planes[0] = {
+                        .texture = p->fruc_output_pl,
+                        .components = p->fruc_output_pl->params.format->num_components,
+                        .component_mapping = {0, 1, 2, 3},
+                    },
+                    .color = pl_color_space_srgb,
+                    .crop = { .x0 = 0, .y0 = 0,
+                              .x1 = src_w, .y1 = src_h },
+                };
+
+                apply_crop(&fruc_image, p->src, src_w, src_h);
+
+                struct pl_render_params fruc_out_params = rparams;
+                fruc_out_params.background = PL_CLEAR_SKIP;
+                fruc_out_params.border = PL_CLEAR_SKIP;
+                pl_render_image(p->rr, &fruc_image, &target, &fruc_out_params);
+
+                valid = true;
+                goto done;
+            }
+            // else: repeated PTS but no valid interp → fall through to normal render
+        }
+    }
+fruc_done:
+    ;
+#endif // HAVE_D3D11 && PL_HAVE_D3D11 && HAVE_NVOFA
+
     // NGX pipeline: VSR (optional) → TrueHDR (optional) → FBO
     // Both features can work independently or chained together.
     // When both are active: video → VSR upscale → TrueHDR SDR→HDR → FBO
@@ -1742,6 +1904,25 @@ static void destroy(struct render_backend *ctx)
         ID3D11Texture2D_Release(p->truehdr_output_d3d);
         p->truehdr_output_d3d = NULL;
     }
+#endif
+
+    // Free FRUC cached textures
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_NVOFA
+    if (p->fruc_active && p->context->fns->nvofa_fruc_destroy)
+        p->context->fns->nvofa_fruc_destroy(p->context);
+    if (p->fruc_render_pl)
+        pl_tex_destroy(p->gpu, &p->fruc_render_pl);
+    if (p->fruc_render_d3d) {
+        ID3D11Texture2D_Release(p->fruc_render_d3d);
+        p->fruc_render_d3d = NULL;
+    }
+    if (p->fruc_output_pl)
+        pl_tex_destroy(p->gpu, &p->fruc_output_pl);
+    if (p->fruc_output_d3d) {
+        ID3D11Texture2D_Release(p->fruc_output_d3d);
+        p->fruc_output_d3d = NULL;
+    }
+    p->fruc_active = false;
 #endif
 
     // Free user shader hooks

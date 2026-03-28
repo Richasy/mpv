@@ -1079,6 +1079,39 @@ if ngx_vsr_found
     dependencies += ngx_vsr_dep
 endif
 
+# NVIDIA Optical Flow Frame Interpolation (NvOFFRUC)
+# Uses the hardware optical flow accelerator on RTX GPUs for frame interpolation.
+# The SDK provides NvOFFRUC.dll which is loaded at runtime — no library linking needed.
+# We detect the SDK by checking for nvOpticalFlowCommon.h (pure C header).
+nvofa_opt = get_option('nvofa').require(
+    features['d3d11'],
+    error_message: 'nvofa requires d3d11!',
+)
+nvofa_path = get_option('nvofa-path')
+nvofa_found = false
+nvofa_inc = []
+if nvofa_opt.allowed() and nvofa_path != ''
+    nvofa_of_inc_dir = include_directories(nvofa_path / 'NvOFInterface')
+    nvofa_has_header = cc.has_header('nvOpticalFlowCommon.h',
+        include_directories: nvofa_of_inc_dir)
+    if nvofa_has_header
+        nvofa_found = true
+        nvofa_inc = [nvofa_of_inc_dir]
+    endif
+elif nvofa_opt.allowed()
+    nvofa_has_header = cc.has_header('nvOpticalFlowCommon.h', required: false)
+    if nvofa_has_header
+        nvofa_found = true
+    endif
+endif
+features += {'nvofa': nvofa_found}
+if nvofa_found
+    nvofa_dep = declare_dependency(
+        include_directories: nvofa_inc,
+    )
+    dependencies += nvofa_dep
+endif
+
 # AMD FSR 1.0 (FidelityFX Super Resolution)
 # Pure compute shader implementation — no vendor SDK required.
 # Shaders are precompiled to DXBC bytecode (no runtime d3dcompiler needed).

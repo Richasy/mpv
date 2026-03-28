@@ -7949,6 +7949,39 @@ them.
     NVIDIA VSR and AMD FSR are mutually exclusive — enabling one will
     automatically disable the other.
 
+``--nvidia-fruc=<off|on>``
+    Enable NVIDIA Optical Flow frame interpolation (FRUC) using the hardware
+    optical flow accelerator on RTX GPUs. This generates intermediate frames
+    between original video frames to increase perceived smoothness, similar
+    to tools like Lossless Scaling. ``--vo=gpu-next`` with D3D11 backend only.
+
+    ``off``
+        Disable frame interpolation (default).
+    ``on``
+        Enable frame interpolation.
+
+    Requires ``--video-sync=display-resample`` and ``--interpolation=yes``
+    to be set. When the display refresh rate is higher than the video frame
+    rate (e.g. 24fps video on a 60Hz display), the renderer uses the NVIDIA
+    Optical Flow SDK (NvOFFRUC) to synthesize intermediate frames for the
+    vsync intervals where the same source frame would otherwise be repeated.
+
+    The NvOFFRUC API internally uses the dedicated optical flow hardware on
+    RTX GPUs (Turing and later) for motion estimation, frame warping, and
+    blending. This runs on a separate hardware unit and does not consume
+    CUDA cores.
+
+    Runtime DLLs ``NvOFFRUC.dll`` and ``cudart64_110.dll`` must be deployed
+    alongside ``libmpv-2.dll``. These are not included with the NVIDIA driver
+    and must be distributed with the application.
+
+    .. note::
+
+        This feature is experimental. The interpolation quality may not match
+        commercial tools like Lossless Scaling or SVP. Fast motion and anime
+        content may show visible artifacts (mosaic blocks) in areas where
+        optical flow estimation fails.
+
 ``--opengl-rectangle-textures``
     Force use of rectangle textures (default: no). Normally this shouldn't have
     any advantages over normal textures. Note that hardware decoding overrides

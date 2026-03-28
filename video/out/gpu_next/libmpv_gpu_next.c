@@ -37,6 +37,7 @@
 
 #include "libmpv_gpu_next.h"
 #include "gl_next_opts.h"
+#include "osdep/timer.h"
 
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11)
 #include <libplacebo/d3d11.h>
@@ -155,6 +156,9 @@ struct priv {
     // Performance data of last frame
     struct frame_info perf_fresh;
     struct frame_info perf_redraw;
+
+    // hwdec frame mapping perf (CPU-side timing, no ra needed)
+    struct mp_pass_perf hwdec_perf;
 
 };
 
@@ -287,6 +291,8 @@ static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
     struct frame_priv *fp = mpi->priv;
     struct priv *p = fp->ctx->priv;
 
+    uint64_t start_ns = mp_raw_time_ns();
+
     ID3D11Texture2D *tex = (ID3D11Texture2D *)mpi->planes[0];
     int subresource = (intptr_t)mpi->planes[1];
 
@@ -322,6 +328,23 @@ static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
 
         frame->planes[n].texture = pl;
     }
+
+    uint64_t elapsed = mp_raw_time_ns() - start_ns;
+
+    struct mp_pass_perf *perf = &p->hwdec_perf;
+    perf->last = elapsed;
+    perf->peak = MPMAX(perf->peak, elapsed);
+    if (perf->count < VO_PERF_SAMPLE_COUNT)
+        perf->samples[perf->count++] = elapsed;
+    else
+        perf->samples[perf->count++ % VO_PERF_SAMPLE_COUNT] = elapsed;
+
+    // Running average
+    uint64_t sum = 0;
+    int n_samples = MPMIN(perf->count, VO_PERF_SAMPLE_COUNT);
+    for (int i = 0; i < n_samples; i++)
+        sum += perf->samples[i];
+    perf->avg = sum / n_samples;
 
     return true;
 }
@@ -1817,26 +1840,39 @@ done:
 }
 
 static inline void copy_frame_info_to_mp(struct frame_info *pl,
-                                         struct mp_frame_perf *mp)
+                                         struct mp_frame_perf *mp,
+                                         struct mp_pass_perf *hwdec_perf)
 {
     mp_assert(pl->count <= VO_PASS_PERF_MAX);
-    mp->count = MPMIN(pl->count, VO_PASS_PERF_MAX);
 
-    for (int i = 0; i < mp->count; ++i) {
+    struct mp_pass_perf *perf = mp->perf;
+    char (*desc)[VO_PASS_DESC_MAX_LEN] = mp->desc;
+    struct mp_pass_perf *perf_end = perf + VO_PASS_PERF_MAX;
+
+    if (hwdec_perf && hwdec_perf->count > 0) {
+        *perf++ = *hwdec_perf;
+        snprintf(*desc, sizeof(*desc), "map frame (hwdec)");
+        desc++;
+    }
+
+    for (int i = 0; i < pl->count && perf < perf_end; ++i) {
         const struct pl_dispatch_info *pass = &pl->info[i];
 
         mp_assert(pass->num_samples <= MP_ARRAY_SIZE(pass->samples));
 
-        struct mp_pass_perf *perf = &mp->perf[i];
         perf->count = MPMIN(pass->num_samples, VO_PERF_SAMPLE_COUNT);
         memcpy(perf->samples, pass->samples, perf->count * sizeof(pass->samples[0]));
         perf->last = pass->last;
         perf->peak = pass->peak;
         perf->avg = pass->average;
 
-        strncpy(mp->desc[i], pass->shader->description, sizeof(mp->desc[i]) - 1);
-        mp->desc[i][sizeof(mp->desc[i]) - 1] = '\0';
+        strncpy(*desc, pass->shader->description, sizeof(*desc) - 1);
+        (*desc)[sizeof(*desc) - 1] = '\0';
+        perf++;
+        desc++;
     }
+
+    mp->count = perf - mp->perf;
 }
 
 static void perfdata(struct render_backend *ctx,
@@ -1844,8 +1880,8 @@ static void perfdata(struct render_backend *ctx,
 {
     struct priv *p = ctx->priv;
     *out = (struct voctrl_performance_data){0};
-    copy_frame_info_to_mp(&p->perf_fresh, &out->fresh);
-    copy_frame_info_to_mp(&p->perf_redraw, &out->redraw);
+    copy_frame_info_to_mp(&p->perf_fresh, &out->fresh, &p->hwdec_perf);
+    copy_frame_info_to_mp(&p->perf_redraw, &out->redraw, NULL);
 }
 
 static void destroy(struct render_backend *ctx)

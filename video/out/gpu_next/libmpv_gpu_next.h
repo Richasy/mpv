@@ -44,6 +44,10 @@ struct libmpv_gpu_next_context {
     void *priv;
 };
 
+// Global RIFE measured FPS for property system access.
+// Written by libmpv_gpu_next render, read by command.c property handler.
+extern double g_rife_measured_fps;
+
 // Backend-specific functions for initializing and using a gpu-next context
 // without a window/swapchain. The caller provides the render target directly.
 struct libmpv_gpu_next_context_fns {
@@ -169,10 +173,11 @@ struct libmpv_gpu_next_context_fns {
     // Check if RIFE backend is available (ORT loaded successfully).
     bool (*rife_available)(struct libmpv_gpu_next_context *ctx);
 
-    // Initialize RIFE session: load 5 ONNX models from model_dir,
+    // Initialize RIFE session: load ONNX model from model_dir/model_file,
     // create ORT sessions, allocate intermediate tensors for given resolution.
     bool (*rife_init_session)(struct libmpv_gpu_next_context *ctx,
-                               const char *model_dir, int width, int height);
+                               const char *model_dir, const char *model_file,
+                               int width, int height);
 
     // Feed a source frame to RIFE (RGBA8 D3D11 texture).
     // Internally maintains frame pair state for interpolation.

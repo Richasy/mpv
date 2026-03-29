@@ -3267,6 +3267,17 @@ static int mp_property_vf_fps(void *ctx, struct m_property *prop,
     return m_property_double_ro(action, arg, 1.0 / avg);
 }
 
+#include "video/out/gpu_next/libmpv_gpu_next.h"
+
+static int mp_property_rife_output_fps(void *ctx, struct m_property *prop,
+                                       int action, void *arg)
+{
+    double fps = g_rife_measured_fps;
+    if (fps < 0.1)
+        return M_PROPERTY_UNAVAILABLE;
+    return m_property_double_ro(action, arg, fps);
+}
+
 #define doubles_equal(x, y) (fabs((x) - (y)) <= 0.001)
 
 static int mp_property_video_aspect_override(void *ctx, struct m_property *prop,
@@ -4585,6 +4596,7 @@ static const struct m_property mp_properties_base[] = {
     {"current-gpu-context", mp_property_gpu_context},
     {"container-fps", mp_property_fps},
     {"estimated-vf-fps", mp_property_vf_fps},
+    {"rife-output-fps", mp_property_rife_output_fps},
     {"video-aspect-override", mp_property_video_aspect_override},
     {"vid", mp_property_switch_track, .priv = (void *)(const int[]){0, STREAM_VIDEO}},
     {"hwdec-current", mp_property_hwdec_current},

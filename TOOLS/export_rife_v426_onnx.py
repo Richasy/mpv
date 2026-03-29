@@ -37,6 +37,8 @@ def parse_args():
                     help="Reference width for export (default: 1280)")
     p.add_argument("--opset", type=int, default=17,
                     help="ONNX opset version (default: 17)")
+    p.add_argument("--lite", action="store_true",
+                    help="Use lite architecture (4 blocks, 32-pixel alignment)")
     return p.parse_args()
 
 
@@ -144,18 +146,31 @@ class IFNet(nn.Module):
         self.encode = Head()
 
 
+class IFNetLite(nn.Module):
+    """RIFE v4.22 lite: 4 blocks, smaller channels, 32-pixel alignment."""
+    def __init__(self):
+        super().__init__()
+        self.block0 = IFBlock(7 + 8, c=192)
+        self.block1 = IFBlock(8 + 4 + 8 + 8, c=128)
+        self.block2 = IFBlock(8 + 4 + 8 + 8, c=64)
+        self.block3 = IFBlock(8 + 4 + 8 + 8, c=32)
+        self.encode = Head()
+
+
 # --- ONNX export wrapper ---
 
 class RIFEExport(nn.Module):
     """Wraps IFNet for clean ONNX export with inlined warp."""
-    def __init__(self, ifnet):
+    def __init__(self, ifnet, lite=False):
         super().__init__()
         self.block0 = ifnet.block0
         self.block1 = ifnet.block1
         self.block2 = ifnet.block2
         self.block3 = ifnet.block3
-        self.block4 = ifnet.block4
+        if not lite:
+            self.block4 = ifnet.block4
         self.encode = ifnet.encode
+        self.lite = lite
 
     def forward(self, imgs, timestep):
         """
@@ -174,9 +189,12 @@ class RIFEExport(nn.Module):
         f0 = self.encode(img0)
         f1 = self.encode(img1)
 
-        # 5-scale iterative flow refinement
-        scale_list = [16, 8, 4, 2, 1]
-        blocks = [self.block0, self.block1, self.block2, self.block3, self.block4]
+        if self.lite:
+            scale_list = [8, 4, 2, 1]
+            blocks = [self.block0, self.block1, self.block2, self.block3]
+        else:
+            scale_list = [16, 8, 4, 2, 1]
+            blocks = [self.block0, self.block1, self.block2, self.block3, self.block4]
 
         flow = None
         mask = None
@@ -184,7 +202,7 @@ class RIFEExport(nn.Module):
         warped_img0 = img0
         warped_img1 = img1
 
-        for i in range(5):
+        for i in range(len(blocks)):
             if flow is None:
                 flow, mask, feat = blocks[i](
                     torch.cat((img0[:, :3], img1[:, :3], f0, f1, timestep_map), 1),
@@ -216,8 +234,15 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
 
     # Load weights
-    print("Loading RIFE v4.26 weights...")
-    ifnet = IFNet()
+    if args.lite:
+        print("Loading RIFE v4.22 lite weights...")
+        ifnet = IFNetLite()
+        pad_align = 32
+    else:
+        print("Loading RIFE v4.26 weights...")
+        ifnet = IFNet()
+        pad_align = 64
+
     weights_path = os.path.join(args.rife_repo, "flownet.pkl")
     state_dict = torch.load(weights_path, map_location=device)
 
@@ -231,15 +256,14 @@ def main():
     print(f"  Loaded {len(clean_sd)} parameters from {weights_path}")
 
     # Create export wrapper
-    model = RIFEExport(ifnet).eval()
+    model = RIFEExport(ifnet, lite=args.lite).eval()
 
     H, W = args.height, args.width
-    # Pad to 64-pixel alignment (required by 5 IFBlocks with scale=16)
-    pad_h = (64 - H % 64) % 64
-    pad_w = (64 - W % 64) % 64
+    pad_h = (pad_align - H % pad_align) % pad_align
+    pad_w = (pad_align - W % pad_align) % pad_align
     pH = H + pad_h
     pW = W + pad_w
-    print(f"  Trace size: {H}x{W} -> padded {pH}x{pW}")
+    print(f"  Trace size: {H}x{W} -> padded {pH}x{pW} (align={pad_align})")
 
     # Dummy inputs
     imgs = torch.randn(1, 6, pH, pW)
@@ -262,7 +286,7 @@ def main():
 
     size_mb = os.path.getsize(args.output) / (1024 * 1024)
     print(f"  Done: {args.output} ({size_mb:.1f} MB)")
-    print(f"\nUsage in mpv: --gmfss-model=/path/to/directory/containing/rife.onnx")
+    print(f"\nUsage in mpv: --rife-model=/path/to/directory/containing/rife.onnx")
 
 
 if __name__ == "__main__":

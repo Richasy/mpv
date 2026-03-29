@@ -351,6 +351,7 @@ struct priv {
     bool rife_available;
     bool rife_session_active;
     int rife_width, rife_height;
+    int rife_pad_align;             // padding alignment (64 for v4.26, 32 for lite)
     ID3D11Device *rife_device;
     ID3D11DeviceContext *rife_ctx;
 
@@ -1844,10 +1845,8 @@ static void rife_destroy_fn(struct libmpv_gpu_next_context *ctx)
         ID3D11DeviceContext_Release(p->rife_ctx);
         p->rife_ctx = NULL;
     }
-    if (p->rife_device) {
-        ID3D11Device_Release(p->rife_device);
-        p->rife_device = NULL;
-    }
+    // Note: rife_device is NOT released here — it's owned by
+    // rife_init() and persists across session re-creation.
 
     // Release RIFE compute shader resources
     if (p->rife_rgba_to_nchw_cs) {
@@ -1886,7 +1885,8 @@ static void rife_destroy_fn(struct libmpv_gpu_next_context *ctx)
 }
 
 static bool rife_init_session_fn(struct libmpv_gpu_next_context *ctx,
-                                   const char *model_dir, int width, int height)
+                                   const char *model_dir, const char *model_file,
+                                   int width, int height)
 {
     struct priv *p = ctx->priv;
     const OrtApi *api = rife_ort.api;
@@ -1932,10 +1932,10 @@ static bool rife_init_session_fn(struct libmpv_gpu_next_context *ctx,
         MP_VERBOSE(ctx, "RIFE: DirectML entry point not found, using CPU.\n");
     }
 
-    // Load RIFE model session (only model needed for fast interpolation)
+    // Load RIFE model session
     {
         char path[MAX_PATH];
-        snprintf(path, sizeof(path), "%s/%s", model_dir, "rife.onnx");
+        snprintf(path, sizeof(path), "%s/%s", model_dir, model_file);
 
         wchar_t wpath[MAX_PATH];
         MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH);
@@ -1943,10 +1943,10 @@ static bool rife_init_session_fn(struct libmpv_gpu_next_context *ctx,
         status = api->CreateSession(p->rife_ort_env, wpath,
                                     p->rife_session_opts,
                                     &p->rife_sessions[RIFE_MODEL_RIFE]);
-        if (!rife_check_ort(ctx, status, "rife.onnx"))
+        if (!rife_check_ort(ctx, status, model_file))
             goto fail;
 
-        MP_VERBOSE(ctx, "RIFE: Loaded rife.onnx\n");
+        MP_VERBOSE(ctx, "RIFE: Loaded %s\n", model_file);
     }
 
     // Get device context
@@ -1997,9 +1997,15 @@ static bool rife_init_session_fn(struct libmpv_gpu_next_context *ctx,
     p->rife_height = height;
     p->rife_has_prev = false;
 
-    // Pre-allocate async inference buffer (padded to 64-pixel alignment)
-    int pad_h = (64 - height % 64) % 64;
-    int pad_w = (64 - width % 64) % 64;
+    // Determine padding alignment from model type
+    // lite model (4 blocks, max scale=8) needs 32-pixel alignment
+    // full model (5 blocks, max scale=16) needs 64-pixel alignment
+    int pad_align = strstr(model_file, "lite") ? 32 : 64;
+    p->rife_pad_align = pad_align;
+
+    // Pre-allocate async inference buffer (padded)
+    int pad_h = (pad_align - height % pad_align) % pad_align;
+    int pad_w = (pad_align - width % pad_align) % pad_align;
     int ph = height + pad_h;
     int pw = width + pad_w;
     p->rife_infer_in = calloc(6 * (size_t)ph * pw, sizeof(float));
@@ -2486,7 +2492,7 @@ static void rife_submit_async_fn(struct libmpv_gpu_next_context *ctx,
     int w = p->rife_width;
     int hw = h * w;
 
-    #define RIFE_PAD_ALIGN 64
+    #define RIFE_PAD_ALIGN p->rife_pad_align
     int pad_h = (RIFE_PAD_ALIGN - h % RIFE_PAD_ALIGN) % RIFE_PAD_ALIGN;
     int pad_w = (RIFE_PAD_ALIGN - w % RIFE_PAD_ALIGN) % RIFE_PAD_ALIGN;
     int ph = h + pad_h;
@@ -2610,7 +2616,13 @@ static void rife_init(struct libmpv_gpu_next_context *ctx,
 
 static void rife_cleanup(struct libmpv_gpu_next_context *ctx)
 {
+    struct priv *p = ctx->priv;
     rife_destroy_fn(ctx);
+    // Release the D3D11 device (owned by rife_init, not by session)
+    if (p->rife_device) {
+        ID3D11Device_Release(p->rife_device);
+        p->rife_device = NULL;
+    }
 }
 
 #endif // HAVE_RIFE

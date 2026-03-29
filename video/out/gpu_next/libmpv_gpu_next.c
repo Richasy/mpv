@@ -39,6 +39,8 @@
 #include "gl_next_opts.h"
 #include "osdep/timer.h"
 
+double g_rife_measured_fps = 0;
+
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11)
 #include <libplacebo/d3d11.h>
 #include <d3d11.h>
@@ -160,10 +162,15 @@ struct priv {
     struct ID3D11Texture2D *rife_output_d3d;    // source-resolution RGBA8 (interp result)
     pl_tex rife_output_pl;
     int rife_w, rife_h;
+    int rife_mode;                               // current active mode (1=standard, 2=high)
     bool rife_active;                            // RIFE session initialized
     double rife_prev_pts;                        // previous frame PTS in seconds
     bool rife_has_prev;                          // have we fed a previous frame?
     bool rife_interp_valid;                      // interpolated frame available?
+    // RIFE FPS measurement
+    int64_t rife_frame_count;                    // frames output in current second
+    double rife_fps_last_time;                   // timestamp of last FPS update
+    double rife_measured_fps;                    // measured output FPS
 #endif
 
     // Performance data of last frame
@@ -1128,8 +1135,13 @@ fruc_done:
         int src_w = src_mpi->params.w;
         int src_h = src_mpi->params.h;
 
-        // (Re-)initialize RIFE session when resolution changes
-        if (!p->rife_active || p->rife_w != src_w || p->rife_h != src_h) {
+        // (Re-)initialize RIFE session when resolution or mode changes
+        bool need_reinit = !p->rife_active || p->rife_w != src_w
+                           || p->rife_h != src_h;
+        bool need_model_switch = p->rife_active && p->rife_mode != rife_mode
+                                 && p->rife_w == src_w && p->rife_h == src_h;
+
+        if (need_reinit) {
             if (p->rife_render_pl)
                 pl_tex_destroy(gpu, &p->rife_render_pl);
             if (p->rife_render_d3d) {
@@ -1169,16 +1181,35 @@ fruc_done:
                 MP_WARN(ctx, "RIFE: Failed to create textures.\n");
                 use_rife = false;
             } else {
+                const char *model_file = (rife_mode == 1)
+                    ? "rife_lite.onnx" : "rife.onnx";
                 bool ok = p->context->fns->rife_init_session(
-                    p->context, p->next_opts->rife_model, src_w, src_h);
+                    p->context, p->next_opts->rife_model,
+                    model_file, src_w, src_h);
                 if (ok) {
                     p->rife_w = src_w;
                     p->rife_h = src_h;
+                    p->rife_mode = rife_mode;
                     p->rife_active = true;
                     p->rife_has_prev = false;
                 } else {
                     use_rife = false;
                 }
+            }
+        } else if (need_model_switch) {
+            // Same resolution, just switch the ONNX model
+            const char *model_file = (rife_mode == 1)
+                ? "rife_lite.onnx" : "rife.onnx";
+            MP_INFO(ctx, "RIFE: Switching model to %s\n", model_file);
+            bool ok = p->context->fns->rife_init_session(
+                p->context, p->next_opts->rife_model,
+                model_file, src_w, src_h);
+            if (ok) {
+                p->rife_mode = rife_mode;
+                p->rife_has_prev = false;
+            } else {
+                use_rife = false;
+                p->rife_active = false;
             }
         }
 
@@ -1206,6 +1237,16 @@ fruc_done:
                 _rp.background = PL_CLEAR_SKIP;                                 \
                 _rp.border = PL_CLEAR_SKIP;                                     \
                 pl_render_image(p->rr, &_img, &target, &_rp);                  \
+                /* Update RIFE FPS counter */                                   \
+                p->rife_frame_count++;                                          \
+                double _now = mp_raw_time_ns() / 1e9;                          \
+                if (_now - p->rife_fps_last_time >= 1.0) {                     \
+                    p->rife_measured_fps = p->rife_frame_count                  \
+                        / (_now - p->rife_fps_last_time);                       \
+                    p->rife_frame_count = 0;                                    \
+                    p->rife_fps_last_time = _now;                               \
+                    g_rife_measured_fps = p->rife_measured_fps;                  \
+                }                                                               \
             } while (0)
 
             if (is_new_frame) {

@@ -986,6 +986,22 @@ local function add_video_out(s)
         end
     end
 
+    local rife = mp.get_property("rife")
+    if rife and rife ~= "off" then
+        local value = rife:sub(1,1):upper() .. rife:sub(2)
+        local out_fps = mp.get_property_number("rife-output-fps", 0)
+        if out_fps > 0 then
+            value = value .. string.format(" (%.1f fps)", out_fps)
+        end
+        if o.use_ass then
+            local reset = o.font_color ~= "" and o.font_color or "FFFFFF"
+            append(s, "", {prefix="RIFE:",
+                   suffix="{\\1c&H00CCCC&}" .. value .. "{\\1c&H" .. reset .. "&}"})
+        else
+            append(s, value, {prefix="RIFE:"})
+        end
+    end
+
     local scale = nil
     if not mp.get_property_native("fullscreen") then
         scale = get_property_cached("current-window-scale")

@@ -56,6 +56,8 @@ ExternalProject_Add(mpv
         -Dngx-vsr-path=/home/richasy/programs/RTX_Video_SDK
         -Dnvofa=enabled
         -Dnvofa-path=/home/richasy/programs/Optical_Flow_SDK_5.0.7
+        -Drife=auto
+        -Donnxruntime-path=/home/richasy/programs/microsoft.ml.onnxruntime.directml/build/native
         -Dc_args='-Wno-error=int-conversion'
     BUILD_COMMAND ${EXEC} LTO_JOB=1 PDB=1 ninja -C <BINARY_DIR>
     INSTALL_COMMAND ""

@@ -46,6 +46,8 @@ struct gl_next_opts {
     int nvidia_truehdr;        // 0=off, 1=natural, 2=standard, 3=vivid
     int nvidia_fruc;           // 0=off, 1=on (NVIDIA Optical Flow frame interpolation)
     int amd_fsr;               // 0=off, 1=on (EASU only), 2=on+sharpen (EASU+RCAS)
+    int rife;                  // 0=off, 1=on (RIFE deep learning frame interpolation)
+    char *rife_model;          // path to RIFE ONNX model directory
 };
 
 #endif

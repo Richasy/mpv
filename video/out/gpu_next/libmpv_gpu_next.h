@@ -163,6 +163,39 @@ struct libmpv_gpu_next_context_fns {
 
     // Destroy FRUC session and release all resources.
     void (*nvofa_fruc_destroy)(struct libmpv_gpu_next_context *ctx);
+
+    // --- RIFE Deep Learning Frame Interpolation ---
+
+    // Check if RIFE backend is available (ORT loaded successfully).
+    bool (*rife_available)(struct libmpv_gpu_next_context *ctx);
+
+    // Initialize RIFE session: load 5 ONNX models from model_dir,
+    // create ORT sessions, allocate intermediate tensors for given resolution.
+    bool (*rife_init_session)(struct libmpv_gpu_next_context *ctx,
+                               const char *model_dir, int width, int height);
+
+    // Feed a source frame to RIFE (RGBA8 D3D11 texture).
+    // Internally maintains frame pair state for interpolation.
+    bool (*rife_feed_frame)(struct libmpv_gpu_next_context *ctx,
+                             struct ID3D11Texture2D *input_tex);
+
+    // Generate an interpolated frame at the given timestep (0.0-1.0).
+    // output_tex: RGBA8 D3D11 texture, same resolution as input.
+    bool (*rife_interpolate)(struct libmpv_gpu_next_context *ctx,
+                              struct ID3D11Texture2D *output_tex,
+                              float timestep);
+
+    // Destroy RIFE session and release all resources.
+    void (*rife_destroy)(struct libmpv_gpu_next_context *ctx);
+
+    // Submit async RIFE inference (non-blocking).
+    // Called after rife_feed_frame when a frame pair is ready.
+    void (*rife_submit_async)(struct libmpv_gpu_next_context *ctx,
+                                float timestep);
+
+    // Non-blocking poll: check if async inference result is available.
+    // Returns true if result is ready (resets internal state to IDLE).
+    bool (*rife_poll_result)(struct libmpv_gpu_next_context *ctx);
 };
 
 extern const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11;

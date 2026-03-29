@@ -153,6 +153,19 @@ struct priv {
     bool fruc_interp_valid;                       // interpolated frame available in output_d3d?
 #endif
 
+    // RIFE deep learning frame interpolation cached textures
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_RIFE
+    struct ID3D11Texture2D *rife_render_d3d;    // source-resolution RGBA8 (input)
+    pl_tex rife_render_pl;
+    struct ID3D11Texture2D *rife_output_d3d;    // source-resolution RGBA8 (interp result)
+    pl_tex rife_output_pl;
+    int rife_w, rife_h;
+    bool rife_active;                            // RIFE session initialized
+    double rife_prev_pts;                        // previous frame PTS in seconds
+    bool rife_has_prev;                          // have we fed a previous frame?
+    bool rife_interp_valid;                      // interpolated frame available?
+#endif
+
     // Performance data of last frame
     struct frame_info perf_fresh;
     struct frame_info perf_redraw;
@@ -1098,6 +1111,166 @@ fruc_done:
     ;
 #endif // HAVE_D3D11 && PL_HAVE_D3D11 && HAVE_NVOFA
 
+    // RIFE deep learning frame interpolation (display-sync mode)
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_RIFE
+    int rife_mode = p->next_opts->rife;
+    bool use_rife = rife_mode > 0 &&
+                     p->context->fns->rife_available &&
+                     p->context->fns->rife_available(p->context) &&
+                     p->next_opts->rife_model &&
+                     p->next_opts->rife_model[0] &&
+                     frame->display_synced &&
+                     frame->current && mix.num_frames > 0;
+
+    if (use_rife) {
+        struct pl_frame *first_frame = (struct pl_frame *) mix.frames[0];
+        struct mp_image *src_mpi = first_frame->user_data;
+        int src_w = src_mpi->params.w;
+        int src_h = src_mpi->params.h;
+
+        // (Re-)initialize RIFE session when resolution changes
+        if (!p->rife_active || p->rife_w != src_w || p->rife_h != src_h) {
+            if (p->rife_render_pl)
+                pl_tex_destroy(gpu, &p->rife_render_pl);
+            if (p->rife_render_d3d) {
+                ID3D11Texture2D_Release(p->rife_render_d3d);
+                p->rife_render_d3d = NULL;
+            }
+            if (p->rife_output_pl)
+                pl_tex_destroy(gpu, &p->rife_output_pl);
+            if (p->rife_output_d3d) {
+                ID3D11Texture2D_Release(p->rife_output_d3d);
+                p->rife_output_d3d = NULL;
+            }
+
+            // Render texture: full resolution (for readback to CPU)
+            p->rife_render_d3d =
+                p->context->fns->fsr_create_texture(p->context, src_w, src_h);
+            if (p->rife_render_d3d) {
+                p->rife_render_pl = pl_d3d11_wrap(gpu, pl_d3d11_wrap_params(
+                    .tex = (ID3D11Resource *)p->rife_render_d3d,
+                    .w = src_w,
+                    .h = src_h,
+                ));
+            }
+
+            // Output texture: full resolution (RIFE v4.26 outputs full-res)
+            p->rife_output_d3d =
+                p->context->fns->fsr_create_texture(p->context, src_w, src_h);
+            if (p->rife_output_d3d) {
+                p->rife_output_pl = pl_d3d11_wrap(gpu, pl_d3d11_wrap_params(
+                    .tex = (ID3D11Resource *)p->rife_output_d3d,
+                    .w = src_w,
+                    .h = src_h,
+                ));
+            }
+
+            if (!p->rife_render_pl || !p->rife_output_pl) {
+                MP_WARN(ctx, "RIFE: Failed to create textures.\n");
+                use_rife = false;
+            } else {
+                bool ok = p->context->fns->rife_init_session(
+                    p->context, p->next_opts->rife_model, src_w, src_h);
+                if (ok) {
+                    p->rife_w = src_w;
+                    p->rife_h = src_h;
+                    p->rife_active = true;
+                    p->rife_has_prev = false;
+                } else {
+                    use_rife = false;
+                }
+            }
+        }
+
+        if (use_rife && p->rife_active) {
+            double cur_pts = frame->current->pts;
+            bool is_new_frame = (cur_pts != p->rife_prev_pts);
+
+            // Helper: blit an RGBA8 texture to the final target via pl_render_image.
+            // All frames (original + interpolated) go through this same path
+            // to avoid visual inconsistency (color/gamma differences).
+            #define RIFE_BLIT_TO_TARGET(tex, tw, th) do {                     \
+                pl_tex_clear(gpu, fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });     \
+                struct pl_frame _img = {                                        \
+                    .repr = pl_color_repr_rgb,                                  \
+                    .num_planes = 1,                                            \
+                    .planes[0] = {                                              \
+                        .texture = (tex),                                       \
+                        .components = (tex)->params.format->num_components,     \
+                        .component_mapping = {0, 1, 2, 3},                     \
+                    },                                                          \
+                    .color = pl_color_space_srgb,                               \
+                    .crop = { .x0 = 0, .y0 = 0, .x1 = (tw), .y1 = (th) },    \
+                };                                                              \
+                struct pl_render_params _rp = rparams;                          \
+                _rp.background = PL_CLEAR_SKIP;                                 \
+                _rp.border = PL_CLEAR_SKIP;                                     \
+                pl_render_image(p->rr, &_img, &target, &_rp);                  \
+            } while (0)
+
+            if (is_new_frame) {
+                // Render current frame to RGBA8 intermediate
+                struct pl_frame rife_target = {
+                    .repr = pl_color_repr_rgb,
+                    .num_planes = 1,
+                    .planes[0] = {
+                        .texture = p->rife_render_pl,
+                        .components = p->rife_render_pl->params.format->num_components,
+                        .component_mapping = {0, 1, 2, 3},
+                    },
+                    .color = pl_color_space_srgb,
+                    .crop = { .x0 = 0, .y0 = 0, .x1 = src_w, .y1 = src_h },
+                };
+
+                struct pl_render_params rife_params = rparams;
+                rife_params.frame_mixer = NULL;
+                if (!pl_render_image_mix(p->rr, &mix, &rife_target, &rife_params)) {
+                    MP_ERR(ctx, "RIFE: Failed rendering to intermediate.\n");
+                    goto rife_done;
+                }
+                pl_gpu_flush(gpu);
+
+                // Feed frame + synchronous interpolation
+                bool feed_ok = p->context->fns->rife_feed_frame(
+                    p->context, p->rife_render_d3d);
+
+                if (feed_ok && p->rife_has_prev) {
+                    bool interp_ok = p->context->fns->rife_interpolate(
+                        p->context, p->rife_output_d3d, 0.5f);
+                    p->rife_interp_valid = interp_ok;
+                } else {
+                    p->rife_interp_valid = false;
+                }
+
+                p->rife_prev_pts = cur_pts;
+                p->rife_has_prev = true;
+
+                // New frame: show interp(prev, current) if available
+                if (p->rife_interp_valid) {
+                    RIFE_BLIT_TO_TARGET(p->rife_output_pl, src_w, src_h);
+                    valid = true;
+                    goto done;
+                }
+
+                // No interp (first frame) → show original via same RGBA8 path
+                RIFE_BLIT_TO_TARGET(p->rife_render_pl, src_w, src_h);
+                valid = true;
+                goto done;
+
+            } else {
+                // Repeated PTS: show original frame (already in rife_render_pl)
+                RIFE_BLIT_TO_TARGET(p->rife_render_pl, src_w, src_h);
+                valid = true;
+                goto done;
+            }
+
+            #undef RIFE_BLIT_TO_TARGET
+        }
+    }
+rife_done:
+    ;
+#endif // HAVE_D3D11 && PL_HAVE_D3D11 && HAVE_RIFE
+
     // NGX pipeline: VSR (optional) → TrueHDR (optional) → FBO
     // Both features can work independently or chained together.
     // When both are active: video → VSR upscale → TrueHDR SDR→HDR → FBO
@@ -1959,6 +2132,25 @@ static void destroy(struct render_backend *ctx)
         p->fruc_output_d3d = NULL;
     }
     p->fruc_active = false;
+#endif
+
+    // Free RIFE cached textures
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_RIFE
+    if (p->rife_active && p->context->fns->rife_destroy)
+        p->context->fns->rife_destroy(p->context);
+    if (p->rife_render_pl)
+        pl_tex_destroy(p->gpu, &p->rife_render_pl);
+    if (p->rife_render_d3d) {
+        ID3D11Texture2D_Release(p->rife_render_d3d);
+        p->rife_render_d3d = NULL;
+    }
+    if (p->rife_output_pl)
+        pl_tex_destroy(p->gpu, &p->rife_output_pl);
+    if (p->rife_output_d3d) {
+        ID3D11Texture2D_Release(p->rife_output_d3d);
+        p->rife_output_d3d = NULL;
+    }
+    p->rife_active = false;
 #endif
 
     // Free user shader hooks

@@ -257,6 +257,41 @@ collect() {
     else
         warn "cudart64_110.dll not found at $CUDART_DLL, skipping"
     fi
+
+    # Copy ONNX Runtime + DirectML DLLs for RIFE frame interpolation
+    local ORT_PKG="/home/richasy/programs/microsoft.ml.onnxruntime.directml"
+    local DML_PKG="/home/richasy/programs/microsoft.ai.directml"
+
+    # Map TARGET_ARCH to NuGet runtime directory names
+    local ORT_ARCH_DIR DML_ARCH_DIR
+    if [ "$TARGET_ARCH" = "aarch64" ]; then
+        ORT_ARCH_DIR="win-arm64"
+        DML_ARCH_DIR="arm64-win"
+    else
+        ORT_ARCH_DIR="win-x64"
+        DML_ARCH_DIR="x64-win"
+    fi
+
+    local ORT_DLL="$ORT_PKG/runtimes/$ORT_ARCH_DIR/native/onnxruntime.dll"
+    local ORT_SHARED_DLL="$ORT_PKG/runtimes/$ORT_ARCH_DIR/native/onnxruntime_providers_shared.dll"
+    local DML_DLL="$DML_PKG/bin/$DML_ARCH_DIR/DirectML.dll"
+
+    if [ -f "$ORT_DLL" ]; then
+        cp "$ORT_DLL" "$ARCH_OUTPUT/"
+        log "onnxruntime.dll copied ($ORT_ARCH_DIR)"
+    else
+        warn "onnxruntime.dll not found at $ORT_DLL, skipping"
+    fi
+    if [ -f "$ORT_SHARED_DLL" ]; then
+        cp "$ORT_SHARED_DLL" "$ARCH_OUTPUT/"
+        log "onnxruntime_providers_shared.dll copied ($ORT_ARCH_DIR)"
+    fi
+    if [ -f "$DML_DLL" ]; then
+        cp "$DML_DLL" "$ARCH_OUTPUT/"
+        log "DirectML.dll copied ($DML_ARCH_DIR)"
+    else
+        warn "DirectML.dll not found at $DML_DLL, skipping"
+    fi
 }
 
 # =============================================================================

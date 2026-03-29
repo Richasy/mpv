@@ -25,6 +25,7 @@
 #include "video/d3d.h"
 #include "video/hwdec.h"
 #include "video/img_format.h"
+#include "osdep/threads.h"
 
 #include <d3d11.h>
 #include <d3d11_4.h>
@@ -282,6 +283,9 @@ static bool ngx_load_dll(struct libmpv_gpu_next_context *ctx)
 // Precompiled DXBC bytecode for EASU and RCAS compute shaders
 #include "video/out/d3d11/fsr/fsr_bytecode.h"
 
+// Precompiled DXBC bytecode for RIFE RGBA8↔NCHW compute shaders
+#include "video/out/d3d11/rife/rife_bytecode.h"
+
 struct priv {
     pl_d3d11 d3d11;
     pl_tex wrapped_tex;
@@ -340,6 +344,60 @@ struct priv {
 
     bool fruc_has_prev_frame;
     double fruc_last_pts_ms;
+#endif
+
+#if HAVE_RIFE
+    // RIFE deep learning frame interpolation state
+    bool rife_available;
+    bool rife_session_active;
+    int rife_width, rife_height;
+    ID3D11Device *rife_device;
+    ID3D11DeviceContext *rife_ctx;
+
+    // ORT state (opaque pointers)
+    void *rife_ort_env;           // OrtEnv*
+    void *rife_session_opts;      // OrtSessionOptions*
+    void *rife_sessions[5];       // OrtSession* (feat, flownet, metric, rife, fusionnet)
+
+    // Staging textures for GPU↔CPU transfer
+    ID3D11Texture2D *rife_staging_read;
+    ID3D11Texture2D *rife_staging_write;
+
+    bool rife_has_prev;
+
+    // CPU tensor buffers (NCHW float at full resolution)
+    float *rife_cpu_buf0;  // previous frame [1,3,H,W]
+    float *rife_cpu_buf1;  // current frame [1,3,H,W]
+    float *rife_cpu_out;   // interpolation output [1,3,H,W]
+
+    // Async inference thread
+    mp_thread rife_thread;
+    mp_mutex rife_mutex;
+    mp_cond rife_cond_work;     // render→bg: new work available
+    mp_cond rife_cond_done;     // bg→render: result ready
+    bool rife_thread_valid;
+    bool rife_terminate;
+
+    // Inference state: 0=IDLE, 1=PENDING, 2=RUNNING, 3=READY
+    int rife_infer_state;
+
+    // Pre-allocated async buffers
+    float *rife_infer_in;      // padded [1,6,pH,pW]
+    int rife_infer_ph, rife_infer_pw;
+    float rife_infer_timestep;
+
+    // Pre-allocated ORT input tensors (reused across frames)
+    void *rife_ort_input;      // OrtValue* for imgs [1,6,pH,pW]
+    void *rife_ort_ts;         // OrtValue* for timestep [1,1,1,1]
+
+    // RIFE compute shaders for GPU format conversion
+    ID3D11ComputeShader *rife_rgba_to_nchw_cs;
+    ID3D11ComputeShader *rife_nchw_to_rgba_cs;
+    ID3D11Buffer *rife_cs_cb;           // constant buffer (32 bytes)
+    ID3D11Buffer *rife_nchw_buf;        // GPU buffer [1,6,pH,pW] float (UAV)
+    ID3D11Buffer *rife_out_buf;         // GPU buffer [1,3,pH,pW] float (UAV+SRV)
+    ID3D11Buffer *rife_nchw_staging;    // CPU-readable staging (input)
+    ID3D11Buffer *rife_out_staging;     // CPU-writable staging (output)
 #endif
 };
 
@@ -1504,6 +1562,1059 @@ static void nvofa_fruc_cleanup(struct libmpv_gpu_next_context *ctx)
 
 #endif // HAVE_NVOFA
 
+// ── RIFE Deep Learning Frame Interpolation ──
+//
+// RIFE uses neural network
+// sub-models orchestrated via ONNX Runtime with DirectML to interpolate
+// frames. A custom softsplat compute shader handles forward warping.
+//
+// Like other features, onnxruntime.dll is loaded at runtime.
+
+#if HAVE_RIFE
+
+#include <onnxruntime_c_api.h>
+
+// Runtime-loaded ORT API
+static struct {
+    HMODULE dll;
+    const OrtApi *api;
+} rife_ort;
+
+static bool rife_load_ort_dll(struct libmpv_gpu_next_context *ctx)
+{
+    if (rife_ort.dll)
+        return true;
+
+    HMODULE dll = LoadLibraryW(L"onnxruntime.dll");
+    if (!dll) {
+        // Fallback: try from same directory as libmpv-2.dll
+        HMODULE self = NULL;
+        if (GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                (LPCWSTR)rife_load_ort_dll, &self) && self)
+        {
+            wchar_t path[MAX_PATH] = {0};
+            DWORD len = GetModuleFileNameW(self, path, MAX_PATH);
+            if (len > 0 && len < MAX_PATH) {
+                wchar_t *slash = wcsrchr(path, L'\\');
+                if (slash) {
+                    wchar_t dir[MAX_PATH] = {0};
+                    wcsncpy(dir, path, slash - path + 1);
+
+                    // Add directory so transitive deps (DirectML.dll,
+                    // onnxruntime_providers_shared.dll) are found too
+                    AddDllDirectory(dir);
+
+                    *(slash + 1) = 0;
+                    wcscat(path, L"onnxruntime.dll");
+                    MP_VERBOSE(ctx, "RIFE: Trying %ls\n", path);
+                    dll = LoadLibraryExW(path, NULL,
+                        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+                }
+            }
+        }
+    }
+
+    if (!dll) {
+        MP_VERBOSE(ctx, "RIFE: onnxruntime.dll not found.\n");
+        return false;
+    }
+
+    typedef const OrtApiBase *(*PFN_OrtGetApiBase)(void);
+    PFN_OrtGetApiBase get_api_base =
+        (PFN_OrtGetApiBase)GetProcAddress(dll, "OrtGetApiBase");
+    if (!get_api_base) {
+        MP_WARN(ctx, "RIFE: Missing OrtGetApiBase in onnxruntime.dll.\n");
+        FreeLibrary(dll);
+        return false;
+    }
+
+    const OrtApiBase *api_base = get_api_base();
+    rife_ort.api = api_base->GetApi(ORT_API_VERSION);
+    if (!rife_ort.api) {
+        // DLL may be older than compile-time header; get whatever version it supports
+        rife_ort.api = api_base->GetApi(1);
+    }
+    if (!rife_ort.api) {
+        MP_WARN(ctx, "RIFE: Failed to get ORT API.\n");
+        FreeLibrary(dll);
+        return false;
+    }
+
+    rife_ort.dll = dll;
+    MP_VERBOSE(ctx, "RIFE: onnxruntime.dll loaded successfully.\n");
+    return true;
+}
+
+// RIFE model session indices
+enum {
+    RIFE_MODEL_FEAT = 0,
+    RIFE_MODEL_FLOWNET,
+    RIFE_MODEL_METRIC,
+    RIFE_MODEL_RIFE,
+    RIFE_MODEL_FUSIONNET,
+    RIFE_MODEL_COUNT
+};
+
+static const char *rife_model_files[RIFE_MODEL_COUNT] = {
+    "feat.onnx",
+    "flownet.onnx",
+    "metric.onnx",
+    "rife.onnx",
+    "fusionnet.onnx",
+};
+
+// Helper: check ORT status and log on error
+static bool rife_check_ort(struct libmpv_gpu_next_context *ctx,
+                             OrtStatus *status, const char *op)
+{
+    if (!status)
+        return true;
+    const char *msg = rife_ort.api->GetErrorMessage(status);
+    MP_ERR(ctx, "RIFE ORT: %s failed: %s\n", op, msg);
+    rife_ort.api->ReleaseStatus(status);
+    return false;
+}
+
+static bool rife_available_fn(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv *p = ctx->priv;
+    return p->rife_available;
+}
+
+// Inference state constants
+#define RIFE_STATE_IDLE    0
+#define RIFE_STATE_PENDING 1
+#define RIFE_STATE_RUNNING 2
+#define RIFE_STATE_READY   3
+
+// Forward declarations for helpers used by the inference thread
+static bool rife_run_session(struct libmpv_gpu_next_context *ctx,
+                               int model_idx,
+                               const char **input_names, OrtValue **inputs, size_t num_inputs,
+                               const char **output_names, OrtValue **outputs, size_t num_outputs);
+static OrtValue *rife_create_tensor(struct libmpv_gpu_next_context *ctx,
+                                      float *data, const int64_t *shape, size_t ndim);
+
+// Background inference thread: waits for work, runs ORT, signals completion.
+// Only touches CPU buffers and ORT API — never touches D3D11 resources.
+static MP_THREAD_VOID rife_infer_thread(void *arg)
+{
+    struct libmpv_gpu_next_context *ctx = arg;
+    struct priv *p = ctx->priv;
+    const OrtApi *api = rife_ort.api;
+
+    mp_thread_set_name("rife-infer");
+
+    mp_mutex_lock(&p->rife_mutex);
+    while (!p->rife_terminate) {
+        while (p->rife_infer_state != RIFE_STATE_PENDING && !p->rife_terminate)
+            mp_cond_wait(&p->rife_cond_work, &p->rife_mutex);
+
+        if (p->rife_terminate)
+            break;
+
+        p->rife_infer_state = RIFE_STATE_RUNNING;
+        int ph = p->rife_infer_ph;
+        int pw = p->rife_infer_pw;
+        float timestep = p->rife_infer_timestep;
+        int h = p->rife_height;
+        int w = p->rife_width;
+        mp_mutex_unlock(&p->rife_mutex);
+
+        // --- ORT inference with pre-allocated input (no mutex held, no D3D11) ---
+        int phw = ph * pw;
+        int hw = h * w;
+        bool ok = false;
+
+        // rife_infer_in already backs rife_ort_input (zero-copy),
+        // data was written by submit_async_fn. Just set timestep.
+        p->rife_infer_timestep = timestep;
+
+        // Use pre-allocated input tensors, let ORT allocate output
+        const char *in_names[] = {"imgs", "timestep"};
+        const char *out_names[] = {"output"};
+        OrtValue *ins[2] = { p->rife_ort_input, p->rife_ort_ts };
+        OrtValue *outputs[1] = {NULL};
+
+        OrtStatus *status = api->Run(
+            p->rife_sessions[RIFE_MODEL_RIFE], NULL,
+            in_names, (const OrtValue *const *)ins, 2,
+            out_names, 1, outputs);
+        ok = rife_check_ort(ctx, status, "Run(rife)");
+
+        if (ok && outputs[0]) {
+            float *data;
+            api->GetTensorMutableData(outputs[0], (void **)&data);
+            // Crop padded output [1,3,ph,pw] → [1,3,h,w]
+            float *final_out = p->rife_cpu_out;
+            for (int c = 0; c < 3; c++)
+                for (int y = 0; y < h; y++)
+                    for (int x = 0; x < w; x++) {
+                        float v = data[c * phw + y * pw + x];
+                        final_out[c * hw + y * w + x] = v < 0 ? 0 : (v > 1 ? 1 : v);
+                    }
+            api->ReleaseValue(outputs[0]);
+        } else {
+            ok = false;
+            if (outputs[0]) api->ReleaseValue(outputs[0]);
+        }
+
+        mp_mutex_lock(&p->rife_mutex);
+        p->rife_infer_state = ok ? RIFE_STATE_READY : RIFE_STATE_IDLE;
+        mp_cond_signal(&p->rife_cond_done);
+    }
+    mp_mutex_unlock(&p->rife_mutex);
+
+    MP_THREAD_RETURN();
+}
+
+static void rife_destroy_fn(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv *p = ctx->priv;
+    const OrtApi *api = rife_ort.api;
+
+    if (!api)
+        return;
+
+    // Stop background inference thread first (before releasing ORT sessions)
+    if (p->rife_thread_valid) {
+        mp_mutex_lock(&p->rife_mutex);
+        p->rife_terminate = true;
+        mp_cond_signal(&p->rife_cond_work);
+        mp_mutex_unlock(&p->rife_mutex);
+        mp_thread_join(p->rife_thread);
+        p->rife_thread_valid = false;
+        mp_mutex_destroy(&p->rife_mutex);
+        mp_cond_destroy(&p->rife_cond_work);
+        mp_cond_destroy(&p->rife_cond_done);
+    }
+
+    free(p->rife_infer_in);
+    p->rife_infer_in = NULL;
+
+    // Release pre-allocated ORT input tensors
+    if (p->rife_ort_input) {
+        api->ReleaseValue(p->rife_ort_input);
+        p->rife_ort_input = NULL;
+    }
+    if (p->rife_ort_ts) {
+        api->ReleaseValue(p->rife_ort_ts);
+        p->rife_ort_ts = NULL;
+    }
+
+    for (int i = 0; i < RIFE_MODEL_COUNT; i++) {
+        if (p->rife_sessions[i]) {
+            api->ReleaseSession(p->rife_sessions[i]);
+            p->rife_sessions[i] = NULL;
+        }
+    }
+
+    if (p->rife_session_opts) {
+        api->ReleaseSessionOptions(p->rife_session_opts);
+        p->rife_session_opts = NULL;
+    }
+
+    if (p->rife_ort_env) {
+        api->ReleaseEnv(p->rife_ort_env);
+        p->rife_ort_env = NULL;
+    }
+
+    // Release staging textures
+    if (p->rife_staging_read) {
+        ID3D11Texture2D_Release(p->rife_staging_read);
+        p->rife_staging_read = NULL;
+    }
+    if (p->rife_staging_write) {
+        ID3D11Texture2D_Release(p->rife_staging_write);
+        p->rife_staging_write = NULL;
+    }
+
+    // Release intermediate CPU buffers
+    free(p->rife_cpu_buf0);
+    p->rife_cpu_buf0 = NULL;
+    free(p->rife_cpu_buf1);
+    p->rife_cpu_buf1 = NULL;
+    free(p->rife_cpu_out);
+    p->rife_cpu_out = NULL;
+
+    if (p->rife_ctx) {
+        ID3D11DeviceContext_Release(p->rife_ctx);
+        p->rife_ctx = NULL;
+    }
+    if (p->rife_device) {
+        ID3D11Device_Release(p->rife_device);
+        p->rife_device = NULL;
+    }
+
+    // Release RIFE compute shader resources
+    if (p->rife_rgba_to_nchw_cs) {
+        ID3D11ComputeShader_Release(p->rife_rgba_to_nchw_cs);
+        p->rife_rgba_to_nchw_cs = NULL;
+    }
+    if (p->rife_nchw_to_rgba_cs) {
+        ID3D11ComputeShader_Release(p->rife_nchw_to_rgba_cs);
+        p->rife_nchw_to_rgba_cs = NULL;
+    }
+    if (p->rife_cs_cb) {
+        ID3D11Buffer_Release(p->rife_cs_cb);
+        p->rife_cs_cb = NULL;
+    }
+    if (p->rife_nchw_buf) {
+        ID3D11Buffer_Release(p->rife_nchw_buf);
+        p->rife_nchw_buf = NULL;
+    }
+    if (p->rife_out_buf) {
+        ID3D11Buffer_Release(p->rife_out_buf);
+        p->rife_out_buf = NULL;
+    }
+    if (p->rife_nchw_staging) {
+        ID3D11Buffer_Release(p->rife_nchw_staging);
+        p->rife_nchw_staging = NULL;
+    }
+    if (p->rife_out_staging) {
+        ID3D11Buffer_Release(p->rife_out_staging);
+        p->rife_out_staging = NULL;
+    }
+
+    p->rife_session_active = false;
+    p->rife_has_prev = false;
+    p->rife_width = 0;
+    p->rife_height = 0;
+}
+
+static bool rife_init_session_fn(struct libmpv_gpu_next_context *ctx,
+                                   const char *model_dir, int width, int height)
+{
+    struct priv *p = ctx->priv;
+    const OrtApi *api = rife_ort.api;
+
+    if (p->rife_session_active)
+        rife_destroy_fn(ctx);
+
+    if (!rife_ort.dll || !p->rife_device)
+        return false;
+
+    OrtStatus *status;
+
+    // Create ORT environment
+    status = api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "mpv_rife",
+                            &p->rife_ort_env);
+    if (!rife_check_ort(ctx, status, "CreateEnv"))
+        return false;
+
+    // Create session options with DirectML provider
+    status = api->CreateSessionOptions(&p->rife_session_opts);
+    if (!rife_check_ort(ctx, status, "CreateSessionOptions"))
+        goto fail;
+
+    api->SetSessionGraphOptimizationLevel(p->rife_session_opts,
+                                           ORT_ENABLE_ALL);
+
+    // Try to load DirectML execution provider
+    // OrtSessionOptionsAppendExecutionProvider_DML is in the DML provider
+    typedef OrtStatus *(*PFN_AppendDML)(OrtSessionOptions *, int);
+    PFN_AppendDML append_dml =
+        (PFN_AppendDML)GetProcAddress(rife_ort.dll,
+            "OrtSessionOptionsAppendExecutionProvider_DML");
+    if (append_dml) {
+        status = append_dml(p->rife_session_opts, 0);
+        if (status) {
+            MP_WARN(ctx, "RIFE: DirectML provider not available, "
+                    "falling back to CPU.\n");
+            api->ReleaseStatus(status);
+        } else {
+            MP_VERBOSE(ctx, "RIFE: DirectML execution provider enabled.\n");
+        }
+    } else {
+        MP_VERBOSE(ctx, "RIFE: DirectML entry point not found, using CPU.\n");
+    }
+
+    // Load RIFE model session (only model needed for fast interpolation)
+    {
+        char path[MAX_PATH];
+        snprintf(path, sizeof(path), "%s/%s", model_dir, "rife.onnx");
+
+        wchar_t wpath[MAX_PATH];
+        MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH);
+
+        status = api->CreateSession(p->rife_ort_env, wpath,
+                                    p->rife_session_opts,
+                                    &p->rife_sessions[RIFE_MODEL_RIFE]);
+        if (!rife_check_ort(ctx, status, "rife.onnx"))
+            goto fail;
+
+        MP_VERBOSE(ctx, "RIFE: Loaded rife.onnx\n");
+    }
+
+    // Get device context
+    if (!p->rife_ctx)
+        ID3D11Device_GetImmediateContext(p->rife_device, &p->rife_ctx);
+
+    // Create staging textures for GPU↔CPU transfer (full resolution)
+    D3D11_TEXTURE2D_DESC staging_desc = {
+        .Width = width,
+        .Height = height,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+        .SampleDesc = { .Count = 1, .Quality = 0 },
+        .Usage = D3D11_USAGE_STAGING,
+        .BindFlags = 0,
+        .CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE,
+    };
+
+    HRESULT hr;
+    hr = ID3D11Device_CreateTexture2D(p->rife_device, &staging_desc, NULL,
+                                       &p->rife_staging_read);
+    if (FAILED(hr)) {
+        MP_ERR(ctx, "RIFE: Failed to create staging read texture.\n");
+        goto fail;
+    }
+
+    // Write staging: full resolution (RIFE v4.26 outputs full-res)
+    hr = ID3D11Device_CreateTexture2D(p->rife_device, &staging_desc, NULL,
+                                       &p->rife_staging_write);
+    if (FAILED(hr)) {
+        MP_ERR(ctx, "RIFE: Failed to create staging write texture.\n");
+        goto fail;
+    }
+
+    // Allocate CPU tensor buffers (full resolution, [1,3,H,W])
+    size_t frame_size = 3 * (size_t)height * width * sizeof(float);
+    p->rife_cpu_buf0 = malloc(frame_size);
+    p->rife_cpu_buf1 = malloc(frame_size);
+    p->rife_cpu_out = malloc(frame_size);
+    if (!p->rife_cpu_buf0 || !p->rife_cpu_buf1 || !p->rife_cpu_out) {
+        MP_ERR(ctx, "RIFE: Out of memory for CPU buffers.\n");
+        goto fail;
+    }
+
+    p->rife_session_active = true;
+    p->rife_width = width;
+    p->rife_height = height;
+    p->rife_has_prev = false;
+
+    // Pre-allocate async inference buffer (padded to 64-pixel alignment)
+    int pad_h = (64 - height % 64) % 64;
+    int pad_w = (64 - width % 64) % 64;
+    int ph = height + pad_h;
+    int pw = width + pad_w;
+    p->rife_infer_in = calloc(6 * (size_t)ph * pw, sizeof(float));
+    if (!p->rife_infer_in) {
+        MP_ERR(ctx, "RIFE: Out of memory for async inference buffer.\n");
+        goto fail;
+    }
+
+    // Create background inference thread
+    mp_mutex_init(&p->rife_mutex);
+    mp_cond_init(&p->rife_cond_work);
+    mp_cond_init(&p->rife_cond_done);
+    p->rife_terminate = false;
+    p->rife_infer_state = RIFE_STATE_IDLE;
+
+    if (mp_thread_create(&p->rife_thread, rife_infer_thread, ctx)) {
+        MP_ERR(ctx, "RIFE: Failed to create inference thread.\n");
+        mp_mutex_destroy(&p->rife_mutex);
+        mp_cond_destroy(&p->rife_cond_work);
+        mp_cond_destroy(&p->rife_cond_done);
+        goto fail;
+    }
+    p->rife_thread_valid = true;
+
+    // Pre-allocate ORT input tensors (reused across frames, zero-alloc per-frame)
+    {
+        OrtMemoryInfo *cpu_mem = NULL;
+        status = api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &cpu_mem);
+        if (!rife_check_ort(ctx, status, "CreateCpuMemoryInfo"))
+            goto fail;
+
+        int64_t imgs_shape[] = {1, 6, ph, pw};
+        size_t imgs_size = 6 * (size_t)ph * pw * sizeof(float);
+        status = api->CreateTensorWithDataAsOrtValue(
+            cpu_mem, p->rife_infer_in, imgs_size,
+            imgs_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            &p->rife_ort_input);
+        if (!rife_check_ort(ctx, status, "CreateTensor(input)")) {
+            api->ReleaseMemoryInfo(cpu_mem);
+            goto fail;
+        }
+
+        int64_t ts_shape[] = {1, 1, 1, 1};
+        status = api->CreateTensorWithDataAsOrtValue(
+            cpu_mem, &p->rife_infer_timestep, sizeof(float),
+            ts_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            &p->rife_ort_ts);
+        if (!rife_check_ort(ctx, status, "CreateTensor(timestep)")) {
+            api->ReleaseMemoryInfo(cpu_mem);
+            goto fail;
+        }
+
+        api->ReleaseMemoryInfo(cpu_mem);
+        MP_VERBOSE(ctx, "RIFE: Pre-allocated input tensors.\n");
+    }
+
+    // Store padded dimensions for the session
+    p->rife_infer_ph = ph;
+    p->rife_infer_pw = pw;
+
+    // Initialize RIFE compute shaders for GPU format conversion
+    {
+        HRESULT hr;
+        hr = ID3D11Device_CreateComputeShader(
+            p->rife_device, rife_rgba8_to_nchw_bytecode,
+            sizeof(rife_rgba8_to_nchw_bytecode), NULL, &p->rife_rgba_to_nchw_cs);
+        if (FAILED(hr)) {
+            MP_ERR(ctx, "RIFE: CreateComputeShader(rgba8_to_nchw) failed: 0x%x\n",
+                   (unsigned)hr);
+            goto fail;
+        }
+
+        hr = ID3D11Device_CreateComputeShader(
+            p->rife_device, rife_nchw_to_rgba8_bytecode,
+            sizeof(rife_nchw_to_rgba8_bytecode), NULL, &p->rife_nchw_to_rgba_cs);
+        if (FAILED(hr)) {
+            MP_ERR(ctx, "RIFE: CreateComputeShader(nchw_to_rgba8) failed: 0x%x\n",
+                   (unsigned)hr);
+            goto fail;
+        }
+
+        // Constant buffer (32 bytes: 8 uint32s)
+        D3D11_BUFFER_DESC cb_desc = {
+            .ByteWidth = 32,
+            .Usage = D3D11_USAGE_DYNAMIC,
+            .BindFlags = D3D11_BIND_CONSTANT_BUFFER,
+            .CPUAccessFlags = D3D11_CPU_ACCESS_WRITE,
+        };
+        hr = ID3D11Device_CreateBuffer(p->rife_device, &cb_desc, NULL, &p->rife_cs_cb);
+        if (FAILED(hr)) {
+            MP_ERR(ctx, "RIFE: CreateBuffer(CS CB) failed: 0x%x\n", (unsigned)hr);
+            goto fail;
+        }
+
+        // GPU buffer for NCHW input [1,6,pH,pW] float (typed R32_FLOAT)
+        size_t nchw_in_size = 6 * (size_t)ph * pw * sizeof(float);
+        D3D11_BUFFER_DESC buf_desc = {
+            .ByteWidth = (UINT)nchw_in_size,
+            .Usage = D3D11_USAGE_DEFAULT,
+            .BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE,
+        };
+        hr = ID3D11Device_CreateBuffer(p->rife_device, &buf_desc, NULL, &p->rife_nchw_buf);
+        if (FAILED(hr)) {
+            MP_ERR(ctx, "RIFE: CreateBuffer(NCHW input) failed: 0x%x\n", (unsigned)hr);
+            goto fail;
+        }
+
+        // Staging buffer for NCHW input (CPU-readable)
+        D3D11_BUFFER_DESC staging_desc = {
+            .ByteWidth = (UINT)nchw_in_size,
+            .Usage = D3D11_USAGE_STAGING,
+            .CPUAccessFlags = D3D11_CPU_ACCESS_READ,
+        };
+        hr = ID3D11Device_CreateBuffer(p->rife_device, &staging_desc, NULL, &p->rife_nchw_staging);
+        if (FAILED(hr)) {
+            MP_ERR(ctx, "RIFE: CreateBuffer(NCHW staging) failed: 0x%x\n", (unsigned)hr);
+            goto fail;
+        }
+
+        // GPU buffer for NCHW output [1,3,pH,pW] float
+        size_t nchw_out_size = 3 * (size_t)ph * pw * sizeof(float);
+        buf_desc.ByteWidth = (UINT)nchw_out_size;
+        buf_desc.MiscFlags = 0;
+        hr = ID3D11Device_CreateBuffer(p->rife_device, &buf_desc, NULL, &p->rife_out_buf);
+        if (FAILED(hr)) {
+            MP_ERR(ctx, "RIFE: CreateBuffer(NCHW output) failed: 0x%x\n", (unsigned)hr);
+            goto fail;
+        }
+
+        // Staging buffer for output (CPU-writable)
+        D3D11_BUFFER_DESC out_staging_desc = {
+            .ByteWidth = (UINT)nchw_out_size,
+            .Usage = D3D11_USAGE_STAGING,
+            .CPUAccessFlags = D3D11_CPU_ACCESS_WRITE,
+        };
+        hr = ID3D11Device_CreateBuffer(p->rife_device, &out_staging_desc, NULL, &p->rife_out_staging);
+        if (FAILED(hr)) {
+            MP_ERR(ctx, "RIFE: CreateBuffer(output staging) failed: 0x%x\n", (unsigned)hr);
+            goto fail;
+        }
+
+        MP_VERBOSE(ctx, "RIFE: RIFE compute shaders initialized (ph=%d, pw=%d).\n", ph, pw);
+    }
+
+    MP_INFO(ctx, "RIFE: Session created (%dx%d, CS+pre-alloc). "
+            "RIFE v4.26 frame interpolation is ready.\n",
+            width, height);
+    return true;
+
+fail:
+    rife_destroy_fn(ctx);
+    return false;
+}
+
+// Convert RGBA8 texture to NCHW float [1, 3, H, W] at full resolution
+static void rife_rgba_to_nchw(const uint8_t *rgba, size_t row_pitch,
+                                 float *nchw, int w, int h)
+{
+    for (int y = 0; y < h; y++) {
+        const uint8_t *row = rgba + y * row_pitch;
+        for (int x = 0; x < w; x++) {
+            for (int c = 0; c < 3; c++) {
+                nchw[c * h * w + y * w + x] = row[x * 4 + c] / 255.0f;
+            }
+        }
+    }
+}
+
+// Convert NCHW float [1, 3, H, W] to RGBA8 (no scaling, direct 1:1 write)
+static void rife_nchw_to_rgba(const float *nchw, uint8_t *rgba, size_t row_pitch,
+                                 int w, int h)
+{
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = rgba + y * row_pitch;
+        for (int x = 0; x < w; x++) {
+            for (int c = 0; c < 3; c++) {
+                float v = nchw[c * h * w + y * w + x];
+                v = v < 0 ? 0 : (v > 1 ? 1 : v);
+                row[x * 4 + c] = (uint8_t)(v * 255.0f + 0.5f);
+            }
+            row[x * 4 + 3] = 255;
+        }
+    }
+}
+
+// Readback RGBA8 GPU texture to CPU NCHW float (full resolution)
+static bool rife_readback_to_nchw(struct libmpv_gpu_next_context *ctx,
+                                     ID3D11Texture2D *tex, float *nchw)
+{
+    struct priv *p = ctx->priv;
+    ID3D11DeviceContext_CopyResource(p->rife_ctx,
+        (ID3D11Resource *)p->rife_staging_read, (ID3D11Resource *)tex);
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = ID3D11DeviceContext_Map(p->rife_ctx,
+        (ID3D11Resource *)p->rife_staging_read, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr))
+        return false;
+
+    rife_rgba_to_nchw(mapped.pData, mapped.RowPitch, nchw,
+                         p->rife_width, p->rife_height);
+
+    ID3D11DeviceContext_Unmap(p->rife_ctx,
+        (ID3D11Resource *)p->rife_staging_read, 0);
+    return true;
+}
+
+// Upload NCHW float result to RGBA8 GPU texture (full resolution)
+static bool rife_upload_from_nchw(struct libmpv_gpu_next_context *ctx,
+                                     const float *nchw, ID3D11Texture2D *tex)
+{
+    struct priv *p = ctx->priv;
+    int w = p->rife_width;
+    int h = p->rife_height;
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = ID3D11DeviceContext_Map(p->rife_ctx,
+        (ID3D11Resource *)p->rife_staging_write, 0, D3D11_MAP_WRITE, 0, &mapped);
+    if (FAILED(hr))
+        return false;
+
+    rife_nchw_to_rgba(nchw, mapped.pData, mapped.RowPitch, w, h);
+
+    ID3D11DeviceContext_Unmap(p->rife_ctx,
+        (ID3D11Resource *)p->rife_staging_write, 0);
+
+    ID3D11DeviceContext_CopyResource(p->rife_ctx,
+        (ID3D11Resource *)tex, (ID3D11Resource *)p->rife_staging_write);
+    return true;
+}
+
+// Run a single ORT session with given inputs/outputs
+static bool rife_run_session(struct libmpv_gpu_next_context *ctx,
+                               int model_idx,
+                               const char **input_names, OrtValue **inputs, size_t num_inputs,
+                               const char **output_names, OrtValue **outputs, size_t num_outputs)
+{
+    struct priv *p = ctx->priv;
+    const OrtApi *api = rife_ort.api;
+
+    OrtStatus *status = api->Run(
+        p->rife_sessions[model_idx], NULL,
+        input_names, (const OrtValue *const *)inputs, num_inputs,
+        output_names, num_outputs, outputs);
+
+    return rife_check_ort(ctx, status, rife_model_files[model_idx]);
+}
+
+// Create an ORT tensor value from a float buffer
+static OrtValue *rife_create_tensor(struct libmpv_gpu_next_context *ctx,
+                                      float *data, const int64_t *shape, size_t ndim)
+{
+    const OrtApi *api = rife_ort.api;
+    OrtMemoryInfo *mem_info = NULL;
+    OrtValue *tensor = NULL;
+
+    OrtStatus *status = api->CreateCpuMemoryInfo(
+        OrtArenaAllocator, OrtMemTypeDefault, &mem_info);
+    if (!rife_check_ort(ctx, status, "CreateCpuMemoryInfo"))
+        return NULL;
+
+    size_t total = 1;
+    for (size_t i = 0; i < ndim; i++)
+        total *= shape[i];
+
+    status = api->CreateTensorWithDataAsOrtValue(
+        mem_info, data, total * sizeof(float),
+        shape, ndim, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &tensor);
+    api->ReleaseMemoryInfo(mem_info);
+
+    if (!rife_check_ort(ctx, status, "CreateTensor"))
+        return NULL;
+
+    return tensor;
+}
+
+// Helper: update CS constant buffer
+static bool rife_update_cs_cb(struct libmpv_gpu_next_context *ctx,
+                                uint32_t src_w, uint32_t src_h,
+                                uint32_t pad_w, uint32_t pad_h,
+                                uint32_t channel_offset)
+{
+    struct priv *p = ctx->priv;
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = ID3D11DeviceContext_Map(p->rife_ctx,
+        (ID3D11Resource *)p->rife_cs_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hr))
+        return false;
+    uint32_t *data = mapped.pData;
+    data[0] = src_w;
+    data[1] = src_h;
+    data[2] = pad_w;
+    data[3] = pad_h;
+    data[4] = channel_offset;
+    data[5] = 0; data[6] = 0; data[7] = 0; // padding
+    ID3D11DeviceContext_Unmap(p->rife_ctx, (ID3D11Resource *)p->rife_cs_cb, 0);
+    return true;
+}
+
+// Run rgba8_to_nchw CS: read texture, write padded NCHW to GPU buffer (channels 0-2 or 3-5)
+static bool rife_rgba8_to_nchw_gpu(struct libmpv_gpu_next_context *ctx,
+                                     ID3D11Texture2D *input_tex,
+                                     uint32_t channel_offset)
+{
+    struct priv *p = ctx->priv;
+    int ph = p->rife_infer_ph;
+    int pw = p->rife_infer_pw;
+    HRESULT hr;
+
+    // Update constants
+    if (!rife_update_cs_cb(ctx, p->rife_width, p->rife_height, pw, ph, channel_offset))
+        return false;
+
+    // Create SRV for input texture
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {
+        .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MipLevels = 1 },
+    };
+    ID3D11ShaderResourceView *input_srv = NULL;
+    hr = ID3D11Device_CreateShaderResourceView(
+        p->rife_device, (ID3D11Resource *)input_tex, &srv_desc, &input_srv);
+    if (FAILED(hr))
+        return false;
+
+    // Create UAV for output buffer (typed R32_FLOAT)
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {
+        .Format = DXGI_FORMAT_R32_FLOAT,
+        .ViewDimension = D3D11_UAV_DIMENSION_BUFFER,
+        .Buffer = {
+            .NumElements = 6 * (UINT)ph * pw,
+        },
+    };
+    ID3D11UnorderedAccessView *output_uav = NULL;
+    hr = ID3D11Device_CreateUnorderedAccessView(
+        p->rife_device, (ID3D11Resource *)p->rife_nchw_buf, &uav_desc, &output_uav);
+    if (FAILED(hr)) {
+        ID3D11ShaderResourceView_Release(input_srv);
+        return false;
+    }
+
+    // Dispatch
+    ID3D11DeviceContext_CSSetShader(p->rife_ctx, p->rife_rgba_to_nchw_cs, NULL, 0);
+    ID3D11DeviceContext_CSSetConstantBuffers(p->rife_ctx, 0, 1, &p->rife_cs_cb);
+    ID3D11DeviceContext_CSSetShaderResources(p->rife_ctx, 0, 1, &input_srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(p->rife_ctx, 0, 1, &output_uav, NULL);
+    ID3D11DeviceContext_Dispatch(p->rife_ctx, (pw + 15) / 16, (ph + 15) / 16, 1);
+
+    // Unbind
+    ID3D11ShaderResourceView *null_srv = NULL;
+    ID3D11UnorderedAccessView *null_uav = NULL;
+    ID3D11DeviceContext_CSSetShaderResources(p->rife_ctx, 0, 1, &null_srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(p->rife_ctx, 0, 1, &null_uav, NULL);
+
+    ID3D11ShaderResourceView_Release(input_srv);
+    ID3D11UnorderedAccessView_Release(output_uav);
+    return true;
+}
+
+// Run nchw_to_rgba8 CS: read from GPU buffer, write to output texture
+static bool rife_nchw_to_rgba8_gpu(struct libmpv_gpu_next_context *ctx,
+                                     ID3D11Texture2D *output_tex)
+{
+    struct priv *p = ctx->priv;
+    int ph = p->rife_infer_ph;
+    int pw = p->rife_infer_pw;
+    HRESULT hr;
+
+    if (!rife_update_cs_cb(ctx, p->rife_width, p->rife_height, pw, ph, 0))
+        return false;
+
+    // Create SRV for output buffer (typed R32_FLOAT)
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {
+        .Format = DXGI_FORMAT_R32_FLOAT,
+        .ViewDimension = D3D11_SRV_DIMENSION_BUFFER,
+        .Buffer = { .NumElements = 3 * (UINT)ph * pw },
+    };
+    ID3D11ShaderResourceView *buf_srv = NULL;
+    hr = ID3D11Device_CreateShaderResourceView(
+        p->rife_device, (ID3D11Resource *)p->rife_out_buf, &srv_desc, &buf_srv);
+    if (FAILED(hr))
+        return false;
+
+    // Create UAV for output texture
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {
+        .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+        .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+    };
+    ID3D11UnorderedAccessView *output_uav = NULL;
+    hr = ID3D11Device_CreateUnorderedAccessView(
+        p->rife_device, (ID3D11Resource *)output_tex, &uav_desc, &output_uav);
+    if (FAILED(hr)) {
+        ID3D11ShaderResourceView_Release(buf_srv);
+        return false;
+    }
+
+    // Dispatch
+    ID3D11DeviceContext_CSSetShader(p->rife_ctx, p->rife_nchw_to_rgba_cs, NULL, 0);
+    ID3D11DeviceContext_CSSetConstantBuffers(p->rife_ctx, 0, 1, &p->rife_cs_cb);
+    ID3D11DeviceContext_CSSetShaderResources(p->rife_ctx, 0, 1, &buf_srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(p->rife_ctx, 0, 1, &output_uav, NULL);
+    ID3D11DeviceContext_Dispatch(p->rife_ctx,
+        (p->rife_width + 15) / 16, (p->rife_height + 15) / 16, 1);
+
+    // Unbind
+    ID3D11ShaderResourceView *null_srv = NULL;
+    ID3D11UnorderedAccessView *null_uav = NULL;
+    ID3D11DeviceContext_CSSetShaderResources(p->rife_ctx, 0, 1, &null_srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(p->rife_ctx, 0, 1, &null_uav, NULL);
+
+    ID3D11ShaderResourceView_Release(buf_srv);
+    ID3D11UnorderedAccessView_Release(output_uav);
+    return true;
+}
+
+static bool rife_feed_frame_fn(struct libmpv_gpu_next_context *ctx,
+                                  ID3D11Texture2D *input_tex)
+{
+    struct priv *p = ctx->priv;
+    if (!p->rife_session_active)
+        return false;
+
+    int ph = p->rife_infer_ph;
+    int pw = p->rife_infer_pw;
+    size_t plane_floats = 3 * (size_t)ph * pw;
+    size_t plane_bytes = plane_floats * sizeof(float);
+
+    // Shift on CPU: img1 → img0 (memmove within rife_infer_in)
+    if (p->rife_has_prev) {
+        memmove(p->rife_infer_in, p->rife_infer_in + plane_floats, plane_bytes);
+    }
+
+    // Run CS: RGBA8 texture → padded NCHW in rife_nchw_buf (channels 0-2 only)
+    if (!rife_rgba8_to_nchw_gpu(ctx, input_tex, 0)) {
+        MP_WARN(ctx, "RIFE: CS rgba8_to_nchw failed.\n");
+        return false;
+    }
+
+    // Copy GPU buffer (channels 0-2) → staging → CPU
+    ID3D11DeviceContext_CopyResource(p->rife_ctx,
+        (ID3D11Resource *)p->rife_nchw_staging,
+        (ID3D11Resource *)p->rife_nchw_buf);
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = ID3D11DeviceContext_Map(p->rife_ctx,
+        (ID3D11Resource *)p->rife_nchw_staging, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        MP_WARN(ctx, "RIFE: Failed to map NCHW staging buffer.\n");
+        return false;
+    }
+
+    // Copy 3 channels (new frame) into img1 slot (channels 3-5) of rife_infer_in
+    float *dst = p->rife_infer_in + (p->rife_has_prev ? plane_floats : 0);
+    memcpy(dst, mapped.pData, plane_bytes);
+
+    ID3D11DeviceContext_Unmap(p->rife_ctx, (ID3D11Resource *)p->rife_nchw_staging, 0);
+
+    if (!p->rife_has_prev) {
+        p->rife_has_prev = true;
+        return false; // Need at least 2 frames
+    }
+
+    return true;
+}
+
+// Submit async inference: build padded input tensor, signal bg thread.
+// Called from render thread after rife_feed_frame_fn succeeds.
+static void rife_submit_async_fn(struct libmpv_gpu_next_context *ctx,
+                                    float timestep)
+{
+    struct priv *p = ctx->priv;
+    if (!p->rife_session_active || !p->rife_has_prev || !p->rife_thread_valid)
+        return;
+
+    mp_mutex_lock(&p->rife_mutex);
+    if (p->rife_infer_state == RIFE_STATE_RUNNING) {
+        // Previous inference still running, skip this submission
+        mp_mutex_unlock(&p->rife_mutex);
+        MP_DBG(ctx, "RIFE: Skipping submit, inference still running.\n");
+        return;
+    }
+
+    int h = p->rife_height;
+    int w = p->rife_width;
+    int hw = h * w;
+
+    #define RIFE_PAD_ALIGN 64
+    int pad_h = (RIFE_PAD_ALIGN - h % RIFE_PAD_ALIGN) % RIFE_PAD_ALIGN;
+    int pad_w = (RIFE_PAD_ALIGN - w % RIFE_PAD_ALIGN) % RIFE_PAD_ALIGN;
+    int ph = h + pad_h;
+    int pw = w + pad_w;
+    int phw = ph * pw;
+
+    float *img0 = p->rife_cpu_buf0;
+    float *img1 = p->rife_cpu_buf1;
+    float *dst = p->rife_infer_in;
+
+    // Build padded [1,6,ph,pw] tensor (replicate-border padding)
+    for (int c = 0; c < 3; c++) {
+        for (int y = 0; y < ph; y++) {
+            int sy = y < h ? y : h - 1;
+            for (int x = 0; x < pw; x++) {
+                int sx = x < w ? x : w - 1;
+                dst[c * phw + y * pw + x] = img0[c * hw + sy * w + sx];
+                dst[(3 + c) * phw + y * pw + x] = img1[c * hw + sy * w + sx];
+            }
+        }
+    }
+
+    p->rife_infer_ph = ph;
+    p->rife_infer_pw = pw;
+    p->rife_infer_timestep = timestep;
+    p->rife_infer_state = RIFE_STATE_PENDING;
+    mp_cond_signal(&p->rife_cond_work);
+    mp_mutex_unlock(&p->rife_mutex);
+}
+
+// Non-blocking poll: check if async inference result is available.
+static bool rife_poll_result_fn(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv *p = ctx->priv;
+    if (!p->rife_thread_valid)
+        return false;
+
+    mp_mutex_lock(&p->rife_mutex);
+    bool ready = (p->rife_infer_state == RIFE_STATE_READY);
+    if (ready)
+        p->rife_infer_state = RIFE_STATE_IDLE;
+    mp_mutex_unlock(&p->rife_mutex);
+    return ready;
+}
+
+// Synchronous interpolation: build padded input, run ORT, crop, upload.
+// Uses pre-allocated input tensor (rife_ort_input backs rife_infer_in).
+static bool rife_interpolate_fn(struct libmpv_gpu_next_context *ctx,
+                                   ID3D11Texture2D *output_tex,
+                                   float timestep)
+{
+    struct priv *p = ctx->priv;
+    const OrtApi *api = rife_ort.api;
+
+    if (!p->rife_session_active || !p->rife_has_prev)
+        return false;
+
+    int ph = p->rife_infer_ph;
+    int pw = p->rife_infer_pw;
+
+    // rife_infer_in already has padded [1,6,ph,pw] from feed_frame (via CS)
+    p->rife_infer_timestep = timestep;
+
+    // Run ORT with pre-allocated input tensors
+    const char *in_names[] = {"imgs", "timestep"};
+    const char *out_names[] = {"output"};
+    OrtValue *ins[2] = { p->rife_ort_input, p->rife_ort_ts };
+    OrtValue *outputs[1] = {NULL};
+
+    OrtStatus *status = api->Run(
+        p->rife_sessions[RIFE_MODEL_RIFE], NULL,
+        in_names, (const OrtValue *const *)ins, 2,
+        out_names, 1, outputs);
+    bool ok = rife_check_ort(ctx, status, "Run(rife)");
+
+    if (ok && outputs[0]) {
+        float *data;
+        api->GetTensorMutableData(outputs[0], (void **)&data);
+
+        // Upload padded ORT output → staging buffer → GPU buffer → CS → RGBA8 texture
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        HRESULT hr = ID3D11DeviceContext_Map(p->rife_ctx,
+            (ID3D11Resource *)p->rife_out_staging, 0, D3D11_MAP_WRITE, 0, &mapped);
+        if (SUCCEEDED(hr)) {
+            memcpy(mapped.pData, data, 3 * (size_t)ph * pw * sizeof(float));
+            ID3D11DeviceContext_Unmap(p->rife_ctx,
+                (ID3D11Resource *)p->rife_out_staging, 0);
+
+            // Staging → GPU buffer
+            ID3D11DeviceContext_CopyResource(p->rife_ctx,
+                (ID3D11Resource *)p->rife_out_buf,
+                (ID3D11Resource *)p->rife_out_staging);
+
+            // CS: NCHW float buffer → RGBA8 texture
+            ok = rife_nchw_to_rgba8_gpu(ctx, output_tex);
+        } else {
+            ok = false;
+        }
+
+        api->ReleaseValue(outputs[0]);
+    } else {
+        ok = false;
+        if (outputs[0]) api->ReleaseValue(outputs[0]);
+    }
+
+    MP_DBG(ctx, "RIFE: Interpolated frame at t=%.2f\n", timestep);
+    return ok;
+}
+
+static void rife_init(struct libmpv_gpu_next_context *ctx,
+                        ID3D11Device *device)
+{
+    struct priv *p = ctx->priv;
+    p->rife_available = rife_load_ort_dll(ctx);
+    if (p->rife_available) {
+        p->rife_device = device;
+        ID3D11Device_AddRef(p->rife_device);
+        MP_VERBOSE(ctx, "RIFE: ORT loaded, RIFE available.\n");
+    }
+}
+
+static void rife_cleanup(struct libmpv_gpu_next_context *ctx)
+{
+    rife_destroy_fn(ctx);
+}
+
+#endif // HAVE_RIFE
+
 static int init(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
 {
     ctx->priv = talloc_zero(NULL, struct priv);
@@ -1561,6 +2672,10 @@ static int init(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
 
 #if HAVE_NVOFA
     nvofa_fruc_init(ctx, (ID3D11Device *)d3d_params->device);
+#endif
+
+#if HAVE_RIFE
+    rife_init(ctx, (ID3D11Device *)d3d_params->device);
 #endif
 
     fsr_init(ctx, (ID3D11Device *)d3d_params->device);
@@ -1629,6 +2744,10 @@ static void destroy(struct libmpv_gpu_next_context *ctx)
     nvofa_fruc_cleanup(ctx);
 #endif
 
+#if HAVE_RIFE
+    rife_cleanup(ctx);
+#endif
+
     fsr_cleanup(ctx);
 
     if (p->wrapped_tex)
@@ -1664,5 +2783,14 @@ const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11 = {
     .nvofa_fruc_feed_frame = nvofa_fruc_feed_frame_fn,
     .nvofa_fruc_interpolate = nvofa_fruc_interpolate_fn,
     .nvofa_fruc_destroy = nvofa_fruc_destroy_fn,
+#endif
+#if HAVE_RIFE
+    .rife_available = rife_available_fn,
+    .rife_init_session = rife_init_session_fn,
+    .rife_feed_frame = rife_feed_frame_fn,
+    .rife_interpolate = rife_interpolate_fn,
+    .rife_destroy = rife_destroy_fn,
+    .rife_submit_async = rife_submit_async_fn,
+    .rife_poll_result = rife_poll_result_fn,
 #endif
 };

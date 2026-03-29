@@ -218,6 +218,10 @@ const struct m_sub_options gl_next_conf = {
             {"off",     0},
             {"on",      1},
             {"sharpen", 2})},
+        {"rife", OPT_CHOICE(rife,
+            {"off", 0},
+            {"on",  1})},
+        {"rife-model", OPT_STRING(rife_model), .flags = M_OPT_FILE},
         {0},
     },
     .defaults = &(struct gl_next_opts) {

@@ -6468,6 +6468,18 @@ static void cmd_stop(void *p)
     mp_wakeup_core(mpctx);
 }
 
+static void cmd_simulate_error(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    struct MPContext *mpctx = cmd->mpctx;
+    int error_code = cmd->args[0].v.i;
+
+    mpctx->error_playing = error_code;
+    mpctx->stop_play = PT_ERROR;
+    mp_abort_playback_async(mpctx);
+    mp_wakeup_core(mpctx);
+}
+
 static void cmd_show_progress(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
@@ -7365,6 +7377,9 @@ const struct mp_cmd_def mp_cmds[] = {
         .priv = &(const bool){1} },
     { "stop", cmd_stop,
         { {"flags", OPT_FLAGS(v.i, {"keep-playlist", 1}), .flags = MP_CMD_OPT_ARG} }
+    },
+    { "simulate-error", cmd_simulate_error,
+        { {"error-code", OPT_INT(v.i), OPTDEF_INT(-20)} }
     },
     { "frame-step", cmd_frame_step,
         {

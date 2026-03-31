@@ -2655,6 +2655,23 @@ static int init(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
 
     ctx->gpu = p->d3d11->gpu;
 
+    // Enable multithread protection on the D3D11 device so that the decoder
+    // thread (FFmpeg D3D11VA) and the render thread (libplacebo) can safely
+    // share the same immediate context.  Without this, zero-copy hwdec on
+    // weaker / older GPUs (e.g. Quadro P620) can trigger a TDR / device-lost
+    // because both threads race on the immediate context unsynchronised.
+    {
+        ID3D10Multithread *multithread = NULL;
+        HRESULT hr = ID3D11Device_QueryInterface(
+            (ID3D11Device *)d3d_params->device,
+            &IID_ID3D10Multithread, (void **)&multithread);
+        if (SUCCEEDED(hr) && multithread) {
+            ID3D10Multithread_SetMultithreadProtected(multithread, TRUE);
+            ID3D10Multithread_Release(multithread);
+            MP_VERBOSE(ctx, "D3D11 multithread protection enabled.\n");
+        }
+    }
+
     // Register D3D11 device for zero-copy hardware decoding (D3D11VA)
     if (ctx->hwdec_devs) {
         static const int subfmts[] = {

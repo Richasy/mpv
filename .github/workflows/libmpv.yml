@@ -83,4 +83,5 @@ jobs:
           path: |
             ${{ env.BUILD_DIR }}/packages/mpv-prefix/src/mpv-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/mpv-prefix/src/mpv-build/meson-logs/*.txt
+            ${{ env.BUILD_DIR }}/packages/ffmpeg-prefix/src/ffmpeg-stamp/*.log
           retention-days: 7

@@ -9,12 +9,11 @@ ExternalProject_Add(libplacebo
         glad
         fast_float
         xxhash
-    GIT_REPOSITORY https://github.com/haasn/libplacebo.git
+    GIT_REPOSITORY https://github.com/Richasy/libplacebo.git
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--filter=tree:0"
     GIT_SUBMODULES ""
     UPDATE_COMMAND ""
-    PATCH_COMMAND bash -c "cd <SOURCE_DIR> && echo '=== Applying D3D11 shader cache invalidation patch ===' && git apply --verbose ${CMAKE_CURRENT_SOURCE_DIR}/libplacebo-0002-d3d11-invalidate-shader-cache-on-pass-destroy.patch && echo '=== All patches applied successfully ==='"
     CONFIGURE_COMMAND ""
     COMMAND bash -c "rm -rf <SOURCE_DIR>/3rdparty/glad"
     COMMAND bash -c "rm -rf <SOURCE_DIR>/3rdparty/fast_float"

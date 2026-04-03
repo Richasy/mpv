@@ -132,8 +132,8 @@ typedef NVSDK_NGX_Result (*PFN_NGX_D3D11_EvaluateFeature)(
     ID3D11DeviceContext *InDevCtx, const NVSDK_NGX_Handle *InFeatureHandle,
     const NVSDK_NGX_Parameter *InParameters, void *InCallback);
 
-// Runtime-loaded function pointers (DLL exports only)
-static struct {
+// Named struct for per-instance NGX function pointers
+struct ngx_dll_fns {
     HMODULE dll;
     PFN_NGX_D3D11_Init D3D11_Init;
     PFN_NGX_D3D11_Shutdown1 D3D11_Shutdown1;
@@ -142,7 +142,7 @@ static struct {
     PFN_NGX_D3D11_CreateFeature D3D11_CreateFeature;
     PFN_NGX_D3D11_ReleaseFeature D3D11_ReleaseFeature;
     PFN_NGX_D3D11_EvaluateFeature D3D11_EvaluateFeature;
-} ngx_fn;
+};
 
 static HMODULE ngx_load_dll_from_registry(struct libmpv_gpu_next_context *ctx)
 {
@@ -181,9 +181,9 @@ static HMODULE ngx_load_dll_from_registry(struct libmpv_gpu_next_context *ctx)
     return dll;
 }
 
-static bool ngx_load_dll(struct libmpv_gpu_next_context *ctx)
+static bool ngx_load_dll(struct libmpv_gpu_next_context *ctx, struct ngx_dll_fns *ngx)
 {
-    if (ngx_fn.dll)
+    if (ngx->dll)
         return true;
 
     // Try standard search path first, then registry
@@ -196,11 +196,11 @@ static bool ngx_load_dll(struct libmpv_gpu_next_context *ctx)
     }
 
 #define NGX_LOAD(name, sym) do {                                             \
-    ngx_fn.name = (void *)GetProcAddress(dll, sym);                          \
-    if (!ngx_fn.name) {                                                      \
+    ngx->name = (void *)GetProcAddress(dll, sym);                            \
+    if (!ngx->name) {                                                        \
         MP_WARN(ctx, "NGX VSR: Missing symbol '%s' in _nvngx.dll.\n", sym);  \
         FreeLibrary(dll);                                                    \
-        memset(&ngx_fn, 0, sizeof(ngx_fn));                                 \
+        memset(ngx, 0, sizeof(*ngx));                                        \
         return false;                                                        \
     }                                                                        \
 } while (0)
@@ -215,7 +215,7 @@ static bool ngx_load_dll(struct libmpv_gpu_next_context *ctx)
     NGX_LOAD(D3D11_EvaluateFeature, "NVSDK_NGX_D3D11_EvaluateFeature");
 #undef NGX_LOAD
 
-    ngx_fn.dll = dll;
+    ngx->dll = dll;
     MP_VERBOSE(ctx, "NGX VSR: _nvngx.dll loaded successfully.\n");
     return true;
 }
@@ -294,6 +294,9 @@ struct priv {
     struct mp_hwdec_ctx hwctx;
 
 #if HAVE_NGX_VSR
+    // Per-instance NGX function pointers (loaded from _nvngx.dll)
+    struct ngx_dll_fns ngx;
+
     // NGX VSR state
     ID3D11Device *d3d_device;
     ID3D11DeviceContext *d3d_ctx;
@@ -324,6 +327,18 @@ struct priv {
     ID3D11SamplerState *fsr_sampler;
 
 #if HAVE_NVOFA
+    // Per-instance NVOFA function pointers (loaded from NvOFFRUC.dll)
+    // Stored as void* to avoid forward-declaring PFN types before struct priv.
+    // Cast to concrete PFN_NvOFFRUC* types at call sites.
+    struct {
+        HMODULE dll;
+        void *Create;
+        void *RegisterResource;
+        void *UnregisterResource;
+        void *Process;
+        void *Destroy;
+    } nvofa;
+
     // NvOFFRUC frame interpolation state
     void *fruc_handle;              // NvOFFRUCHandle (opaque pointer)
     bool fruc_available;
@@ -347,6 +362,13 @@ struct priv {
 #endif
 
 #if HAVE_RIFE
+    // Per-instance ORT function pointers (loaded from onnxruntime.dll)
+    // OrtApi* stored as void* to avoid #include <onnxruntime_c_api.h> before struct priv.
+    struct {
+        HMODULE dll;
+        const void *api;  // const OrtApi*, cast at call sites
+    } ort;
+
     // RIFE deep learning frame interpolation state
     bool rife_available;
     bool rife_session_active;
@@ -438,7 +460,7 @@ static void ngx_vsr_init(struct libmpv_gpu_next_context *ctx, ID3D11Device *devi
 
     MP_VERBOSE(ctx, "NGX VSR: Initializing NVIDIA NGX SDK...\n");
 
-    if (!ngx_load_dll(ctx))
+    if (!ngx_load_dll(ctx, &p->ngx))
         return;
 
     // Keep a reference to the device
@@ -446,7 +468,7 @@ static void ngx_vsr_init(struct libmpv_gpu_next_context *ctx, ID3D11Device *devi
     ID3D11Device_AddRef(p->d3d_device);
 
     // Initialize NGX
-    result = ngx_fn.D3D11_Init(MPV_NGX_APP_ID, L".", device, NULL,
+    result = p->ngx.D3D11_Init(MPV_NGX_APP_ID, L".", device, NULL,
                                 NVSDK_NGX_Version_API);
     if (MPV_NGX_FAILED(result)) {
         MP_WARN(ctx, "NGX VSR: NVSDK_NGX_D3D11_Init failed (0x%x). "
@@ -457,7 +479,7 @@ static void ngx_vsr_init(struct libmpv_gpu_next_context *ctx, ID3D11Device *devi
     MP_VERBOSE(ctx, "NGX VSR: SDK initialized successfully.\n");
 
     // Get capability parameters
-    result = ngx_fn.D3D11_GetCapabilityParameters(&p->ngx_params);
+    result = p->ngx.D3D11_GetCapabilityParameters(&p->ngx_params);
     if (MPV_NGX_FAILED(result)) {
         MP_WARN(ctx, "NGX VSR: GetCapabilityParameters failed (0x%x).\n",
                 (unsigned)result);
@@ -493,7 +515,7 @@ static void ngx_vsr_init(struct libmpv_gpu_next_context *ctx, ID3D11Device *devi
     if (p->multithread)
         ID3D10Multithread_Enter(p->multithread);
 
-    result = ngx_fn.D3D11_CreateFeature(p->d3d_ctx, MPV_NGX_FEATURE_VSR,
+    result = p->ngx.D3D11_CreateFeature(p->d3d_ctx, MPV_NGX_FEATURE_VSR,
                                          p->ngx_params, &p->ngx_vsr_handle);
 
     if (p->multithread)
@@ -524,7 +546,7 @@ static void ngx_vsr_init(struct libmpv_gpu_next_context *ctx, ID3D11Device *devi
     if (p->multithread)
         ID3D10Multithread_Enter(p->multithread);
 
-    result = ngx_fn.D3D11_CreateFeature(p->d3d_ctx, MPV_NGX_FEATURE_TRUEHDR,
+    result = p->ngx.D3D11_CreateFeature(p->d3d_ctx, MPV_NGX_FEATURE_TRUEHDR,
                                          p->ngx_params, &p->ngx_truehdr_handle);
 
     if (p->multithread)
@@ -556,25 +578,25 @@ static void ngx_vsr_cleanup(struct libmpv_gpu_next_context *ctx)
 
     if (p->ngx_vsr_handle) {
         MP_VERBOSE(ctx, "NGX VSR: Releasing VSR feature...\n");
-        ngx_fn.D3D11_ReleaseFeature(p->ngx_vsr_handle);
+        p->ngx.D3D11_ReleaseFeature(p->ngx_vsr_handle);
         p->ngx_vsr_handle = NULL;
     }
 
     if (p->ngx_truehdr_handle) {
         MP_VERBOSE(ctx, "NGX TrueHDR: Releasing TrueHDR feature...\n");
-        ngx_fn.D3D11_ReleaseFeature(p->ngx_truehdr_handle);
+        p->ngx.D3D11_ReleaseFeature(p->ngx_truehdr_handle);
         p->ngx_truehdr_handle = NULL;
     }
     p->ngx_truehdr_available = false;
 
     if (p->ngx_initialized) {
         MP_VERBOSE(ctx, "NGX VSR: Shutting down NGX SDK...\n");
-        ngx_fn.D3D11_Shutdown1(p->d3d_device);
+        p->ngx.D3D11_Shutdown1(p->d3d_device);
         p->ngx_initialized = false;
     }
 
     if (p->ngx_params) {
-        ngx_fn.D3D11_DestroyParameters(p->ngx_params);
+        p->ngx.D3D11_DestroyParameters(p->ngx_params);
         p->ngx_params = NULL;
     }
 
@@ -589,6 +611,11 @@ static void ngx_vsr_cleanup(struct libmpv_gpu_next_context *ctx)
     if (p->d3d_device) {
         ID3D11Device_Release(p->d3d_device);
         p->d3d_device = NULL;
+    }
+
+    if (p->ngx.dll) {
+        FreeLibrary(p->ngx.dll);
+        p->ngx.dll = NULL;
     }
 
     p->ngx_vsr_available = false;
@@ -670,7 +697,7 @@ static bool ngx_vsr_process_fn(struct libmpv_gpu_next_context *ctx,
     if (p->multithread)
         ID3D10Multithread_Enter(p->multithread);
 
-    NVSDK_NGX_Result result = ngx_fn.D3D11_EvaluateFeature(
+    NVSDK_NGX_Result result = p->ngx.D3D11_EvaluateFeature(
         p->d3d_ctx, p->ngx_vsr_handle, p->ngx_params, NULL);
 
     if (p->multithread)
@@ -804,7 +831,7 @@ static bool ngx_truehdr_process_fn(struct libmpv_gpu_next_context *ctx,
     if (p->multithread)
         ID3D10Multithread_Enter(p->multithread);
 
-    NVSDK_NGX_Result result = ngx_fn.D3D11_EvaluateFeature(
+    NVSDK_NGX_Result result = p->ngx.D3D11_EvaluateFeature(
         p->d3d_ctx, p->ngx_truehdr_handle, p->ngx_params, NULL);
 
     if (p->multithread)
@@ -1214,19 +1241,10 @@ typedef NvOFFRUC_STATUS_t (CALLBACK *PFN_NvOFFRUCProcess)(
     const NvOFFRUC_ProcessOutParams_t *);
 typedef NvOFFRUC_STATUS_t (CALLBACK *PFN_NvOFFRUCDestroy)(NvOFFRUCHandle_t);
 
-// Runtime-loaded function pointers
-static struct {
-    HMODULE dll;
-    PFN_NvOFFRUCCreate Create;
-    PFN_NvOFFRUCRegisterResource RegisterResource;
-    PFN_NvOFFRUCUnregisterResource UnregisterResource;
-    PFN_NvOFFRUCProcess Process;
-    PFN_NvOFFRUCDestroy Destroy;
-} nvofa_fn;
 
-static bool nvofa_load_dll(struct libmpv_gpu_next_context *ctx)
+static bool nvofa_load_dll(struct libmpv_gpu_next_context *ctx, struct priv *p)
 {
-    if (nvofa_fn.dll)
+    if (p->nvofa.dll)
         return true;
 
     // Try standard search path first
@@ -1271,11 +1289,11 @@ static bool nvofa_load_dll(struct libmpv_gpu_next_context *ctx)
     }
 
 #define NVOFA_LOAD(field, name) do {                                        \
-    nvofa_fn.field = (void *)GetProcAddress(dll, name);                     \
-    if (!nvofa_fn.field) {                                                  \
+    p->nvofa.field = (void *)GetProcAddress(dll, name);                     \
+    if (!p->nvofa.field) {                                                  \
         MP_WARN(ctx, "NVOFA FRUC: Missing symbol '%s'.\n", name);           \
         FreeLibrary(dll);                                                   \
-        memset(&nvofa_fn, 0, sizeof(nvofa_fn));                             \
+        memset(&p->nvofa, 0, sizeof(p->nvofa));                             \
         return false;                                                       \
     }                                                                       \
 } while (0)
@@ -1287,7 +1305,7 @@ static bool nvofa_load_dll(struct libmpv_gpu_next_context *ctx)
     NVOFA_LOAD(Destroy, "NvOFFRUCDestroy");
 #undef NVOFA_LOAD
 
-    nvofa_fn.dll = dll;
+    p->nvofa.dll = dll;
     MP_VERBOSE(ctx, "NVOFA FRUC: NvOFFRUC.dll loaded successfully.\n");
     return true;
 }
@@ -1308,9 +1326,9 @@ static void nvofa_fruc_destroy_fn(struct libmpv_gpu_next_context *ctx)
         unreg.pArrResource[0] = p->fruc_interp_tex;
         unreg.pArrResource[1] = p->fruc_render_tex[0];
         unreg.pArrResource[2] = p->fruc_render_tex[1];
-        nvofa_fn.UnregisterResource(p->fruc_handle, &unreg);
+        ((PFN_NvOFFRUCUnregisterResource)p->nvofa.UnregisterResource)(p->fruc_handle, &unreg);
 
-        nvofa_fn.Destroy(p->fruc_handle);
+        ((PFN_NvOFFRUCDestroy)p->nvofa.Destroy)(p->fruc_handle);
         p->fruc_handle = NULL;
         p->fruc_session_active = false;
     }
@@ -1358,7 +1376,7 @@ static bool nvofa_fruc_init_session_fn(struct libmpv_gpu_next_context *ctx,
     if (p->fruc_session_active)
         nvofa_fruc_destroy_fn(ctx);
 
-    if (!nvofa_fn.dll || !p->fruc_device)
+    if (!p->nvofa.dll || !p->fruc_device)
         return false;
 
     if (!p->fruc_ctx)
@@ -1432,7 +1450,7 @@ static bool nvofa_fruc_init_session_fn(struct libmpv_gpu_next_context *ctx,
     create_params.eSurfaceFormat = NvOFFRUC_SURFACE_ARGB;
     create_params.eCUDAResourceType = NvOFFRUC_CUDA_UNDEFINED;
 
-    NvOFFRUC_STATUS_t status = nvofa_fn.Create(&create_params, &p->fruc_handle);
+    NvOFFRUC_STATUS_t status = ((PFN_NvOFFRUCCreate)p->nvofa.Create)(&create_params, &p->fruc_handle);
     if (status != NvOFFRUC_SUCCESS) {
         MP_ERR(ctx, "NVOFA FRUC: NvOFFRUCCreate failed (status=%d).\n", status);
         nvofa_fruc_destroy_fn(ctx);
@@ -1447,10 +1465,10 @@ static bool nvofa_fruc_init_session_fn(struct libmpv_gpu_next_context *ctx,
     reg.pArrResource[1] = p->fruc_render_tex[0];
     reg.pArrResource[2] = p->fruc_render_tex[1];
 
-    status = nvofa_fn.RegisterResource(p->fruc_handle, &reg);
+    status = ((PFN_NvOFFRUCRegisterResource)p->nvofa.RegisterResource)(p->fruc_handle, &reg);
     if (status != NvOFFRUC_SUCCESS) {
         MP_ERR(ctx, "NVOFA FRUC: RegisterResource failed (status=%d).\n", status);
-        nvofa_fn.Destroy(p->fruc_handle);
+        ((PFN_NvOFFRUCDestroy)p->nvofa.Destroy)(p->fruc_handle);
         p->fruc_handle = NULL;
         nvofa_fruc_destroy_fn(ctx);
         return false;
@@ -1503,7 +1521,7 @@ static bool nvofa_fruc_feed_frame_fn(struct libmpv_gpu_next_context *ctx,
     p->fruc_fence_value++;
     out_params.uSyncSignal.FenceSignalValue.uiFenceValueToSignalOn = p->fruc_fence_value;
 
-    NvOFFRUC_STATUS_t status = nvofa_fn.Process(
+    NvOFFRUC_STATUS_t status = ((PFN_NvOFFRUCProcess)p->nvofa.Process)(
         p->fruc_handle, &in_params, &out_params);
 
     if (status != NvOFFRUC_SUCCESS) {
@@ -1548,7 +1566,7 @@ static void nvofa_fruc_init(struct libmpv_gpu_next_context *ctx,
                             ID3D11Device *device)
 {
     struct priv *p = ctx->priv;
-    p->fruc_available = nvofa_load_dll(ctx);
+    p->fruc_available = nvofa_load_dll(ctx, p);
     if (p->fruc_available) {
         p->fruc_device = device;
         ID3D11Device_AddRef(p->fruc_device);
@@ -1558,7 +1576,13 @@ static void nvofa_fruc_init(struct libmpv_gpu_next_context *ctx,
 
 static void nvofa_fruc_cleanup(struct libmpv_gpu_next_context *ctx)
 {
+    struct priv *p = ctx->priv;
     nvofa_fruc_destroy_fn(ctx);
+
+    if (p->nvofa.dll) {
+        FreeLibrary(p->nvofa.dll);
+        p->nvofa.dll = NULL;
+    }
 }
 
 #endif // HAVE_NVOFA
@@ -1575,15 +1599,10 @@ static void nvofa_fruc_cleanup(struct libmpv_gpu_next_context *ctx)
 
 #include <onnxruntime_c_api.h>
 
-// Runtime-loaded ORT API
-static struct {
-    HMODULE dll;
-    const OrtApi *api;
-} rife_ort;
 
-static bool rife_load_ort_dll(struct libmpv_gpu_next_context *ctx)
+static bool rife_load_ort_dll(struct libmpv_gpu_next_context *ctx, struct priv *p)
 {
-    if (rife_ort.dll)
+    if (p->ort.dll)
         return true;
 
     HMODULE dll = LoadLibraryW(L"onnxruntime.dll");
@@ -1633,18 +1652,18 @@ static bool rife_load_ort_dll(struct libmpv_gpu_next_context *ctx)
     }
 
     const OrtApiBase *api_base = get_api_base();
-    rife_ort.api = api_base->GetApi(ORT_API_VERSION);
-    if (!rife_ort.api) {
+    p->ort.api = api_base->GetApi(ORT_API_VERSION);
+    if (!p->ort.api) {
         // DLL may be older than compile-time header; get whatever version it supports
-        rife_ort.api = api_base->GetApi(1);
+        p->ort.api = api_base->GetApi(1);
     }
-    if (!rife_ort.api) {
+    if (!p->ort.api) {
         MP_WARN(ctx, "RIFE: Failed to get ORT API.\n");
         FreeLibrary(dll);
         return false;
     }
 
-    rife_ort.dll = dll;
+    p->ort.dll = dll;
     MP_VERBOSE(ctx, "RIFE: onnxruntime.dll loaded successfully.\n");
     return true;
 }
@@ -1673,9 +1692,11 @@ static bool rife_check_ort(struct libmpv_gpu_next_context *ctx,
 {
     if (!status)
         return true;
-    const char *msg = rife_ort.api->GetErrorMessage(status);
+    struct priv *p = ctx->priv;
+    const OrtApi *api = (const OrtApi *)p->ort.api;
+    const char *msg = api->GetErrorMessage(status);
     MP_ERR(ctx, "RIFE ORT: %s failed: %s\n", op, msg);
-    rife_ort.api->ReleaseStatus(status);
+    api->ReleaseStatus(status);
     return false;
 }
 
@@ -1705,7 +1726,7 @@ static MP_THREAD_VOID rife_infer_thread(void *arg)
 {
     struct libmpv_gpu_next_context *ctx = arg;
     struct priv *p = ctx->priv;
-    const OrtApi *api = rife_ort.api;
+    const OrtApi *api = (const OrtApi *)p->ort.api;
 
     mp_thread_set_name("rife-infer");
 
@@ -1775,7 +1796,7 @@ static MP_THREAD_VOID rife_infer_thread(void *arg)
 static void rife_destroy_fn(struct libmpv_gpu_next_context *ctx)
 {
     struct priv *p = ctx->priv;
-    const OrtApi *api = rife_ort.api;
+    const OrtApi *api = (const OrtApi *)p->ort.api;
 
     if (!api)
         return;
@@ -1889,12 +1910,12 @@ static bool rife_init_session_fn(struct libmpv_gpu_next_context *ctx,
                                    int width, int height)
 {
     struct priv *p = ctx->priv;
-    const OrtApi *api = rife_ort.api;
+    const OrtApi *api = (const OrtApi *)p->ort.api;
 
     if (p->rife_session_active)
         rife_destroy_fn(ctx);
 
-    if (!rife_ort.dll || !p->rife_device)
+    if (!p->ort.dll || !p->rife_device)
         return false;
 
     OrtStatus *status;
@@ -1917,7 +1938,7 @@ static bool rife_init_session_fn(struct libmpv_gpu_next_context *ctx,
     // OrtSessionOptionsAppendExecutionProvider_DML is in the DML provider
     typedef OrtStatus *(*PFN_AppendDML)(OrtSessionOptions *, int);
     PFN_AppendDML append_dml =
-        (PFN_AppendDML)GetProcAddress(rife_ort.dll,
+        (PFN_AppendDML)GetProcAddress(p->ort.dll,
             "OrtSessionOptionsAppendExecutionProvider_DML");
     if (append_dml) {
         status = append_dml(p->rife_session_opts, 0);
@@ -2244,7 +2265,7 @@ static bool rife_run_session(struct libmpv_gpu_next_context *ctx,
                                const char **output_names, OrtValue **outputs, size_t num_outputs)
 {
     struct priv *p = ctx->priv;
-    const OrtApi *api = rife_ort.api;
+    const OrtApi *api = (const OrtApi *)p->ort.api;
 
     OrtStatus *status = api->Run(
         p->rife_sessions[model_idx], NULL,
@@ -2258,7 +2279,8 @@ static bool rife_run_session(struct libmpv_gpu_next_context *ctx,
 static OrtValue *rife_create_tensor(struct libmpv_gpu_next_context *ctx,
                                       float *data, const int64_t *shape, size_t ndim)
 {
-    const OrtApi *api = rife_ort.api;
+    struct priv *p = ctx->priv;
+    const OrtApi *api = (const OrtApi *)p->ort.api;
     OrtMemoryInfo *mem_info = NULL;
     OrtValue *tensor = NULL;
 
@@ -2545,7 +2567,7 @@ static bool rife_interpolate_fn(struct libmpv_gpu_next_context *ctx,
                                    float timestep)
 {
     struct priv *p = ctx->priv;
-    const OrtApi *api = rife_ort.api;
+    const OrtApi *api = (const OrtApi *)p->ort.api;
 
     if (!p->rife_session_active || !p->rife_has_prev)
         return false;
@@ -2606,7 +2628,7 @@ static void rife_init(struct libmpv_gpu_next_context *ctx,
                         ID3D11Device *device)
 {
     struct priv *p = ctx->priv;
-    p->rife_available = rife_load_ort_dll(ctx);
+    p->rife_available = rife_load_ort_dll(ctx, p);
     if (p->rife_available) {
         p->rife_device = device;
         ID3D11Device_AddRef(p->rife_device);
@@ -2622,6 +2644,11 @@ static void rife_cleanup(struct libmpv_gpu_next_context *ctx)
     if (p->rife_device) {
         ID3D11Device_Release(p->rife_device);
         p->rife_device = NULL;
+    }
+
+    if (p->ort.dll) {
+        FreeLibrary(p->ort.dll);
+        p->ort.dll = NULL;
     }
 }
 

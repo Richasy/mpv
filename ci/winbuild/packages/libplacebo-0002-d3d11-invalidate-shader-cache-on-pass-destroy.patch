@@ -1,0 +1,71 @@
+From bfeecd4830f40bb7d40735f080bc184f7d6a1f80 Mon Sep 17 00:00:00 2001
+From: Richasy <thansy@foxmail.com>
+Date: Fri, 3 Apr 2026 19:52:10 +0800
+Subject: [PATCH] fix: invalidate D3D11 shader cache on pass destroy
+
+When glsl-shaders is cleared and re-set with the same shaders, the cache
+key (based on GLSL source hash) matches the old entry. The cached DXBC
+bytecode is restored without re-running SPIRV-Cross, which can cause
+VS/PS TEXCOORD semantic register mismatches and D3D11 linkage errors.
+
+Fix by removing the cache entry in pl_d3d11_pass_destroy() so the next
+pass creation performs a full recompilation.
+---
+ src/d3d11/gpu.h      |  3 +++
+ src/d3d11/gpu_pass.c | 12 ++++++++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/src/d3d11/gpu.h b/src/d3d11/gpu.h
+index c6d842e..bb2d2f3 100644
+--- a/src/d3d11/gpu.h
++++ b/src/d3d11/gpu.h
+@@ -205,6 +205,9 @@ struct pl_pass_d3d11 {
+     ID3D11ShaderResourceView **srv_arr;
+     ID3D11SamplerState **sampler_arr;
+     ID3D11UnorderedAccessView **uav_arr;
++
++    // Cache key for invalidating shader cache on pass destroy
++    uint64_t cache_key;
+ };
+ 
+ void pl_d3d11_pass_destroy(pl_gpu gpu, pl_pass pass);
+diff --git a/src/d3d11/gpu_pass.c b/src/d3d11/gpu_pass.c
+index 0f934a1..ef6c7f2 100644
+--- a/src/d3d11/gpu_pass.c
++++ b/src/d3d11/gpu_pass.c
+@@ -665,6 +665,16 @@ void pl_d3d11_pass_destroy(pl_gpu gpu, pl_pass pass)
+     struct d3d11_ctx *ctx = p->ctx;
+     struct pl_pass_d3d11 *pass_p = PL_PRIV(pass);
+ 
++    // Invalidate shader cache entry to prevent stale DXBC from being reused
++    // when the same shader source is reloaded after a glsl-shaders reset
++    if (pass_p->cache_key) {
++        pl_cache gpu_cache = pl_gpu_cache(gpu);
++        if (gpu_cache) {
++            pl_cache_obj invalidate = { .key = pass_p->cache_key };
++            pl_cache_try_set(gpu_cache, &invalidate);
++        }
++    }
++
+     SAFE_RELEASE(pass_p->vs);
+     SAFE_RELEASE(pass_p->ps);
+     SAFE_RELEASE(pass_p->cs);
+@@ -767,6 +777,7 @@ static bool pass_create_raster(pl_gpu gpu, struct pl_pass_t *pass,
+     D3D(ID3D11Device_CreateBlendState(p->dev, &bdesc, &pass_p->bstate));
+ 
+     d3d11_update_program_cache(gpu, pass, obj.key, &vs_str, &ps_str, NULL);
++    pass_p->cache_key = obj.key;
+ 
+     success = true;
+ error:
+@@ -816,6 +827,7 @@ static bool pass_create_compute(pl_gpu gpu, struct pl_pass_t *pass,
+     }
+ 
+     d3d11_update_program_cache(gpu, pass, obj.key, NULL, NULL, &cs_str);
++    pass_p->cache_key = obj.key;
+ 
+     success = true;
+ error:
+-- 
+2.51.2.windows.1
+

@@ -505,7 +505,9 @@ features += {'win32-executable': win32 and get_option('cplayer')}
 if win32
     timer_source = files('osdep/timer-win32.c')
     sources += files('osdep/w32_keyboard.c',
-                     'osdep/windows_utils.c')
+                     'osdep/windows_utils.c',
+                     'stream/stream_smb.c')
+    dependencies += cc.find_library('mpr')
 endif
 
 features += {'win32-desktop': win32 and not uwp.found()}

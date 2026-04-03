@@ -61,6 +61,9 @@ extern const stream_info_t stream_info_bluray;
 extern const stream_info_t stream_info_edl;
 extern const stream_info_t stream_info_libarchive;
 extern const stream_info_t stream_info_cb;
+#ifdef _WIN32
+extern const stream_info_t stream_info_smb;
+#endif
 
 static const stream_info_t *const stream_list[] = {
     &stream_info_mpv,
@@ -81,6 +84,9 @@ static const stream_info_t *const stream_list[] = {
 #endif
 #if HAVE_LIBARCHIVE
     &stream_info_libarchive,
+#endif
+#ifdef _WIN32
+    &stream_info_smb,
 #endif
     &stream_info_memory,
     &stream_info_null,

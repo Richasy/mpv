@@ -86,6 +86,8 @@ jobs:
 
       - name: Upload libmpv-2.dll to Azure Blob
         if: inputs.upload_target == 'azure' || inputs.upload_target == 'both'
+        env:
+          AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
         run: |
           DLL_PATH="$OUTPUT_DIR/${{ matrix.arch }}/libmpv-2.dll"
           if [ ! -f "$DLL_PATH" ]; then
@@ -94,12 +96,11 @@ jobs:
           fi
           echo "Uploading libmpv-2.dll for ${{ matrix.name }} to Azure Blob..."
           az storage blob upload \
-            --account-name stzrichasy93186517876623 \
             --container-name rodel-player-deps \
             --name "native/${{ matrix.name }}/libmpv-2.dll" \
             --file "$DLL_PATH" \
             --overwrite \
-            --auth-mode login
+            --connection-string "$AZURE_STORAGE_CONNECTION_STRING"
           echo "Uploaded: native/${{ matrix.name }}/libmpv-2.dll"
 
       - name: Upload build logs on failure

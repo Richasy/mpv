@@ -563,6 +563,24 @@ static void ngx_vsr_init(struct libmpv_gpu_next_context *ctx, ID3D11Device *devi
             "NVIDIA RTX TrueHDR is ready.\n");
 }
 
+// Thread-local flag used by the VEH to know whether we are inside the
+// guarded NGX cleanup section.  When set, an access-violation is caught
+// and turned into a longjmp instead of a process-fatal crash.
+#include <setjmp.h>
+static __thread volatile int  ngx_cleanup_guard_active;
+static __thread jmp_buf       ngx_cleanup_jmpbuf;
+
+static LONG CALLBACK ngx_cleanup_veh(EXCEPTION_POINTERS *ep)
+{
+    if (ngx_cleanup_guard_active &&
+        ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+    {
+        ngx_cleanup_guard_active = 0;
+        longjmp(ngx_cleanup_jmpbuf, 1);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static void ngx_vsr_cleanup(struct libmpv_gpu_next_context *ctx)
 {
     struct priv *p = ctx->priv;
@@ -576,29 +594,53 @@ static void ngx_vsr_cleanup(struct libmpv_gpu_next_context *ctx)
         p->vsr_output_tex = NULL;
     }
 
-    if (p->ngx_vsr_handle) {
-        MP_VERBOSE(ctx, "NGX VSR: Releasing VSR feature...\n");
-        p->ngx.D3D11_ReleaseFeature(p->ngx_vsr_handle);
+    // Guard against NVIDIA _nvngx.dll access-violation during feature
+    // release / SDK shutdown.  Some driver versions crash inside
+    // ReleaseFeature or Shutdown1 with a write to address 0x5.  We
+    // install a Vectored Exception Handler so the process survives.
+    void *veh = AddVectoredExceptionHandler(1, ngx_cleanup_veh);
+
+    if (setjmp(ngx_cleanup_jmpbuf) == 0) {
+        ngx_cleanup_guard_active = 1;
+
+        if (p->ngx_vsr_handle) {
+            MP_VERBOSE(ctx, "NGX VSR: Releasing VSR feature...\n");
+            p->ngx.D3D11_ReleaseFeature(p->ngx_vsr_handle);
+            p->ngx_vsr_handle = NULL;
+        }
+
+        if (p->ngx_truehdr_handle) {
+            MP_VERBOSE(ctx, "NGX TrueHDR: Releasing TrueHDR feature...\n");
+            p->ngx.D3D11_ReleaseFeature(p->ngx_truehdr_handle);
+            p->ngx_truehdr_handle = NULL;
+        }
+        p->ngx_truehdr_available = false;
+
+        if (p->ngx_initialized) {
+            MP_VERBOSE(ctx, "NGX VSR: Shutting down NGX SDK...\n");
+            p->ngx.D3D11_Shutdown1(p->d3d_device);
+            p->ngx_initialized = false;
+        }
+
+        if (p->ngx_params) {
+            p->ngx.D3D11_DestroyParameters(p->ngx_params);
+            p->ngx_params = NULL;
+        }
+
+        ngx_cleanup_guard_active = 0;
+    } else {
+        // We caught an access-violation in the NGX cleanup path.
+        // The driver left some state half-torn-down; null out handles
+        // so we don't double-free, but otherwise continue normally.
+        MP_WARN(ctx, "NGX: Caught access-violation during cleanup — "
+                "NVIDIA driver bug, ignoring.\n");
         p->ngx_vsr_handle = NULL;
-    }
-
-    if (p->ngx_truehdr_handle) {
-        MP_VERBOSE(ctx, "NGX TrueHDR: Releasing TrueHDR feature...\n");
-        p->ngx.D3D11_ReleaseFeature(p->ngx_truehdr_handle);
         p->ngx_truehdr_handle = NULL;
-    }
-    p->ngx_truehdr_available = false;
-
-    if (p->ngx_initialized) {
-        MP_VERBOSE(ctx, "NGX VSR: Shutting down NGX SDK...\n");
-        p->ngx.D3D11_Shutdown1(p->d3d_device);
         p->ngx_initialized = false;
-    }
-
-    if (p->ngx_params) {
-        p->ngx.D3D11_DestroyParameters(p->ngx_params);
         p->ngx_params = NULL;
     }
+
+    RemoveVectoredExceptionHandler(veh);
 
     if (p->multithread) {
         ID3D10Multithread_Release(p->multithread);

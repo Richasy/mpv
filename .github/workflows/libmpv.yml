@@ -11,6 +11,14 @@ on:
         description: 'Build ARM64'
         type: boolean
         default: true
+      upload_target:
+        description: 'Upload target'
+        type: choice
+        options:
+          - github
+          - azure
+          - both
+        default: github
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -69,11 +77,30 @@ jobs:
           ls -lh "$OUTPUT_DIR/libmpv-${{ matrix.name }}.7z"
 
       - name: Upload to GitHub Artifacts
+        if: inputs.upload_target == 'github' || inputs.upload_target == 'both'
         uses: actions/upload-artifact@v4
         with:
           name: libmpv-${{ matrix.name }}
           path: ${{ env.OUTPUT_DIR }}/libmpv-${{ matrix.name }}.7z
           retention-days: 30
+
+      - name: Upload libmpv-2.dll to Azure Blob
+        if: inputs.upload_target == 'azure' || inputs.upload_target == 'both'
+        run: |
+          DLL_PATH="$OUTPUT_DIR/${{ matrix.arch }}/libmpv-2.dll"
+          if [ ! -f "$DLL_PATH" ]; then
+            echo "ERROR: libmpv-2.dll not found at $DLL_PATH"
+            exit 1
+          fi
+          echo "Uploading libmpv-2.dll for ${{ matrix.name }} to Azure Blob..."
+          az storage blob upload \
+            --account-name stzrichasy93186517876623 \
+            --container-name rodel-player-deps \
+            --name "native/${{ matrix.name }}/libmpv-2.dll" \
+            --file "$DLL_PATH" \
+            --overwrite \
+            --auth-mode login
+          echo "Uploaded: native/${{ matrix.name }}/libmpv-2.dll"
 
       - name: Upload build logs on failure
         if: failure()

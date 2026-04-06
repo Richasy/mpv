@@ -381,6 +381,32 @@ static int parse_url(struct pl_parser *p)
     return parse_ini_thing(p, "[InternetShortcut]", "URL");
 }
 
+static int parse_strm(struct pl_parser *p)
+{
+    bstr line = pl_get_line(p);
+    if (line.len == 0) {
+        pl_free_line(p, line);
+        return -1;
+    }
+    if (!bstr_startswith0(line, "http://") &&
+        !bstr_startswith0(line, "https://") &&
+        !bstr_startswith0(line, "rtsp://") &&
+        !bstr_startswith0(line, "rtmp://") &&
+        !bstr_startswith0(line, "rtp://") &&
+        !bstr_startswith0(line, "mms://"))
+    {
+        pl_free_line(p, line);
+        return -1;
+    }
+    if (p->probing) {
+        pl_free_line(p, line);
+        return 0;
+    }
+    pl_add(p, line);
+    pl_free_line(p, line);
+    return 0;
+}
+
 static int parse_txt(struct pl_parser *p)
 {
     if (!p->force)
@@ -620,6 +646,7 @@ static const struct pl_format playlist_formats[] = {
     {"pls", parse_pls,
      MIME_TYPES("audio/x-scpls")},
     {"url", parse_url},
+    {"strm", parse_strm},
     {"txt", parse_txt},
     {0},
 };

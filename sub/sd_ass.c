@@ -396,15 +396,6 @@ static void filter_and_add(struct sd *sd, struct demux_packet *pkt)
                       llrint(pkt->pts * 1000),
                       llrint(pkt->duration * 1000));
 
-    if (track->n_events != old_n_events) {
-        MP_INFO(sd, "filter_and_add: events %d->%d, pts=%.3f dur=%.3f "
-                "len=%zu data='%.80s'\n",
-                old_n_events, track->n_events,
-                pkt->pts, pkt->duration,
-                (size_t)pkt->len,
-                pkt->buffer ? (const char *)pkt->buffer : "(null)");
-    }
-
     // This bookkeeping only has any practical use for ASS subs
     // over a VO with no video.
     if (!ctx->is_converted) {

@@ -31,6 +31,10 @@
 #include "osdep/mac/app_bridge.h"
 #endif
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 /*
  * mpv_render_context is managed by the host application - the host application
  * can access it any time, even if the VO is destroyed (or not created yet).
@@ -631,6 +635,15 @@ static int control(struct vo *vo, uint32_t request, void *data)
         mp_mutex_unlock(&ctx->lock);
         vo->want_redraw = true;
         return VO_TRUE;
+#ifdef _WIN32
+    case VOCTRL_KILL_SCREENSAVER:
+        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED |
+                                ES_DISPLAY_REQUIRED);
+        return VO_TRUE;
+    case VOCTRL_RESTORE_SCREENSAVER:
+        SetThreadExecutionState(ES_CONTINUOUS);
+        return VO_TRUE;
+#endif
     }
 
     // VOCTRLs that access the renderer directly. These are safe to call

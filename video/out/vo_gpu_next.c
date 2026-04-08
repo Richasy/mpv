@@ -223,6 +223,8 @@ const struct m_sub_options gl_next_conf = {
             {"standard", 1},
             {"high",     2})},
         {"rife-model", OPT_STRING(rife_model), .flags = M_OPT_FILE},
+        {"rife-streams", OPT_INT(rife_streams), .flags = 0,
+            M_RANGE(1, 4)},
         {0},
     },
     .defaults = &(struct gl_next_opts) {
@@ -233,6 +235,7 @@ const struct m_sub_options gl_next_conf = {
         .image_subs_hdr_peak = PL_COLOR_SDR_WHITE,
         .target_hint = -1,
         .target_hint_strict = true,
+        .rife_streams = 2,
     },
     .size = sizeof(struct gl_next_opts),
     .change_flags = UPDATE_VIDEO,

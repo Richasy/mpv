@@ -175,9 +175,10 @@ struct libmpv_gpu_next_context_fns {
 
     // Initialize RIFE session: load ONNX model from model_dir/model_file,
     // create ORT sessions, allocate intermediate tensors for given resolution.
+    // num_streams: number of parallel inference streams (1-4).
     bool (*rife_init_session)(struct libmpv_gpu_next_context *ctx,
                                const char *model_dir, const char *model_file,
-                               int width, int height);
+                               int width, int height, int num_streams);
 
     // Feed a source frame to RIFE (RGBA8 D3D11 texture).
     // Internally maintains frame pair state for interpolation.
@@ -201,6 +202,11 @@ struct libmpv_gpu_next_context_fns {
     // Non-blocking poll: check if async inference result is available.
     // Returns true if result is ready (resets internal state to IDLE).
     bool (*rife_poll_result)(struct libmpv_gpu_next_context *ctx);
+
+    // Upload completed async inference result to GPU texture.
+    // Call after rife_poll_result returns true.
+    bool (*rife_upload_result)(struct libmpv_gpu_next_context *ctx,
+                                 struct ID3D11Texture2D *output_tex);
 };
 
 extern const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11;

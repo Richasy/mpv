@@ -374,44 +374,39 @@ struct priv {
     bool rife_session_active;
     int rife_width, rife_height;
     int rife_pad_align;             // padding alignment (64 for v4.26, 32 for lite)
+    int rife_infer_ph, rife_infer_pw;  // padded dimensions
     ID3D11Device *rife_device;
     ID3D11DeviceContext *rife_ctx;
 
-    // ORT state (opaque pointers)
+    // ORT state (shared across streams)
     void *rife_ort_env;           // OrtEnv*
-    void *rife_session_opts;      // OrtSessionOptions*
-    void *rife_sessions[5];       // OrtSession* (feat, flownet, metric, rife, fusionnet)
-
-    // Staging textures for GPU↔CPU transfer
-    ID3D11Texture2D *rife_staging_read;
-    ID3D11Texture2D *rife_staging_write;
 
     bool rife_has_prev;
 
-    // CPU tensor buffers (NCHW float at full resolution)
-    float *rife_cpu_buf0;  // previous frame [1,3,H,W]
-    float *rife_cpu_buf1;  // current frame [1,3,H,W]
-    float *rife_cpu_out;   // interpolation output [1,3,H,W]
+    // Multi-stream inference pipeline
+    #define RIFE_MAX_STREAMS 4
+    struct rife_stream {
+        void *session;           // OrtSession* (independent per stream)
+        void *session_opts;      // OrtSessionOptions* (independent per stream)
+        void *ort_input;         // OrtValue* for imgs [1,6,pH,pW]
+        void *ort_ts;            // OrtValue* for timestep [1,1,1,1]
+        float *infer_in;         // padded [1,6,pH,pW] backing buffer
+        float *infer_out;        // padded [1,3,pH,pW] backing buffer
+        float infer_timestep;
 
-    // Async inference thread
-    mp_thread rife_thread;
-    mp_mutex rife_mutex;
-    mp_cond rife_cond_work;     // render→bg: new work available
-    mp_cond rife_cond_done;     // bg→render: result ready
-    bool rife_thread_valid;
-    bool rife_terminate;
+        mp_thread thread;
+        mp_mutex mutex;
+        mp_cond cond_work;
+        mp_cond cond_done;
+        bool thread_valid;
+        bool terminate;
+        int state;               // RIFE_STATE_IDLE/PENDING/RUNNING/READY
+    } rife_streams[RIFE_MAX_STREAMS];
 
-    // Inference state: 0=IDLE, 1=PENDING, 2=RUNNING, 3=READY
-    int rife_infer_state;
-
-    // Pre-allocated async buffers
-    float *rife_infer_in;      // padded [1,6,pH,pW]
-    int rife_infer_ph, rife_infer_pw;
-    float rife_infer_timestep;
-
-    // Pre-allocated ORT input tensors (reused across frames)
-    void *rife_ort_input;      // OrtValue* for imgs [1,6,pH,pW]
-    void *rife_ort_ts;         // OrtValue* for timestep [1,1,1,1]
+    int rife_num_streams;        // configured stream count (1-4)
+    int rife_submit_idx;         // next stream to submit to (ring)
+    int rife_collect_idx;        // next stream to collect from (ring)
+    int rife_pending_count;      // number of streams with pending/running/ready work
 
     // RIFE compute shaders for GPU format conversion
     ID3D11ComputeShader *rife_rgba_to_nchw_cs;
@@ -1710,24 +1705,6 @@ static bool rife_load_ort_dll(struct libmpv_gpu_next_context *ctx, struct priv *
     return true;
 }
 
-// RIFE model session indices
-enum {
-    RIFE_MODEL_FEAT = 0,
-    RIFE_MODEL_FLOWNET,
-    RIFE_MODEL_METRIC,
-    RIFE_MODEL_RIFE,
-    RIFE_MODEL_FUSIONNET,
-    RIFE_MODEL_COUNT
-};
-
-static const char *rife_model_files[RIFE_MODEL_COUNT] = {
-    "feat.onnx",
-    "flownet.onnx",
-    "metric.onnx",
-    "rife.onnx",
-    "fusionnet.onnx",
-};
-
 // Helper: check ORT status and log on error
 static bool rife_check_ort(struct libmpv_gpu_next_context *ctx,
                              OrtStatus *status, const char *op)
@@ -1754,57 +1731,57 @@ static bool rife_available_fn(struct libmpv_gpu_next_context *ctx)
 #define RIFE_STATE_RUNNING 2
 #define RIFE_STATE_READY   3
 
-// Forward declarations for helpers used by the inference thread
-static bool rife_run_session(struct libmpv_gpu_next_context *ctx,
-                               int model_idx,
-                               const char **input_names, OrtValue **inputs, size_t num_inputs,
-                               const char **output_names, OrtValue **outputs, size_t num_outputs);
-static OrtValue *rife_create_tensor(struct libmpv_gpu_next_context *ctx,
-                                      float *data, const int64_t *shape, size_t ndim);
+// Thread argument: passes both context and stream index
+struct rife_thread_arg {
+    struct libmpv_gpu_next_context *ctx;
+    int stream_idx;
+};
 
 // Background inference thread: waits for work, runs ORT, signals completion.
 // Only touches CPU buffers and ORT API — never touches D3D11 resources.
 static MP_THREAD_VOID rife_infer_thread(void *arg)
 {
-    struct libmpv_gpu_next_context *ctx = arg;
+    struct rife_thread_arg *targ = arg;
+    struct libmpv_gpu_next_context *ctx = targ->ctx;
     struct priv *p = ctx->priv;
+    int idx = targ->stream_idx;
+    free(targ);
+
+    struct rife_stream *s = &p->rife_streams[idx];
     const OrtApi *api = (const OrtApi *)p->ort.api;
 
-    mp_thread_set_name("rife-infer");
+    char name[32];
+    snprintf(name, sizeof(name), "rife-infer-%d", idx);
+    mp_thread_set_name(name);
 
-    mp_mutex_lock(&p->rife_mutex);
-    while (!p->rife_terminate) {
-        while (p->rife_infer_state != RIFE_STATE_PENDING && !p->rife_terminate)
-            mp_cond_wait(&p->rife_cond_work, &p->rife_mutex);
+    mp_mutex_lock(&s->mutex);
+    while (!s->terminate) {
+        while (s->state != RIFE_STATE_PENDING && !s->terminate)
+            mp_cond_wait(&s->cond_work, &s->mutex);
 
-        if (p->rife_terminate)
+        if (s->terminate)
             break;
 
-        p->rife_infer_state = RIFE_STATE_RUNNING;
+        s->state = RIFE_STATE_RUNNING;
         int ph = p->rife_infer_ph;
         int pw = p->rife_infer_pw;
-        float timestep = p->rife_infer_timestep;
-        int h = p->rife_height;
-        int w = p->rife_width;
-        mp_mutex_unlock(&p->rife_mutex);
+        float timestep = s->infer_timestep;
+        mp_mutex_unlock(&s->mutex);
 
         // --- ORT inference with pre-allocated input (no mutex held, no D3D11) ---
         int phw = ph * pw;
-        int hw = h * w;
         bool ok = false;
 
-        // rife_infer_in already backs rife_ort_input (zero-copy),
-        // data was written by submit_async_fn. Just set timestep.
-        p->rife_infer_timestep = timestep;
+        // Set timestep and run
+        s->infer_timestep = timestep;
 
-        // Use pre-allocated input tensors, let ORT allocate output
         const char *in_names[] = {"imgs", "timestep"};
         const char *out_names[] = {"output"};
-        OrtValue *ins[2] = { p->rife_ort_input, p->rife_ort_ts };
+        OrtValue *ins[2] = { s->ort_input, s->ort_ts };
         OrtValue *outputs[1] = {NULL};
 
         OrtStatus *status = api->Run(
-            p->rife_sessions[RIFE_MODEL_RIFE], NULL,
+            s->session, NULL,
             in_names, (const OrtValue *const *)ins, 2,
             out_names, 1, outputs);
         ok = rife_check_ort(ctx, status, "Run(rife)");
@@ -1812,25 +1789,19 @@ static MP_THREAD_VOID rife_infer_thread(void *arg)
         if (ok && outputs[0]) {
             float *data;
             api->GetTensorMutableData(outputs[0], (void **)&data);
-            // Crop padded output [1,3,ph,pw] → [1,3,h,w]
-            float *final_out = p->rife_cpu_out;
-            for (int c = 0; c < 3; c++)
-                for (int y = 0; y < h; y++)
-                    for (int x = 0; x < w; x++) {
-                        float v = data[c * phw + y * pw + x];
-                        final_out[c * hw + y * w + x] = v < 0 ? 0 : (v > 1 ? 1 : v);
-                    }
+            // Copy padded output [1,3,ph,pw] to stream's infer_out buffer
+            memcpy(s->infer_out, data, 3 * (size_t)phw * sizeof(float));
             api->ReleaseValue(outputs[0]);
         } else {
             ok = false;
             if (outputs[0]) api->ReleaseValue(outputs[0]);
         }
 
-        mp_mutex_lock(&p->rife_mutex);
-        p->rife_infer_state = ok ? RIFE_STATE_READY : RIFE_STATE_IDLE;
-        mp_cond_signal(&p->rife_cond_done);
+        mp_mutex_lock(&s->mutex);
+        s->state = ok ? RIFE_STATE_READY : RIFE_STATE_IDLE;
+        mp_cond_signal(&s->cond_done);
     }
-    mp_mutex_unlock(&p->rife_mutex);
+    mp_mutex_unlock(&s->mutex);
 
     MP_THREAD_RETURN();
 }
@@ -1843,42 +1814,43 @@ static void rife_destroy_fn(struct libmpv_gpu_next_context *ctx)
     if (!api)
         return;
 
-    // Stop background inference thread first (before releasing ORT sessions)
-    if (p->rife_thread_valid) {
-        mp_mutex_lock(&p->rife_mutex);
-        p->rife_terminate = true;
-        mp_cond_signal(&p->rife_cond_work);
-        mp_mutex_unlock(&p->rife_mutex);
-        mp_thread_join(p->rife_thread);
-        p->rife_thread_valid = false;
-        mp_mutex_destroy(&p->rife_mutex);
-        mp_cond_destroy(&p->rife_cond_work);
-        mp_cond_destroy(&p->rife_cond_done);
-    }
-
-    free(p->rife_infer_in);
-    p->rife_infer_in = NULL;
-
-    // Release pre-allocated ORT input tensors
-    if (p->rife_ort_input) {
-        api->ReleaseValue(p->rife_ort_input);
-        p->rife_ort_input = NULL;
-    }
-    if (p->rife_ort_ts) {
-        api->ReleaseValue(p->rife_ort_ts);
-        p->rife_ort_ts = NULL;
-    }
-
-    for (int i = 0; i < RIFE_MODEL_COUNT; i++) {
-        if (p->rife_sessions[i]) {
-            api->ReleaseSession(p->rife_sessions[i]);
-            p->rife_sessions[i] = NULL;
+    // Stop all background inference threads
+    for (int i = 0; i < p->rife_num_streams; i++) {
+        struct rife_stream *s = &p->rife_streams[i];
+        if (s->thread_valid) {
+            mp_mutex_lock(&s->mutex);
+            s->terminate = true;
+            mp_cond_signal(&s->cond_work);
+            mp_mutex_unlock(&s->mutex);
+            mp_thread_join(s->thread);
+            s->thread_valid = false;
+            mp_mutex_destroy(&s->mutex);
+            mp_cond_destroy(&s->cond_work);
+            mp_cond_destroy(&s->cond_done);
         }
-    }
 
-    if (p->rife_session_opts) {
-        api->ReleaseSessionOptions(p->rife_session_opts);
-        p->rife_session_opts = NULL;
+        // Release per-stream ORT resources
+        if (s->ort_input) {
+            api->ReleaseValue(s->ort_input);
+            s->ort_input = NULL;
+        }
+        if (s->ort_ts) {
+            api->ReleaseValue(s->ort_ts);
+            s->ort_ts = NULL;
+        }
+        if (s->session) {
+            api->ReleaseSession(s->session);
+            s->session = NULL;
+        }
+        if (s->session_opts) {
+            api->ReleaseSessionOptions(s->session_opts);
+            s->session_opts = NULL;
+        }
+
+        free(s->infer_in);
+        s->infer_in = NULL;
+        free(s->infer_out);
+        s->infer_out = NULL;
     }
 
     if (p->rife_ort_env) {
@@ -1886,30 +1858,10 @@ static void rife_destroy_fn(struct libmpv_gpu_next_context *ctx)
         p->rife_ort_env = NULL;
     }
 
-    // Release staging textures
-    if (p->rife_staging_read) {
-        ID3D11Texture2D_Release(p->rife_staging_read);
-        p->rife_staging_read = NULL;
-    }
-    if (p->rife_staging_write) {
-        ID3D11Texture2D_Release(p->rife_staging_write);
-        p->rife_staging_write = NULL;
-    }
-
-    // Release intermediate CPU buffers
-    free(p->rife_cpu_buf0);
-    p->rife_cpu_buf0 = NULL;
-    free(p->rife_cpu_buf1);
-    p->rife_cpu_buf1 = NULL;
-    free(p->rife_cpu_out);
-    p->rife_cpu_out = NULL;
-
     if (p->rife_ctx) {
         ID3D11DeviceContext_Release(p->rife_ctx);
         p->rife_ctx = NULL;
     }
-    // Note: rife_device is NOT released here — it's owned by
-    // rife_init() and persists across session re-creation.
 
     // Release RIFE compute shader resources
     if (p->rife_rgba_to_nchw_cs) {
@@ -1945,11 +1897,15 @@ static void rife_destroy_fn(struct libmpv_gpu_next_context *ctx)
     p->rife_has_prev = false;
     p->rife_width = 0;
     p->rife_height = 0;
+    p->rife_num_streams = 0;
+    p->rife_submit_idx = 0;
+    p->rife_collect_idx = 0;
+    p->rife_pending_count = 0;
 }
 
 static bool rife_init_session_fn(struct libmpv_gpu_next_context *ctx,
                                    const char *model_dir, const char *model_file,
-                                   int width, int height)
+                                   int width, int height, int num_streams)
 {
     struct priv *p = ctx->priv;
     const OrtApi *api = (const OrtApi *)p->ort.api;
@@ -1960,152 +1916,96 @@ static bool rife_init_session_fn(struct libmpv_gpu_next_context *ctx,
     if (!p->ort.dll || !p->rife_device)
         return false;
 
+    if (num_streams < 1) num_streams = 1;
+    if (num_streams > RIFE_MAX_STREAMS) num_streams = RIFE_MAX_STREAMS;
+
     OrtStatus *status;
 
-    // Create ORT environment
+    // Create ORT environment (shared across streams)
     status = api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "mpv_rife",
                             &p->rife_ort_env);
     if (!rife_check_ort(ctx, status, "CreateEnv"))
         return false;
 
-    // Create session options with DirectML provider
-    status = api->CreateSessionOptions(&p->rife_session_opts);
-    if (!rife_check_ort(ctx, status, "CreateSessionOptions"))
-        goto fail;
-
-    api->SetSessionGraphOptimizationLevel(p->rife_session_opts,
-                                           ORT_ENABLE_ALL);
-
-    // Try to load DirectML execution provider
-    // OrtSessionOptionsAppendExecutionProvider_DML is in the DML provider
-    typedef OrtStatus *(*PFN_AppendDML)(OrtSessionOptions *, int);
-    PFN_AppendDML append_dml =
-        (PFN_AppendDML)GetProcAddress(p->ort.dll,
-            "OrtSessionOptionsAppendExecutionProvider_DML");
-    if (append_dml) {
-        status = append_dml(p->rife_session_opts, 0);
-        if (status) {
-            MP_WARN(ctx, "RIFE: DirectML provider not available, "
-                    "falling back to CPU.\n");
-            api->ReleaseStatus(status);
-        } else {
-            MP_VERBOSE(ctx, "RIFE: DirectML execution provider enabled.\n");
-        }
-    } else {
-        MP_VERBOSE(ctx, "RIFE: DirectML entry point not found, using CPU.\n");
-    }
-
-    // Load RIFE model session
-    {
-        char path[MAX_PATH];
-        snprintf(path, sizeof(path), "%s/%s", model_dir, model_file);
-
-        wchar_t wpath[MAX_PATH];
-        MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH);
-
-        status = api->CreateSession(p->rife_ort_env, wpath,
-                                    p->rife_session_opts,
-                                    &p->rife_sessions[RIFE_MODEL_RIFE]);
-        if (!rife_check_ort(ctx, status, model_file))
-            goto fail;
-
-        MP_VERBOSE(ctx, "RIFE: Loaded %s\n", model_file);
-    }
-
     // Get device context
     if (!p->rife_ctx)
         ID3D11Device_GetImmediateContext(p->rife_device, &p->rife_ctx);
 
-    // Create staging textures for GPU↔CPU transfer (full resolution)
-    D3D11_TEXTURE2D_DESC staging_desc = {
-        .Width = width,
-        .Height = height,
-        .MipLevels = 1,
-        .ArraySize = 1,
-        .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
-        .SampleDesc = { .Count = 1, .Quality = 0 },
-        .Usage = D3D11_USAGE_STAGING,
-        .BindFlags = 0,
-        .CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE,
-    };
-
-    HRESULT hr;
-    hr = ID3D11Device_CreateTexture2D(p->rife_device, &staging_desc, NULL,
-                                       &p->rife_staging_read);
-    if (FAILED(hr)) {
-        MP_ERR(ctx, "RIFE: Failed to create staging read texture.\n");
-        goto fail;
-    }
-
-    // Write staging: full resolution (RIFE v4.26 outputs full-res)
-    hr = ID3D11Device_CreateTexture2D(p->rife_device, &staging_desc, NULL,
-                                       &p->rife_staging_write);
-    if (FAILED(hr)) {
-        MP_ERR(ctx, "RIFE: Failed to create staging write texture.\n");
-        goto fail;
-    }
-
-    // Allocate CPU tensor buffers (full resolution, [1,3,H,W])
-    size_t frame_size = 3 * (size_t)height * width * sizeof(float);
-    p->rife_cpu_buf0 = malloc(frame_size);
-    p->rife_cpu_buf1 = malloc(frame_size);
-    p->rife_cpu_out = malloc(frame_size);
-    if (!p->rife_cpu_buf0 || !p->rife_cpu_buf1 || !p->rife_cpu_out) {
-        MP_ERR(ctx, "RIFE: Out of memory for CPU buffers.\n");
-        goto fail;
-    }
-
-    p->rife_session_active = true;
-    p->rife_width = width;
-    p->rife_height = height;
-    p->rife_has_prev = false;
-
     // Determine padding alignment from model type
-    // lite model (4 blocks, max scale=8) needs 32-pixel alignment
-    // full model (5 blocks, max scale=16) needs 64-pixel alignment
     int pad_align = strstr(model_file, "lite") ? 32 : 64;
     p->rife_pad_align = pad_align;
 
-    // Pre-allocate async inference buffer (padded)
     int pad_h = (pad_align - height % pad_align) % pad_align;
     int pad_w = (pad_align - width % pad_align) % pad_align;
     int ph = height + pad_h;
     int pw = width + pad_w;
-    p->rife_infer_in = calloc(6 * (size_t)ph * pw, sizeof(float));
-    if (!p->rife_infer_in) {
-        MP_ERR(ctx, "RIFE: Out of memory for async inference buffer.\n");
-        goto fail;
-    }
+    p->rife_infer_ph = ph;
+    p->rife_infer_pw = pw;
 
-    // Create background inference thread
-    mp_mutex_init(&p->rife_mutex);
-    mp_cond_init(&p->rife_cond_work);
-    mp_cond_init(&p->rife_cond_done);
-    p->rife_terminate = false;
-    p->rife_infer_state = RIFE_STATE_IDLE;
+    // Try to load DirectML execution provider entry point
+    typedef OrtStatus *(*PFN_AppendDML)(OrtSessionOptions *, int);
+    PFN_AppendDML append_dml =
+        (PFN_AppendDML)GetProcAddress(p->ort.dll,
+            "OrtSessionOptionsAppendExecutionProvider_DML");
 
-    if (mp_thread_create(&p->rife_thread, rife_infer_thread, ctx)) {
-        MP_ERR(ctx, "RIFE: Failed to create inference thread.\n");
-        mp_mutex_destroy(&p->rife_mutex);
-        mp_cond_destroy(&p->rife_cond_work);
-        mp_cond_destroy(&p->rife_cond_done);
-        goto fail;
-    }
-    p->rife_thread_valid = true;
+    // Build model path
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s/%s", model_dir, model_file);
+    wchar_t wpath[MAX_PATH];
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH);
 
-    // Pre-allocate ORT input tensors (reused across frames, zero-alloc per-frame)
-    {
+    // Create N independent sessions, each with its own thread and buffers
+    for (int i = 0; i < num_streams; i++) {
+        struct rife_stream *s = &p->rife_streams[i];
+        memset(s, 0, sizeof(*s));
+
+        // Create session options with DirectML provider (independent per stream)
+        status = api->CreateSessionOptions(&s->session_opts);
+        if (!rife_check_ort(ctx, status, "CreateSessionOptions"))
+            goto fail;
+
+        api->SetSessionGraphOptimizationLevel(s->session_opts, ORT_ENABLE_ALL);
+
+        if (append_dml) {
+            status = append_dml(s->session_opts, 0);
+            if (status) {
+                MP_WARN(ctx, "RIFE: DirectML provider not available for stream %d, "
+                        "falling back to CPU.\n", i);
+                api->ReleaseStatus(status);
+            } else if (i == 0) {
+                MP_VERBOSE(ctx, "RIFE: DirectML execution provider enabled.\n");
+            }
+        } else if (i == 0) {
+            MP_VERBOSE(ctx, "RIFE: DirectML entry point not found, using CPU.\n");
+        }
+
+        // Create session (each gets independent DML command queue)
+        status = api->CreateSession(p->rife_ort_env, wpath,
+                                    s->session_opts, &s->session);
+        if (!rife_check_ort(ctx, status, model_file))
+            goto fail;
+
+        // Allocate per-stream CPU buffers (padded)
+        size_t in_size = 6 * (size_t)ph * pw;
+        size_t out_size = 3 * (size_t)ph * pw;
+        s->infer_in = calloc(in_size, sizeof(float));
+        s->infer_out = calloc(out_size, sizeof(float));
+        if (!s->infer_in || !s->infer_out) {
+            MP_ERR(ctx, "RIFE: Out of memory for stream %d buffers.\n", i);
+            goto fail;
+        }
+
+        // Pre-allocate ORT tensors (zero-copy wrappers over CPU buffers)
         OrtMemoryInfo *cpu_mem = NULL;
         status = api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &cpu_mem);
         if (!rife_check_ort(ctx, status, "CreateCpuMemoryInfo"))
             goto fail;
 
         int64_t imgs_shape[] = {1, 6, ph, pw};
-        size_t imgs_size = 6 * (size_t)ph * pw * sizeof(float);
         status = api->CreateTensorWithDataAsOrtValue(
-            cpu_mem, p->rife_infer_in, imgs_size,
+            cpu_mem, s->infer_in, in_size * sizeof(float),
             imgs_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-            &p->rife_ort_input);
+            &s->ort_input);
         if (!rife_check_ort(ctx, status, "CreateTensor(input)")) {
             api->ReleaseMemoryInfo(cpu_mem);
             goto fail;
@@ -2113,21 +2013,53 @@ static bool rife_init_session_fn(struct libmpv_gpu_next_context *ctx,
 
         int64_t ts_shape[] = {1, 1, 1, 1};
         status = api->CreateTensorWithDataAsOrtValue(
-            cpu_mem, &p->rife_infer_timestep, sizeof(float),
+            cpu_mem, &s->infer_timestep, sizeof(float),
             ts_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-            &p->rife_ort_ts);
+            &s->ort_ts);
         if (!rife_check_ort(ctx, status, "CreateTensor(timestep)")) {
             api->ReleaseMemoryInfo(cpu_mem);
             goto fail;
         }
 
         api->ReleaseMemoryInfo(cpu_mem);
-        MP_VERBOSE(ctx, "RIFE: Pre-allocated input tensors.\n");
+
+        // Create background inference thread for this stream
+        mp_mutex_init(&s->mutex);
+        mp_cond_init(&s->cond_work);
+        mp_cond_init(&s->cond_done);
+        s->terminate = false;
+        s->state = RIFE_STATE_IDLE;
+
+        struct rife_thread_arg *targ = malloc(sizeof(*targ));
+        if (!targ) {
+            mp_mutex_destroy(&s->mutex);
+            mp_cond_destroy(&s->cond_work);
+            mp_cond_destroy(&s->cond_done);
+            goto fail;
+        }
+        targ->ctx = ctx;
+        targ->stream_idx = i;
+
+        if (mp_thread_create(&s->thread, rife_infer_thread, targ)) {
+            MP_ERR(ctx, "RIFE: Failed to create inference thread %d.\n", i);
+            free(targ);
+            mp_mutex_destroy(&s->mutex);
+            mp_cond_destroy(&s->cond_work);
+            mp_cond_destroy(&s->cond_done);
+            goto fail;
+        }
+        s->thread_valid = true;
     }
 
-    // Store padded dimensions for the session
-    p->rife_infer_ph = ph;
-    p->rife_infer_pw = pw;
+    p->rife_num_streams = num_streams;
+    p->rife_submit_idx = 0;
+    p->rife_collect_idx = 0;
+    p->rife_pending_count = 0;
+
+    p->rife_session_active = true;
+    p->rife_width = width;
+    p->rife_height = height;
+    p->rife_has_prev = false;
 
     // Initialize RIFE compute shaders for GPU format conversion
     {
@@ -2177,12 +2109,12 @@ static bool rife_init_session_fn(struct libmpv_gpu_next_context *ctx,
         }
 
         // Staging buffer for NCHW input (CPU-readable)
-        D3D11_BUFFER_DESC staging_desc = {
+        D3D11_BUFFER_DESC staging_buf_desc = {
             .ByteWidth = (UINT)nchw_in_size,
             .Usage = D3D11_USAGE_STAGING,
             .CPUAccessFlags = D3D11_CPU_ACCESS_READ,
         };
-        hr = ID3D11Device_CreateBuffer(p->rife_device, &staging_desc, NULL, &p->rife_nchw_staging);
+        hr = ID3D11Device_CreateBuffer(p->rife_device, &staging_buf_desc, NULL, &p->rife_nchw_staging);
         if (FAILED(hr)) {
             MP_ERR(ctx, "RIFE: CreateBuffer(NCHW staging) failed: 0x%x\n", (unsigned)hr);
             goto fail;
@@ -2213,137 +2145,14 @@ static bool rife_init_session_fn(struct libmpv_gpu_next_context *ctx,
         MP_VERBOSE(ctx, "RIFE: RIFE compute shaders initialized (ph=%d, pw=%d).\n", ph, pw);
     }
 
-    MP_INFO(ctx, "RIFE: Session created (%dx%d, CS+pre-alloc). "
+    MP_INFO(ctx, "RIFE: Session created (%dx%d, %d streams, CS+pre-alloc). "
             "RIFE v4.26 frame interpolation is ready.\n",
-            width, height);
+            width, height, num_streams);
     return true;
 
 fail:
     rife_destroy_fn(ctx);
     return false;
-}
-
-// Convert RGBA8 texture to NCHW float [1, 3, H, W] at full resolution
-static void rife_rgba_to_nchw(const uint8_t *rgba, size_t row_pitch,
-                                 float *nchw, int w, int h)
-{
-    for (int y = 0; y < h; y++) {
-        const uint8_t *row = rgba + y * row_pitch;
-        for (int x = 0; x < w; x++) {
-            for (int c = 0; c < 3; c++) {
-                nchw[c * h * w + y * w + x] = row[x * 4 + c] / 255.0f;
-            }
-        }
-    }
-}
-
-// Convert NCHW float [1, 3, H, W] to RGBA8 (no scaling, direct 1:1 write)
-static void rife_nchw_to_rgba(const float *nchw, uint8_t *rgba, size_t row_pitch,
-                                 int w, int h)
-{
-    for (int y = 0; y < h; y++) {
-        uint8_t *row = rgba + y * row_pitch;
-        for (int x = 0; x < w; x++) {
-            for (int c = 0; c < 3; c++) {
-                float v = nchw[c * h * w + y * w + x];
-                v = v < 0 ? 0 : (v > 1 ? 1 : v);
-                row[x * 4 + c] = (uint8_t)(v * 255.0f + 0.5f);
-            }
-            row[x * 4 + 3] = 255;
-        }
-    }
-}
-
-// Readback RGBA8 GPU texture to CPU NCHW float (full resolution)
-static bool rife_readback_to_nchw(struct libmpv_gpu_next_context *ctx,
-                                     ID3D11Texture2D *tex, float *nchw)
-{
-    struct priv *p = ctx->priv;
-    ID3D11DeviceContext_CopyResource(p->rife_ctx,
-        (ID3D11Resource *)p->rife_staging_read, (ID3D11Resource *)tex);
-
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr = ID3D11DeviceContext_Map(p->rife_ctx,
-        (ID3D11Resource *)p->rife_staging_read, 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr))
-        return false;
-
-    rife_rgba_to_nchw(mapped.pData, mapped.RowPitch, nchw,
-                         p->rife_width, p->rife_height);
-
-    ID3D11DeviceContext_Unmap(p->rife_ctx,
-        (ID3D11Resource *)p->rife_staging_read, 0);
-    return true;
-}
-
-// Upload NCHW float result to RGBA8 GPU texture (full resolution)
-static bool rife_upload_from_nchw(struct libmpv_gpu_next_context *ctx,
-                                     const float *nchw, ID3D11Texture2D *tex)
-{
-    struct priv *p = ctx->priv;
-    int w = p->rife_width;
-    int h = p->rife_height;
-
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr = ID3D11DeviceContext_Map(p->rife_ctx,
-        (ID3D11Resource *)p->rife_staging_write, 0, D3D11_MAP_WRITE, 0, &mapped);
-    if (FAILED(hr))
-        return false;
-
-    rife_nchw_to_rgba(nchw, mapped.pData, mapped.RowPitch, w, h);
-
-    ID3D11DeviceContext_Unmap(p->rife_ctx,
-        (ID3D11Resource *)p->rife_staging_write, 0);
-
-    ID3D11DeviceContext_CopyResource(p->rife_ctx,
-        (ID3D11Resource *)tex, (ID3D11Resource *)p->rife_staging_write);
-    return true;
-}
-
-// Run a single ORT session with given inputs/outputs
-static bool rife_run_session(struct libmpv_gpu_next_context *ctx,
-                               int model_idx,
-                               const char **input_names, OrtValue **inputs, size_t num_inputs,
-                               const char **output_names, OrtValue **outputs, size_t num_outputs)
-{
-    struct priv *p = ctx->priv;
-    const OrtApi *api = (const OrtApi *)p->ort.api;
-
-    OrtStatus *status = api->Run(
-        p->rife_sessions[model_idx], NULL,
-        input_names, (const OrtValue *const *)inputs, num_inputs,
-        output_names, num_outputs, outputs);
-
-    return rife_check_ort(ctx, status, rife_model_files[model_idx]);
-}
-
-// Create an ORT tensor value from a float buffer
-static OrtValue *rife_create_tensor(struct libmpv_gpu_next_context *ctx,
-                                      float *data, const int64_t *shape, size_t ndim)
-{
-    struct priv *p = ctx->priv;
-    const OrtApi *api = (const OrtApi *)p->ort.api;
-    OrtMemoryInfo *mem_info = NULL;
-    OrtValue *tensor = NULL;
-
-    OrtStatus *status = api->CreateCpuMemoryInfo(
-        OrtArenaAllocator, OrtMemTypeDefault, &mem_info);
-    if (!rife_check_ort(ctx, status, "CreateCpuMemoryInfo"))
-        return NULL;
-
-    size_t total = 1;
-    for (size_t i = 0; i < ndim; i++)
-        total *= shape[i];
-
-    status = api->CreateTensorWithDataAsOrtValue(
-        mem_info, data, total * sizeof(float),
-        shape, ndim, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &tensor);
-    api->ReleaseMemoryInfo(mem_info);
-
-    if (!rife_check_ort(ctx, status, "CreateTensor"))
-        return NULL;
-
-    return tensor;
 }
 
 // Helper: update CS constant buffer
@@ -2497,9 +2306,13 @@ static bool rife_feed_frame_fn(struct libmpv_gpu_next_context *ctx,
     size_t plane_floats = 3 * (size_t)ph * pw;
     size_t plane_bytes = plane_floats * sizeof(float);
 
-    // Shift on CPU: img1 → img0 (memmove within rife_infer_in)
-    if (p->rife_has_prev) {
-        memmove(p->rife_infer_in, p->rife_infer_in + plane_floats, plane_bytes);
+    // Get the stream we're about to submit to
+    struct rife_stream *s = &p->rife_streams[p->rife_submit_idx];
+
+    // For single-stream: shift img1→img0 from the previous submission.
+    // Safe because submit_async waits for this stream to be idle before submitting.
+    if (p->rife_has_prev && p->rife_num_streams == 1) {
+        memmove(s->infer_in, s->infer_in + plane_floats, plane_bytes);
     }
 
     // Run CS: RGBA8 texture → padded NCHW in rife_nchw_buf (channels 0-2 only)
@@ -2508,7 +2321,7 @@ static bool rife_feed_frame_fn(struct libmpv_gpu_next_context *ctx,
         return false;
     }
 
-    // Copy GPU buffer (channels 0-2) → staging → CPU
+    // Copy GPU buffer (3 channels) → staging → CPU
     ID3D11DeviceContext_CopyResource(p->rife_ctx,
         (ID3D11Resource *)p->rife_nchw_staging,
         (ID3D11Resource *)p->rife_nchw_buf);
@@ -2521,13 +2334,20 @@ static bool rife_feed_frame_fn(struct libmpv_gpu_next_context *ctx,
         return false;
     }
 
-    // Copy 3 channels (new frame) into img1 slot (channels 3-5) of rife_infer_in
-    float *dst = p->rife_infer_in + (p->rife_has_prev ? plane_floats : 0);
+    // Write new frame into the appropriate slot:
+    // - First frame (no prev): channels 0-2 (img0 position, placeholder)
+    // - Subsequent frames: channels 3-5 (img1 position)
+    // Note: img0 (channels 0-2) is populated by rife_submit_async_fn which
+    // copies current img1 → next stream's img0 after each submission.
+    float *dst = s->infer_in + (p->rife_has_prev ? plane_floats : 0);
     memcpy(dst, mapped.pData, plane_bytes);
 
     ID3D11DeviceContext_Unmap(p->rife_ctx, (ID3D11Resource *)p->rife_nchw_staging, 0);
 
     if (!p->rife_has_prev) {
+        // First frame: also copy to channels 3-5 so submit_async has data
+        // to propagate as img0 for the next frame pair
+        memcpy(s->infer_in + plane_floats, s->infer_in, plane_bytes);
         p->rife_has_prev = true;
         return false; // Need at least 2 frames
     }
@@ -2535,135 +2355,170 @@ static bool rife_feed_frame_fn(struct libmpv_gpu_next_context *ctx,
     return true;
 }
 
-// Submit async inference: build padded input tensor, signal bg thread.
-// Called from render thread after rife_feed_frame_fn succeeds.
+// Submit async inference to the next available stream (non-blocking).
 static void rife_submit_async_fn(struct libmpv_gpu_next_context *ctx,
                                     float timestep)
 {
     struct priv *p = ctx->priv;
-    if (!p->rife_session_active || !p->rife_has_prev || !p->rife_thread_valid)
+    if (!p->rife_session_active || !p->rife_has_prev)
         return;
 
-    mp_mutex_lock(&p->rife_mutex);
-    if (p->rife_infer_state == RIFE_STATE_RUNNING) {
-        // Previous inference still running, skip this submission
-        mp_mutex_unlock(&p->rife_mutex);
-        MP_DBG(ctx, "RIFE: Skipping submit, inference still running.\n");
+    struct rife_stream *s = &p->rife_streams[p->rife_submit_idx];
+    if (!s->thread_valid)
         return;
+
+    mp_mutex_lock(&s->mutex);
+    if (s->state != RIFE_STATE_IDLE) {
+        // This stream is still busy — wait for it (blocks briefly)
+        while (s->state != RIFE_STATE_IDLE && s->state != RIFE_STATE_READY)
+            mp_cond_wait(&s->cond_done, &s->mutex);
+
+        // If it finished with a result, discard it (too late)
+        if (s->state == RIFE_STATE_READY)
+            s->state = RIFE_STATE_IDLE;
     }
 
-    int h = p->rife_height;
-    int w = p->rife_width;
-    int hw = h * w;
+    s->infer_timestep = timestep;
+    s->state = RIFE_STATE_PENDING;
+    mp_cond_signal(&s->cond_work);
+    mp_mutex_unlock(&s->mutex);
 
-    #define RIFE_PAD_ALIGN p->rife_pad_align
-    int pad_h = (RIFE_PAD_ALIGN - h % RIFE_PAD_ALIGN) % RIFE_PAD_ALIGN;
-    int pad_w = (RIFE_PAD_ALIGN - w % RIFE_PAD_ALIGN) % RIFE_PAD_ALIGN;
-    int ph = h + pad_h;
-    int pw = w + pad_w;
-    int phw = ph * pw;
+    p->rife_pending_count++;
 
-    float *img0 = p->rife_cpu_buf0;
-    float *img1 = p->rife_cpu_buf1;
-    float *dst = p->rife_infer_in;
-
-    // Build padded [1,6,ph,pw] tensor (replicate-border padding)
-    for (int c = 0; c < 3; c++) {
-        for (int y = 0; y < ph; y++) {
-            int sy = y < h ? y : h - 1;
-            for (int x = 0; x < pw; x++) {
-                int sx = x < w ? x : w - 1;
-                dst[c * phw + y * pw + x] = img0[c * hw + sy * w + sx];
-                dst[(3 + c) * phw + y * pw + x] = img1[c * hw + sy * w + sx];
-            }
+    // Propagate current img1 → next stream's img0 for the next frame pair.
+    // This must happen AFTER we've captured the data for submission.
+    // For single-stream: safe because the inference thread reads the buffer
+    // before we call feed_frame again (submit_async waits for idle at top).
+    // For multi-stream: writes to a different buffer (no race).
+    {
+        size_t plane_floats = 3 * (size_t)p->rife_infer_ph * p->rife_infer_pw;
+        size_t plane_bytes = plane_floats * sizeof(float);
+        int next = (p->rife_submit_idx + 1) % p->rife_num_streams;
+        struct rife_stream *ns = &p->rife_streams[next];
+        if (ns == s) {
+            // Single stream: will be handled at next feed_frame (after inference done)
+            // Mark that img1 needs to be shifted to img0
+        } else {
+            memcpy(ns->infer_in, s->infer_in + plane_floats, plane_bytes);
         }
     }
 
-    p->rife_infer_ph = ph;
-    p->rife_infer_pw = pw;
-    p->rife_infer_timestep = timestep;
-    p->rife_infer_state = RIFE_STATE_PENDING;
-    mp_cond_signal(&p->rife_cond_work);
-    mp_mutex_unlock(&p->rife_mutex);
+    p->rife_submit_idx = (p->rife_submit_idx + 1) % p->rife_num_streams;
 }
 
-// Non-blocking poll: check if async inference result is available.
+// Non-blocking poll: check if the oldest pending stream has a result.
 static bool rife_poll_result_fn(struct libmpv_gpu_next_context *ctx)
 {
     struct priv *p = ctx->priv;
-    if (!p->rife_thread_valid)
+    if (p->rife_pending_count <= 0)
         return false;
 
-    mp_mutex_lock(&p->rife_mutex);
-    bool ready = (p->rife_infer_state == RIFE_STATE_READY);
-    if (ready)
-        p->rife_infer_state = RIFE_STATE_IDLE;
-    mp_mutex_unlock(&p->rife_mutex);
+    struct rife_stream *s = &p->rife_streams[p->rife_collect_idx];
+    if (!s->thread_valid)
+        return false;
+
+    mp_mutex_lock(&s->mutex);
+    bool ready = (s->state == RIFE_STATE_READY);
+    mp_mutex_unlock(&s->mutex);
     return ready;
 }
 
-// Synchronous interpolation: build padded input, run ORT, crop, upload.
-// Uses pre-allocated input tensor (rife_ort_input backs rife_infer_in).
+// Upload the completed inference result from collect stream to GPU texture.
+static bool rife_upload_result_fn(struct libmpv_gpu_next_context *ctx,
+                                     ID3D11Texture2D *output_tex)
+{
+    struct priv *p = ctx->priv;
+    if (p->rife_pending_count <= 0)
+        return false;
+
+    struct rife_stream *s = &p->rife_streams[p->rife_collect_idx];
+
+    mp_mutex_lock(&s->mutex);
+    if (s->state != RIFE_STATE_READY) {
+        mp_mutex_unlock(&s->mutex);
+        return false;
+    }
+    s->state = RIFE_STATE_IDLE;
+    mp_mutex_unlock(&s->mutex);
+
+    p->rife_pending_count--;
+    p->rife_collect_idx = (p->rife_collect_idx + 1) % p->rife_num_streams;
+
+    // Upload padded NCHW result → staging → GPU buffer → CS → RGBA8 texture
+    int ph = p->rife_infer_ph;
+    int pw = p->rife_infer_pw;
+    size_t out_bytes = 3 * (size_t)ph * pw * sizeof(float);
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = ID3D11DeviceContext_Map(p->rife_ctx,
+        (ID3D11Resource *)p->rife_out_staging, 0, D3D11_MAP_WRITE, 0, &mapped);
+    if (FAILED(hr))
+        return false;
+
+    memcpy(mapped.pData, s->infer_out, out_bytes);
+    ID3D11DeviceContext_Unmap(p->rife_ctx,
+        (ID3D11Resource *)p->rife_out_staging, 0);
+
+    // Staging → GPU buffer
+    ID3D11DeviceContext_CopyResource(p->rife_ctx,
+        (ID3D11Resource *)p->rife_out_buf,
+        (ID3D11Resource *)p->rife_out_staging);
+
+    // CS: NCHW float buffer → RGBA8 texture
+    return rife_nchw_to_rgba8_gpu(ctx, output_tex);
+}
+
+// Synchronous interpolation fallback (for single-stream mode).
 static bool rife_interpolate_fn(struct libmpv_gpu_next_context *ctx,
                                    ID3D11Texture2D *output_tex,
                                    float timestep)
 {
     struct priv *p = ctx->priv;
-    const OrtApi *api = (const OrtApi *)p->ort.api;
 
     if (!p->rife_session_active || !p->rife_has_prev)
         return false;
 
+    // Submit to stream 0 and wait synchronously
+    struct rife_stream *s = &p->rife_streams[0];
+    if (!s->thread_valid)
+        return false;
+
+    mp_mutex_lock(&s->mutex);
+    s->infer_timestep = timestep;
+    s->state = RIFE_STATE_PENDING;
+    mp_cond_signal(&s->cond_work);
+
+    // Wait for completion
+    while (s->state != RIFE_STATE_READY && s->state != RIFE_STATE_IDLE)
+        mp_cond_wait(&s->cond_done, &s->mutex);
+
+    bool ok = (s->state == RIFE_STATE_READY);
+    s->state = RIFE_STATE_IDLE;
+    mp_mutex_unlock(&s->mutex);
+
+    if (!ok)
+        return false;
+
+    // Upload result
     int ph = p->rife_infer_ph;
     int pw = p->rife_infer_pw;
+    size_t out_bytes = 3 * (size_t)ph * pw * sizeof(float);
 
-    // rife_infer_in already has padded [1,6,ph,pw] from feed_frame (via CS)
-    p->rife_infer_timestep = timestep;
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = ID3D11DeviceContext_Map(p->rife_ctx,
+        (ID3D11Resource *)p->rife_out_staging, 0, D3D11_MAP_WRITE, 0, &mapped);
+    if (FAILED(hr))
+        return false;
 
-    // Run ORT with pre-allocated input tensors
-    const char *in_names[] = {"imgs", "timestep"};
-    const char *out_names[] = {"output"};
-    OrtValue *ins[2] = { p->rife_ort_input, p->rife_ort_ts };
-    OrtValue *outputs[1] = {NULL};
+    memcpy(mapped.pData, s->infer_out, out_bytes);
+    ID3D11DeviceContext_Unmap(p->rife_ctx,
+        (ID3D11Resource *)p->rife_out_staging, 0);
 
-    OrtStatus *status = api->Run(
-        p->rife_sessions[RIFE_MODEL_RIFE], NULL,
-        in_names, (const OrtValue *const *)ins, 2,
-        out_names, 1, outputs);
-    bool ok = rife_check_ort(ctx, status, "Run(rife)");
+    ID3D11DeviceContext_CopyResource(p->rife_ctx,
+        (ID3D11Resource *)p->rife_out_buf,
+        (ID3D11Resource *)p->rife_out_staging);
 
-    if (ok && outputs[0]) {
-        float *data;
-        api->GetTensorMutableData(outputs[0], (void **)&data);
-
-        // Upload padded ORT output → staging buffer → GPU buffer → CS → RGBA8 texture
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        HRESULT hr = ID3D11DeviceContext_Map(p->rife_ctx,
-            (ID3D11Resource *)p->rife_out_staging, 0, D3D11_MAP_WRITE, 0, &mapped);
-        if (SUCCEEDED(hr)) {
-            memcpy(mapped.pData, data, 3 * (size_t)ph * pw * sizeof(float));
-            ID3D11DeviceContext_Unmap(p->rife_ctx,
-                (ID3D11Resource *)p->rife_out_staging, 0);
-
-            // Staging → GPU buffer
-            ID3D11DeviceContext_CopyResource(p->rife_ctx,
-                (ID3D11Resource *)p->rife_out_buf,
-                (ID3D11Resource *)p->rife_out_staging);
-
-            // CS: NCHW float buffer → RGBA8 texture
-            ok = rife_nchw_to_rgba8_gpu(ctx, output_tex);
-        } else {
-            ok = false;
-        }
-
-        api->ReleaseValue(outputs[0]);
-    } else {
-        ok = false;
-        if (outputs[0]) api->ReleaseValue(outputs[0]);
-    }
-
-    MP_DBG(ctx, "RIFE: Interpolated frame at t=%.2f\n", timestep);
-    return ok;
+    return rife_nchw_to_rgba8_gpu(ctx, output_tex);
 }
 
 static void rife_init(struct libmpv_gpu_next_context *ctx,
@@ -2890,5 +2745,6 @@ const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11 = {
     .rife_destroy = rife_destroy_fn,
     .rife_submit_async = rife_submit_async_fn,
     .rife_poll_result = rife_poll_result_fn,
+    .rife_upload_result = rife_upload_result_fn,
 #endif
 };

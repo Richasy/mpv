@@ -7982,6 +7982,45 @@ them.
         content may show visible artifacts (mosaic blocks) in areas where
         optical flow estimation fails.
 
+``--rife=<off|standard|high>``
+    Enable RIFE (Real-Time Intermediate Flow Estimation) deep learning frame
+    interpolation using ONNX Runtime with DirectML. This generates intermediate
+    frames between original video frames using a neural network, producing
+    higher quality results than traditional optical flow methods.
+    ``--vo=gpu-next`` with D3D11 backend only.
+
+    ``off``
+        Disable RIFE frame interpolation (default).
+    ``standard``
+        Use the lightweight RIFE model (``rife_lite.onnx``). Faster inference
+        with slightly lower quality. Uses 32-pixel alignment.
+    ``high``
+        Use the full RIFE model (``rife.onnx``). Higher quality at the cost
+        of increased GPU usage. Uses 64-pixel alignment.
+
+    Requires ``--video-sync=display-resample`` and ``--interpolation=yes``
+    to be set. Also requires ``--rife-model`` to point to the directory
+    containing the ONNX model file.
+
+    Runtime DLL ``onnxruntime.dll`` (with DirectML support) must be deployed
+    alongside ``libmpv-2.dll``.
+
+``--rife-model=<path>``
+    Path to the directory containing the RIFE ONNX model file. The directory
+    should contain ``rife_lite.onnx`` (for ``--rife=standard``) and/or
+    ``rife.onnx`` (for ``--rife=high``).
+
+``--rife-streams=<1-4>``
+    Number of parallel ONNX Runtime inference streams (default: 2). Each
+    stream creates an independent ORT session with its own DirectML command
+    queue, enabling pipelined inference where multiple frames can be processed
+    concurrently.
+
+    Higher values increase throughput at the cost of GPU memory. A value of 2
+    is typically sufficient to saturate the GPU. Values above 3 are unlikely
+    to provide additional benefit unless the per-frame inference time is very
+    short relative to the frame interval.
+
 ``--opengl-rectangle-textures``
     Force use of rectangle textures (default: no). Normally this shouldn't have
     any advantages over normal textures. Note that hardware decoding overrides

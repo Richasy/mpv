@@ -1185,7 +1185,8 @@ fruc_done:
                     ? "rife_lite.onnx" : "rife.onnx";
                 bool ok = p->context->fns->rife_init_session(
                     p->context, p->next_opts->rife_model,
-                    model_file, src_w, src_h);
+                    model_file, src_w, src_h,
+                    p->next_opts->rife_streams);
                 if (ok) {
                     p->rife_w = src_w;
                     p->rife_h = src_h;
@@ -1203,7 +1204,8 @@ fruc_done:
             MP_INFO(ctx, "RIFE: Switching model to %s\n", model_file);
             bool ok = p->context->fns->rife_init_session(
                 p->context, p->next_opts->rife_model,
-                model_file, src_w, src_h);
+                model_file, src_w, src_h,
+                p->next_opts->rife_streams);
             if (ok) {
                 p->rife_mode = rife_mode;
                 p->rife_has_prev = false;
@@ -1271,35 +1273,57 @@ fruc_done:
                 }
                 pl_gpu_flush(gpu);
 
-                // Feed frame + synchronous interpolation
+                // Feed frame to RIFE
                 bool feed_ok = p->context->fns->rife_feed_frame(
                     p->context, p->rife_render_d3d);
 
                 if (feed_ok && p->rife_has_prev) {
-                    bool interp_ok = p->context->fns->rife_interpolate(
-                        p->context, p->rife_output_d3d, 0.5f);
-                    p->rife_interp_valid = interp_ok;
-                } else {
-                    p->rife_interp_valid = false;
+                    // Submit async inference for this frame pair
+                    p->context->fns->rife_submit_async(
+                        p->context, 0.5f);
                 }
 
                 p->rife_prev_pts = cur_pts;
                 p->rife_has_prev = true;
 
-                // New frame: show interp(prev, current) if available
-                if (p->rife_interp_valid) {
-                    RIFE_BLIT_TO_TARGET(p->rife_output_pl, src_w, src_h);
-                    valid = true;
-                    goto done;
+                // Check if a previous async result is ready to display
+                if (p->context->fns->rife_poll_result &&
+                    p->context->fns->rife_poll_result(p->context)) {
+                    // Upload and display the interpolated frame
+                    if (p->context->fns->rife_upload_result &&
+                        p->context->fns->rife_upload_result(
+                            p->context, p->rife_output_d3d)) {
+                        p->rife_interp_valid = true;
+                        RIFE_BLIT_TO_TARGET(p->rife_output_pl, src_w, src_h);
+                        valid = true;
+                        goto done;
+                    }
                 }
 
-                // No interp (first frame) → show original via same RGBA8 path
+                // No async result ready — show original frame
                 RIFE_BLIT_TO_TARGET(p->rife_render_pl, src_w, src_h);
                 valid = true;
                 goto done;
 
             } else {
-                // Repeated PTS: show original frame (already in rife_render_pl)
+                // Repeated PTS: check if async result became ready
+                if (p->rife_interp_valid) {
+                    RIFE_BLIT_TO_TARGET(p->rife_output_pl, src_w, src_h);
+                    valid = true;
+                    goto done;
+                }
+                if (p->context->fns->rife_poll_result &&
+                    p->context->fns->rife_poll_result(p->context)) {
+                    if (p->context->fns->rife_upload_result &&
+                        p->context->fns->rife_upload_result(
+                            p->context, p->rife_output_d3d)) {
+                        p->rife_interp_valid = true;
+                        RIFE_BLIT_TO_TARGET(p->rife_output_pl, src_w, src_h);
+                        valid = true;
+                        goto done;
+                    }
+                }
+                // Still no result — show original
                 RIFE_BLIT_TO_TARGET(p->rife_render_pl, src_w, src_h);
                 valid = true;
                 goto done;

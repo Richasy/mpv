@@ -48,6 +48,7 @@ struct gl_next_opts {
     int amd_fsr;               // 0=off, 1=on (EASU only), 2=on+sharpen (EASU+RCAS)
     int rife;                  // 0=off, 1=standard (FP16), 2=high (FP32)
     char *rife_model;          // path to RIFE ONNX model directory
+    int rife_streams;          // number of parallel inference streams (1-4, default 2)
 };
 
 #endif

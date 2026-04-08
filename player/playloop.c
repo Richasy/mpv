@@ -1278,15 +1278,19 @@ void run_playloop(struct MPContext *mpctx)
         const char *wl_opts = mpctx->opts->whisper_lookahead;
         bool want_active = wl_opts && wl_opts[0] && mpctx->ao_chain;
         bool is_active = !!mpctx->whisper_lookahead;
-        if (want_active && !is_active && mpctx->restart_complete)
+        if (want_active && !is_active && mpctx->restart_complete) {
             whisper_lookahead_start(mpctx, wl_opts);
-        else if (!want_active && is_active)
+            mp_notify_property(mpctx, "whisper-loading");
+        } else if (!want_active && is_active) {
             whisper_lookahead_stop(mpctx);
+            mp_notify_property(mpctx, "whisper-loading");
+        }
 
         // If async init failed, clean up silently.
         if (is_active && whisper_lookahead_failed(mpctx)) {
             MP_WARN(mpctx, "whisper lookahead: async init failed, cleaning up\n");
             whisper_lookahead_stop(mpctx);
+            mp_notify_property(mpctx, "whisper-loading");
         }
 
         // Auto-select the Whisper subtitle track once it appears.
@@ -1299,6 +1303,7 @@ void run_playloop(struct MPContext *mpctx)
         if (whisper_lookahead_ready(mpctx) &&
             !whisper_lookahead_track_selected(mpctx))
         {
+            mp_notify_property(mpctx, "whisper-loading");
             for (int n = 0; n < mpctx->num_tracks; n++) {
                 struct track *t = mpctx->tracks[n];
                 if (t->type == STREAM_SUB &&

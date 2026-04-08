@@ -2689,6 +2689,13 @@ Property list
     loaded. This is because the same underlying code is used for seeking and
     resyncing.)
 
+``whisper-loading``
+    Whether the whisper lookahead pipeline is currently initializing in the
+    background (loading the model, opening the secondary demuxer, etc.).
+    Returns ``yes``/true while the init thread is running, ``no``/false once
+    initialization completes (success or failure) or if whisper is not active.
+    Useful for showing a loading indicator in the UI when using libmpv.
+
 ``mixer-active``
     Whether the audio mixer is active.
 

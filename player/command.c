@@ -1473,6 +1473,16 @@ static int mp_property_seeking(void *ctx, struct m_property *prop,
     return m_property_bool_ro(action, arg, !mpctx->restart_complete);
 }
 
+static int mp_property_whisper_loading(void *ctx, struct m_property *prop,
+                                       int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    bool loading = mpctx->whisper_lookahead &&
+                   !whisper_lookahead_ready(mpctx) &&
+                   !whisper_lookahead_failed(mpctx);
+    return m_property_bool_ro(action, arg, loading);
+}
+
 static int mp_property_playback_abort(void *ctx, struct m_property *prop,
                                       int action, void *arg)
 {
@@ -4529,6 +4539,7 @@ static const struct m_property mp_properties_base[] = {
     {"core-idle", mp_property_core_idle},
     {"eof-reached", mp_property_eof_reached},
     {"seeking", mp_property_seeking},
+    {"whisper-loading", mp_property_whisper_loading},
     {"playback-abort", mp_property_playback_abort},
     {"cache-speed", mp_property_cache_speed},
     {"demuxer-cache-duration", mp_property_demuxer_cache_duration},

@@ -1272,6 +1272,8 @@ void run_playloop(struct MPContext *mpctx)
     // Delay startup until restart_complete is true, so that any initial seek
     // (resume from saved position, trakt progress, etc.) has already finished
     // and get_current_time() returns the correct playback position.
+    // whisper_lookahead_start() launches a background init thread, so the
+    // call returns immediately without blocking the playloop.
     {
         const char *wl_opts = mpctx->opts->whisper_lookahead;
         bool want_active = wl_opts && wl_opts[0] && mpctx->ao_chain;
@@ -1281,13 +1283,22 @@ void run_playloop(struct MPContext *mpctx)
         else if (!want_active && is_active)
             whisper_lookahead_stop(mpctx);
 
+        // If async init failed, clean up silently.
+        if (is_active && whisper_lookahead_failed(mpctx)) {
+            MP_WARN(mpctx, "whisper lookahead: async init failed, cleaning up\n");
+            whisper_lookahead_stop(mpctx);
+        }
+
         // Auto-select the Whisper subtitle track once it appears.
         // demuxer_feed_af_sub() lazily creates a "Whisper" sub track,
         // but it is not auto-selected. Find it and select it once.
         // Note: The Rodel Player C# side also polls for this track
         // via WaitForWhisperTrackAsync and sets SubtitleId. Both paths
         // are safe because mp_switch_track_n checks t->selected.
-        if (is_active && !whisper_lookahead_track_selected(mpctx)) {
+        // Only attempt after the init thread finishes successfully.
+        if (whisper_lookahead_ready(mpctx) &&
+            !whisper_lookahead_track_selected(mpctx))
+        {
             for (int n = 0; n < mpctx->num_tracks; n++) {
                 struct track *t = mpctx->tracks[n];
                 if (t->type == STREAM_SUB &&

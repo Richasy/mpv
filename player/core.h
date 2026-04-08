@@ -526,6 +526,8 @@ void whisper_lookahead_stop(struct MPContext *mpctx);
 void whisper_lookahead_seek(struct MPContext *mpctx, double pts);
 bool whisper_lookahead_track_selected(struct MPContext *mpctx);
 void whisper_lookahead_set_track_selected(struct MPContext *mpctx, bool val);
+bool whisper_lookahead_ready(struct MPContext *mpctx);
+bool whisper_lookahead_failed(struct MPContext *mpctx);
 
 // configfiles.c
 void mp_parse_cfgfiles(struct MPContext *mpctx);

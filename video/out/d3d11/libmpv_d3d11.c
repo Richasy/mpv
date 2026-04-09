@@ -181,15 +181,91 @@ static HMODULE ngx_load_dll_from_registry(struct libmpv_gpu_next_context *ctx)
     return dll;
 }
 
+// Search for _nvngx.dll in the NVIDIA driver's DriverStore directory.
+// The driver always installs _nvngx.dll there, but the path is not in the
+// standard DLL search order. We enumerate nv_dispi.inf_amd64_* directories
+// under DriverStore\FileRepository and pick the one with the newest
+// write time that contains _nvngx.dll.
+static HMODULE ngx_load_dll_from_driver_store(struct libmpv_gpu_next_context *ctx)
+{
+    wchar_t sys[MAX_PATH];
+    UINT len = GetSystemDirectoryW(sys, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH)
+        return NULL;
+
+    // Build: C:\Windows\System32\DriverStore\FileRepository\nv_dispi.inf_amd64_*
+    wchar_t pattern[MAX_PATH];
+    _snwprintf(pattern, MAX_PATH,
+               L"%ls\\DriverStore\\FileRepository\\nv_dispi.inf_amd64_*",
+               sys);
+    pattern[MAX_PATH - 1] = 0;
+
+    WIN32_FIND_DATAW fd;
+    HANDLE find = FindFirstFileExW(pattern, FindExInfoBasic, &fd,
+                                   FindExSearchLimitToDirectories, NULL, 0);
+    if (find == INVALID_HANDLE_VALUE) {
+        MP_VERBOSE(ctx, "NGX VSR: No NVIDIA driver directories found in "
+                   "DriverStore.\n");
+        return NULL;
+    }
+
+    // Build base path: ...\DriverStore\FileRepository\
+    wchar_t base[MAX_PATH];
+    _snwprintf(base, MAX_PATH,
+               L"%ls\\DriverStore\\FileRepository\\", sys);
+    base[MAX_PATH - 1] = 0;
+
+    HMODULE best_dll = NULL;
+    FILETIME best_time = {0};
+
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            continue;
+
+        wchar_t full[MAX_PATH];
+        _snwprintf(full, MAX_PATH, L"%ls%ls\\_nvngx.dll", base, fd.cFileName);
+        full[MAX_PATH - 1] = 0;
+
+        // Check if the file exists and get its write time
+        WIN32_FIND_DATAW file_fd;
+        HANDLE file_find = FindFirstFileExW(full, FindExInfoBasic, &file_fd,
+                                            FindExSearchNameMatch, NULL, 0);
+        if (file_find == INVALID_HANDLE_VALUE)
+            continue;
+        FindClose(file_find);
+
+        // Pick the newest _nvngx.dll (latest driver version)
+        if (CompareFileTime(&file_fd.ftLastWriteTime, &best_time) > 0) {
+            HMODULE dll = LoadLibraryW(full);
+            if (dll) {
+                if (best_dll)
+                    FreeLibrary(best_dll);
+                best_dll = dll;
+                best_time = file_fd.ftLastWriteTime;
+                MP_VERBOSE(ctx, "NGX VSR: Found _nvngx.dll in DriverStore: "
+                           "%ls\n", full);
+            }
+        }
+    } while (FindNextFileW(find, &fd));
+
+    FindClose(find);
+
+    if (!best_dll)
+        MP_VERBOSE(ctx, "NGX VSR: _nvngx.dll not found in DriverStore.\n");
+    return best_dll;
+}
+
 static bool ngx_load_dll(struct libmpv_gpu_next_context *ctx, struct ngx_dll_fns *ngx)
 {
     if (ngx->dll)
         return true;
 
-    // Try standard search path first, then registry
+    // Try standard search path first, then registry, then DriverStore
     HMODULE dll = LoadLibraryW(L"_nvngx.dll");
     if (!dll)
         dll = ngx_load_dll_from_registry(ctx);
+    if (!dll)
+        dll = ngx_load_dll_from_driver_store(ctx);
     if (!dll) {
         MP_WARN(ctx, "NGX VSR: _nvngx.dll not found, VSR unavailable.\n");
         return false;

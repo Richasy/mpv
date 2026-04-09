@@ -209,7 +209,7 @@ static HMODULE ngx_load_dll_from_driver_store(struct libmpv_gpu_next_context *ct
         return NULL;
     }
 
-    // Build base path: ...\DriverStore\FileRepository\
+    // Build base path: ...\DriverStore\FileRepository
     wchar_t base[MAX_PATH];
     _snwprintf(base, MAX_PATH,
                L"%ls\\DriverStore\\FileRepository\\", sys);

@@ -509,12 +509,6 @@ static void decode(struct sd *sd, struct demux_packet *packet)
         // for discarding duplicate (already seen) packets but we check this
         // anyways for our purposes for ASS subtitles.
         packet->seen = check_packet_seen(sd, packet);
-        MP_INFO(sd, "decode native ASS: pts=%.3f dur=%.3f seen=%d "
-                "len=%zu buf='%.80s'\n",
-                packet->pts, packet->duration,
-                (int)packet->seen,
-                (size_t)packet->len,
-                packet->buffer ? (const char *)packet->buffer : "(null)");
         filter_and_add(sd, packet);
     }
 }

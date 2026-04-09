@@ -28,12 +28,15 @@
 
 #include "common/av_common.h"
 #include "common/common.h"
+#include "options/m_config_core.h"
 #include "osdep/threads.h"
 #include "osdep/windows_utils.h"
 #include "video/fmt-conversion.h"
 #include "video/hwdec.h"
 #include "video/mp_image_pool.h"
 #include "video/mp_image.h"
+#include "video/out/d3d11/context.h"
+#include "video/out/gpu/d3d11_helpers.h"
 
 #include "d3d.h"
 
@@ -115,6 +118,7 @@ static struct AVBufferRef *d3d11_create_standalone(struct mpv_global *global,
         struct mp_log *plog, struct hwcontext_create_dev_params *params)
 {
     ID3D11Device *device = NULL;
+    IDXGIAdapter1 *adapter = NULL;
     HRESULT hr;
 
     d3d_load_dlls();
@@ -123,9 +127,28 @@ static struct AVBufferRef *d3d11_create_standalone(struct mpv_global *global,
         return NULL;
     }
 
-    hr = d3d11_D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
-                                 D3D11_CREATE_DEVICE_VIDEO_SUPPORT, NULL, 0,
-                                 D3D11_SDK_VERSION, &device, NULL, NULL);
+    // Read d3d11-adapter option so copy-back hwdec uses the same GPU as
+    // the render context (important on multi-GPU / Optimus laptops).
+    struct d3d11_opts *opts = mp_get_config_group(NULL, global, &d3d11_conf);
+    char *adapter_name = (opts && opts->adapter_name && *opts->adapter_name)
+                         ? opts->adapter_name : NULL;
+    if (adapter_name)
+        adapter = mp_get_dxgi_adapter(plog, bstr0(adapter_name), NULL);
+
+    if (adapter) {
+        hr = d3d11_D3D11CreateDevice((IDXGIAdapter *)adapter,
+                                     D3D_DRIVER_TYPE_UNKNOWN, NULL,
+                                     D3D11_CREATE_DEVICE_VIDEO_SUPPORT, NULL, 0,
+                                     D3D11_SDK_VERSION, &device, NULL, NULL);
+        SAFE_RELEASE(adapter);
+    } else {
+        hr = d3d11_D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                     D3D11_CREATE_DEVICE_VIDEO_SUPPORT, NULL, 0,
+                                     D3D11_SDK_VERSION, &device, NULL, NULL);
+    }
+
+    talloc_free(opts);
+
     if (FAILED(hr)) {
         mp_err(plog, "Failed to create D3D11 Device: %s\n",
                mp_HRESULT_to_str(hr));

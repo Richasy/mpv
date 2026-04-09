@@ -31,18 +31,6 @@
 #include <libplacebo/d3d11.h>
 #endif
 
-struct d3d11_opts {
-    int feature_level;
-    int warp;
-    bool flip;
-    int sync_interval;
-    char *adapter_name;
-    int output_format;
-    int color_space;
-    bool exclusive_fs;
-    int output_mode;
-};
-
 #define OPT_BASE_STRUCT struct d3d11_opts
 const struct m_sub_options d3d11_conf = {
     .opts = (const struct m_option[]) {

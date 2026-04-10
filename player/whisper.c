@@ -101,6 +101,9 @@ struct whisper_lookahead {
     // Deduplication
     char *last_text;
 
+    // Throttle: latest audio PTS processed by the lookahead pipeline
+    double lookahead_pts;
+
     // Lifecycle
     struct mp_cancel *cancel;
 
@@ -130,6 +133,135 @@ struct sink_priv {
     struct whisper_lookahead *wl;
 };
 
+// Inject a single subtitle with the given text, pts, and duration.
+static void inject_subtitle(struct whisper_lookahead *wl,
+                            const char *text, double pts, double dur)
+{
+    if (!wl->primary_stream || !wl->primary_demuxer || !text || !text[0])
+        return;
+
+    char *sub_text = NULL;
+    if (wl->translator) {
+        char *translated = whisper_translate(wl->translator, wl, text);
+        if (translated) {
+            sub_text = talloc_asprintf(wl,
+                "{\\fs72\\c&H00FFFFFF&\\3c&H00000000&\\bord3}%s"
+                "\\N{\\fs48\\c&H00E0FFFF&\\3c&H00000000&\\bord2}%s",
+                translated, text);
+            wl->translations_injected++;
+            MP_INFO(wl, "translated #%d: %.40s%s\n",
+                    wl->translations_injected,
+                    translated,
+                    strlen(translated) > 40 ? "..." : "");
+            talloc_free(translated);
+        }
+    }
+
+    if (!sub_text)
+        sub_text = talloc_strdup(wl, text);
+
+    char *ass_line = talloc_asprintf(wl,
+        "%d,0,Default,,0,0,0,,%s",
+        wl->subtitles_injected, sub_text);
+    talloc_free(sub_text);
+
+    size_t ass_len = strlen(ass_line);
+    struct demux_packet *dp = new_demux_packet_from(
+        wl->primary_demuxer->packet_pool,
+        (void *)ass_line, ass_len);
+    if (dp) {
+        dp->pts = pts;
+        dp->dts = pts;
+        dp->duration = dur;
+        dp->sub_duration = dur;
+
+        demuxer_feed_af_sub(wl->primary_stream, dp);
+        wl->subtitles_injected++;
+        MP_INFO(wl, "subtitle #%d @ %.3f (dur=%.1f): %.40s%s\n",
+                wl->subtitles_injected, pts, dur, text,
+                strlen(text) > 40 ? "..." : "");
+
+        mp_wakeup_core(wl->mpctx);
+    }
+    talloc_free(ass_line);
+}
+
+// Parse JSON segments array: [{"s":ms,"e":ms,"t":"text"}, ...]
+static void process_whisper_segments(struct whisper_lookahead *wl,
+                                     const char *json)
+{
+    if (!json || json[0] != '[')
+        return;
+
+    const char *p = json + 1;
+    while (*p) {
+        while (*p && *p != '{') {
+            if (*p == ']') return;
+            p++;
+        }
+        if (!*p) break;
+        p++;
+
+        int64_t s_ms = -1, e_ms = -1;
+        char text_buf[4096] = {0};
+
+        while (*p && *p != '}') {
+            while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\r' || *p == '\t')
+                p++;
+            if (*p == '}') break;
+            if (*p != '"') { p++; continue; }
+
+            p++;
+            char key = *p;
+            while (*p && *p != ':') p++;
+            if (!*p) break;
+            p++;
+            while (*p == ' ') p++;
+
+            if (key == 's' || key == 'e') {
+                char *end;
+                int64_t val = strtoll(p, &end, 10);
+                if (key == 's') s_ms = val;
+                else            e_ms = val;
+                p = end;
+            } else if (key == 't') {
+                if (*p != '"') { p++; continue; }
+                p++;
+                size_t ti = 0;
+                while (*p && *p != '"' && ti < sizeof(text_buf) - 1) {
+                    if (*p == '\\' && *(p + 1)) {
+                        p++;
+                        switch (*p) {
+                        case '"':  text_buf[ti++] = '"'; break;
+                        case '\\': text_buf[ti++] = '\\'; break;
+                        case 'n':  text_buf[ti++] = '\n'; break;
+                        case 'r':  text_buf[ti++] = '\r'; break;
+                        case 't':  text_buf[ti++] = '\t'; break;
+                        case 'u':
+                            if (*(p+1) && *(p+2) && *(p+3) && *(p+4))
+                                p += 4;
+                            break;
+                        default: text_buf[ti++] = *p; break;
+                        }
+                    } else {
+                        text_buf[ti++] = *p;
+                    }
+                    p++;
+                }
+                text_buf[ti] = '\0';
+                if (*p == '"') p++;
+            }
+        }
+        if (*p == '}') p++;
+
+        if (s_ms >= 0 && e_ms > s_ms && text_buf[0]) {
+            double pts = s_ms / 1000.0;
+            double dur = (e_ms - s_ms) / 1000.0;
+            inject_subtitle(wl, text_buf, pts, dur);
+        }
+    }
+}
+
 static void sink_process(struct mp_filter *f)
 {
     struct sink_priv *p = f->priv;
@@ -155,7 +287,14 @@ static void sink_process(struct mp_filter *f)
 
         wl->frames_received++;
 
-        // Log first frame and periodic progress
+        // Track lookahead progress for throttling
+        {
+            struct mp_aframe *af = frame.data;
+            double pts = mp_aframe_get_pts(af);
+            if (pts != MP_NOPTS_VALUE)
+                wl->lookahead_pts = pts;
+        }
+
         if (wl->frames_received == 1) {
             struct mp_aframe *af = frame.data;
             MP_INFO(wl, "sink: first audio frame received, pts=%.3f, rate=%d\n",
@@ -169,7 +308,6 @@ static void sink_process(struct mp_filter *f)
         struct mp_aframe *af = frame.data;
         AVFrame *avf = mp_aframe_get_raw_avframe(af);
         if (avf && avf->metadata) {
-            // Log all metadata keys on first frame that has any
             if (wl->frames_with_meta == 0) {
                 MP_INFO(wl, "sink: first frame with metadata, keys:\n");
                 const AVDictionaryEntry *t = NULL;
@@ -179,92 +317,15 @@ static void sink_process(struct mp_filter *f)
             wl->frames_with_meta++;
 
             const AVDictionaryEntry *e =
-                av_dict_get(avf->metadata, "lavfi.whisper.text", NULL, 0);
-            const char *text = e ? e->value : NULL;
-            if (text && text[0]) {
+                av_dict_get(avf->metadata, "lavfi.whisper.segments", NULL, 0);
+            const char *segments_json = e ? e->value : NULL;
+            if (segments_json && segments_json[0]) {
                 bool changed = !wl->last_text ||
-                               strcmp(wl->last_text, text) != 0;
+                               strcmp(wl->last_text, segments_json) != 0;
                 if (changed) {
                     talloc_free(wl->last_text);
-                    wl->last_text = talloc_strdup(wl, text);
-
-                    if (wl->primary_stream && wl->primary_demuxer) {
-                        // Use start_ms from whisper metadata for accurate PTS
-                        const AVDictionaryEntry *e_start =
-                            av_dict_get(avf->metadata, "lavfi.whisper.start_ms", NULL, 0);
-                        const AVDictionaryEntry *e_dur =
-                            av_dict_get(avf->metadata, "lavfi.whisper.duration", NULL, 0);
-
-                        double pts;
-                        if (e_start) {
-                            pts = strtoll(e_start->value, NULL, 10) / 1000.0;
-                        } else {
-                            pts = mp_aframe_get_pts(af);
-                        }
-
-                        double dur = e_dur ? atof(e_dur->value) : 5.0;
-
-                        // Build subtitle text: if translator is active,
-                        // create bilingual ASS event (translated on top,
-                        // original smaller below); otherwise just the
-                        // original text as a plain ASS dialogue line.
-                        char *sub_text = NULL;
-                        if (wl->translator) {
-                            char *translated = whisper_translate(
-                                wl->translator, wl, text);
-                            if (translated) {
-                                // ASS dialogue text:
-                                // Top: translated (white, large, black outline)
-                                // Bottom: original (light yellow, smaller, black outline)
-                                // \c&H00FFFFFF& = white, \c&H00E0FFFF& = light yellow (BGR)
-                                // \3c&H00000000& = black outline
-                                sub_text = talloc_asprintf(wl,
-                                    "{\\fs72\\c&H00FFFFFF&\\3c&H00000000&\\bord3}%s"
-                                    "\\N{\\fs48\\c&H00E0FFFF&\\3c&H00000000&\\bord2}%s",
-                                    translated, text);
-                                wl->translations_injected++;
-                                MP_INFO(wl, "translated #%d: %.40s%s\n",
-                                        wl->translations_injected,
-                                        translated,
-                                        strlen(translated) > 40 ? "..." : "");
-                                talloc_free(translated);
-                            }
-                        }
-
-                        // Fallback: no translator or translation failed
-                        if (!sub_text)
-                            sub_text = talloc_strdup(wl, text);
-
-                        // Build ASS chunk for ass_process_chunk():
-                        // Format: ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text
-                        // (no Start/End — PTS and duration come from demux_packet)
-                        char *ass_line = talloc_asprintf(wl,
-                            "%d,0,Default,,0,0,0,,%s",
-                            wl->subtitles_injected, sub_text);
-                        talloc_free(sub_text);
-
-                        size_t ass_len = strlen(ass_line);
-                        struct demux_packet *dp = new_demux_packet_from(
-                            wl->primary_demuxer->packet_pool,
-                            (void *)ass_line, ass_len);
-                        if (dp) {
-                            dp->pts = pts;
-                            dp->duration = dur;
-                            dp->sub_duration = dur;
-
-                            demuxer_feed_af_sub(wl->primary_stream, dp);
-                            wl->subtitles_injected++;
-                            MP_INFO(wl, "subtitle #%d @ %.3f (dur=%.1f): %.40s%s\n",
-                                    wl->subtitles_injected, pts, dur, text,
-                                    strlen(text) > 40 ? "..." : "");
-
-                            // Wake up the main playloop so it can pick up
-                            // the new subtitle track (on first injection)
-                            // and display the subtitle.
-                            mp_wakeup_core(wl->mpctx);
-                        }
-                        talloc_free(ass_line);
-                    }
+                    wl->last_text = talloc_strdup(wl, segments_json);
+                    process_whisper_segments(wl, segments_json);
                 }
             }
         }
@@ -312,6 +373,18 @@ static MP_THREAD_VOID lookahead_thread(void *ptr)
             mp_filter_reset(wl->root_filter);
             talloc_free(wl->last_text);
             wl->last_text = NULL;
+            wl->lookahead_pts = MP_NOPTS_VALUE;
+        }
+
+        // Throttle: if lookahead is too far ahead of playback, pause to
+        // avoid unnecessary network traffic and server load.
+        double la_pts = wl->lookahead_pts;
+        double play_pts = wl->mpctx->playback_pts;
+        if (la_pts != MP_NOPTS_VALUE && play_pts != MP_NOPTS_VALUE &&
+            la_pts - play_pts > 60.0)
+        {
+            mp_dispatch_queue_process(wl->dispatch, 0.5);
+            continue;
         }
 
         bool progress = mp_filter_graph_run(wl->root_filter);
@@ -477,10 +550,6 @@ static MP_THREAD_VOID init_thread_fn(void *ptr)
             p = comma ? comma + 1 : NULL;
         }
     }
-    // Force synchronous mode: lookahead runs on its own thread at full speed,
-    // so we want whisper's filter_frame to block until inference completes.
-    MP_TARRAY_APPEND(wl, filter_opts, num_opts, talloc_strdup(wl, "sync"));
-    MP_TARRAY_APPEND(wl, filter_opts, num_opts, talloc_strdup(wl, "1"));
     MP_TARRAY_APPEND(wl, filter_opts, num_opts, NULL);
 
     MP_INFO(wl, "init: creating whisper filter with %d option pairs:\n",

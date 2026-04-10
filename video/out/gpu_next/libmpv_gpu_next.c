@@ -300,6 +300,14 @@ static bool get_d3d11_plane_views(int hw_subfmt,
         *num_planes = 1;
         views[0] = (struct d3d11_plane_view){ DXGI_FORMAT_B8G8R8A8_UNORM, 1, 1 };
         return true;
+    case IMGFMT_X2BGR10:
+        *num_planes = 1;
+        views[0] = (struct d3d11_plane_view){ DXGI_FORMAT_R10G10B10A2_UNORM, 1, 1 };
+        return true;
+    case IMGFMT_RGBAF16:
+        *num_planes = 1;
+        views[0] = (struct d3d11_plane_view){ DXGI_FORMAT_R16G16B16A16_FLOAT, 1, 1 };
+        return true;
     default:
         return false;
     }

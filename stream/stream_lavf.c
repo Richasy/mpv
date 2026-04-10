@@ -42,6 +42,7 @@ struct stream_lavf_params {
     bool cookies_enabled;
     char *cookies_file;
     char *useragent;
+    char *default_useragent;
     char *referrer;
     char **http_header_fields;
     bool tls_verify;
@@ -57,6 +58,7 @@ const struct m_sub_options stream_lavf_conf = {
         {"stream-lavf-o", OPT_KEYVALUELIST(avopts)},
         {"http-header-fields", OPT_STRINGLIST(http_header_fields)},
         {"user-agent", OPT_STRING(useragent)},
+        {"default-user-agent", OPT_STRING(default_useragent)},
         {"referrer", OPT_STRING(referrer)},
         {"cookies", OPT_BOOL(cookies_enabled)},
         {"cookies-file", OPT_STRING(cookies_file), .flags = M_OPT_FILE},
@@ -70,7 +72,7 @@ const struct m_sub_options stream_lavf_conf = {
     },
     .size = sizeof(struct stream_lavf_params),
     .defaults = &(const struct stream_lavf_params){
-        .useragent = "libmpv",
+        .default_useragent = "libmpv",
         .timeout = 60,
     },
 };
@@ -188,8 +190,11 @@ void mp_setup_av_network_options(AVDictionary **dict, const char *target_fmt,
         mp_get_config_group(temp, global, &stream_lavf_conf);
 
     // HTTP specific options (other protocols ignore them)
-    if (opts->useragent)
-        av_dict_set(dict, "user_agent", opts->useragent, 0);
+    const char *ua = opts->useragent;
+    if (!ua || !ua[0])
+        ua = opts->default_useragent;
+    if (ua)
+        av_dict_set(dict, "user_agent", ua, 0);
     if (opts->cookies_enabled) {
         char *file = opts->cookies_file;
         if (file && file[0])

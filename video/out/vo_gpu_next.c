@@ -1334,6 +1334,56 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             target.color.transfer = PL_COLOR_TRC_SRGB;
 #endif
     }
+    // ── HDR debug: dump final target color space (once) ──
+    {
+        static int hdr_dbg_count = 0;
+        if (hdr_dbg_count < 3) {
+            hdr_dbg_count++;
+            struct pl_color_space *c = &target.color;
+            MP_INFO(vo, "[vo_gpu_next] target.color: trc=%d prim=%d "
+                    "max_luma=%.1f min_luma=%.6f max_cll=%.1f max_fall=%.1f "
+                    "prim_valid=%d red=(%.4f,%.4f) green=(%.4f,%.4f) "
+                    "blue=(%.4f,%.4f) white=(%.4f,%.4f)\n",
+                    c->transfer, c->primaries,
+                    c->hdr.max_luma, c->hdr.min_luma,
+                    c->hdr.max_cll, c->hdr.max_fall,
+                    pl_primaries_valid(&c->hdr.prim),
+                    c->hdr.prim.red.x, c->hdr.prim.red.y,
+                    c->hdr.prim.green.x, c->hdr.prim.green.y,
+                    c->hdr.prim.blue.x, c->hdr.prim.blue.y,
+                    c->hdr.prim.white.x, c->hdr.prim.white.y);
+            MP_INFO(vo, "[vo_gpu_next] target_csp: trc=%d prim=%d "
+                    "max_luma=%.1f min_luma=%.6f | "
+                    "hint: trc=%d prim=%d max_luma=%.1f min_luma=%.6f | "
+                    "external_params=%d target_hint=%d\n",
+                    target_csp.transfer, target_csp.primaries,
+                    target_csp.hdr.max_luma, target_csp.hdr.min_luma,
+                    hint.transfer, hint.primaries,
+                    hint.hdr.max_luma, hint.hdr.min_luma,
+                    external_params, target_hint);
+            if (frame->current) {
+                struct pl_color_space *s = &frame->current->params.color;
+                MP_INFO(vo, "[vo_gpu_next] source.color: trc=%d prim=%d "
+                        "max_luma=%.1f min_luma=%.6f max_cll=%.1f\n",
+                        s->transfer, s->primaries,
+                        s->hdr.max_luma, s->hdr.min_luma,
+                        s->hdr.max_cll);
+            }
+            MP_INFO(vo, "[vo_gpu_next] opts: target_prim=%d target_trc=%d "
+                    "target_peak=%d hdr_ref_white=%d target_contrast=%d "
+                    "sdr_adj_gamma=%d treat_srgb=%d dither_depth=%d\n",
+                    opts->target_prim, opts->target_trc,
+                    opts->target_peak, opts->hdr_reference_white,
+                    opts->target_contrast, opts->sdr_adjust_gamma,
+                    opts->treat_srgb_as_power22, opts->dither_depth);
+            MP_INFO(vo, "[vo_gpu_next] repr: sys=%d levels=%d "
+                    "bits.sample=%d bits.color=%d bits.sig=%d\n",
+                    target.repr.sys, target.repr.levels,
+                    target.repr.bits.sample_depth,
+                    target.repr.bits.color_depth,
+                    target.repr.bits.bit_shift);
+        }
+    }
     stats_time_start(p->stats, "osd-update");
     update_overlays(vo, p->osd_res,
                     (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,

@@ -30,6 +30,11 @@
 #include <d3d11.h>
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
+#include <dxgi1_6.h>
+
+#if PL_API_VER < 362
+#define PL_COLOR_TRC_SCRGB PL_COLOR_TRC_LINEAR
+#endif
 
 // ── NVIDIA NGX VSR via runtime loading ──
 //
@@ -366,6 +371,10 @@ struct priv {
     pl_d3d11 d3d11;
     pl_tex wrapped_tex;
 
+    // Cached monitor HDR metadata from DXGI output
+    DXGI_OUTPUT_DESC1 output_desc;
+    bool has_output_desc;
+
     // D3D11VA hwdec device context for zero-copy hardware decoding
     struct mp_hwdec_ctx hwctx;
 
@@ -502,8 +511,8 @@ static struct pl_color_space dxgi_csp_to_pl(int dxgi_csp)
     switch (dxgi_csp) {
     case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
         return (struct pl_color_space) {
-            .transfer  = PL_COLOR_TRC_LINEAR,
-            .primaries = PL_COLOR_PRIM_UNKNOWN,
+            .transfer  = PL_COLOR_TRC_SCRGB,
+            .primaries = PL_COLOR_PRIM_BT_709,
         };
     case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
         return (struct pl_color_space) {
@@ -2709,6 +2718,45 @@ static int init(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
 
     fsr_init(ctx, (ID3D11Device *)d3d_params->device);
 
+    // Query primary monitor HDR metadata via DXGI for tone mapping
+    {
+        IDXGIDevice *dxgi_dev = NULL;
+        HRESULT hr = ID3D11Device_QueryInterface(
+            (ID3D11Device *)d3d_params->device,
+            &IID_IDXGIDevice, (void **)&dxgi_dev);
+        if (SUCCEEDED(hr)) {
+            IDXGIAdapter *adapter = NULL;
+            hr = IDXGIDevice_GetAdapter(dxgi_dev, &adapter);
+            if (SUCCEEDED(hr)) {
+                IDXGIOutput *output = NULL;
+                if (SUCCEEDED(IDXGIAdapter_EnumOutputs(adapter, 0, &output))) {
+                    IDXGIOutput6 *output6 = NULL;
+                    if (SUCCEEDED(IDXGIOutput_QueryInterface(
+                            output, &IID_IDXGIOutput6, (void **)&output6)))
+                    {
+                        if (SUCCEEDED(IDXGIOutput6_GetDesc1(output6,
+                                                            &p->output_desc)))
+                        {
+                            p->has_output_desc = true;
+                            MP_VERBOSE(ctx, "Monitor HDR: MaxLum=%.0f, "
+                                       "MinLum=%.4f, MaxFALL=%.0f, BPC=%d, "
+                                       "CSP=%d\n",
+                                       (double)p->output_desc.MaxLuminance,
+                                       p->output_desc.MinLuminance,
+                                       (double)p->output_desc.MaxFullFrameLuminance,
+                                       p->output_desc.BitsPerColor,
+                                       p->output_desc.ColorSpace);
+                        }
+                        IDXGIOutput6_Release(output6);
+                    }
+                    IDXGIOutput_Release(output);
+                }
+                IDXGIAdapter_Release(adapter);
+            }
+            IDXGIDevice_Release(dxgi_dev);
+        }
+    }
+
     return 0;
 }
 
@@ -2741,7 +2789,41 @@ static int wrap_fbo(struct libmpv_gpu_next_context *ctx, mpv_render_param *param
     *out = p->wrapped_tex;
     *w = fbo->w;
     *h = fbo->h;
-    *out_csp = dxgi_csp_to_pl(fbo->color_space);
+
+    struct pl_color_space csp = dxgi_csp_to_pl(fbo->color_space);
+
+    {
+        static int wrap_dbg = 0;
+        static int last_csp = -1;
+        if (wrap_dbg < 3 || fbo->color_space != last_csp) {
+            wrap_dbg++;
+            last_csp = fbo->color_space;
+            MP_INFO(ctx, "[wrap_fbo] fbo->color_space=%d, has_output_desc=%d, "
+                    "csp.trc=%d csp.prim=%d "
+                    "max_luma=%.1f min_luma=%.4f\n",
+                    fbo->color_space, p->has_output_desc,
+                    csp.transfer, csp.primaries,
+                    csp.hdr.max_luma, csp.hdr.min_luma);
+        }
+    }
+
+    if (p->has_output_desc &&
+        (fbo->color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 ||
+         fbo->color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020))
+    {
+        csp.hdr.max_luma = p->output_desc.MaxLuminance;
+        csp.hdr.min_luma = p->output_desc.MinLuminance;
+        csp.hdr.prim.red.x   = p->output_desc.RedPrimary[0];
+        csp.hdr.prim.red.y   = p->output_desc.RedPrimary[1];
+        csp.hdr.prim.green.x = p->output_desc.GreenPrimary[0];
+        csp.hdr.prim.green.y = p->output_desc.GreenPrimary[1];
+        csp.hdr.prim.blue.x  = p->output_desc.BluePrimary[0];
+        csp.hdr.prim.blue.y  = p->output_desc.BluePrimary[1];
+        csp.hdr.prim.white.x = p->output_desc.WhitePoint[0];
+        csp.hdr.prim.white.y = p->output_desc.WhitePoint[1];
+    }
+    *out_csp = csp;
+
     return 0;
 }
 

@@ -20,7 +20,13 @@
 #include <libplacebo/utils/frame_queue.h>
 #include <libplacebo/utils/libav.h>
 
+// PL_COLOR_TRC_SCRGB was added in libplacebo API 362
+#if PL_API_VER < 362
+#define PL_COLOR_TRC_SCRGB PL_COLOR_TRC_LINEAR
+#endif
+
 #include "common/common.h"
+#include "common/msg.h"
 #include "options/m_config.h"
 #include "options/options.h"
 #include "video/fmt-conversion.h"
@@ -29,6 +35,7 @@
 #include "video/out/libmpv.h"
 #include "video/out/gpu/hwdec.h"
 #include "video/out/gpu/video.h"
+#include "video/out/gpu/video_shaders.h"
 #include "video/out/placebo/utils.h"
 #include "options/path.h"
 #include "stream/stream.h"
@@ -103,6 +110,7 @@ struct priv {
     uint64_t last_id;
     double last_pts;
     bool want_reset;
+    bool render_opts_inited;
 
     pl_options pars;
     struct m_config_cache *opts_cache;
@@ -611,10 +619,23 @@ static void update_overlays(struct render_backend *ctx,
         case SUBBITMAP_BGRA:
             ol->mode = PL_OVERLAY_NORMAL;
             ol->repr.alpha = PL_ALPHA_PREMULTIPLIED;
+            // Infer bitmap colorspace from the current frame in queue
+            if (pl_color_transfer_is_hdr(frame->color.transfer)) {
+                if (p->next_opts->image_subs_hdr_peak != -1) {
+                    ol->color.hdr = (struct pl_hdr_metadata) {
+                        .max_luma = p->next_opts->image_subs_hdr_peak,
+                    };
+                }
+            }
             break;
         case SUBBITMAP_LIBASS:
             ol->mode = PL_OVERLAY_MONOCHROME;
             ol->repr.alpha = PL_ALPHA_INDEPENDENT;
+            if (pl_color_transfer_is_hdr(frame->color.transfer)) {
+                ol->color.hdr = (struct pl_hdr_metadata) {
+                    .max_luma = p->next_opts->sub_hdr_peak,
+                };
+            }
             break;
         }
     }
@@ -834,6 +855,115 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
         update_user_shaders(p);
     const struct gl_video_opts *opts = p->opts_cache->opts;
 
+    // Apply mpv's render options to pl_options — mirrors
+    // update_render_options() in vo_gpu_next.c so that tone mapping,
+    // gamut mapping, peak detection, deband, sigmoid, dithering and
+    // scaler selections match the window-mode path.
+    if (changed || !p->render_opts_inited) {
+        p->render_opts_inited = true;
+        pl_options pars = p->pars;
+
+        pars->params.skip_anti_aliasing = !opts->correct_downscaling;
+        pars->params.disable_linear_scaling = !opts->linear_downscaling && !opts->linear_upscaling;
+
+        // Deband
+        pars->params.deband_params = opts->deband ? &pars->deband_params : NULL;
+        pars->deband_params.iterations = opts->deband_opts->iterations;
+        pars->deband_params.radius = opts->deband_opts->range;
+        pars->deband_params.threshold = opts->deband_opts->threshold / 16.384;
+        pars->deband_params.grain = opts->deband_opts->grain / 8.192;
+
+        // Sigmoid
+        pars->params.sigmoid_params = opts->sigmoid_upscaling ? &pars->sigmoid_params : NULL;
+        pars->sigmoid_params.center = opts->sigmoid_center;
+        pars->sigmoid_params.slope = opts->sigmoid_slope;
+
+        // Peak detection
+        pars->params.peak_detect_params = opts->tone_map.compute_peak >= 0 ? &pars->peak_detect_params : NULL;
+        pars->peak_detect_params.smoothing_period = opts->tone_map.decay_rate;
+        pars->peak_detect_params.scene_threshold_low = opts->tone_map.scene_threshold_low;
+        pars->peak_detect_params.scene_threshold_high = opts->tone_map.scene_threshold_high;
+        pars->peak_detect_params.percentile = opts->tone_map.peak_percentile;
+        pars->peak_detect_params.allow_delayed = p->next_opts->delayed_peak;
+
+        // Tone mapping
+        static const struct pl_tone_map_function * const tone_map_funs[] = {
+            [TONE_MAPPING_AUTO]     = &pl_tone_map_auto,
+            [TONE_MAPPING_CLIP]     = &pl_tone_map_clip,
+            [TONE_MAPPING_MOBIUS]   = &pl_tone_map_mobius,
+            [TONE_MAPPING_REINHARD] = &pl_tone_map_reinhard,
+            [TONE_MAPPING_HABLE]    = &pl_tone_map_hable,
+            [TONE_MAPPING_GAMMA]    = &pl_tone_map_gamma,
+            [TONE_MAPPING_LINEAR]   = &pl_tone_map_linear,
+            [TONE_MAPPING_SPLINE]   = &pl_tone_map_spline,
+            [TONE_MAPPING_BT_2390]  = &pl_tone_map_bt2390,
+            [TONE_MAPPING_BT_2446A] = &pl_tone_map_bt2446a,
+            [TONE_MAPPING_ST2094_40] = &pl_tone_map_st2094_40,
+            [TONE_MAPPING_ST2094_10] = &pl_tone_map_st2094_10,
+        };
+
+        static const struct pl_gamut_map_function * const gamut_modes[] = {
+            [GAMUT_AUTO]            = NULL, // resolved below
+            [GAMUT_CLIP]            = &pl_gamut_map_clip,
+            [GAMUT_PERCEPTUAL]      = &pl_gamut_map_perceptual,
+            [GAMUT_RELATIVE]        = &pl_gamut_map_relative,
+            [GAMUT_SATURATION]      = &pl_gamut_map_saturation,
+            [GAMUT_ABSOLUTE]        = &pl_gamut_map_absolute,
+            [GAMUT_DESATURATE]      = &pl_gamut_map_desaturate,
+            [GAMUT_DARKEN]          = &pl_gamut_map_darken,
+            [GAMUT_WARN]            = &pl_gamut_map_highlight,
+            [GAMUT_LINEAR]          = &pl_gamut_map_linear,
+        };
+
+        pars->color_map_params.tone_mapping_function = tone_map_funs[opts->tone_map.curve];
+AV_NOWARN_DEPRECATED(
+        pars->color_map_params.tone_mapping_param = opts->tone_map.curve_param;
+        if (isnan(pars->color_map_params.tone_mapping_param))
+            pars->color_map_params.tone_mapping_param = 0.0;
+)
+        pars->color_map_params.inverse_tone_mapping = opts->tone_map.inverse;
+        pars->color_map_params.contrast_recovery = opts->tone_map.contrast_recovery;
+        pars->color_map_params.contrast_smoothness = opts->tone_map.contrast_smoothness;
+
+        const struct pl_gamut_map_function *gm = gamut_modes[opts->tone_map.gamut_mode];
+        pars->color_map_params.gamut_mapping = gm ? gm : pl_color_map_default_params.gamut_mapping;
+
+        // Dithering
+        pars->params.dither_params = NULL;
+        pars->params.error_diffusion = NULL;
+        switch (opts->dither_algo) {
+        case DITHER_ERROR_DIFFUSION:
+            pars->params.error_diffusion = pl_find_error_diffusion_kernel(opts->error_diffusion);
+            MP_FALLTHROUGH;
+        case DITHER_ORDERED:
+        case DITHER_FRUIT:
+            pars->params.dither_params = &pars->dither_params;
+            pars->dither_params.method = opts->dither_algo == DITHER_ORDERED
+                                    ? PL_DITHER_ORDERED_FIXED
+                                    : PL_DITHER_BLUE_NOISE;
+            pars->dither_params.lut_size = opts->dither_size;
+            pars->dither_params.temporal = opts->temporal_dither;
+            break;
+        }
+        if (opts->dither_depth < 0) {
+            pars->params.dither_params = NULL;
+            pars->params.error_diffusion = NULL;
+        }
+
+        MP_INFO(ctx, "[libmpv] render opts applied: tone_map=%s gamut=%s "
+                "deband=%d sigmoid=%d peak_detect=%d dither=%d "
+                "correct_ds=%d linear_ds=%d linear_us=%d\n",
+                pars->color_map_params.tone_mapping_function
+                    ? pars->color_map_params.tone_mapping_function->name : "null",
+                pars->color_map_params.gamut_mapping
+                    ? pars->color_map_params.gamut_mapping->name : "null",
+                opts->deband, opts->sigmoid_upscaling,
+                opts->tone_map.compute_peak >= 0,
+                opts->dither_algo,
+                opts->correct_downscaling,
+                opts->linear_downscaling, opts->linear_upscaling);
+    }
+
     // Build render params
     pl_options pars = p->pars;
     struct pl_render_params rparams = pars->params;
@@ -907,9 +1037,17 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
         p->last_id = id;
     }
 
-    // Build target frame
+    // Build target frame — derive bit depth from texture format
+    int depth = fbo->params.format->component_depth[0];
     struct pl_frame target = {
-        .repr = pl_color_repr_rgb,
+        .repr = {
+            .sys = PL_COLOR_SYSTEM_RGB,
+            .levels = PL_COLOR_LEVELS_FULL,
+            .bits = {
+                .sample_depth = depth,
+                .color_depth = depth,
+            },
+        },
         .num_planes = 1,
         .planes[0] = {
             .texture = fbo,
@@ -919,13 +1057,102 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
         .color = fbo_csp,
     };
 
-    // Apply target colorspace overrides from options
+    // Apply target colorspace overrides — mirrors vo_gpu_next.c draw_frame()
+    // logic so that libmpv rendering matches the window-based path.
+
+    // Post-process target_csp the same way vo_gpu_next does (lines 1138-1147)
+    if (!pl_color_transfer_is_hdr(fbo_csp.transfer)) {
+        if (fbo_csp.hdr.min_luma > PL_COLOR_SDR_WHITE / PL_COLOR_SDR_CONTRAST)
+            fbo_csp.hdr.min_luma = 0;
+    }
+    fbo_csp.hdr.max_fall = 0;
+    target.color = fbo_csp;
+
+    // Colorspace overrides (mirrors apply_target_options, lines 928-978)
     if (opts->target_prim)
         target.color.primaries = opts->target_prim;
     if (opts->target_trc)
         target.color.transfer = opts->target_trc;
     if (opts->target_peak)
         target.color.hdr.max_luma = opts->target_peak;
+    if (opts->hdr_reference_white &&
+        !pl_color_transfer_is_hdr(target.color.transfer))
+    {
+        target.color.hdr.max_luma = opts->hdr_reference_white;
+    }
+
+    // Apply target contrast (mirrors apply_target_contrast, lines 899-926)
+    if (!opts->target_contrast) {
+        // auto: keep display-reported min_luma
+    } else if (opts->target_contrast == -1) {
+        // infinite contrast (OLED)
+        target.color.hdr.min_luma = 1e-7;
+    } else {
+        pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+            .color = &target.color,
+            .metadata = PL_HDR_METADATA_HDR10,
+            .scaling = PL_HDR_NITS,
+            .out_max = &target.color.hdr.max_luma,
+        ));
+        target.color.hdr.min_luma =
+            target.color.hdr.max_luma / opts->target_contrast;
+    }
+
+    // Parse raw target gamut primaries if specified
+    if (opts->target_gamut)
+        mp_parse_raw_primaries(mp_null_log, opts->target_gamut,
+                               &target.color.hdr.prim);
+
+    // ── HDR debug: dump final target color space (once) ──
+    {
+        static int hdr_dbg_count = 0;
+        static int last_trc = -1;
+        static bool source_logged = false;
+        if (hdr_dbg_count < 3 || target.color.transfer != last_trc
+            || (!source_logged && frame->current)) {
+            hdr_dbg_count++;
+            last_trc = target.color.transfer;
+            struct pl_color_space *c = &target.color;
+            MP_INFO(ctx, "[libmpv] target.color: trc=%d prim=%d "
+                    "max_luma=%.1f min_luma=%.6f max_cll=%.1f max_fall=%.1f "
+                    "prim_valid=%d red=(%.4f,%.4f) green=(%.4f,%.4f) "
+                    "blue=(%.4f,%.4f) white=(%.4f,%.4f)\n",
+                    c->transfer, c->primaries,
+                    c->hdr.max_luma, c->hdr.min_luma,
+                    c->hdr.max_cll, c->hdr.max_fall,
+                    pl_primaries_valid(&c->hdr.prim),
+                    c->hdr.prim.red.x, c->hdr.prim.red.y,
+                    c->hdr.prim.green.x, c->hdr.prim.green.y,
+                    c->hdr.prim.blue.x, c->hdr.prim.blue.y,
+                    c->hdr.prim.white.x, c->hdr.prim.white.y);
+            MP_INFO(ctx, "[libmpv] fbo_csp: trc=%d prim=%d "
+                    "max_luma=%.1f min_luma=%.6f\n",
+                    fbo_csp.transfer, fbo_csp.primaries,
+                    fbo_csp.hdr.max_luma, fbo_csp.hdr.min_luma);
+            if (frame->current) {
+                struct pl_color_space *s = &frame->current->params.color;
+                MP_INFO(ctx, "[libmpv] source.color: trc=%d prim=%d "
+                        "max_luma=%.1f min_luma=%.6f max_cll=%.1f\n",
+                        s->transfer, s->primaries,
+                        s->hdr.max_luma, s->hdr.min_luma,
+                        s->hdr.max_cll);
+                source_logged = true;
+            }
+            MP_INFO(ctx, "[libmpv] opts: target_prim=%d target_trc=%d "
+                    "target_peak=%d hdr_ref_white=%d target_contrast=%d "
+                    "sdr_adj_gamma=%d treat_srgb=%d dither_depth=%d\n",
+                    opts->target_prim, opts->target_trc,
+                    opts->target_peak, opts->hdr_reference_white,
+                    opts->target_contrast, opts->sdr_adjust_gamma,
+                    opts->treat_srgb_as_power22, opts->dither_depth);
+            MP_INFO(ctx, "[libmpv] repr: sys=%d levels=%d "
+                    "bits.sample=%d bits.color=%d bits.sig=%d\n",
+                    target.repr.sys, target.repr.levels,
+                    target.repr.bits.sample_depth,
+                    target.repr.bits.color_depth,
+                    target.repr.bits.bit_shift);
+        }
+    }
 
     // Render OSD/subtitle overlays onto target frame
     if (p->osd) {
@@ -1874,6 +2101,9 @@ static void screenshot(struct render_backend *ctx, struct vo_frame *frame,
     }
 
     // Get the current frame from queue
+    // Flush renderer cache to avoid stale peak detection / tone mapping
+    // state from the normal render path affecting screenshot output.
+    pl_renderer_flush_cache(p->rr);
     struct pl_frame_mix mix;
     struct pl_queue_params qparams = *pl_queue_params(
         .pts = p->last_pts,

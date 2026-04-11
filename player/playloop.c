@@ -996,7 +996,16 @@ static void handle_keep_open(struct MPContext *mpctx)
         mpctx->stop_play = KEEP_PLAYING;
         if (mpctx->vo_chain) {
             if (!vo_has_frame(mpctx->video_out)) { // EOF not reached normally
+                double saved_pts = mpctx->last_seek_pts;
                 seek_to_last_frame(mpctx);
+                // If seek_to_last_frame failed to produce a frame (e.g. HTTP
+                // seek error), restore last_seek_pts so that time-pos does not
+                // jump to the end of the file.
+                if (mpctx->playback_pts == MP_NOPTS_VALUE &&
+                    !vo_has_frame(mpctx->video_out))
+                {
+                    mpctx->last_seek_pts = saved_pts;
+                }
                 mpctx->audio_status = STATUS_EOF;
                 mpctx->video_status = STATUS_EOF;
             }

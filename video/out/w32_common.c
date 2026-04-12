@@ -2068,6 +2068,17 @@ static MP_THREAD_VOID gui_thread(void *ptr)
         w32->embed_desktop = true;
     } else if (w32->opts->WinID > 0) {
         w32->parent = (HWND)(intptr_t)(w32->opts->WinID);
+
+        // Paint the parent window black immediately to avoid white flash
+        // before the mpv child window covers it. This is especially important
+        // for WinUI AppWindow hosts whose default background is white.
+        HDC hdc = GetDC(w32->parent);
+        if (hdc) {
+            RECT rc;
+            GetClientRect(w32->parent, &rc);
+            FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+            ReleaseDC(w32->parent, hdc);
+        }
     }
 
     ATOM cls = get_window_class();

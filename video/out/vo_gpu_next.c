@@ -1522,6 +1522,21 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
                          frame->display_synced &&
                          frame->current && mix.num_frames > 0;
 
+        // Debug: log RIFE gate conditions once per second
+        {
+            static double last_log = 0;
+            double now = mp_time_sec();
+            if (now - last_log > 1.0) {
+                last_log = now;
+                MP_INFO(vo, "RIFE debug: mode=%d avail=%d model_ok=%d "
+                        "display_synced=%d current=%d num_frames=%d => use=%d\n",
+                        rife_mode, (int)rife_avail, (int)rife_model_ok,
+                        (int)frame->display_synced,
+                        (int)(frame->current != NULL),
+                        (int)mix.num_frames, (int)use_rife);
+            }
+        }
+
         if (use_rife) {
             struct pl_frame *first_frame = (struct pl_frame *) mix.frames[0];
             struct mp_image *src_mpi = first_frame->user_data;

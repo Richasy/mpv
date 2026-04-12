@@ -1356,13 +1356,28 @@ fruc_done:
     // RIFE deep learning frame interpolation (display-sync mode)
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_RIFE
     int rife_mode = p->next_opts->rife;
-    bool use_rife = rife_mode > 0 &&
-                     p->context->fns->rife_available &&
-                     p->context->fns->rife_available(p->context) &&
-                     p->next_opts->rife_model &&
-                     p->next_opts->rife_model[0] &&
+    bool rife_avail = p->context->fns->rife_available &&
+                      p->context->fns->rife_available(p->context);
+    bool rife_model_ok = p->next_opts->rife_model &&
+                         p->next_opts->rife_model[0];
+    bool use_rife = rife_mode > 0 && rife_avail && rife_model_ok &&
                      frame->display_synced &&
                      frame->current && mix.num_frames > 0;
+
+    // Debug: log RIFE gate conditions once per second
+    {
+        static double last_log = 0;
+        double now = mp_time_sec();
+        if (now - last_log > 1.0) {
+            last_log = now;
+            MP_INFO(ctx, "RIFE debug: mode=%d avail=%d model_ok=%d "
+                    "display_synced=%d current=%d num_frames=%d => use=%d\n",
+                    rife_mode, (int)rife_avail, (int)rife_model_ok,
+                    (int)frame->display_synced,
+                    (int)(frame->current != NULL),
+                    (int)mix.num_frames, (int)use_rife);
+        }
+    }
 
     if (use_rife) {
         struct pl_frame *first_frame = (struct pl_frame *) mix.frames[0];

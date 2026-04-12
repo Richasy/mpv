@@ -1378,6 +1378,23 @@ fruc_done:
                     (int)mix.num_frames, (int)use_rife);
         }
     }
+#else
+    // Debug: RIFE not compiled in
+    {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            MP_INFO(ctx, "RIFE debug: NOT compiled in (HAVE_D3D11=%d PL_HAVE_D3D11=%d HAVE_RIFE=%d)\n",
+                    HAVE_D3D11,
+#ifdef PL_HAVE_D3D11
+                    1,
+#else
+                    0,
+#endif
+                    HAVE_RIFE);
+        }
+    }
+#endif
 
     if (use_rife) {
         struct pl_frame *first_frame = (struct pl_frame *) mix.frames[0];

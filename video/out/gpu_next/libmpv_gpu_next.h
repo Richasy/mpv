@@ -210,3 +210,12 @@ struct libmpv_gpu_next_context_fns {
 };
 
 extern const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11;
+
+// Lightweight RIFE context: create from an existing D3D11 device.
+// Only initializes RIFE inference and fsr_create_texture for texture allocation.
+// Used by vo_gpu_next.c which has its own swapchain but needs RIFE.
+#if HAVE_D3D11 && HAVE_RIFE
+struct libmpv_gpu_next_context *rife_context_create(
+    struct mp_log *log, struct ID3D11Device *device);
+void rife_context_destroy(struct libmpv_gpu_next_context **ctx);
+#endif

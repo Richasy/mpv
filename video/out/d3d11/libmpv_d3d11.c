@@ -2906,3 +2906,38 @@ const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11 = {
     .rife_upload_result = rife_upload_result_fn,
 #endif
 };
+
+// ── Lightweight RIFE context for vo_gpu_next ──
+
+#if HAVE_RIFE
+struct libmpv_gpu_next_context *rife_context_create(
+    struct mp_log *log, ID3D11Device *device)
+{
+    struct libmpv_gpu_next_context *ctx =
+        talloc_zero(NULL, struct libmpv_gpu_next_context);
+    ctx->log = log;
+    ctx->fns = &libmpv_gpu_next_context_d3d11;
+
+    struct priv *p = talloc_zero(ctx, struct priv);
+    ctx->priv = p;
+
+    // Initialize texture creation (fsr_create_texture) and RIFE inference
+    fsr_init(ctx, device);
+    rife_init(ctx, device);
+
+    return ctx;
+}
+
+void rife_context_destroy(struct libmpv_gpu_next_context **pctx)
+{
+    if (!pctx || !*pctx)
+        return;
+    struct libmpv_gpu_next_context *ctx = *pctx;
+
+    rife_cleanup(ctx);
+    fsr_cleanup(ctx);
+
+    talloc_free(ctx);
+    *pctx = NULL;
+}
+#endif

@@ -1103,57 +1103,6 @@ AV_NOWARN_DEPRECATED(
         mp_parse_raw_primaries(mp_null_log, opts->target_gamut,
                                &target.color.hdr.prim);
 
-    // ── HDR debug: dump final target color space (once) ──
-    {
-        static int hdr_dbg_count = 0;
-        static int last_trc = -1;
-        static bool source_logged = false;
-        if (hdr_dbg_count < 3 || target.color.transfer != last_trc
-            || (!source_logged && frame->current)) {
-            hdr_dbg_count++;
-            last_trc = target.color.transfer;
-            struct pl_color_space *c = &target.color;
-            MP_INFO(ctx, "[libmpv] target.color: trc=%d prim=%d "
-                    "max_luma=%.1f min_luma=%.6f max_cll=%.1f max_fall=%.1f "
-                    "prim_valid=%d red=(%.4f,%.4f) green=(%.4f,%.4f) "
-                    "blue=(%.4f,%.4f) white=(%.4f,%.4f)\n",
-                    c->transfer, c->primaries,
-                    c->hdr.max_luma, c->hdr.min_luma,
-                    c->hdr.max_cll, c->hdr.max_fall,
-                    pl_primaries_valid(&c->hdr.prim),
-                    c->hdr.prim.red.x, c->hdr.prim.red.y,
-                    c->hdr.prim.green.x, c->hdr.prim.green.y,
-                    c->hdr.prim.blue.x, c->hdr.prim.blue.y,
-                    c->hdr.prim.white.x, c->hdr.prim.white.y);
-            MP_INFO(ctx, "[libmpv] fbo_csp: trc=%d prim=%d "
-                    "max_luma=%.1f min_luma=%.6f\n",
-                    fbo_csp.transfer, fbo_csp.primaries,
-                    fbo_csp.hdr.max_luma, fbo_csp.hdr.min_luma);
-            if (frame->current) {
-                struct pl_color_space *s = &frame->current->params.color;
-                MP_INFO(ctx, "[libmpv] source.color: trc=%d prim=%d "
-                        "max_luma=%.1f min_luma=%.6f max_cll=%.1f\n",
-                        s->transfer, s->primaries,
-                        s->hdr.max_luma, s->hdr.min_luma,
-                        s->hdr.max_cll);
-                source_logged = true;
-            }
-            MP_INFO(ctx, "[libmpv] opts: target_prim=%d target_trc=%d "
-                    "target_peak=%d hdr_ref_white=%d target_contrast=%d "
-                    "sdr_adj_gamma=%d treat_srgb=%d dither_depth=%d\n",
-                    opts->target_prim, opts->target_trc,
-                    opts->target_peak, opts->hdr_reference_white,
-                    opts->target_contrast, opts->sdr_adjust_gamma,
-                    opts->treat_srgb_as_power22, opts->dither_depth);
-            MP_INFO(ctx, "[libmpv] repr: sys=%d levels=%d "
-                    "bits.sample=%d bits.color=%d bits.sig=%d\n",
-                    target.repr.sys, target.repr.levels,
-                    target.repr.bits.sample_depth,
-                    target.repr.bits.color_depth,
-                    target.repr.bits.bit_shift);
-        }
-    }
-
     // Render OSD/subtitle overlays onto target frame
     if (p->osd) {
         double pts = frame->current ? frame->current->pts : 0;
@@ -1363,21 +1312,6 @@ fruc_done:
     bool use_rife = rife_mode > 0 && rife_avail && rife_model_ok &&
                      frame->display_synced &&
                      frame->current && mix.num_frames > 0;
-
-    // Debug: log RIFE gate conditions once per second
-    {
-        static double last_log = 0;
-        double now = mp_time_sec();
-        if (now - last_log > 1.0) {
-            last_log = now;
-            MP_INFO(ctx, "RIFE debug: mode=%d avail=%d model_ok=%d "
-                    "display_synced=%d current=%d num_frames=%d => use=%d\n",
-                    rife_mode, (int)rife_avail, (int)rife_model_ok,
-                    (int)frame->display_synced,
-                    (int)(frame->current != NULL),
-                    (int)mix.num_frames, (int)use_rife);
-        }
-    }
 
     if (use_rife) {
         struct pl_frame *first_frame = (struct pl_frame *) mix.frames[0];

@@ -45,6 +45,7 @@
 #include "libmpv_gpu_next.h"
 #include "gl_next_opts.h"
 #include "osdep/timer.h"
+#include "osdep/threads.h"
 
 double g_rife_measured_fps = 0;
 
@@ -181,11 +182,12 @@ struct priv {
     double rife_measured_fps;                    // measured output FPS
 #endif
 
-    // Performance data of last frame
+    // Performance data of last frame (protected by perf_lock)
+    mp_mutex perf_lock;
     struct frame_info perf_fresh;
     struct frame_info perf_redraw;
 
-    // hwdec frame mapping perf (CPU-side timing, no ra needed)
+    // hwdec frame mapping perf (CPU-side timing, protected by perf_lock)
     struct mp_pass_perf hwdec_perf;
 
 };
@@ -367,6 +369,7 @@ static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
 
     uint64_t elapsed = mp_raw_time_ns() - start_ns;
 
+    mp_mutex_lock(&p->perf_lock);
     struct mp_pass_perf *perf = &p->hwdec_perf;
     perf->last = elapsed;
     perf->peak = MPMAX(perf->peak, elapsed);
@@ -381,6 +384,7 @@ static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
     for (int i = 0; i < n_samples; i++)
         sum += perf->samples[i];
     perf->avg = sum / n_samples;
+    mp_mutex_unlock(&p->perf_lock);
 
     return true;
 }
@@ -692,6 +696,7 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
 {
     ctx->priv = talloc_zero(NULL, struct priv);
     struct priv *p = ctx->priv;
+    mp_mutex_init(&p->perf_lock);
 
     char *api = get_mpv_render_param(params, MPV_RENDER_PARAM_API_TYPE, NULL);
     if (!api)
@@ -830,8 +835,10 @@ static void info_callback(void *priv, const struct pl_render_info *info)
     default: abort();
     }
 
+    mp_mutex_lock(&p->perf_lock);
     frame->count = info->index + 1;
     pl_dispatch_info_move(&frame->info[info->index], info->pass);
+    mp_mutex_unlock(&p->perf_lock);
 }
 
 static int render(struct render_backend *ctx, mpv_render_param *params,
@@ -2305,8 +2312,10 @@ static void perfdata(struct render_backend *ctx,
 {
     struct priv *p = ctx->priv;
     *out = (struct voctrl_performance_data){0};
+    mp_mutex_lock(&p->perf_lock);
     copy_frame_info_to_mp(&p->perf_fresh, &out->fresh, &p->hwdec_perf);
     copy_frame_info_to_mp(&p->perf_redraw, &out->redraw, NULL);
+    mp_mutex_unlock(&p->perf_lock);
 }
 
 static void destroy(struct render_backend *ctx)
@@ -2415,6 +2424,8 @@ static void destroy(struct render_backend *ctx)
         pl_shader_info_deref(&p->perf_fresh.info[i].shader);
         pl_shader_info_deref(&p->perf_redraw.info[i].shader);
     }
+
+    mp_mutex_destroy(&p->perf_lock);
 
     pl_options_free(&p->pars);
 

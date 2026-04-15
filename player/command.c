@@ -4748,7 +4748,7 @@ static const char *const *const mp_event_property_change[] = {
       "video-format", "video-codec", "video-bitrate", "dwidth", "dheight",
       "width", "height", "container-fps", "aspect", "aspect-name", "vo-configured", "current-vo",
       "video-dec-params", "osd-dimensions", "hwdec", "hwdec-current", "hwdec-interop",
-      "window-id", "track-list", "current-tracks"),
+      "window-id", "display-swapchain", "track-list", "current-tracks"),
     E(MPV_EVENT_AUDIO_RECONFIG, "audio-format", "audio-codec", "audio-bitrate",
       "samplerate", "channels", "audio", "volume", "volume-gain", "mute",
       "current-ao", "audio-codec-name", "audio-params", "track-list", "current-tracks",

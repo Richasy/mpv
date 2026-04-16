@@ -153,6 +153,7 @@ static void set_errno_from_lasterror(void)
     // This just handles the error codes expected from CreateFile at the moment
     switch (GetLastError()) {
     case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
         errno = ENOENT;
         break;
     case ERROR_SHARING_VIOLATION:
@@ -166,10 +167,57 @@ static void set_errno_from_lasterror(void)
     case ERROR_PIPE_BUSY:
         errno = EAGAIN;
         break;
+    case ERROR_FILENAME_EXCED_RANGE:
+        errno = ENAMETOOLONG;
+        break;
     default:
         errno = EINVAL;
         break;
     }
+}
+
+// Build an extended-length path (\\?\...) from a wide-char path.
+// Returns a talloc-allocated wide string, or NULL if the path cannot be extended.
+// Only call this when CreateFileW/MoveFileExW fails with ERROR_FILENAME_EXCED_RANGE.
+static wchar_t *mp_extend_long_path(void *talloc_ctx, const wchar_t *wpath)
+{
+    if (!wpath || !wpath[0])
+        return NULL;
+
+    // Already extended or device namespace path
+    if (wcsncmp(wpath, L"\\\\?\\", 4) == 0 || wcsncmp(wpath, L"\\\\.\\", 4) == 0)
+        return NULL;
+
+    size_t len = wcslen(wpath);
+
+    // Normalize forward slashes to backslashes (\\?\ requires backslashes)
+    wchar_t *norm = talloc_array(talloc_ctx, wchar_t, len + 1);
+    for (size_t i = 0; i <= len; i++)
+        norm[i] = (wpath[i] == L'/') ? L'\\' : wpath[i];
+
+    // UNC path: \\server\share -> \\?\UNC\server\share
+    if (norm[0] == L'\\' && norm[1] == L'\\') {
+        wchar_t *result = talloc_array(talloc_ctx, wchar_t, len + 7);
+        wmemcpy(result, L"\\\\?\\UNC\\", 8);
+        wmemcpy(result + 8, norm + 2, len - 2 + 1);
+        talloc_free(norm);
+        return result;
+    }
+
+    // Drive-letter path: C:\... -> \\?\C:\...
+    if (((norm[0] >= L'A' && norm[0] <= L'Z') ||
+         (norm[0] >= L'a' && norm[0] <= L'z')) && norm[1] == L':')
+    {
+        wchar_t *result = talloc_array(talloc_ctx, wchar_t, len + 5);
+        wmemcpy(result, L"\\\\?\\", 4);
+        wmemcpy(result + 4, norm, len + 1);
+        talloc_free(norm);
+        return result;
+    }
+
+    // Not a recognized absolute path
+    talloc_free(norm);
+    return NULL;
 }
 
 static time_t filetime_to_unix_time(int64_t wintime)
@@ -293,6 +341,18 @@ int mp_stat(const char *path, struct mp_stat *buf)
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | SECURITY_SQOS_PRESENT |
         SECURITY_IDENTIFICATION, NULL);
+
+    if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILENAME_EXCED_RANGE) {
+        wchar_t *long_path = mp_extend_long_path(NULL, wpath);
+        if (long_path) {
+            h = CreateFileW(long_path, FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | SECURITY_SQOS_PRESENT |
+                SECURITY_IDENTIFICATION, NULL);
+            talloc_free(long_path);
+        }
+    }
+
     talloc_free(wpath);
     if (h == INVALID_HANDLE_VALUE) {
         set_errno_from_lasterror();
@@ -470,6 +530,16 @@ int mp_open(const char *filename, int oflag, ...)
     // Open the Windows file handle
     wchar_t *wpath = mp_from_utf8(NULL, filename);
     HANDLE h = CreateFileW(wpath, access, share, NULL, disposition, flags, NULL);
+
+    // Retry with \\?\ prefix for paths exceeding MAX_PATH
+    if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILENAME_EXCED_RANGE) {
+        wchar_t *long_path = mp_extend_long_path(NULL, wpath);
+        if (long_path) {
+            h = CreateFileW(long_path, access, share, NULL, disposition, flags, NULL);
+            talloc_free(long_path);
+        }
+    }
+
     talloc_free(wpath);
     if (h == INVALID_HANDLE_VALUE) {
         set_errno_from_lasterror();
@@ -499,6 +569,19 @@ int mp_rename(const char *oldpath, const char *newpath)
     wchar_t *woldpath = mp_from_utf8(NULL, oldpath),
         *wnewpath = mp_from_utf8(NULL, newpath);
     BOOL ok = MoveFileExW(woldpath, wnewpath, MOVEFILE_REPLACE_EXISTING);
+
+    if (!ok && GetLastError() == ERROR_FILENAME_EXCED_RANGE) {
+        wchar_t *long_old = mp_extend_long_path(NULL, woldpath);
+        wchar_t *long_new = mp_extend_long_path(NULL, wnewpath);
+        if (long_old || long_new) {
+            ok = MoveFileExW(long_old ? long_old : woldpath,
+                             long_new ? long_new : wnewpath,
+                             MOVEFILE_REPLACE_EXISTING);
+        }
+        talloc_free(long_old);
+        talloc_free(long_new);
+    }
+
     talloc_free(woldpath);
     talloc_free(wnewpath);
     if (!ok) {

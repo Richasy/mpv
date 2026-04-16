@@ -51,6 +51,10 @@
 #include "demux/demux.h"
 #include "video/out/vo.h"
 
+extern const stream_info_t stream_info_ffmpeg;
+
+#include "stream_iso_cache.h"
+
 #define TITLE_MENU -1
 #define TITLE_LONGEST -2
 
@@ -70,6 +74,10 @@ struct priv {
     char *device;
 
     struct dvd_opts *opts;
+
+    stream_t *iso_stream;
+    struct iso_cache *iso_cache;
+    dvdnav_stream_cb stream_cb;
 };
 
 struct dvd_opts {
@@ -542,6 +550,26 @@ static void stream_dvdnav_close(stream_t *s)
     priv->dvdnav = NULL;
     if (priv->dvd_speed)
         dvd_set_speed(s, priv->filename, -1);
+    if (priv->iso_cache)
+        iso_cache_free(priv->iso_cache);
+    if (priv->iso_stream)
+        free_stream(priv->iso_stream);
+}
+
+static int dvd_stream_seek(void *p_stream, uint64_t i_pos)
+{
+    struct iso_cache *cache = p_stream;
+    cache->pos = (int64_t)i_pos;
+    return 0;
+}
+
+static int dvd_stream_read(void *p_stream, void *buffer, int i_read)
+{
+    struct iso_cache *cache = p_stream;
+    int ret = iso_cache_read(cache, buffer, cache->pos, i_read);
+    if (ret > 0)
+        cache->pos += ret;
+    return ret;
 }
 
 static struct priv *new_dvdnav_stream(stream_t *stream, char *filename)
@@ -552,14 +580,39 @@ static struct priv *new_dvdnav_stream(stream_t *stream, char *filename)
     if (!filename)
         return NULL;
 
-    if (!(priv->filename = mp_get_user_path(priv, stream->global, filename)))
-        return NULL;
+    if (strncmp(filename, "http://", 7) == 0 ||
+        strncmp(filename, "https://", 8) == 0)
+    {
+        struct stream_open_args open_args = {
+            .global = stream->global,
+            .cancel = stream->cancel,
+            .url = filename,
+            .flags = STREAM_READ | (stream->stream_origin & STREAM_ORIGIN_MASK),
+            .sinfo = &stream_info_ffmpeg,
+        };
+        stream_create_with_args(&open_args, &priv->iso_stream);
+        if (!priv->iso_stream || !priv->iso_stream->seekable) {
+            MP_ERR(stream, "Cannot open or seek in remote ISO: %s\n", filename);
+            return NULL;
+        }
+        priv->iso_cache = iso_cache_create(priv, priv->iso_stream, stream->log);
+        priv->stream_cb.pf_seek = dvd_stream_seek;
+        priv->stream_cb.pf_read = dvd_stream_read;
+        priv->stream_cb.pf_readv = NULL;
+        priv->filename = talloc_strdup(priv, filename);
+        if (dvdnav_open_stream(&priv->dvdnav, priv->iso_cache,
+                               &priv->stream_cb) != DVDNAV_STATUS_OK)
+            return NULL;
+    } else {
+        if (!(priv->filename = mp_get_user_path(priv, stream->global, filename)))
+            return NULL;
 
-    priv->dvd_speed = priv->opts->speed;
-    dvd_set_speed(stream, priv->filename, priv->dvd_speed);
+        priv->dvd_speed = priv->opts->speed;
+        dvd_set_speed(stream, priv->filename, priv->dvd_speed);
 
-    if (dvdnav_open(&(priv->dvdnav), priv->filename) != DVDNAV_STATUS_OK)
-        return NULL;
+        if (dvdnav_open(&(priv->dvdnav), priv->filename) != DVDNAV_STATUS_OK)
+            return NULL;
+    }
 
     if (!priv->dvdnav)
         return NULL;
@@ -746,5 +799,102 @@ const stream_info_t stream_info_ifo_dvdnav = {
     .name = "ifo_dvdnav",
     .open = ifo_dvdnav_stream_open,
     .protocols = (const char*const[]){ "file", "", NULL },
+    .stream_origin = STREAM_ORIGIN_UNSAFE,
+};
+
+static bool dvd_url_has_iso_extension(const char *url)
+{
+    const char *end = strpbrk(url, "?#");
+    size_t len = end ? (size_t)(end - url) : strlen(url);
+    return len >= 4 && strncasecmp(url + len - 4, ".iso", 4) == 0;
+}
+
+static int iso_dvdnav_stream_open(stream_t *stream)
+{
+    if (!dvd_url_has_iso_extension(stream->url))
+        return STREAM_NO_MATCH;
+
+    if (!stream->access_references)
+        return STREAM_NO_MATCH;
+
+    struct priv *priv = talloc_zero(stream, struct priv);
+    stream->priv = priv;
+    priv->track = TITLE_LONGEST;
+
+    struct MPOpts *opts = mp_get_config_group(NULL, stream->global, &mp_opt_root);
+    if (opts->edition_id >= 0)
+        priv->track = opts->edition_id;
+    talloc_free(opts);
+
+    priv->opts = mp_get_config_group(stream, stream->global, &dvd_conf);
+    priv->device = talloc_strdup(priv, stream->url);
+
+    MP_INFO(stream, "ISO detected over HTTP. Trying DVD...\n");
+
+    if (!new_dvdnav_stream(stream, priv->device)) {
+        MP_VERBOSE(stream, "Not a valid DVD ISO.\n");
+        stream_dvdnav_close(stream);
+        return STREAM_UNSUPPORTED;
+    }
+
+    if (priv->track == TITLE_LONGEST) {
+        dvdnav_t *dvdnav = priv->dvdnav;
+        uint64_t best_length = 0;
+        int best_title = -1;
+        int32_t num_titles;
+        if (dvdnav_get_number_of_titles(dvdnav, &num_titles) == DVDNAV_STATUS_OK) {
+            MP_VERBOSE(stream, "List of available DVD titles:\n");
+            for (int n = 1; n <= num_titles; n++) {
+                uint64_t *parts = NULL, duration = 0;
+                dvdnav_describe_title_chapters(dvdnav, n, &parts, &duration);
+                if (parts) {
+                    if (duration > best_length) {
+                        best_length = duration;
+                        best_title = n;
+                    }
+                    if (duration > 90000) {
+                        char *time = mp_format_time(duration / 90000, false);
+                        MP_VERBOSE(stream, "title: %3d duration: %s\n",
+                                   n - 1, time);
+                        talloc_free(time);
+                    }
+                    free(parts);
+                }
+            }
+        }
+        priv->track = best_title - 1;
+        MP_INFO(stream, "Selecting DVD title %d.\n", priv->track);
+    }
+
+    if (priv->track >= 0) {
+        priv->title = priv->track;
+        if (dvdnav_title_play(priv->dvdnav, priv->track + 1) != DVDNAV_STATUS_OK) {
+            MP_ERR(stream, "dvdnav_stream, couldn't select title %d, error '%s'\n",
+                   priv->track, dvdnav_err_to_string(priv->dvdnav));
+            stream_dvdnav_close(stream);
+            return STREAM_UNSUPPORTED;
+        }
+    } else {
+        MP_ERR(stream, "No valid DVD title found.\n");
+        stream_dvdnav_close(stream);
+        return STREAM_UNSUPPORTED;
+    }
+
+    if (priv->opts->angle > 1)
+        dvdnav_angle_change(priv->dvdnav, priv->opts->angle);
+
+    stream->fill_buffer = fill_buffer;
+    stream->control = control;
+    stream->close = stream_dvdnav_close;
+    stream->demuxer = "+disc";
+    stream->lavf_type = "mpeg";
+
+    return STREAM_OK;
+}
+
+const stream_info_t stream_info_iso_dvdnav = {
+    .name = "iso/dvdnav",
+    .open = iso_dvdnav_stream_open,
+    .protocols = (const char*const[]){ "http", "https", NULL },
     .stream_origin = STREAM_ORIGIN_UNSAFE,
 };

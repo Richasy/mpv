@@ -50,6 +50,10 @@
 #include "sub/img_convert.h"
 #include "video/mp_image.h"
 
+extern const stream_info_t stream_info_ffmpeg;
+
+#include "stream_iso_cache.h"
+
 #define BLURAY_SECTOR_SIZE     6144
 
 #define BLURAY_DEFAULT_ANGLE      0
@@ -103,6 +107,7 @@ struct bluray_priv_s {
     struct m_config_cache *opts_cache;
 
     stream_t *iso_stream;  // HTTP stream for remote ISO playback
+    struct iso_cache *iso_cache; // block cache for remote ISO
 };
 
 inline static int play_playlist(struct bluray_priv_s *priv, int playlist)
@@ -117,15 +122,11 @@ inline static int play_title(struct bluray_priv_s *priv, int title)
 
 static int bluray_read_blocks(void *handle, void *buf, int lba, int num_blocks)
 {
-    stream_t *iso_stream = handle;
+    struct iso_cache *cache = handle;
     int64_t offset = (int64_t)lba * 2048;
     int size = num_blocks * 2048;
 
-    if (!stream_seek(iso_stream, offset))
-        return -1;
-
-    int read = stream_read(iso_stream, buf, size);
-    if (read < size)
+    if (iso_cache_read(cache, buf, offset, size) < size)
         return -1;
 
     return num_blocks;
@@ -141,6 +142,8 @@ static void bluray_stream_close(stream_t *s)
         bd_free_title_info(priv->title_info);
     if (priv->bd)
         bd_close(priv->bd);
+    if (priv->iso_cache)
+        iso_cache_free(priv->iso_cache);
     if (priv->iso_stream)
         free_stream(priv->iso_stream);
 }
@@ -458,14 +461,22 @@ static int bluray_stream_open_internal(stream_t *s)
     /* open device */
     BLURAY *bd;
     if (strncmp(device, "http://", 7) == 0 || strncmp(device, "https://", 8) == 0) {
-        b->iso_stream = stream_create(device, STREAM_READ, s->cancel, s->global);
+        struct stream_open_args open_args = {
+            .global = s->global,
+            .cancel = s->cancel,
+            .url = device,
+            .flags = STREAM_READ | (s->stream_origin & STREAM_ORIGIN_MASK),
+            .sinfo = &stream_info_ffmpeg,
+        };
+        stream_create_with_args(&open_args, &b->iso_stream);
         if (!b->iso_stream || !b->iso_stream->seekable) {
             MP_ERR(s, "Cannot open or seek in remote ISO: %s\n", device);
             ret = STREAM_UNSUPPORTED;
             goto err;
         }
+        b->iso_cache = iso_cache_create(b, b->iso_stream, s->log);
         bd = bd_init();
-        if (!bd || !bd_open_stream(bd, b->iso_stream, bluray_read_blocks)) {
+        if (!bd || !bd_open_stream(bd, b->iso_cache, bluray_read_blocks)) {
             MP_ERR(s, "Couldn't open Blu-ray stream from: %s\n", device);
             if (bd)
                 bd_close(bd);
@@ -691,5 +702,40 @@ const stream_info_t stream_info_bdmv_dir = {
     .name = "bdmv/bluray",
     .open = bdmv_dir_stream_open,
     .protocols = (const char*const[]){ "file", "", NULL },
+    .stream_origin = STREAM_ORIGIN_UNSAFE,
+};
+
+static bool url_has_iso_extension(const char *url)
+{
+    const char *end = strpbrk(url, "?#");
+    size_t len = end ? (size_t)(end - url) : strlen(url);
+    return len >= 4 && strncasecmp(url + len - 4, ".iso", 4) == 0;
+}
+
+static int iso_bluray_stream_open(stream_t *s)
+{
+    if (!url_has_iso_extension(s->url))
+        return STREAM_NO_MATCH;
+
+    if (!s->access_references)
+        return STREAM_NO_MATCH;
+
+    struct bluray_priv_s *b = talloc_zero(s, struct bluray_priv_s);
+    s->priv = b;
+
+    struct MPOpts *opts = mp_get_config_group(NULL, s->global, &mp_opt_root);
+    b->cfg_title = opts->edition_id >= 0 ? opts->edition_id : BLURAY_DEFAULT_TITLE;
+    talloc_free(opts);
+
+    b->cfg_device = talloc_strdup(b, s->url);
+
+    MP_INFO(s, "ISO detected over HTTP. Trying Blu-ray...\n");
+    return bluray_stream_open_internal(s);
+}
+
+const stream_info_t stream_info_iso_bluray = {
+    .name = "iso/bluray",
+    .open = iso_bluray_stream_open,
+    .protocols = (const char*const[]){ "http", "https", NULL },
     .stream_origin = STREAM_ORIGIN_UNSAFE,
 };

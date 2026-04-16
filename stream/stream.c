@@ -56,8 +56,10 @@ extern const stream_info_t stream_info_slice;
 extern const stream_info_t stream_info_fd;
 extern const stream_info_t stream_info_ifo_dvdnav;
 extern const stream_info_t stream_info_dvdnav;
+extern const stream_info_t stream_info_iso_dvdnav;
 extern const stream_info_t stream_info_bdmv_dir;
 extern const stream_info_t stream_info_bluray;
+extern const stream_info_t stream_info_iso_bluray;
 extern const stream_info_t stream_info_edl;
 extern const stream_info_t stream_info_libarchive;
 extern const stream_info_t stream_info_cb;
@@ -96,6 +98,12 @@ static const stream_info_t *const stream_list[] = {
     &stream_info_slice,
     &stream_info_fd,
     &stream_info_cb,
+#if HAVE_LIBBLURAY
+    &stream_info_iso_bluray,
+#endif
+#if HAVE_DVDNAV
+    &stream_info_iso_dvdnav,
+#endif
     &stream_info_ffmpeg,
     &stream_info_ffmpeg_unsafe,
 };

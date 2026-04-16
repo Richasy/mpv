@@ -1067,6 +1067,55 @@ bool mp_dxgi_output_desc_from_swapchain(struct mp_dxgi_factory_ctx *ctx,
     return false;
 }
 
+// Query the display output descriptor from the D3D11 device's adapter.
+// Only returns a result when the adapter has exactly one output, to avoid
+// guessing wrong on multi-monitor setups (composition mode has no HWND to
+// identify the correct monitor).
+bool mp_dxgi_output_desc_from_device(ID3D11Device *device,
+                                     DXGI_OUTPUT_DESC1 *desc)
+{
+    IDXGIDevice1 *dxgi_dev = NULL;
+    IDXGIAdapter1 *adapter = NULL;
+    IDXGIOutput *output = NULL;
+    IDXGIOutput *second_output = NULL;
+    IDXGIOutput6 *output6 = NULL;
+    bool result = false;
+    HRESULT hr;
+
+    hr = ID3D11Device_QueryInterface(device, &IID_IDXGIDevice1,
+                                     (void**)&dxgi_dev);
+    if (FAILED(hr))
+        goto done;
+
+    hr = IDXGIDevice1_GetParent(dxgi_dev, &IID_IDXGIAdapter1,
+                                (void**)&adapter);
+    if (FAILED(hr))
+        goto done;
+
+    hr = IDXGIAdapter1_EnumOutputs(adapter, 0, &output);
+    if (FAILED(hr))
+        goto done;
+
+    // Only use this heuristic for single-output adapters to avoid picking
+    // the wrong display on multi-monitor setups.
+    if (SUCCEEDED(IDXGIAdapter1_EnumOutputs(adapter, 1, &second_output)))
+        goto done;
+
+    if (SUCCEEDED(IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput6,
+                                             (void**)&output6)))
+    {
+        result = SUCCEEDED(IDXGIOutput6_GetDesc1(output6, desc));
+    }
+
+done:
+    SAFE_RELEASE(output6);
+    SAFE_RELEASE(second_output);
+    SAFE_RELEASE(output);
+    SAFE_RELEASE(adapter);
+    SAFE_RELEASE(dxgi_dev);
+    return result;
+}
+
 struct pl_color_space mp_dxgi_desc_to_color_space(const DXGI_OUTPUT_DESC1 *desc)
 {
     struct pl_color_space ret = {0};

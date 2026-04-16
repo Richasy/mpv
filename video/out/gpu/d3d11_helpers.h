@@ -78,6 +78,8 @@ bool mp_dxgi_output_desc_from_hwnd(struct mp_dxgi_factory_ctx *ctx,
 bool mp_dxgi_output_desc_from_swapchain(struct mp_dxgi_factory_ctx *ctx,
                                         IDXGISwapChain *swapchain,
                                         DXGI_OUTPUT_DESC1 *desc);
+bool mp_dxgi_output_desc_from_device(ID3D11Device *device,
+                                     DXGI_OUTPUT_DESC1 *desc);
 
 struct pl_color_space mp_dxgi_desc_to_color_space(const DXGI_OUTPUT_DESC1 *desc);
 

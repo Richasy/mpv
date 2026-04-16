@@ -197,12 +197,21 @@ static int d3d11_color_depth(struct ra_swapchain *sw)
 
 static struct pl_color_space d3d11_target_color_space(struct ra_swapchain *sw)
 {
-    if (sw->ctx->opts.composition)
-        return (struct pl_color_space){0};
-
     struct priv *p = sw->priv;
-
     DXGI_OUTPUT_DESC1 desc;
+
+    if (sw->ctx->opts.composition) {
+        m_config_cache_update(p->vo_opts_cache);
+        HWND hwnd = (HWND)(intptr_t)p->vo_opts->d3d11_composition_hwnd;
+        if (hwnd) {
+            if (mp_dxgi_output_desc_from_hwnd(&p->dxgi_ctx, hwnd, &desc))
+                return mp_dxgi_desc_to_color_space(&desc);
+        }
+        if (mp_dxgi_output_desc_from_device(p->device, &desc))
+            return mp_dxgi_desc_to_color_space(&desc);
+        return (struct pl_color_space){0};
+    }
+
     if (mp_dxgi_output_desc_from_hwnd(&p->dxgi_ctx, vo_w32_hwnd(sw->ctx->vo), &desc))
         return mp_dxgi_desc_to_color_space(&desc);
 

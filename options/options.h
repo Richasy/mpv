@@ -88,6 +88,8 @@ typedef struct mp_vo_opts {
 
     struct m_geometry d3d11_composition_size;
 
+    int64_t d3d11_composition_hwnd;
+
     int swapchain_depth;  // max number of images to render ahead
 
     struct m_geometry video_crop;

@@ -1879,7 +1879,6 @@ static void handle_toplevel_config(void *data, struct xdg_toplevel *toplevel,
     wl->tiled = is_tiled;
 
     wl->locked_size = is_fullscreen || is_maximized || is_tiled;
-    wl->reconfigured = false;
 
     if (wl->requested_decoration)
         request_decoration_mode(wl, wl->requested_decoration);
@@ -1927,17 +1926,17 @@ static void handle_toplevel_config(void *data, struct xdg_toplevel *toplevel,
     wl->surface_local.x1 = width;
     wl->surface_local.y1 = height;
 
-    if (mp_rect_equals(&old_geometry, &wl->geometry))
-        return;
-
 resize:
-    MP_VERBOSE(wl, "Resizing due to xdg from %ix%i to %ix%i\n",
-               mp_rect_w(old_geometry), mp_rect_h(old_geometry),
-               mp_rect_w(wl->geometry), mp_rect_h(wl->geometry));
+    if (!mp_rect_equals(&old_geometry, &wl->geometry)) {
+        MP_VERBOSE(wl, "Resizing due to xdg from %ix%i to %ix%i\n",
+                   mp_rect_w(old_geometry), mp_rect_h(old_geometry),
+                   mp_rect_w(wl->geometry), mp_rect_h(wl->geometry));
+        wl->pending_vo_events |= VO_EVENT_RESIZE;
+    }
 
-    wl->pending_vo_events |= VO_EVENT_RESIZE;
-    wl->override_surface_local = width == 0 || height == 0;
+    wl->override_surface_local = width == 0 || height == 0 || wl->reconfigured;
     wl->toplevel_configured = true;
+    wl->reconfigured = false;
 }
 
 static void handle_toplevel_close(void *data, struct xdg_toplevel *xdg_toplevel)
@@ -3860,6 +3859,7 @@ static void set_geometry(struct vo_wayland_state *wl, bool resize)
     if (resize) {
         if (!wl->locked_size)
             wl->geometry = wl->window_size;
+        wl->reconfigured = true;
         wl->override_surface_local = true;
         wl->pending_vo_events |= VO_EVENT_RESIZE;
     }
@@ -4260,6 +4260,8 @@ int vo_wayland_control(struct vo *vo, int *events, int request, void *arg)
         wl->window_size.y0 = 0;
         wl->window_size.x1 = s[0];
         wl->window_size.y1 = s[1];
+        wl->reconfigured = true;
+        wl->override_surface_local = true;
         if (!wl->opts->fullscreen && !wl->tiled) {
             if (wl->opts->window_maximized) {
                 xdg_toplevel_unset_maximized(wl->xdg_toplevel);
@@ -4269,7 +4271,6 @@ int vo_wayland_control(struct vo *vo, int *events, int request, void *arg)
                     return VO_TRUE;
             }
             wl->geometry = wl->window_size;
-            wl->override_surface_local = true;
             wl->pending_vo_events |= VO_EVENT_RESIZE;
         }
         return VO_TRUE;

@@ -178,6 +178,12 @@ build() {
 collect() {
     local ARCH="$TARGET_ARCH"
     local ARCH_OUTPUT="$OUTPUT_DIR/$ARCH"
+
+    # Wipe any stale artifacts from previous runs so removed dependencies
+    # (e.g. nvngx_vsr.dll, NvOFFRUC.dll, onnxruntime.dll, DirectML.dll)
+    # do not leak back into the uploaded archive.
+    log "Wiping previous artifacts at $ARCH_OUTPUT..."
+    rm -rf "$ARCH_OUTPUT"
     mkdir -p "$ARCH_OUTPUT/include/mpv"
 
     log "Collecting build artifacts for $ARCH..."

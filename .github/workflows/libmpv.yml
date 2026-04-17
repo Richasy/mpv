@@ -69,20 +69,14 @@ jobs:
           export MPV_SRC_DIR="$GITHUB_WORKSPACE"
           bash ci/build-libmpv.sh all
 
-      - name: Package artifacts as 7z
-        run: |
-          cd "$OUTPUT_DIR/${{ matrix.arch }}"
-          7z a -t7z -mx=9 "$OUTPUT_DIR/libmpv-${{ matrix.name }}.7z" .
-          echo "Packaged archive:"
-          ls -lh "$OUTPUT_DIR/libmpv-${{ matrix.name }}.7z"
-
       - name: Upload to GitHub Artifacts
         if: inputs.upload_target == 'github' || inputs.upload_target == 'both'
         uses: actions/upload-artifact@v4
         with:
           name: libmpv-${{ matrix.name }}
-          path: ${{ env.OUTPUT_DIR }}/libmpv-${{ matrix.name }}.7z
+          path: ${{ env.OUTPUT_DIR }}/${{ matrix.arch }}/
           retention-days: 30
+          compression-level: 6
 
       - name: Upload libmpv-2.dll to Azure Blob
         if: inputs.upload_target == 'azure' || inputs.upload_target == 'both'

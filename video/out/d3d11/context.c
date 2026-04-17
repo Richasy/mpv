@@ -24,8 +24,11 @@
 #include "video/out/gpu/d3d11_helpers.h"
 #include "video/out/gpu/spirv.h"
 #include "video/out/w32_common.h"
+#include "video/out/win32/displayconfig.h"
 #include "context.h"
 #include "ra_d3d11.h"
+
+#include <shellscalingapi.h>
 
 #ifdef PL_HAVE_D3D11
 #include <libplacebo/d3d11.h>
@@ -113,6 +116,10 @@ struct priv {
     int64_t last_sync_qpc_time;
     int64_t vsync_duration_qpc;
     int64_t last_submit_qpc;
+
+    // Composition mode: cache the monitor currently hosting the host HWND so
+    // we can notify the core (VO_EVENT_WIN_STATE) when it changes.
+    HMONITOR composition_monitor;
 
     struct mp_dxgi_factory_ctx dxgi_ctx;
 };
@@ -404,6 +411,138 @@ static bool d3d11_set_fullscreen(struct ra_ctx *ctx)
     return true;
 }
 
+// ----- Composition mode display info helpers --------------------------------
+// In composition mode mpv does not own the HWND (the host application, e.g. a
+// WinUI XAML SwapChainPanel, owns it). Therefore we cannot reuse w32_common's
+// window/monitor tracking. Instead we look up monitor info directly from the
+// composition HWND provided via the d3d11-composition-hwnd option.
+
+static double composition_refresh_rate_from_gdi(const wchar_t *device)
+{
+    DEVMODEW dm = { .dmSize = sizeof dm };
+    if (!EnumDisplaySettingsW(device, ENUM_CURRENT_SETTINGS, &dm))
+        return 0.0;
+
+    // See w32_common.c: a return of 0 or 1 means "hardware default".
+    if (dm.dmDisplayFrequency <= 1)
+        return 0.0;
+
+    double rv = dm.dmDisplayFrequency;
+    // Convert common integer rates back to the fractional NTSC rates.
+    switch (dm.dmDisplayFrequency) {
+        case  23: case  29: case  47: case  59: case  71:
+        case  89: case  95: case 119: case 143: case 164:
+        case 239: case 359: case 479:
+            rv = (rv + 1) / 1.001;
+    }
+    return rv;
+}
+
+static HWND composition_get_hwnd(struct priv *p)
+{
+    m_config_cache_update(p->vo_opts_cache);
+    return (HWND)(intptr_t)p->vo_opts->d3d11_composition_hwnd;
+}
+
+static HMONITOR composition_get_monitor(struct priv *p)
+{
+    HWND hwnd = composition_get_hwnd(p);
+    if (!hwnd)
+        return NULL;
+    return MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+}
+
+static double composition_get_display_fps(struct priv *p)
+{
+    HMONITOR mon = composition_get_monitor(p);
+    if (!mon)
+        return 0.0;
+    MONITORINFOEXW mi = { .cbSize = sizeof mi };
+    if (!GetMonitorInfoW(mon, (MONITORINFO *)&mi))
+        return 0.0;
+
+    double freq = mp_w32_displayconfig_get_refresh_rate(mi.szDevice);
+    if (freq == 0.0)
+        freq = composition_refresh_rate_from_gdi(mi.szDevice);
+    return freq;
+}
+
+static double composition_get_hidpi_scale(struct priv *p)
+{
+    HMONITOR mon = composition_get_monitor(p);
+    if (!mon)
+        return 0.0;
+    UINT dx = 0, dy = 0;
+    if (GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy) != S_OK || !dx)
+        return 0.0;
+    return dx / 96.0;
+}
+
+static void composition_get_display_res(struct priv *p, int res[2])
+{
+    res[0] = res[1] = 0;
+    HMONITOR mon = composition_get_monitor(p);
+    if (!mon)
+        return;
+    MONITORINFO mi = { .cbSize = sizeof mi };
+    if (!GetMonitorInfoW(mon, &mi))
+        return;
+    res[0] = mi.rcMonitor.right - mi.rcMonitor.left;
+    res[1] = mi.rcMonitor.bottom - mi.rcMonitor.top;
+}
+
+// Poll the monitor hosting the composition HWND and flag VO_EVENT_WIN_STATE
+// when it changes, so the core re-queries display FPS / DPI / ICC.
+static void composition_poll_monitor(struct ra_ctx *ctx, int *events)
+{
+    struct priv *p = ctx->priv;
+    HMONITOR mon = composition_get_monitor(p);
+    if (mon != p->composition_monitor) {
+        p->composition_monitor = mon;
+        if (events)
+            *events |= VO_EVENT_WIN_STATE;
+    }
+}
+
+static int composition_control(struct ra_ctx *ctx, int *events, int request,
+                               void *arg)
+{
+    struct priv *p = ctx->priv;
+    int ret = VO_TRUE;
+
+    switch (request) {
+    case VOCTRL_GET_DISPLAY_FPS: {
+        double fps = composition_get_display_fps(p);
+        if (fps <= 0)
+            return VO_NOTAVAIL;
+        *(double *)arg = fps;
+        break;
+    }
+    case VOCTRL_GET_HIDPI_SCALE: {
+        double scale = composition_get_hidpi_scale(p);
+        if (scale <= 0)
+            return VO_NOTAVAIL;
+        *(double *)arg = scale;
+        break;
+    }
+    case VOCTRL_GET_DISPLAY_RES: {
+        int res[2];
+        composition_get_display_res(p, res);
+        if (!res[0] || !res[1])
+            return VO_NOTAVAIL;
+        ((int *)arg)[0] = res[0];
+        ((int *)arg)[1] = res[1];
+        break;
+    }
+    case VOCTRL_CHECK_EVENTS:
+        composition_poll_monitor(ctx, events);
+        break;
+    default:
+        break;
+    }
+    return ret;
+}
+
 static int d3d11_control(struct ra_ctx *ctx, int *events, int request, void *arg)
 {
     struct priv *p = ctx->priv;
@@ -439,7 +578,11 @@ static int d3d11_control(struct ra_ctx *ctx, int *events, int request, void *arg
         fullscreen_switch_needed = false;
     }
 
-    ret = ctx->opts.composition ? VO_TRUE : vo_w32_control(ctx->vo, events, request, arg);
+    if (ctx->opts.composition) {
+        ret = composition_control(ctx, events, request, arg);
+    } else {
+        ret = vo_w32_control(ctx->vo, events, request, arg);
+    }
 
     // if entering full screen, handle d3d11 after general windowing stuff
     if (fullscreen_switch_needed && p->vo_opts->fullscreen) {

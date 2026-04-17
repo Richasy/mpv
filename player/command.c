@@ -2915,25 +2915,6 @@ static int mp_property_focused(void *ctx, struct m_property *prop,
     return m_property_bool_ro(action, arg, focused);
 }
 
-static int mp_property_vsr_output_size(void *ctx, struct m_property *prop,
-                                       int action, void *arg)
-{
-    MPContext *mpctx = ctx;
-    struct vo *vo = mpctx->video_out;
-    if (!vo)
-        return M_PROPERTY_UNAVAILABLE;
-    int wh[2];
-    if (vo_control(vo, VOCTRL_GET_VSR_OUTPUT_SIZE, &wh) <= 0)
-        return M_PROPERTY_UNAVAILABLE;
-    if (wh[0] <= 0 || wh[1] <= 0)
-        return M_PROPERTY_UNAVAILABLE;
-    if (strcmp(prop->name, "vsr-output-width") == 0) {
-        return m_property_int_ro(action, arg, wh[0]);
-    } else {
-        return m_property_int_ro(action, arg, wh[1]);
-    }
-}
-
 static int mp_property_display_names(void *ctx, struct m_property *prop,
                                      int action, void *arg)
 {
@@ -3275,17 +3256,6 @@ static int mp_property_vf_fps(void *ctx, struct m_property *prop,
     if (avg <= 0)
         return M_PROPERTY_UNAVAILABLE;
     return m_property_double_ro(action, arg, 1.0 / avg);
-}
-
-#include "video/out/gpu_next/libmpv_gpu_next.h"
-
-static int mp_property_rife_output_fps(void *ctx, struct m_property *prop,
-                                       int action, void *arg)
-{
-    double fps = g_rife_measured_fps;
-    if (fps < 0.1)
-        return M_PROPERTY_UNAVAILABLE;
-    return m_property_double_ro(action, arg, fps);
 }
 
 #define doubles_equal(x, y) (fabs((x) - (y)) <= 0.001)
@@ -4607,7 +4577,6 @@ static const struct m_property mp_properties_base[] = {
     {"current-gpu-context", mp_property_gpu_context},
     {"container-fps", mp_property_fps},
     {"estimated-vf-fps", mp_property_vf_fps},
-    {"rife-output-fps", mp_property_rife_output_fps},
     {"video-aspect-override", mp_property_video_aspect_override},
     {"vid", mp_property_switch_track, .priv = (void *)(const int[]){0, STREAM_VIDEO}},
     {"hwdec-current", mp_property_hwdec_current},
@@ -4667,8 +4636,6 @@ static const struct m_property mp_properties_base[] = {
     {"sub-bitrate", mp_property_packet_bitrate, .priv = (void *)&(const int){STREAM_SUB}},
 
     {"focused", mp_property_focused},
-    {"vsr-output-width", mp_property_vsr_output_size},
-    {"vsr-output-height", mp_property_vsr_output_size},
     {"display-names", mp_property_display_names},
     {"display-fps", mp_property_display_fps},
     {"estimated-display-fps", mp_property_estimated_display_fps},
@@ -6479,18 +6446,6 @@ static void cmd_stop(void *p)
     mp_wakeup_core(mpctx);
 }
 
-static void cmd_simulate_error(void *p)
-{
-    struct mp_cmd_ctx *cmd = p;
-    struct MPContext *mpctx = cmd->mpctx;
-    int error_code = cmd->args[0].v.i;
-
-    mpctx->error_playing = error_code;
-    mpctx->stop_play = PT_ERROR;
-    mp_abort_playback_async(mpctx);
-    mp_wakeup_core(mpctx);
-}
-
 static void cmd_show_progress(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
@@ -7388,9 +7343,6 @@ const struct mp_cmd_def mp_cmds[] = {
         .priv = &(const bool){1} },
     { "stop", cmd_stop,
         { {"flags", OPT_FLAGS(v.i, {"keep-playlist", 1}), .flags = MP_CMD_OPT_ARG} }
-    },
-    { "simulate-error", cmd_simulate_error,
-        { {"error-code", OPT_INT(v.i), OPTDEF_INT(-20)} }
     },
     { "frame-step", cmd_frame_step,
         {

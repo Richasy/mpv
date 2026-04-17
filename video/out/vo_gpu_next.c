@@ -60,10 +60,6 @@
 #include <libplacebo/d3d11.h>
 #include "video/out/d3d11/ra_d3d11.h"
 #include "osdep/windows_utils.h"
-#if HAVE_RIFE
-#include "gpu_next/libmpv_gpu_next.h"
-#include "osdep/timer.h"
-#endif
 #endif
 
 
@@ -164,24 +160,6 @@ struct priv {
     struct frame_info perf_redraw;
 
     struct mp_image_params target_params;
-
-#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_RIFE
-    // RIFE deep learning frame interpolation (vo_gpu_next path)
-    struct libmpv_gpu_next_context *rife_ctx;
-    struct ID3D11Texture2D *rife_render_d3d;
-    pl_tex rife_render_pl;
-    struct ID3D11Texture2D *rife_output_d3d;
-    pl_tex rife_output_pl;
-    int rife_w, rife_h;
-    int rife_mode;
-    bool rife_active;
-    double rife_prev_pts;
-    bool rife_has_prev;
-    bool rife_interp_valid;
-    int64_t rife_frame_count;
-    double rife_fps_last_time;
-    double rife_measured_fps;
-#endif
 };
 
 static void update_render_options(struct vo *vo);
@@ -221,32 +199,6 @@ const struct m_sub_options gl_next_conf = {
         {"target-colorspace-hint-strict", OPT_BOOL(target_hint_strict)},
         // No `target-lut-type` because we don't support non-RGB targets
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
-        {"nvidia-vsr", OPT_CHOICE(nvidia_vsr,
-            {"off",     0},
-            {"bicubic", 1},
-            {"low",     2},
-            {"medium",  3},
-            {"high",    4},
-            {"ultra",   5})},
-        {"nvidia-truehdr", OPT_CHOICE(nvidia_truehdr,
-            {"off",      0},
-            {"natural",  1},
-            {"standard", 2},
-            {"vivid",    3})},
-        {"nvidia-fruc", OPT_CHOICE(nvidia_fruc,
-            {"off", 0},
-            {"on",  1})},
-        {"amd-fsr", OPT_CHOICE(amd_fsr,
-            {"off",     0},
-            {"on",      1},
-            {"sharpen", 2})},
-        {"rife", OPT_CHOICE(rife,
-            {"off",      0},
-            {"standard", 1},
-            {"high",     2})},
-        {"rife-model", OPT_STRING(rife_model), .flags = M_OPT_FILE},
-        {"rife-streams", OPT_INT(rife_streams), .flags = 0,
-            M_RANGE(1, 4)},
         {0},
     },
     .defaults = &(struct gl_next_opts) {
@@ -257,7 +209,6 @@ const struct m_sub_options gl_next_conf = {
         .image_subs_hdr_peak = PL_COLOR_SDR_WHITE,
         .target_hint = -1,
         .target_hint_strict = true,
-        .rife_streams = 2,
     },
     .size = sizeof(struct gl_next_opts),
     .change_flags = UPDATE_VIDEO,
@@ -1461,210 +1412,6 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             update_hook_opts_dynamic(p, p->hooks[i], frame->current);
     }
 
-    // RIFE deep learning frame interpolation (display-sync mode)
-#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_RIFE
-    if (p->rife_ctx) {
-        int rife_mode = p->next_opts->rife;
-        bool rife_avail = p->rife_ctx->fns->rife_available &&
-                          p->rife_ctx->fns->rife_available(p->rife_ctx);
-        bool rife_model_ok = p->next_opts->rife_model &&
-                             p->next_opts->rife_model[0];
-        bool use_rife = rife_mode > 0 && rife_avail && rife_model_ok &&
-                         frame->display_synced &&
-                         frame->current && mix.num_frames > 0;
-
-        if (use_rife) {
-            struct pl_frame *first_frame = (struct pl_frame *) mix.frames[0];
-            struct mp_image *src_mpi = first_frame->user_data;
-            int src_w = src_mpi->params.w;
-            int src_h = src_mpi->params.h;
-
-            bool need_reinit = !p->rife_active || p->rife_w != src_w
-                               || p->rife_h != src_h;
-            bool need_model_switch = p->rife_active && p->rife_mode != rife_mode
-                                     && p->rife_w == src_w && p->rife_h == src_h;
-
-            if (need_reinit) {
-                if (p->rife_render_pl)
-                    pl_tex_destroy(gpu, &p->rife_render_pl);
-                if (p->rife_render_d3d) {
-                    ID3D11Texture2D_Release(p->rife_render_d3d);
-                    p->rife_render_d3d = NULL;
-                }
-                if (p->rife_output_pl)
-                    pl_tex_destroy(gpu, &p->rife_output_pl);
-                if (p->rife_output_d3d) {
-                    ID3D11Texture2D_Release(p->rife_output_d3d);
-                    p->rife_output_d3d = NULL;
-                }
-
-                p->rife_render_d3d =
-                    p->rife_ctx->fns->fsr_create_texture(p->rife_ctx, src_w, src_h);
-                if (p->rife_render_d3d) {
-                    p->rife_render_pl = pl_d3d11_wrap(gpu, pl_d3d11_wrap_params(
-                        .tex = (ID3D11Resource *)p->rife_render_d3d,
-                        .w = src_w,
-                        .h = src_h,
-                    ));
-                }
-
-                p->rife_output_d3d =
-                    p->rife_ctx->fns->fsr_create_texture(p->rife_ctx, src_w, src_h);
-                if (p->rife_output_d3d) {
-                    p->rife_output_pl = pl_d3d11_wrap(gpu, pl_d3d11_wrap_params(
-                        .tex = (ID3D11Resource *)p->rife_output_d3d,
-                        .w = src_w,
-                        .h = src_h,
-                    ));
-                }
-
-                if (!p->rife_render_pl || !p->rife_output_pl) {
-                    MP_WARN(vo, "RIFE: Failed to create textures.\n");
-                    use_rife = false;
-                } else {
-                    const char *model_file = (rife_mode == 1)
-                        ? "rife_lite.onnx" : "rife.onnx";
-                    bool ok = p->rife_ctx->fns->rife_init_session(
-                        p->rife_ctx, p->next_opts->rife_model,
-                        model_file, src_w, src_h,
-                        p->next_opts->rife_streams);
-                    if (ok) {
-                        p->rife_w = src_w;
-                        p->rife_h = src_h;
-                        p->rife_mode = rife_mode;
-                        p->rife_active = true;
-                        p->rife_has_prev = false;
-                    } else {
-                        use_rife = false;
-                    }
-                }
-            } else if (need_model_switch) {
-                const char *model_file = (rife_mode == 1)
-                    ? "rife_lite.onnx" : "rife.onnx";
-                MP_INFO(vo, "RIFE: Switching model to %s\n", model_file);
-                bool ok = p->rife_ctx->fns->rife_init_session(
-                    p->rife_ctx, p->next_opts->rife_model,
-                    model_file, src_w, src_h,
-                    p->next_opts->rife_streams);
-                if (ok) {
-                    p->rife_mode = rife_mode;
-                    p->rife_has_prev = false;
-                } else {
-                    use_rife = false;
-                    p->rife_active = false;
-                }
-            }
-
-            if (use_rife && p->rife_active) {
-                double cur_pts = frame->current->pts;
-                bool is_new_frame = (cur_pts != p->rife_prev_pts);
-
-                #define RIFE_BLIT_TO_TARGET(tex, tw, th) do {                       \
-                    pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 }); \
-                    struct pl_frame _img = {                                        \
-                        .repr = pl_color_repr_rgb,                                  \
-                        .num_planes = 1,                                            \
-                        .planes[0] = {                                              \
-                            .texture = (tex),                                       \
-                            .components = (tex)->params.format->num_components,     \
-                            .component_mapping = {0, 1, 2, 3},                     \
-                        },                                                          \
-                        .color = pl_color_space_srgb,                               \
-                        .crop = { .x0 = 0, .y0 = 0, .x1 = (tw), .y1 = (th) },    \
-                    };                                                              \
-                    struct pl_render_params _rp = params;                            \
-                    _rp.background = PL_CLEAR_SKIP;                                 \
-                    _rp.border = PL_CLEAR_SKIP;                                     \
-                    pl_render_image(p->rr, &_img, &target, &_rp);                   \
-                    p->rife_frame_count++;                                           \
-                    double _now = mp_raw_time_ns() / 1e9;                           \
-                    if (_now - p->rife_fps_last_time >= 1.0) {                      \
-                        p->rife_measured_fps = p->rife_frame_count                  \
-                            / (_now - p->rife_fps_last_time);                       \
-                        p->rife_frame_count = 0;                                    \
-                        p->rife_fps_last_time = _now;                               \
-                        g_rife_measured_fps = p->rife_measured_fps;                  \
-                    }                                                               \
-                } while (0)
-
-                if (is_new_frame) {
-                    struct pl_frame rife_target = {
-                        .repr = pl_color_repr_rgb,
-                        .num_planes = 1,
-                        .planes[0] = {
-                            .texture = p->rife_render_pl,
-                            .components = p->rife_render_pl->params.format->num_components,
-                            .component_mapping = {0, 1, 2, 3},
-                        },
-                        .color = pl_color_space_srgb,
-                        .crop = { .x0 = 0, .y0 = 0, .x1 = src_w, .y1 = src_h },
-                    };
-
-                    struct pl_render_params rife_params = params;
-                    rife_params.frame_mixer = NULL;
-                    if (!pl_render_image_mix(p->rr, &mix, &rife_target, &rife_params)) {
-                        MP_ERR(vo, "RIFE: Failed rendering to intermediate.\n");
-                        goto rife_done;
-                    }
-                    pl_gpu_flush(gpu);
-
-                    bool feed_ok = p->rife_ctx->fns->rife_feed_frame(
-                        p->rife_ctx, p->rife_render_d3d);
-
-                    if (feed_ok && p->rife_has_prev) {
-                        p->rife_ctx->fns->rife_submit_async(
-                            p->rife_ctx, 0.5f);
-                    }
-
-                    p->rife_prev_pts = cur_pts;
-                    p->rife_has_prev = true;
-
-                    if (p->rife_ctx->fns->rife_poll_result &&
-                        p->rife_ctx->fns->rife_poll_result(p->rife_ctx)) {
-                        if (p->rife_ctx->fns->rife_upload_result &&
-                            p->rife_ctx->fns->rife_upload_result(
-                                p->rife_ctx, p->rife_output_d3d)) {
-                            p->rife_interp_valid = true;
-                            RIFE_BLIT_TO_TARGET(p->rife_output_pl, src_w, src_h);
-                            valid = true;
-                            goto done;
-                        }
-                    }
-
-                    RIFE_BLIT_TO_TARGET(p->rife_render_pl, src_w, src_h);
-                    valid = true;
-                    goto done;
-
-                } else {
-                    if (p->rife_interp_valid) {
-                        RIFE_BLIT_TO_TARGET(p->rife_output_pl, src_w, src_h);
-                        valid = true;
-                        goto done;
-                    }
-                    if (p->rife_ctx->fns->rife_poll_result &&
-                        p->rife_ctx->fns->rife_poll_result(p->rife_ctx)) {
-                        if (p->rife_ctx->fns->rife_upload_result &&
-                            p->rife_ctx->fns->rife_upload_result(
-                                p->rife_ctx, p->rife_output_d3d)) {
-                            p->rife_interp_valid = true;
-                            RIFE_BLIT_TO_TARGET(p->rife_output_pl, src_w, src_h);
-                            valid = true;
-                            goto done;
-                        }
-                    }
-                    RIFE_BLIT_TO_TARGET(p->rife_render_pl, src_w, src_h);
-                    valid = true;
-                    goto done;
-                }
-
-                #undef RIFE_BLIT_TO_TARGET
-            }
-        }
-    }
-rife_done:
-    ;
-#endif // HAVE_D3D11 && PL_HAVE_D3D11 && HAVE_RIFE
-
     // Render frame
     stats_time_start(p->stats, "render");
     bool render_ok = pl_render_image_mix(p->rr, &mix, &target, &params);
@@ -2396,25 +2143,6 @@ static void uninit(struct vo *vo)
 
     pl_icc_close(&p->icc_profile);
 
-#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_RIFE
-    if (p->rife_active && p->rife_ctx && p->rife_ctx->fns->rife_destroy)
-        p->rife_ctx->fns->rife_destroy(p->rife_ctx);
-    if (p->rife_render_pl)
-        pl_tex_destroy(p->gpu, &p->rife_render_pl);
-    if (p->rife_render_d3d) {
-        ID3D11Texture2D_Release(p->rife_render_d3d);
-        p->rife_render_d3d = NULL;
-    }
-    if (p->rife_output_pl)
-        pl_tex_destroy(p->gpu, &p->rife_output_pl);
-    if (p->rife_output_d3d) {
-        ID3D11Texture2D_Release(p->rife_output_d3d);
-        p->rife_output_d3d = NULL;
-    }
-    p->rife_active = false;
-    rife_context_destroy(&p->rife_ctx);
-#endif
-
     pl_renderer_destroy(&p->rr);
 
     for (int i = 0; i < VO_PASS_PERF_MAX; ++i) {
@@ -2468,16 +2196,6 @@ static int preinit(struct vo *vo)
     vo->hwdec_devs = hwdec_devices_create();
     hwdec_devices_set_loader(vo->hwdec_devs, load_hwdec_api, vo);
     ra_hwdec_ctx_init(&p->hwdec_ctx, vo->hwdec_devs, gl_opts->hwdec_interop, false);
-
-#if HAVE_D3D11 && defined(PL_HAVE_D3D11) && HAVE_RIFE
-    if (ra_is_d3d11(p->ra_ctx->ra)) {
-        ID3D11Device *dev = ra_d3d11_get_device(p->ra_ctx->ra);
-        if (dev) {
-            p->rife_ctx = rife_context_create(p->log, dev);
-            ID3D11Device_Release(dev);
-        }
-    }
-#endif
 
     mp_mutex_init(&p->dr_lock);
 

@@ -1,0 +1,11 @@
+remove the libmpv D3D11 render backend and its public API:
+`MPV_RENDER_API_TYPE_D3D11`, `MPV_RENDER_PARAM_D3D11_INIT_PARAMS`,
+`MPV_RENDER_PARAM_D3D11_FBO`, `MPV_RENDER_PARAM_VSR_CAPABILITIES`,
+`MPV_RENDER_PARAM_TRUEHDR_CAPABILITIES`, `MPV_RENDER_PARAM_DISPLAY_FPS`,
+`mpv_vsr_capabilities`, `mpv_truehdr_capabilities`, and the
+`render_d3d11.h` header. Also remove the accompanying VO-level options
+`--nvidia-vsr`, `--nvidia-truehdr`, `--nvidia-fruc`, `--amd-fsr`,
+`--rife`, `--rife-model`, `--rife-streams` and the properties
+`vsr-output-width`, `vsr-output-height`, `rife-output-fps`. External D3D11
+integrations should use the stock `wid` / d3d11 composition path via
+`vo=gpu-next` instead.

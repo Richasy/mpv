@@ -1418,20 +1418,6 @@ double vo_get_display_fps(struct vo *vo)
     return res;
 }
 
-void vo_set_display_fps(struct vo *vo, double fps)
-{
-    struct vo_internal *in = vo->in;
-    mp_mutex_lock(&in->lock);
-    if (fps > 0 && in->display_fps != fps) {
-        in->nominal_vsync_interval = 1e9 / fps;
-        in->vsync_interval = MPMAX(in->nominal_vsync_interval, 1);
-        in->display_fps = fps;
-        in->reported_display_fps = fps;
-        MP_VERBOSE(vo, "Display FPS set to %f for display sync.\n", fps);
-    }
-    mp_mutex_unlock(&in->lock);
-}
-
 void * vo_get_display_swapchain(struct vo *vo)
 {
     return vo->display_swapchain;

@@ -260,7 +260,6 @@ sources = files(
     'video/out/placebo/utils.c',
     'video/out/vo_gpu_next.c',
     'video/out/gpu_next/context.c',
-    'video/out/gpu_next/libmpv_gpu_next.c',
 
     ## osdep
     'osdep/io.c',
@@ -1045,109 +1044,8 @@ d3d11 = get_option('d3d11').require(
 features += {'d3d11': d3d11.allowed()}
 if features['d3d11']
     sources += files('video/out/d3d11/context.c',
-                     'video/out/d3d11/ra_d3d11.c',
-                     'video/out/d3d11/libmpv_d3d11.c')
+                     'video/out/d3d11/ra_d3d11.c')
 endif
-
-# NVIDIA NGX VSR (RTX Video Super Resolution)
-# NGX functions are loaded at runtime via LoadLibrary/_nvngx.dll,
-# so we only need the SDK headers at build time (no library linking).
-ngx_vsr_opt = get_option('ngx-vsr').require(
-    features['d3d11'],
-    error_message: 'ngx-vsr requires d3d11!',
-)
-ngx_vsr_path = get_option('ngx-vsr-path')
-ngx_vsr_found = false
-ngx_vsr_inc = []
-if ngx_vsr_opt.allowed() and ngx_vsr_path != ''
-    ngx_vsr_inc_dir = include_directories(ngx_vsr_path / 'include')
-    ngx_vsr_has_header = cc.has_header('nvsdk_ngx_defs.h',
-        include_directories: ngx_vsr_inc_dir)
-    if ngx_vsr_has_header
-        ngx_vsr_found = true
-        ngx_vsr_inc = [ngx_vsr_inc_dir]
-    endif
-elif ngx_vsr_opt.allowed()
-    ngx_vsr_has_header = cc.has_header('nvsdk_ngx_defs.h', required: false)
-    if ngx_vsr_has_header
-        ngx_vsr_found = true
-    endif
-endif
-features += {'ngx-vsr': ngx_vsr_found}
-if ngx_vsr_found
-    ngx_vsr_dep = declare_dependency(
-        include_directories: ngx_vsr_inc,
-    )
-    dependencies += ngx_vsr_dep
-endif
-
-# NVIDIA Optical Flow Frame Interpolation (NvOFFRUC)
-# Uses the hardware optical flow accelerator on RTX GPUs for frame interpolation.
-# The SDK provides NvOFFRUC.dll which is loaded at runtime — no library linking needed.
-# We detect the SDK by checking for nvOpticalFlowCommon.h (pure C header).
-nvofa_opt = get_option('nvofa').require(
-    features['d3d11'],
-    error_message: 'nvofa requires d3d11!',
-)
-nvofa_path = get_option('nvofa-path')
-nvofa_found = false
-nvofa_inc = []
-if nvofa_opt.allowed() and nvofa_path != ''
-    nvofa_of_inc_dir = include_directories(nvofa_path / 'NvOFInterface')
-    nvofa_has_header = cc.has_header('nvOpticalFlowCommon.h',
-        include_directories: nvofa_of_inc_dir)
-    if nvofa_has_header
-        nvofa_found = true
-        nvofa_inc = [nvofa_of_inc_dir]
-    endif
-elif nvofa_opt.allowed()
-    nvofa_has_header = cc.has_header('nvOpticalFlowCommon.h', required: false)
-    if nvofa_has_header
-        nvofa_found = true
-    endif
-endif
-features += {'nvofa': nvofa_found}
-if nvofa_found
-    nvofa_dep = declare_dependency(
-        include_directories: nvofa_inc,
-    )
-    dependencies += nvofa_dep
-endif
-
-# RIFE frame interpolation (via ONNX Runtime + DirectML)
-rife_opt = get_option('rife').require(
-    features['d3d11'],
-    error_message: 'rife requires d3d11!',
-)
-ort_path = get_option('onnxruntime-path')
-rife_found = false
-rife_inc = []
-if rife_opt.allowed() and ort_path != ''
-    ort_inc_dir = include_directories(ort_path / 'include')
-    rife_has_header = cc.has_header('onnxruntime_c_api.h',
-        include_directories: ort_inc_dir, required: false)
-    if rife_has_header
-        rife_found = true
-        rife_inc = [ort_inc_dir]
-    endif
-elif rife_opt.allowed()
-    rife_has_header = cc.has_header('onnxruntime_c_api.h', required: false)
-    if rife_has_header
-        rife_found = true
-    endif
-endif
-features += {'rife': rife_found}
-if rife_found
-    rife_dep = declare_dependency(
-        include_directories: rife_inc,
-    )
-    dependencies += rife_dep
-endif
-
-# AMD FSR 1.0 (FidelityFX Super Resolution)
-# Pure compute shader implementation — no vendor SDK required.
-# Shaders are precompiled to DXBC bytecode (no runtime d3dcompiler needed).
-features += {'amd-fsr': features['d3d11']}
 
 wayland = {
     'deps': [dependency('wayland-client', version: '>= 1.23.0', required: get_option('wayland')),

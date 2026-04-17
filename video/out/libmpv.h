@@ -75,19 +75,9 @@ struct render_backend_fns {
     // Implementation of mpv_render_context_render().
     int (*render)(struct render_backend *ctx, mpv_render_param *params,
                   struct vo_frame *frame);
-    // Query VSR capabilities. Optional; if NULL, all fields default to 0.
-    void (*get_vsr_capabilities)(struct render_backend *ctx,
-                                 struct mpv_vsr_capabilities *out);
-    // Query VSR output size. Optional; if NULL or VSR inactive, w/h are 0.
-    void (*get_vsr_output_size)(struct render_backend *ctx,
-                                int *w, int *h);
-    // Query TrueHDR capabilities. Optional; if NULL, all fields default to 0.
-    void (*get_truehdr_capabilities)(struct render_backend *ctx,
-                                     struct mpv_truehdr_capabilities *out);
     // Free all data in ctx->priv.
     void (*destroy)(struct render_backend *ctx);
 };
 
-extern const struct render_backend_fns render_backend_gpu_next;
 extern const struct render_backend_fns render_backend_gpu;
 extern const struct render_backend_fns render_backend_sw;

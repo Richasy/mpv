@@ -116,7 +116,6 @@ struct mpv_render_context {
 };
 
 const struct render_backend_fns *render_backends[] = {
-    &render_backend_gpu_next,
     &render_backend_gpu,
     &render_backend_sw,
     NULL
@@ -346,12 +345,6 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
         !GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_SKIP_RENDERING, int, 0);
 
     if (do_render) {
-        // Inject display FPS from host application for display-sync modes
-        double *display_fps = get_mpv_render_param(params,
-                                                   MPV_RENDER_PARAM_DISPLAY_FPS, NULL);
-        if (display_fps && *display_fps > 0 && ctx->vo)
-            vo_set_display_fps(ctx->vo, *display_fps);
-
         int vp_w, vp_h;
         int err = ctx->renderer->fns->get_target_size(ctx->renderer, params,
                                                     &vp_w, &vp_h);
@@ -498,22 +491,6 @@ int mpv_render_context_get_info(mpv_render_context *ctx,
                     MPV_RENDER_FRAME_INFO_BLOCK_VSYNC : 0);
             info->target_time = frame->pts;
         }
-        res = 0;
-        break;
-    }
-    case MPV_RENDER_PARAM_VSR_CAPABILITIES: {
-        mpv_vsr_capabilities *caps = param.data;
-        *caps = (mpv_vsr_capabilities){0};
-        if (ctx->renderer && ctx->renderer->fns->get_vsr_capabilities)
-            ctx->renderer->fns->get_vsr_capabilities(ctx->renderer, caps);
-        res = 0;
-        break;
-    }
-    case MPV_RENDER_PARAM_TRUEHDR_CAPABILITIES: {
-        mpv_truehdr_capabilities *caps = param.data;
-        *caps = (mpv_truehdr_capabilities){0};
-        if (ctx->renderer && ctx->renderer->fns->get_truehdr_capabilities)
-            ctx->renderer->fns->get_truehdr_capabilities(ctx->renderer, caps);
         res = 0;
         break;
     }
@@ -664,14 +641,6 @@ static int control(struct vo *vo, uint32_t request, void *data)
     case VOCTRL_PERFORMANCE_DATA:
         if (ctx->renderer->fns->perfdata) {
             ctx->renderer->fns->perfdata(ctx->renderer, data);
-            return VO_TRUE;
-        }
-        return VO_NOTIMPL;
-    case VOCTRL_GET_VSR_OUTPUT_SIZE:
-        if (ctx->renderer->fns->get_vsr_output_size) {
-            int *wh = data;
-            ctx->renderer->fns->get_vsr_output_size(ctx->renderer,
-                                                     &wh[0], &wh[1]);
             return VO_TRUE;
         }
         return VO_NOTIMPL;

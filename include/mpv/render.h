@@ -422,77 +422,7 @@ typedef enum mpv_render_param_type {
      * See MPV_RENDER_PARAM_SW_STRIDE for alignment requirements.
      */
     MPV_RENDER_PARAM_SW_POINTER = 20,
-    /**
-     * D3D11 initialization parameters. Valid for mpv_render_context_create().
-     * Type: mpv_d3d11_init_params*
-     *
-     * The caller provides their own ID3D11Device. mpv does not take ownership
-     * of the device; the caller must keep it alive for the lifetime of the
-     * render context.
-     */
-    MPV_RENDER_PARAM_D3D11_INIT_PARAMS = 21,
-    /**
-     * D3D11 render target. Valid for mpv_render_context_render().
-     * Type: mpv_d3d11_fbo*
-     *
-     * The caller provides an ID3D11Texture2D that mpv will render into.
-     */
-    MPV_RENDER_PARAM_D3D11_FBO = 22,
-    /**
-     * Query VSR (Video Super Resolution) capabilities from the render context.
-     * Valid for mpv_render_context_get_info().
-     *
-     * Type: mpv_vsr_capabilities*
-     *
-     * The struct is filled with information about which VSR backends are
-     * available at runtime. Fields for unavailable backends are set to 0.
-     */
-    MPV_RENDER_PARAM_VSR_CAPABILITIES = 23,
-    /**
-     * Query TrueHDR (SDR-to-HDR) capabilities from the render context.
-     * Valid for mpv_render_context_get_info().
-     *
-     * Type: mpv_truehdr_capabilities*
-     *
-     * The struct is filled with information about whether NVIDIA RTX TrueHDR
-     * is available at runtime. Fields for unavailable backends are set to 0.
-     */
-    MPV_RENDER_PARAM_TRUEHDR_CAPABILITIES = 24,
-    /**
-     * Display refresh rate in Hz. Valid for mpv_render_context_render().
-     * Type: double*
-     *
-     * When provided, this enables display-sync video timing modes
-     * (video-sync=display-*). The value should be the monitor's refresh rate
-     * (e.g. 60.0, 120.0, 144.0). If not provided or <= 0, display-sync is
-     * unavailable unless --display-fps-override is set.
-     *
-     * For best results with frame interpolation (--interpolation), also call
-     * mpv_render_context_report_swap() after each buffer swap/present to
-     * provide vsync timing feedback.
-     */
-    MPV_RENDER_PARAM_DISPLAY_FPS = 25,
 } mpv_render_param_type;
-
-/**
- * Runtime VSR capability information, queried via
- * MPV_RENDER_PARAM_VSR_CAPABILITIES.
- */
-typedef struct mpv_vsr_capabilities {
-    int nvidia_vsr;  // 1 if NVIDIA RTX VSR is available, 0 otherwise
-    int amd_vsr;     // reserved for future AMD VSR, always 0
-    int intel_vsr;   // reserved for future Intel VSR, always 0
-} mpv_vsr_capabilities;
-
-/**
- * Runtime TrueHDR capability information, queried via
- * MPV_RENDER_PARAM_TRUEHDR_CAPABILITIES.
- */
-typedef struct mpv_truehdr_capabilities {
-    int nvidia_truehdr;  // 1 if NVIDIA RTX TrueHDR is available, 0 otherwise
-    int reserved1;       // reserved for future use, always 0
-    int reserved2;       // reserved for future use, always 0
-} mpv_truehdr_capabilities;
 
 /**
  * For backwards compatibility with the old naming of
@@ -538,8 +468,6 @@ typedef struct mpv_render_param {
 #define MPV_RENDER_API_TYPE_OPENGL "opengl"
 // See section "Software renderer"
 #define MPV_RENDER_API_TYPE_SW "sw"
-// See render_d3d11.h
-#define MPV_RENDER_API_TYPE_D3D11 "d3d11"
 
 /**
  * Flags used in mpv_render_frame_info.flags. Each value represents a bit in it.

@@ -42,13 +42,6 @@ struct gl_next_opts {
     int target_hint_mode;
     bool target_hint_strict;
     char **raw_opts;
-    int nvidia_vsr;            // 0=off, 1=bicubic, 2=low, 3=medium, 4=high, 5=ultra
-    int nvidia_truehdr;        // 0=off, 1=natural, 2=standard, 3=vivid
-    int nvidia_fruc;           // 0=off, 1=on (NVIDIA Optical Flow frame interpolation)
-    int amd_fsr;               // 0=off, 1=on (EASU only), 2=on+sharpen (EASU+RCAS)
-    int rife;                  // 0=off, 1=standard (FP16), 2=high (FP32)
-    char *rife_model;          // path to RIFE ONNX model directory
-    int rife_streams;          // number of parallel inference streams (1-4, default 2)
 };
 
 #endif

@@ -1,1 +1,0 @@
-add `--nvidia-vsr` option for NVIDIA RTX Video Super Resolution via NGX SDK

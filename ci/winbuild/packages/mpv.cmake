@@ -52,12 +52,6 @@ ExternalProject_Add(mpv
         -Dvulkan=enabled
         -Dsubrandr=enabled
         ${mpv_gl}
-        -Dngx-vsr=enabled
-        -Dngx-vsr-path=/home/richasy/programs/RTX_Video_SDK
-        -Dnvofa=enabled
-        -Dnvofa-path=/home/richasy/programs/Optical_Flow_SDK_5.0.7
-        -Drife=auto
-        -Donnxruntime-path=/home/richasy/programs/microsoft.ml.onnxruntime.directml/build/native
         -Dc_args='-Wno-error=int-conversion'
     BUILD_COMMAND ${EXEC} LTO_JOB=1 PDB=1 ninja -C <BINARY_DIR>
     INSTALL_COMMAND ""
@@ -83,8 +77,6 @@ ExternalProject_Add_Step(mpv copy-binary
     COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/include/mpv/stream_cb.h    ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv/stream_cb.h
     COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/include/mpv/render.h       ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv/render.h
     COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/include/mpv/render_gl.h    ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv/render_gl.h
-    COMMAND ${CMAKE_COMMAND} -E copy /home/richasy/programs/Optical_Flow_SDK_5.0.7/NvOFFRUC/NvOFFRUCSample/bin/win64/NvOFFRUC.dll     ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/NvOFFRUC.dll
-    COMMAND ${CMAKE_COMMAND} -E copy /home/richasy/programs/Optical_Flow_SDK_5.0.7/NvOFFRUC/NvOFFRUCSample/bin/win64/cudart64_110.dll ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/cudart64_110.dll
     COMMENT "Copying mpv binaries and manual"
 )
 

@@ -962,46 +962,6 @@ local function add_video_out(s)
         append_property(s, "deinterlace", {prefix="Deinterlacing:"})
     end
 
-    local nvvsr = mp.get_property("nvidia-vsr")
-    if nvvsr and nvvsr ~= "off" then
-        local value = nvvsr:sub(1,1):upper() .. nvvsr:sub(2)
-        if o.use_ass then
-            local reset = o.font_color ~= "" and o.font_color or "FFFFFF"
-            append(s, "", {prefix="NVIDIA VSR:",
-                   suffix="{\\1c&H00CC00&}" .. value .. "{\\1c&H" .. reset .. "&}"})
-        else
-            append(s, value, {prefix="NVIDIA VSR:"})
-        end
-    end
-
-    local amdfsr = mp.get_property("amd-fsr")
-    if amdfsr and amdfsr ~= "off" then
-        local value = amdfsr:sub(1,1):upper() .. amdfsr:sub(2)
-        if o.use_ass then
-            local reset = o.font_color ~= "" and o.font_color or "FFFFFF"
-            append(s, "", {prefix="AMD FSR:",
-                   suffix="{\\1c&H0000FF&}" .. value .. "{\\1c&H" .. reset .. "&}"})
-        else
-            append(s, value, {prefix="AMD FSR:"})
-        end
-    end
-
-    local rife = mp.get_property("rife")
-    if rife and rife ~= "off" then
-        local value = rife:sub(1,1):upper() .. rife:sub(2)
-        local out_fps = mp.get_property_number("rife-output-fps", 0)
-        if out_fps > 0 then
-            value = value .. string.format(" (%.1f fps)", out_fps)
-        end
-        if o.use_ass then
-            local reset = o.font_color ~= "" and o.font_color or "FFFFFF"
-            append(s, "", {prefix="RIFE:",
-                   suffix="{\\1c&H00CCCC&}" .. value .. "{\\1c&H" .. reset .. "&}"})
-        else
-            append(s, value, {prefix="RIFE:"})
-        end
-    end
-
     local scale = nil
     if not mp.get_property_native("fullscreen") then
         scale = get_property_cached("current-window-scale")

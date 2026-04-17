@@ -133,8 +133,6 @@ enum mp_voctrl {
     // Clipboard
     VOCTRL_GET_CLIPBOARD,               // struct voctrl_clipboard*
     VOCTRL_SET_CLIPBOARD,
-
-    VOCTRL_GET_VSR_OUTPUT_SIZE,         // int[2] (w/h), 0/0 if inactive
 };
 
 // Helper to expose what kind of content is currently playing to the VO.
@@ -557,7 +555,6 @@ double vo_get_vsync_interval(struct vo *vo);
 double vo_get_estimated_vsync_interval(struct vo *vo);
 double vo_get_estimated_vsync_jitter(struct vo *vo);
 double vo_get_display_fps(struct vo *vo);
-void vo_set_display_fps(struct vo *vo, double fps);
 void * vo_get_display_swapchain(struct vo *vo);
 double vo_get_delay(struct vo *vo);
 void vo_discard_timing_info(struct vo *vo);

@@ -1416,6 +1416,36 @@ if features['amf']
     sources += files('video/filter/vf_amf.c')
 endif
 
+# RIFE frame interpolation (via ONNX Runtime + DirectML).
+# Headers only at build time; onnxruntime.dll is loaded at runtime via LoadLibrary.
+rife_opt = get_option('rife').require(
+    features['d3d11'],
+    error_message: 'rife requires d3d11!',
+)
+ort_path = get_option('onnxruntime-path')
+rife_found = false
+rife_inc = []
+if rife_opt.allowed() and ort_path != ''
+    ort_inc_dir = include_directories(ort_path / 'include')
+    rife_has_header = cc.has_header('onnxruntime_c_api.h',
+        include_directories: ort_inc_dir, required: false)
+    if rife_has_header
+        rife_found = true
+        rife_inc = [ort_inc_dir]
+    endif
+elif rife_opt.allowed()
+    rife_has_header = cc.has_header('onnxruntime_c_api.h', required: false)
+    if rife_has_header
+        rife_found = true
+    endif
+endif
+features += {'rife': rife_found}
+if rife_found
+    rife_dep = declare_dependency(include_directories: rife_inc)
+    dependencies += rife_dep
+    sources += files('video/filter/vf_rife.c')
+endif
+
 if features['d3d-hwaccel'] and features['egl-angle']
     sources += files('video/out/opengl/hwdec_d3d11egl.c')
 endif

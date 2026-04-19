@@ -149,12 +149,31 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
     if (!ra_get_imgfmt_desc(mapper->ra, mapper->dst_params.imgfmt, &desc))
         return -1;
 
+    DXGI_FORMAT copy_fmt = DXGI_FORMAT_UNKNOWN;
+    switch (mapper->dst_params.imgfmt) {
+    case IMGFMT_NV12: copy_fmt = DXGI_FORMAT_NV12; break;
+    case IMGFMT_P010: copy_fmt = DXGI_FORMAT_P010; break;
+    case IMGFMT_BGRA: copy_fmt = DXGI_FORMAT_B8G8R8A8_UNORM; break;
+    case IMGFMT_X2BGR10: copy_fmt = DXGI_FORMAT_R10G10B10A2_UNORM; break;
+    case IMGFMT_RGBAF16: copy_fmt = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
+    }
+
     if (o->opts->zero_copy) {
         // In the zero-copy path, we create the ra_tex objects in the map
         // operation, so we just need to store the format of each plane
         p->num_planes = desc.num_planes;
-        for (int i = 0; i < desc.num_planes; i++)
+        for (int i = 0; i < desc.num_planes; i++) {
             p->fmt[i] = desc.planes[i];
+            // For single-plane RGB formats, prefer the ra_format that
+            // matches the actual DXGI layout (BGRA8 etc), so SRV creation
+            // gets a compatible format.
+            if (desc.num_planes == 1 && copy_fmt != DXGI_FORMAT_UNKNOWN) {
+                const struct ra_format *match =
+                    ra_d3d11_get_ra_format(mapper->ra, copy_fmt);
+                if (match)
+                    p->fmt[i] = match;
+            }
+        }
     } else {
         // Minimal alignment requirement for NV12 and P010
         mapper->dst_params.w = MP_ALIGN_UP(mapper->dst_params.w, 2);
@@ -163,15 +182,8 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
         struct mp_image layout = {0};
         mp_image_set_params(&layout, &mapper->dst_params);
 
-        DXGI_FORMAT copy_fmt;
-        switch (mapper->dst_params.imgfmt) {
-        case IMGFMT_NV12: copy_fmt = DXGI_FORMAT_NV12; break;
-        case IMGFMT_P010: copy_fmt = DXGI_FORMAT_P010; break;
-        case IMGFMT_BGRA: copy_fmt = DXGI_FORMAT_B8G8R8A8_UNORM; break;
-        case IMGFMT_X2BGR10: copy_fmt = DXGI_FORMAT_R10G10B10A2_UNORM; break;
-        case IMGFMT_RGBAF16: copy_fmt = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
-        default: return -1;
-        }
+        if (copy_fmt == DXGI_FORMAT_UNKNOWN)
+            return -1;
 
         D3D11_TEXTURE2D_DESC copy_desc = {
             .Width = mapper->dst_params.w,
@@ -190,9 +202,21 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
         }
 
         for (int i = 0; i < desc.num_planes; i++) {
+            // For single-plane RGB-style formats whose actual DXGI layout
+            // doesn't match what ra_get_imgfmt_desc() returned (e.g. BGRA
+            // resolves to the rgba8 ra_format because bgra8 isn't "regular"),
+            // pick the ra_format that actually matches copy_fmt so the SRV
+            // creation in ra_d3d11_wrap_tex_video() gets a compatible format.
+            const struct ra_format *plane_fmt = desc.planes[i];
+            if (desc.num_planes == 1) {
+                const struct ra_format *match =
+                    ra_d3d11_get_ra_format(mapper->ra, copy_fmt);
+                if (match)
+                    plane_fmt = match;
+            }
             mapper->tex[i] = ra_d3d11_wrap_tex_video(mapper->ra, p->copy_tex,
                 mp_image_plane_w(&layout, i), mp_image_plane_h(&layout, i), 0,
-                desc.planes[i]);
+                plane_fmt);
             if (!mapper->tex[i]) {
                 MP_FATAL(mapper, "Could not create RA texture view\n");
                 return -1;

@@ -58,6 +58,8 @@ option('wasapi', type: 'feature', value: 'auto', description: 'WASAPI audio outp
 
 # video output features
 option('amf', type: 'feature', value: 'auto', description: 'AMD AMF')
+option('rife', type: 'feature', value: 'auto', description: 'RIFE frame interpolation (DirectML via ONNX Runtime)')
+option('onnxruntime-path', type: 'string', value: '', description: 'Path to ONNX Runtime SDK root directory (containing include/onnxruntime_c_api.h)')
 option('caca', type: 'feature', value: 'auto', description: 'CACA')
 option('cocoa', type: 'feature', value: 'auto', description: 'Cocoa')
 option('d3d11', type: 'feature', value: 'auto', description: 'Direct3D 11 video output')

@@ -627,11 +627,12 @@ local function append_display_sync(s)
 end
 
 
-local function append_filters(s, prop, prefix)
+local function append_filters(s, prop, prefix, skip_label)
     local length = 0
     local filters = {}
 
     for _,f in ipairs(mp.get_property_native(prop, {})) do
+        if not (skip_label and f.label == skip_label) then
         local n = f.name
         if f.enabled ~= nil and not f.enabled then
             n = n .. " (disabled)"
@@ -653,6 +654,7 @@ local function append_filters(s, prop, prefix)
 
         length = length + n:len() + p:len()
         filters[#filters+1] = no_ASS(n) .. it(no_ASS(p))
+        end
     end
 
     if #filters > 0 then
@@ -1058,7 +1060,59 @@ local function add_video(s)
     append_img_params(s, r, ro)
     append_hdr(s, ro)
     append_property(s, "video-bitrate", {prefix="Bitrate:"})
-    append_filters(s, "vf", "Filters:")
+    -- Probe RIFE metadata once so we can both (a) suppress the rife filter
+    -- entry from the generic Filters: line (its dedicated section already
+    -- shows everything) and (b) render the dedicated section below.
+    local rife = mp.get_property_native("vf-metadata/rife", nil)
+    local rife_on = rife and (rife.enabled == "yes" or rife.enabled == true)
+    append_filters(s, "vf", "Filters:", rife_on and "rife" or nil)
+
+    -- RIFE filter stats: only shown when a labeled "rife" filter is present,
+    -- exposes vf-metadata, AND is currently enabled. Recommended label is
+    -- "rife" (e.g. vf=@rife:rife=...).
+    if rife_on then
+        local sep2 = o.prefix_sep .. o.prefix_sep
+        local indent2 = o.indent .. o.indent
+
+        -- Line 1: header + processing geometry.
+        s[#s+1] = o.nl .. o.indent .. bold("RIFE:") .. o.prefix_sep ..
+                  bold(no_ASS(rife.enabled or "-")) .. o.prefix_sep ..
+                  bold(no_ASS(rife.multiplier or "-"))
+        append(s, no_ASS(rife.proc or "-"), {prefix="Proc:", nl="",
+                                             indent=sep2})
+        append(s, no_ASS(rife.scale or "-"), {prefix="Scale:", nl="",
+                                              indent=sep2})
+
+        -- Line 2: pipeline toggles + last inference time.
+        append(s, no_ASS(rife.zerocopy or "-"), {prefix="ZC:",
+                                                 indent=indent2})
+        append(s, no_ASS(rife["nv12-input"] or "-"), {prefix="NV12-in:",
+                                                     nl="", indent=sep2})
+        append(s, no_ASS(rife["frame-diff"] or "-"), {prefix="Diff:",
+                                                     nl="", indent=sep2})
+        append(s, no_ASS((rife["last-infer-ms"] or "-") .. " ms"),
+               {prefix="Infer:", nl="", indent=sep2})
+
+        -- Line 3: skip stats + last diff result.
+        local skipped = (tonumber(rife["skipped-static"]) or 0) +
+                        (tonumber(rife["skipped-scene"])  or 0)
+        local tot = tonumber(rife["total-pairs"]) or 0
+        local skip_pct = tot > 0 and (100.0 * skipped / tot) or 0.0
+        append(s, string.format("%d / %d  (%.1f%%)", skipped, tot, skip_pct),
+               {prefix="Skipped:", indent=indent2})
+        append(s, no_ASS(rife["diff-ratio"] or "-"), {prefix="Ratio:",
+                                                     nl="", indent=sep2})
+        local kind = rife["diff-kind"] or "-"
+        append(s, no_ASS(kind), {prefix="Kind:", nl="", indent=sep2})
+        local out_fps = tonumber(rife["output-fps"]) or 0
+        local in_fps  = tonumber(rife["source-fps"]) or 0
+        if out_fps > 0 or in_fps > 0 then
+            append(s, string.format("%.1f fps", out_fps), {prefix="Out:",
+                                                           indent=indent2})
+            append(s, string.format("%.1f fps", in_fps),  {prefix="In:",
+                                                           nl="", indent=sep2})
+        end
+    end
 end
 
 

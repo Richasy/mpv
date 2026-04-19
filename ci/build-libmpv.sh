@@ -17,6 +17,11 @@ set -e
 #   MPV_REPO      - mpv git repository URL (default: https://github.com/Richasy/mpv.git)
 #   MPV_COMMIT    - mpv git commit/branch/tag (default: master)
 #   MPV_SRC_DIR   - path to mpv source (for copying headers)
+#   BUILD_TYPE    - 'release' (default) or 'debug'. Debug switches mpv meson
+#                   options to -Doptimization=0 -Db_lto=false -Db_ndebug=false
+#                   so PDBs are stepable and asserts are kept on. PDB=1 is
+#                   already always passed to ninja so PDBs are produced for
+#                   release builds too (handy for crash-dump symbolication).
 # =============================================================================
 
 export PATH="$HOME/.local/bin:$PATH"
@@ -44,6 +49,11 @@ WINBUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/winbuild"
 
 MPV_REPO="${MPV_REPO:-https://github.com/Richasy/mpv.git}"
 MPV_COMMIT="${MPV_COMMIT:-master}"
+BUILD_TYPE="${BUILD_TYPE:-release}"
+case "$BUILD_TYPE" in
+    release|debug) ;;
+    *) err "BUILD_TYPE must be 'release' or 'debug', got: $BUILD_TYPE" ;;
+esac
 
 # =============================================================================
 # Install prerequisites (run with --install-deps)
@@ -74,7 +84,7 @@ install_deps() {
 # Patch mpv.cmake to use specified repo and commit
 # =============================================================================
 patch_mpv_cmake() {
-    log "Patching mpv.cmake (repo: $MPV_REPO, commit: $MPV_COMMIT)..."
+    log "Patching mpv.cmake (repo: $MPV_REPO, commit: $MPV_COMMIT, build: $BUILD_TYPE)..."
     local mpv_cmake="$WINBUILD_DIR/packages/mpv.cmake"
 
     if [ ! -f "$mpv_cmake.orig" ]; then
@@ -85,6 +95,13 @@ patch_mpv_cmake() {
 
     sed -i "s|GIT_REPOSITORY https://github.com/Richasy/mpv.git|GIT_REPOSITORY ${MPV_REPO}|" "$mpv_cmake"
     sed -i "s|GIT_TAG master|GIT_TAG ${MPV_COMMIT}|" "$mpv_cmake"
+
+    if [ "$BUILD_TYPE" = "debug" ]; then
+        log "Switching meson options to debug build (no optimization, no LTO, asserts on)..."
+        sed -i "s|-Db_ndebug=true|-Db_ndebug=false|" "$mpv_cmake"
+        sed -i "s|-Doptimization=3|-Doptimization=0|" "$mpv_cmake"
+        sed -i "s|-Db_lto=true|-Db_lto=false|" "$mpv_cmake"
+    fi
 
     log "mpv.cmake patched successfully"
 }
@@ -188,21 +205,74 @@ collect() {
 
     log "Collecting build artifacts for $ARCH..."
 
-    # Find and copy libmpv-2.dll
+    # Copy ONNX Runtime + DirectML DLLs for vf_rife (silently skip if SDK
+    # is not provisioned on this runner).
+    local ORT_PKG="/home/richasy/programs/microsoft.ml.onnxruntime.directml"
+    local DML_PKG="/home/richasy/programs/microsoft.ai.directml"
+    local ORT_ARCH_DIR DML_ARCH_DIR
+    if [ "$TARGET_ARCH" = "aarch64" ]; then
+        ORT_ARCH_DIR="win-arm64"
+        DML_ARCH_DIR="arm64-win"
+    else
+        ORT_ARCH_DIR="win-x64"
+        DML_ARCH_DIR="x64-win"
+    fi
+    local ORT_DLL="$ORT_PKG/runtimes/$ORT_ARCH_DIR/native/onnxruntime.dll"
+    local ORT_SHARED_DLL="$ORT_PKG/runtimes/$ORT_ARCH_DIR/native/onnxruntime_providers_shared.dll"
+    local DML_DLL="$DML_PKG/bin/$DML_ARCH_DIR/DirectML.dll"
+    if [ -f "$ORT_DLL" ]; then
+        cp "$ORT_DLL" "$ARCH_OUTPUT/"
+        log "onnxruntime.dll copied ($ORT_ARCH_DIR)"
+    else
+        warn "onnxruntime.dll not found at $ORT_DLL, skipping"
+    fi
+    if [ -f "$ORT_SHARED_DLL" ]; then
+        cp "$ORT_SHARED_DLL" "$ARCH_OUTPUT/"
+        log "onnxruntime_providers_shared.dll copied ($ORT_ARCH_DIR)"
+    fi
+    if [ -f "$DML_DLL" ]; then
+        cp "$DML_DLL" "$ARCH_OUTPUT/"
+        log "DirectML.dll copied ($DML_ARCH_DIR)"
+    else
+        warn "DirectML.dll not found at $DML_DLL, skipping"
+    fi
+
+    # Find and copy libmpv-2.dll (and libmpv-2.pdb when produced - PDB=1 is
+    # always passed to the linker so PDBs exist for both release and debug
+    # builds; debug builds simply produce more useful PDBs).
     local MPV_DEV_DIR=$(find "$BUILD_DIR" -path "*/mpv-dev*" -type d 2>/dev/null | head -1)
+    local DLL_DIR=""
     if [ -n "$MPV_DEV_DIR" ] && [ -f "$MPV_DEV_DIR/libmpv-2.dll" ]; then
         cp "$MPV_DEV_DIR/libmpv-2.dll" "$ARCH_OUTPUT/"
         cp "$MPV_DEV_DIR/libmpv.dll.a" "$ARCH_OUTPUT/" 2>/dev/null || true
+        DLL_DIR="$MPV_DEV_DIR"
         log "libmpv-2.dll copied from $MPV_DEV_DIR"
     else
         local DLL_PATH=$(find "$BUILD_DIR" -name "libmpv-2.dll" -type f 2>/dev/null | head -1)
         if [ -n "$DLL_PATH" ]; then
             cp "$DLL_PATH" "$ARCH_OUTPUT/"
-            cp "$(dirname "$DLL_PATH")/libmpv.dll.a" "$ARCH_OUTPUT/" 2>/dev/null || true
-            log "libmpv-2.dll copied from $(dirname "$DLL_PATH")"
+            DLL_DIR=$(dirname "$DLL_PATH")
+            cp "$DLL_DIR/libmpv.dll.a" "$ARCH_OUTPUT/" 2>/dev/null || true
+            log "libmpv-2.dll copied from $DLL_DIR"
         else
             err "libmpv-2.dll not found for $ARCH"
         fi
+    fi
+
+    # PDB lives next to the DLL only in the linker BINARY_DIR (not copied
+    # into mpv-dev by the upstream cmake), so search both DLL_DIR and the
+    # whole BUILD_DIR as a fallback.
+    local PDB_PATH=""
+    if [ -n "$DLL_DIR" ] && [ -f "$DLL_DIR/libmpv-2.pdb" ]; then
+        PDB_PATH="$DLL_DIR/libmpv-2.pdb"
+    else
+        PDB_PATH=$(find "$BUILD_DIR" -name "libmpv-2.pdb" -type f 2>/dev/null | head -1)
+    fi
+    if [ -n "$PDB_PATH" ] && [ -f "$PDB_PATH" ]; then
+        cp "$PDB_PATH" "$ARCH_OUTPUT/"
+        log "libmpv-2.pdb copied from $(dirname "$PDB_PATH") ($(du -h "$PDB_PATH" | cut -f1))"
+    else
+        warn "libmpv-2.pdb not found - crash dumps will not symbolicate"
     fi
 
     # Copy headers

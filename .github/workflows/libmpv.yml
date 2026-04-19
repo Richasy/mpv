@@ -19,6 +19,13 @@ on:
           - azure
           - both
         default: github
+      build_type:
+        description: 'Build type (release = -O3 LTO + PDB; debug = -O0 no-LTO, asserts on, PDB)'
+        type: choice
+        options:
+          - release
+          - debug
+        default: release
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -58,6 +65,8 @@ jobs:
       TARGET_ARCH: ${{ matrix.arch }}
       MPV_REPO: https://github.com/Richasy/mpv.git
       MPV_COMMIT: ${{ github.sha }}
+      BUILD_TYPE: ${{ inputs.build_type }}
+      BUILD_SUFFIX: ${{ inputs.build_type == 'debug' && '-debug' || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -73,7 +82,7 @@ jobs:
         if: inputs.upload_target == 'github' || inputs.upload_target == 'both'
         uses: actions/upload-artifact@v4
         with:
-          name: libmpv-${{ matrix.name }}
+          name: libmpv-${{ matrix.name }}${{ env.BUILD_SUFFIX }}
           path: ${{ env.OUTPUT_DIR }}/${{ matrix.arch }}/
           retention-days: 30
           compression-level: 6
@@ -84,18 +93,30 @@ jobs:
           AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
         run: |
           DLL_PATH="$OUTPUT_DIR/${{ matrix.arch }}/libmpv-2.dll"
+          PDB_PATH="$OUTPUT_DIR/${{ matrix.arch }}/libmpv-2.pdb"
+          AZ_DIR="native/${{ matrix.name }}${BUILD_SUFFIX}"
           if [ ! -f "$DLL_PATH" ]; then
             echo "ERROR: libmpv-2.dll not found at $DLL_PATH"
             exit 1
           fi
-          echo "Uploading libmpv-2.dll for ${{ matrix.name }} to Azure Blob..."
+          echo "Uploading libmpv-2.dll for ${{ matrix.name }}${BUILD_SUFFIX} to Azure Blob..."
           az storage blob upload \
             --container-name rodel-player-deps \
-            --name "native/${{ matrix.name }}/libmpv-2.dll" \
+            --name "$AZ_DIR/libmpv-2.dll" \
             --file "$DLL_PATH" \
             --overwrite \
             --connection-string "$AZURE_STORAGE_CONNECTION_STRING"
-          echo "Uploaded: native/${{ matrix.name }}/libmpv-2.dll"
+          echo "Uploaded: $AZ_DIR/libmpv-2.dll"
+          if [ -f "$PDB_PATH" ]; then
+            echo "Uploading libmpv-2.pdb..."
+            az storage blob upload \
+              --container-name rodel-player-deps \
+              --name "$AZ_DIR/libmpv-2.pdb" \
+              --file "$PDB_PATH" \
+              --overwrite \
+              --connection-string "$AZURE_STORAGE_CONNECTION_STRING"
+            echo "Uploaded: $AZ_DIR/libmpv-2.pdb"
+          fi
 
       - name: Upload build logs on failure
         if: failure()

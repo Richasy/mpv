@@ -2,3 +2,6 @@
 !/subprojects/packagefiles
 !/subprojects/*.wrap
 .claude/
+
+rife_validate/
+DirectML.dll

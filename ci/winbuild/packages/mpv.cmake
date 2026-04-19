@@ -53,6 +53,8 @@ ExternalProject_Add(mpv
         -Dsubrandr=enabled
         ${mpv_gl}
         -Dc_args='-Wno-error=int-conversion'
+        -Drife=auto
+        -Donnxruntime-path=/home/richasy/programs/microsoft.ml.onnxruntime.directml/build/native
     BUILD_COMMAND ${EXEC} LTO_JOB=1 PDB=1 ninja -C <BINARY_DIR>
     INSTALL_COMMAND ""
     LOG_DOWNLOAD 1 LOG_UPDATE 1 LOG_CONFIGURE 1 LOG_BUILD 1 LOG_INSTALL 1

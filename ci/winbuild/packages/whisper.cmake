@@ -25,9 +25,16 @@ ExternalProject_Add(whisper
         # available on the BUILD HOST (Linux) — install via:
         #   sudo apt-get install -y glslc       (Ubuntu 22.04+)
         # or by extracting glslc from a LunarG Vulkan SDK / shaderc release.
+        #
+        # CMake's FindVulkan on Windows targets searches for vulkan-1.lib;
+        # our cross build installs libvulkan.a (static loader from the
+        # vulkan package), so point Vulkan_LIBRARY/Vulkan_INCLUDE_DIR at it
+        # explicitly to bypass the platform-specific name probe.
         -DGGML_VULKAN=ON
         -DGGML_VULKAN_RUN_TESTS=OFF
         -DGGML_VULKAN_CHECK_RESULTS=OFF
+        -DVulkan_LIBRARY=${MINGW_INSTALL_PREFIX}/lib/libvulkan.a
+        -DVulkan_INCLUDE_DIR=${MINGW_INSTALL_PREFIX}/include
         -DWHISPER_BUILD_TESTS=OFF
         -DWHISPER_BUILD_EXAMPLES=OFF
         -DWHISPER_BUILD_SERVER=OFF

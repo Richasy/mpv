@@ -157,6 +157,9 @@ build() {
     rm -f "$_MINGW_PREFIX"/lib/libwhisper.* \
           "$_MINGW_PREFIX"/lib/libggml.* \
           "$_MINGW_PREFIX"/lib/libggml-*.* \
+          "$_MINGW_PREFIX"/lib/whisper.* \
+          "$_MINGW_PREFIX"/lib/ggml.* \
+          "$_MINGW_PREFIX"/lib/ggml-*.* \
           "$_MINGW_PREFIX"/lib/pkgconfig/whisper.pc \
           "$_MINGW_PREFIX"/bin/whisper.dll \
           "$_MINGW_PREFIX"/bin/ggml*.dll 2>/dev/null || true

@@ -271,8 +271,10 @@ collect() {
     local WHISPER_BIN_DIR="$MINGW_PREFIX/bin"
     if [ -d "$WHISPER_BIN_DIR" ]; then
         local copied_any=0
-        # whisper.cpp shared lib
-        for dll in whisper.dll; do
+        # whisper.cpp shared lib.  mingw cmake adds the 'lib' prefix
+        # (libwhisper.dll) but the import lib still resolves -lwhisper to
+        # this DLL, so we just need the file to be next to libmpv-2.dll.
+        for dll in libwhisper.dll whisper.dll; do
             if [ -f "$WHISPER_BIN_DIR/$dll" ]; then
                 cp "$WHISPER_BIN_DIR/$dll" "$ARCH_OUTPUT/"
                 log "$dll copied"

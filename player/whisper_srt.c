@@ -188,7 +188,7 @@ struct ws_srt_segments *ws_srt_parse_buffer(void *talloc_parent,
     }
 
     if (log) {
-        MP_VERBOSE(log, "ws_srt: parsed %d segments from %zu bytes\n",
+        mp_verbose(log, "ws_srt: parsed %d segments from %zu bytes\n",
                    out->count, len);
     }
     return out;
@@ -201,7 +201,7 @@ struct ws_srt_segments *ws_srt_parse_file(void *talloc_parent,
     FILE *f = fopen(path, "rb");
     if (!f) {
         if (log)
-            MP_ERR(log, "ws_srt: cannot open %s\n", path);
+            mp_err(log, "ws_srt: cannot open %s\n", path);
         return NULL;
     }
     fseek(f, 0, SEEK_END);
@@ -210,7 +210,7 @@ struct ws_srt_segments *ws_srt_parse_file(void *talloc_parent,
     if (sz <= 0 || sz > 32 * 1024 * 1024) {
         fclose(f);
         if (log)
-            MP_WARN(log, "ws_srt: empty or oversized file %s (%ld bytes)\n",
+            mp_warn(log, "ws_srt: empty or oversized file %s (%ld bytes)\n",
                     path, sz);
         return NULL;
     }

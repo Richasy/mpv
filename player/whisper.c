@@ -227,7 +227,7 @@ static char *make_temp_outdir(void *tctx, struct mp_log *log)
         if (CreateDirectoryA(path, NULL))
             return path;
         if (GetLastError() != ERROR_ALREADY_EXISTS) {
-            MP_WARN(log, "make_temp_outdir: CreateDirectory failed for '%s' "
+            mp_warn(log, "make_temp_outdir: CreateDirectory failed for '%s' "
                     "(err=%lu)\n", path, GetLastError());
             talloc_free(path);
             return NULL;
@@ -238,7 +238,7 @@ static char *make_temp_outdir(void *tctx, struct mp_log *log)
 #endif
         talloc_free(path);
     }
-    MP_ERR(log, "make_temp_outdir: failed after 20 attempts\n");
+    mp_err(log, "make_temp_outdir: failed after 20 attempts\n");
     return NULL;
 }
 
@@ -285,7 +285,7 @@ static void on_child_stderr(void *ctx, char *data, size_t size)
     if (size == 0) {
         if (c->fill > 0) {
             c->buf[c->fill] = '\0';
-            MP_VERBOSE(c->log, "fw.stderr: %s\n", c->buf);
+            mp_verbose(c->log, "fw.stderr: %s\n", c->buf);
             c->fill = 0;
         }
         return;
@@ -304,14 +304,14 @@ static void on_child_stderr(void *ctx, char *data, size_t size)
             char *line = c->buf;
             if (nl > line && nl[-1] == '\r') nl[-1] = '\0';
             if (line[0])
-                MP_VERBOSE(c->log, "fw.stderr: %s\n", line);
+                mp_verbose(c->log, "fw.stderr: %s\n", line);
             size_t consumed = (nl - c->buf) + 1;
             memmove(c->buf, c->buf + consumed, c->fill - consumed);
             c->fill -= consumed;
         }
         if (c->fill >= sizeof(c->buf) - 1) {
             c->buf[c->fill] = '\0';
-            MP_VERBOSE(c->log, "fw.stderr: %s\n", c->buf);
+            mp_verbose(c->log, "fw.stderr: %s\n", c->buf);
             c->fill = 0;
         }
     }

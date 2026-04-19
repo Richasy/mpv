@@ -146,6 +146,22 @@ build() {
     rm -rf "$SRC_PACKAGES/whisper" 2>/dev/null || true
     rm -rf "$BUILD_DIR/packages/whisper-prefix/src/whisper-stamp" 2>/dev/null || true
     rm -rf "$BUILD_DIR/packages/whisper-prefix/src/whisper-build" 2>/dev/null || true
+    # Also strip stale install-prefix artifacts left behind by older
+    # static whisper builds (libggml.a, libggml-base.a, libwhisper.a,
+    # ...).  If we don't, ffmpeg/mpv will happily pick those up over the
+    # new libggml.dll.a import lib and fail to link with
+    # "undefined symbol: ggml_backend_cpu_reg" because backend
+    # registration moved into ggml-cpu.dll.
+    log "Removing stale whisper/ggml artifacts from install prefix..."
+    local _MINGW_PREFIX="$BUILD_DIR/${ARCH}-w64-mingw32"
+    rm -f "$_MINGW_PREFIX"/lib/libwhisper.* \
+          "$_MINGW_PREFIX"/lib/libggml.* \
+          "$_MINGW_PREFIX"/lib/libggml-*.* \
+          "$_MINGW_PREFIX"/lib/pkgconfig/whisper.pc \
+          "$_MINGW_PREFIX"/bin/whisper.dll \
+          "$_MINGW_PREFIX"/bin/ggml*.dll 2>/dev/null || true
+    rm -rf "$_MINGW_PREFIX"/lib/cmake/whisper \
+           "$_MINGW_PREFIX"/lib/cmake/ggml 2>/dev/null || true
 
     # Configure CMake
     log "Configuring CMake for $ARCH..."

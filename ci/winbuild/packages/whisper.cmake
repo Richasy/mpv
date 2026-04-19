@@ -40,6 +40,7 @@ ExternalProject_Add(whisper
         -DVulkan_LIBRARY=${MINGW_INSTALL_PREFIX}/lib/libvulkan.a
         -DVulkan_INCLUDE_DIR=${MINGW_INSTALL_PREFIX}/include
         -DCMAKE_SHARED_LINKER_FLAGS='-lcfgmgr32 -lshlwapi'
+        -DCMAKE_MODULE_LINKER_FLAGS='-lcfgmgr32 -lshlwapi'
         -DCMAKE_EXE_LINKER_FLAGS='-lcfgmgr32 -lshlwapi'
         -DWHISPER_BUILD_TESTS=OFF
         -DWHISPER_BUILD_EXAMPLES=OFF

@@ -135,17 +135,11 @@ build() {
     rm -rf "$BUILD_DIR/packages/libplacebo-prefix/src/libplacebo-stamp" 2>/dev/null || true
     rm -rf "$BUILD_DIR/packages/libplacebo-prefix/src/libplacebo-build" 2>/dev/null || true
 
-    # Force ffmpeg re-clone to pick up new configure options (e.g. --enable-whisper)
+    # Force ffmpeg re-clone to pick up new configure options
     log "Removing ffmpeg source cache to force re-clone..."
     rm -rf "$SRC_PACKAGES/ffmpeg" 2>/dev/null || true
     rm -rf "$BUILD_DIR/packages/ffmpeg-prefix/src/ffmpeg-stamp" 2>/dev/null || true
     rm -rf "$BUILD_DIR/packages/ffmpeg-prefix/src/ffmpeg-build" 2>/dev/null || true
-
-    # Force whisper re-build
-    log "Removing whisper cache to force rebuild..."
-    rm -rf "$SRC_PACKAGES/whisper" 2>/dev/null || true
-    rm -rf "$BUILD_DIR/packages/whisper-prefix/src/whisper-stamp" 2>/dev/null || true
-    rm -rf "$BUILD_DIR/packages/whisper-prefix/src/whisper-build" 2>/dev/null || true
 
     # Configure CMake
     log "Configuring CMake for $ARCH..."

@@ -177,6 +177,7 @@ sources = files(
     'player/sub.c',
     'player/video.c',
     'player/whisper.c',
+    'player/whisper_srt.c',
     'player/whisper_translate.c',
 
     ## clipboard

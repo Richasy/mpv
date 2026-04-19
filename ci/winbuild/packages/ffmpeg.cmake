@@ -32,7 +32,7 @@ ExternalProject_Add(ffmpeg
         dav1d
         rubberband
         openal-soft
-    GIT_REPOSITORYhttps://github.com/Richasy/FFmpeg.git
+    GIT_REPOSITORY https://github.com/Richasy/FFmpeg.git
     GIT_TAG master
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--sparse --filter=tree:0"

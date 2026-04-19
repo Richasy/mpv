@@ -30,11 +30,17 @@ ExternalProject_Add(whisper
         # our cross build installs libvulkan.a (static loader from the
         # vulkan package), so point Vulkan_LIBRARY/Vulkan_INCLUDE_DIR at it
         # explicitly to bypass the platform-specific name probe.
+        #
+        # The static Vulkan loader pulls in CM_* (cfgmgr32) and shlwapi
+        # symbols which are listed in vulkan.pc Libs.private but not picked
+        # up by find_package(Vulkan); add them to the link line directly.
         -DGGML_VULKAN=ON
         -DGGML_VULKAN_RUN_TESTS=OFF
         -DGGML_VULKAN_CHECK_RESULTS=OFF
         -DVulkan_LIBRARY=${MINGW_INSTALL_PREFIX}/lib/libvulkan.a
         -DVulkan_INCLUDE_DIR=${MINGW_INSTALL_PREFIX}/include
+        -DCMAKE_SHARED_LINKER_FLAGS=-lcfgmgr32\ -lshlwapi
+        -DCMAKE_EXE_LINKER_FLAGS=-lcfgmgr32\ -lshlwapi
         -DWHISPER_BUILD_TESTS=OFF
         -DWHISPER_BUILD_EXAMPLES=OFF
         -DWHISPER_BUILD_SERVER=OFF

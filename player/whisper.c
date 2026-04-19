@@ -123,6 +123,12 @@ struct whisper_lookahead {
     int subtitles_injected;
     int translations_injected;
     int chunks_processed;
+
+    // Chunked work-loop state (LOCAL mode)
+    mp_mutex seek_mutex;
+    bool seek_pending;
+    double seek_target;
+    int64_t last_injected_end_ms;  // de-dup across chunk boundaries
 };
 
 // ----------------------------------------------------------------------------
@@ -174,22 +180,6 @@ static void inject_one(struct whisper_lookahead *wl,
         mp_wakeup_core(wl->mpctx);
     }
     talloc_free(ass_line);
-}
-
-static void inject_segments(struct whisper_lookahead *wl,
-                            struct ws_srt_segments *segs,
-                            double t0_offset_sec)
-{
-    if (!segs || segs->count == 0)
-        return;
-    for (int i = 0; i < segs->count; i++) {
-        if (atomic_load(&wl->terminate))
-            return;
-        struct ws_srt_segment *s = &segs->items[i];
-        double pts = t0_offset_sec + s->start_ms / 1000.0;
-        double dur = (s->end_ms - s->start_ms) / 1000.0;
-        inject_one(wl, s->text, pts, dur);
-    }
 }
 
 // ----------------------------------------------------------------------------
@@ -304,14 +294,14 @@ static void on_child_stderr(void *ctx, char *data, size_t size)
             char *line = c->buf;
             if (nl > line && nl[-1] == '\r') nl[-1] = '\0';
             if (line[0])
-                mp_verbose(c->log, "fw.stderr: %s\n", line);
+                mp_info(c->log, "fw: %s\n", line);
             size_t consumed = (nl - c->buf) + 1;
             memmove(c->buf, c->buf + consumed, c->fill - consumed);
             c->fill -= consumed;
         }
         if (c->fill >= sizeof(c->buf) - 1) {
             c->buf[c->fill] = '\0';
-            mp_verbose(c->log, "fw.stderr: %s\n", c->buf);
+            mp_info(c->log, "fw: %s\n", c->buf);
             c->fill = 0;
         }
     }
@@ -321,6 +311,8 @@ static int run_faster_whisper(struct whisper_lookahead *wl,
                               void *tctx,
                               const char *audio_path,
                               const char *out_dir,
+                              double clip_t0_sec,
+                              double clip_t1_sec,
                               char **out_srt_path)
 {
     *out_srt_path = NULL;
@@ -347,11 +339,16 @@ static int run_faster_whisper(struct whisper_lookahead *wl,
     }
     MP_TARRAY_APPEND(tctx, args, n, talloc_strdup(tctx, "--beep_off"));
     MP_TARRAY_APPEND(tctx, args, n, talloc_strdup(tctx, "--print_progress"));
+    if (clip_t1_sec > clip_t0_sec) {
+        MP_TARRAY_APPEND(tctx, args, n, talloc_strdup(tctx, "--clip_timestamps"));
+        MP_TARRAY_APPEND(tctx, args, n,
+            talloc_asprintf(tctx, "%.3f,%.3f", clip_t0_sec, clip_t1_sec));
+    }
     MP_TARRAY_APPEND(tctx, args, n, talloc_strdup(tctx, audio_path));
     MP_TARRAY_APPEND(tctx, args, n, NULL);
 
-    MP_INFO(wl, "spawn: %s --model %s --device %s (audio=%s, out=%s)\n",
-            wl->fastwhisper_exe, wl->model, wl->device, audio_path, out_dir);
+    MP_INFO(wl, "spawn: clip [%.2f, %.2f] -> %s\n",
+            clip_t0_sec, clip_t1_sec, out_dir);
 
     struct stderr_capture cap_err = { .log = wl->log };
     struct stderr_capture cap_out = { .log = wl->log };
@@ -405,38 +402,140 @@ static int run_faster_whisper(struct whisper_lookahead *wl,
 }
 
 // ----------------------------------------------------------------------------
-// LOCAL_FILE mode
+// LOCAL_FILE mode (chunked, lookahead-style)
 // ----------------------------------------------------------------------------
+
+// inject only segments overlapping [t0_sec, t1_sec); de-dup using
+// last_injected_end_ms so VAD-extended boundary segments aren't repeated.
+static void inject_segments_clipped(struct whisper_lookahead *wl,
+                                    struct ws_srt_segments *segs,
+                                    double t0_sec, double t1_sec)
+{
+    if (!segs || segs->count == 0)
+        return;
+    int64_t t0_ms = (int64_t)(t0_sec * 1000.0);
+    int64_t t1_ms = (int64_t)(t1_sec * 1000.0);
+    int injected = 0;
+    for (int i = 0; i < segs->count; i++) {
+        if (atomic_load(&wl->terminate))
+            return;
+        struct ws_srt_segment *s = &segs->items[i];
+        // Reject segments fully outside the clip range.
+        if (s->end_ms <= t0_ms || s->start_ms >= t1_ms)
+            continue;
+        // De-dup: skip anything not strictly past last injected end.
+        if (s->start_ms < wl->last_injected_end_ms)
+            continue;
+        double pts = s->start_ms / 1000.0;
+        double dur = (s->end_ms - s->start_ms) / 1000.0;
+        if (dur < 0.1) dur = 0.1;
+        inject_one(wl, s->text, pts, dur);
+        wl->last_injected_end_ms = s->end_ms;
+        injected++;
+    }
+    if (injected == 0)
+        MP_VERBOSE(wl, "chunk [%.2f,%.2f]: 0 new segments\n", t0_sec, t1_sec);
+}
 
 static int do_local_transcribe(struct whisper_lookahead *wl)
 {
-    void *tctx = talloc_new(NULL);
-    char *out_dir = make_temp_outdir(tctx, wl->log);
-    if (!out_dir) {
-        talloc_free(tctx);
-        return -1;
+    struct MPContext *mpctx = wl->mpctx;
+    double duration = mpctx->demuxer ? mpctx->demuxer->duration : -1.0;
+    if (duration <= 0.0) {
+        MP_WARN(wl, "duration unknown; falling back to single-shot transcription\n");
+        duration = 0.0;  // 0 = no upper bound
     }
 
-    char *srt_path = NULL;
-    int rc = run_faster_whisper(wl, tctx, wl->filename, out_dir, &srt_path);
-    if (rc != 0 || !srt_path) {
+    double chunk_sec = wl->chunk_sec > 0 ? (double)wl->chunk_sec : 60.0;
+
+    // Snap initial chunk start to a multiple of chunk_sec at or before
+    // current playback position so we don't redo earlier audio.
+    double start_pts = mpctx->playback_pts;
+    if (start_pts == MP_NOPTS_VALUE || start_pts < 0) start_pts = 0;
+    double chunk_t0 = floor(start_pts / chunk_sec) * chunk_sec;
+    wl->last_injected_end_ms = (int64_t)(chunk_t0 * 1000.0);
+
+    MP_INFO(wl, "local: starting chunked transcription, duration=%.1f, "
+            "chunk_sec=%.1f, start_t0=%.2f\n",
+            duration, chunk_sec, chunk_t0);
+
+    while (!atomic_load(&wl->terminate)) {
+        // Honor a pending seek (highest priority).
+        mp_mutex_lock(&wl->seek_mutex);
+        if (wl->seek_pending) {
+            double tgt = wl->seek_target;
+            wl->seek_pending = false;
+            mp_mutex_unlock(&wl->seek_mutex);
+            chunk_t0 = floor(tgt / chunk_sec) * chunk_sec;
+            if (chunk_t0 < 0) chunk_t0 = 0;
+            wl->last_injected_end_ms = (int64_t)(chunk_t0 * 1000.0);
+            MP_INFO(wl, "local: seek -> %.2f, chunk_t0 reset to %.2f\n",
+                    tgt, chunk_t0);
+        } else {
+            mp_mutex_unlock(&wl->seek_mutex);
+        }
+
+        if (duration > 0 && chunk_t0 >= duration) {
+            MP_INFO(wl, "local: reached EOF (chunk_t0=%.2f, duration=%.2f)\n",
+                    chunk_t0, duration);
+            break;
+        }
+
+        // If playback head has already raced past us by more than 2 chunks,
+        // jump ahead to avoid wasting work on stale audio.
+        double pp = mpctx->playback_pts;
+        if (pp != MP_NOPTS_VALUE && pp > chunk_t0 + 2 * chunk_sec) {
+            double new_t0 = floor(pp / chunk_sec) * chunk_sec;
+            MP_INFO(wl, "local: playhead at %.2f outpaced chunk_t0 %.2f; "
+                    "skipping to %.2f\n", pp, chunk_t0, new_t0);
+            chunk_t0 = new_t0;
+            wl->last_injected_end_ms = (int64_t)(chunk_t0 * 1000.0);
+        }
+
+        double chunk_t1 = chunk_t0 + chunk_sec;
+        if (duration > 0 && chunk_t1 > duration)
+            chunk_t1 = duration;
+
+        void *tctx = talloc_new(NULL);
+        char *out_dir = make_temp_outdir(tctx, wl->log);
+        if (!out_dir) {
+            talloc_free(tctx);
+            return -1;
+        }
+
+        // Reset per-spawn cancel so a previous abort doesn't carry over.
+        mp_cancel_reset(wl->child_cancel);
+
+        char *srt_path = NULL;
+        int rc = run_faster_whisper(wl, tctx, wl->filename, out_dir,
+                                    chunk_t0, chunk_t1, &srt_path);
+
+        // Detect aborted-by-seek vs hard error.
+        bool aborted = mp_cancel_test(wl->child_cancel);
+
+        if (rc != 0) {
+            rmtree_quiet(wl->log, out_dir);
+            talloc_free(tctx);
+            if (aborted && !atomic_load(&wl->terminate)) {
+                // Likely a seek; loop will pick up seek_pending.
+                MP_INFO(wl, "local: chunk aborted, continuing\n");
+                continue;
+            }
+            MP_ERR(wl, "local: chunk failed at t=%.2f, stopping\n", chunk_t0);
+            return -1;
+        }
+
+        struct ws_srt_segments *segs =
+            srt_path ? ws_srt_parse_file(tctx, wl->log, srt_path) : NULL;
+        if (segs && segs->count > 0)
+            inject_segments_clipped(wl, segs, chunk_t0, chunk_t1);
+
         rmtree_quiet(wl->log, out_dir);
         talloc_free(tctx);
-        return -1;
-    }
 
-    struct ws_srt_segments *segs =
-        ws_srt_parse_file(tctx, wl->log, srt_path);
-    if (!segs || segs->count == 0) {
-        MP_WARN(wl, "no segments parsed from %s\n", srt_path);
-    } else {
-        MP_INFO(wl, "injecting %d segments from local transcription\n",
-                segs->count);
-        inject_segments(wl, segs, 0.0);
+        wl->chunks_processed++;
+        chunk_t0 = chunk_t1;
     }
-
-    rmtree_quiet(wl->log, out_dir);
-    talloc_free(tctx);
     return 0;
 }
 
@@ -656,6 +755,7 @@ void whisper_lookahead_start(struct MPContext *mpctx, const char *whisper_opts)
     mp_cancel_set_parent(wl->cancel, mpctx->playback_abort);
     wl->child_cancel = mp_cancel_new(wl);
     mp_cancel_set_parent(wl->child_cancel, wl->cancel);
+    mp_mutex_init(&wl->seek_mutex);
 
     char *path = mp_get_user_path(wl, mpctx->global, mpctx->filename);
     wl->filename = talloc_strdup(wl, path);
@@ -696,6 +796,8 @@ void whisper_lookahead_stop(struct MPContext *mpctx)
 
     whisper_translator_destroy(&wl->translator);
 
+    mp_mutex_destroy(&wl->seek_mutex);
+
     mpctx->whisper_lookahead = NULL;
     talloc_free(wl);
 
@@ -707,10 +809,12 @@ void whisper_lookahead_seek(struct MPContext *mpctx, double pts)
     struct whisper_lookahead *wl = mpctx->whisper_lookahead;
     if (!wl || pts == MP_NOPTS_VALUE)
         return;
-    if (wl->mode == WL_MODE_NETWORK) {
-        MP_VERBOSE(wl, "seek: network mode seek to %.3f (no-op for now)\n",
-                   pts);
-    }
+    mp_mutex_lock(&wl->seek_mutex);
+    wl->seek_pending = true;
+    wl->seek_target = pts;
+    mp_mutex_unlock(&wl->seek_mutex);
+    mp_cancel_trigger(wl->child_cancel);
+    MP_VERBOSE(wl, "seek: requested %.3f (will abort current chunk)\n", pts);
 }
 
 bool whisper_lookahead_track_selected(struct MPContext *mpctx)

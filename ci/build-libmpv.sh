@@ -195,6 +195,7 @@ build() {
 collect() {
     local ARCH="$TARGET_ARCH"
     local ARCH_OUTPUT="$OUTPUT_DIR/$ARCH"
+    local MINGW_PREFIX="$BUILD_DIR/${ARCH}-w64-mingw32"
 
     # Wipe any stale artifacts from previous runs so removed dependencies
     # (e.g. nvngx_vsr.dll, NvOFFRUC.dll, onnxruntime.dll, DirectML.dll)
@@ -235,6 +236,48 @@ collect() {
         log "DirectML.dll copied ($DML_ARCH_DIR)"
     else
         warn "DirectML.dll not found at $DML_DLL, skipping"
+    fi
+
+    # Copy whisper.cpp + ggml backend dlls so af_whisper can load and
+    # ggml_backend_load_all() can discover GPU backends at runtime.
+    #
+    # We always ship: whisper.dll, ggml.dll, ggml-base.dll, ggml-cpu*.dll,
+    #                 ggml-vulkan.dll
+    # Vulkan needs only vulkan-1.dll which is a Windows system DLL on Win10+
+    # (provided by the GPU driver) — no extra DLL on our side.
+    #
+    # ggml-cuda.dll is NOT shipped here.  Callers (e.g. Rodel.Player) drop it
+    # in alongside libmpv-2.dll if they want CUDA acceleration; ggml will
+    # auto-discover it.
+    local WHISPER_BIN_DIR="$MINGW_PREFIX/bin"
+    if [ -d "$WHISPER_BIN_DIR" ]; then
+        local copied_any=0
+        # whisper.cpp shared lib
+        for dll in whisper.dll; do
+            if [ -f "$WHISPER_BIN_DIR/$dll" ]; then
+                cp "$WHISPER_BIN_DIR/$dll" "$ARCH_OUTPUT/"
+                log "$dll copied"
+                copied_any=1
+            fi
+        done
+        # ggml core + all CPU/Vulkan backends.  Use a glob since CPU may be
+        # split into ggml-cpu-haswell.dll / ggml-cpu-skylakex.dll etc. when
+        # GGML_CPU_ALL_VARIANTS=ON.
+        for dll in "$WHISPER_BIN_DIR"/ggml.dll \
+                   "$WHISPER_BIN_DIR"/ggml-base.dll \
+                   "$WHISPER_BIN_DIR"/ggml-cpu*.dll \
+                   "$WHISPER_BIN_DIR"/ggml-vulkan.dll; do
+            if [ -f "$dll" ]; then
+                cp "$dll" "$ARCH_OUTPUT/"
+                log "$(basename "$dll") copied"
+                copied_any=1
+            fi
+        done
+        if [ "$copied_any" = "0" ]; then
+            warn "No whisper/ggml DLLs found under $WHISPER_BIN_DIR"
+        fi
+    else
+        warn "MinGW bin dir not found: $WHISPER_BIN_DIR (whisper/ggml DLLs not copied)"
     fi
 
     # Find and copy libmpv-2.dll (and libmpv-2.pdb when produced - PDB=1 is

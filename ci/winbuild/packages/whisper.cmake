@@ -1,4 +1,7 @@
 ExternalProject_Add(whisper
+    DEPENDS
+        vulkan
+        vulkan-header
     GIT_REPOSITORY https://github.com/ggml-org/whisper.cpp.git
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--filter=tree:0"
@@ -9,7 +12,22 @@ ExternalProject_Add(whisper
         -DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_FILE}
         -DCMAKE_INSTALL_PREFIX=${MINGW_INSTALL_PREFIX}
         -DCMAKE_FIND_ROOT_PATH=${MINGW_INSTALL_PREFIX}
-        -DBUILD_SHARED_LIBS=OFF
+        # Build as shared libs so each backend (ggml-cpu, ggml-vulkan, ggml-cuda)
+        # can be discovered at runtime by ggml_backend_load_all().  This lets us
+        # ship Vulkan as the default GPU path and lets callers (Rodel.Player)
+        # drop in ggml-cuda.dll alongside libmpv-2.dll for CUDA acceleration
+        # without any rebuild of mpv.
+        -DBUILD_SHARED_LIBS=ON
+        -DGGML_BACKEND_DL=ON
+        -DGGML_NATIVE=OFF
+        # Vulkan backend.  Cross-compiled to Windows; the Vulkan loader/headers
+        # come from our own vulkan/vulkan-header packages.  glslc must be
+        # available on the BUILD HOST (Linux) — install via:
+        #   sudo apt-get install -y glslc       (Ubuntu 22.04+)
+        # or by extracting glslc from a LunarG Vulkan SDK / shaderc release.
+        -DGGML_VULKAN=ON
+        -DGGML_VULKAN_RUN_TESTS=OFF
+        -DGGML_VULKAN_CHECK_RESULTS=OFF
         -DWHISPER_BUILD_TESTS=OFF
         -DWHISPER_BUILD_EXAMPLES=OFF
         -DWHISPER_BUILD_SERVER=OFF
@@ -18,30 +36,14 @@ ExternalProject_Add(whisper
     LOG_DOWNLOAD 1 LOG_UPDATE 1 LOG_CONFIGURE 1 LOG_BUILD 1 LOG_INSTALL 1
 )
 
-# whisper.cpp installs ggml libraries without the "lib" prefix (ggml.a, ggml-base.a)
-# but whisper.pc references them as -lggml -lggml-base which expects libggml.a etc.
-# Create symlinks so the linker can find them.
+# With BUILD_SHARED_LIBS=ON the install layout is:
+#   bin/  whisper.dll, ggml.dll, ggml-base.dll, ggml-cpu*.dll, ggml-vulkan.dll
+#   lib/  libwhisper.dll.a, libggml*.dll.a (proper mingw import libs, no fixup
+#         needed)
+#   lib/pkgconfig/whisper.pc  (generated correctly by upstream cmake for shared
+#                              builds — Libs: -L${libdir} -lwhisper)
 #
-# Also fix whisper.pc: the generated Libs line is missing -lggml-cpu (which contains
-# ggml_backend_cpu_reg) and has wrong link order. Fix to:
-#   Libs: -L${libdir} -lwhisper -lggml-cpu -lggml-base -lggml
-ExternalProject_Add_Step(whisper fix-pkgconfig
-    DEPENDEES install
-    # Create lib-prefixed symlinks
-    COMMAND ${CMAKE_COMMAND} -E create_symlink
-        ${MINGW_INSTALL_PREFIX}/lib/ggml.a
-        ${MINGW_INSTALL_PREFIX}/lib/libggml.a
-    COMMAND ${CMAKE_COMMAND} -E create_symlink
-        ${MINGW_INSTALL_PREFIX}/lib/ggml-base.a
-        ${MINGW_INSTALL_PREFIX}/lib/libggml-base.a
-    COMMAND ${CMAKE_COMMAND} -E create_symlink
-        ${MINGW_INSTALL_PREFIX}/lib/ggml-cpu.a
-        ${MINGW_INSTALL_PREFIX}/lib/libggml-cpu.a
-    # Fix whisper.pc Libs line: add -lggml-cpu and correct link order
-    COMMAND sed -i
-        "s|Libs:.*|Libs: -L\$\{libdir\} -lwhisper -lggml-cpu -lggml-base -lggml|"
-        ${MINGW_INSTALL_PREFIX}/lib/pkgconfig/whisper.pc
-)
+# We don't need the static-build pc fixup / lib*.a symlinks anymore.
 
 force_rebuild_git(whisper)
 cleanup(whisper install)

@@ -370,14 +370,22 @@ static int run_faster_whisper(struct whisper_lookahead *wl,
     on_child_stderr(&cap_err, NULL, 0);
     on_child_stderr(&cap_out, NULL, 0);
 
-    if (res.error != MP_SUBPROCESS_OK) {
+    if (res.error != MP_SUBPROCESS_OK &&
+        res.error != MP_SUBPROCESS_EKILLED_BY_US) {
         MP_ERR(wl, "spawn failed: %s\n", mp_subprocess_err_str(res.error));
         return -1;
     }
+    if (res.error == MP_SUBPROCESS_EKILLED_BY_US)
+        return -2;  // aborted (likely a seek)
+
+    // NOTE: Purfview's faster-whisper.exe (PyInstaller-bundled) frequently
+    // crashes on shutdown (0xC0000409 STACK_BUFFER_OVERRUN) after writing
+    // the SRT successfully. We deliberately ignore the exit status and
+    // trust the SRT file: caller treats "missing SRT" as an empty (silent)
+    // chunk, not a fatal error.
     if (res.exit_status != 0) {
-        MP_ERR(wl, "faster-whisper.exe exited with status %u\n",
-               res.exit_status);
-        return -1;
+        MP_VERBOSE(wl, "fw.exe exited with status %u (ignored if SRT exists)\n",
+                   res.exit_status);
     }
 
     // Compute the SRT name: <basename without extension>.srt in out_dir
@@ -393,8 +401,10 @@ static int run_faster_whisper(struct whisper_lookahead *wl,
 
     FILE *f = fopen(srt, "rb");
     if (!f) {
-        MP_ERR(wl, "expected SRT not found at %s\n", srt);
-        return -1;
+        // Silent clip (VAD filtered everything) — not an error.
+        MP_VERBOSE(wl, "no SRT produced for this chunk (silent clip?)\n");
+        *out_srt_path = NULL;
+        return 0;
     }
     fclose(f);
     *out_srt_path = srt;
@@ -510,25 +520,26 @@ static int do_local_transcribe(struct whisper_lookahead *wl)
         int rc = run_faster_whisper(wl, tctx, wl->filename, out_dir,
                                     chunk_t0, chunk_t1, &srt_path);
 
-        // Detect aborted-by-seek vs hard error.
-        bool aborted = mp_cancel_test(wl->child_cancel);
-
+        if (rc == -2) {
+            // Aborted (likely seek). Drop output, loop continues.
+            rmtree_quiet(wl->log, out_dir);
+            talloc_free(tctx);
+            MP_INFO(wl, "local: chunk aborted, continuing\n");
+            continue;
+        }
         if (rc != 0) {
             rmtree_quiet(wl->log, out_dir);
             talloc_free(tctx);
-            if (aborted && !atomic_load(&wl->terminate)) {
-                // Likely a seek; loop will pick up seek_pending.
-                MP_INFO(wl, "local: chunk aborted, continuing\n");
-                continue;
-            }
             MP_ERR(wl, "local: chunk failed at t=%.2f, stopping\n", chunk_t0);
             return -1;
         }
 
-        struct ws_srt_segments *segs =
-            srt_path ? ws_srt_parse_file(tctx, wl->log, srt_path) : NULL;
-        if (segs && segs->count > 0)
-            inject_segments_clipped(wl, segs, chunk_t0, chunk_t1);
+        if (srt_path) {
+            struct ws_srt_segments *segs =
+                ws_srt_parse_file(tctx, wl->log, srt_path);
+            if (segs && segs->count > 0)
+                inject_segments_clipped(wl, segs, chunk_t0, chunk_t1);
+        }
 
         rmtree_quiet(wl->log, out_dir);
         talloc_free(tctx);

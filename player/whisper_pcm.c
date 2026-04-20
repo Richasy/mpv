@@ -137,7 +137,12 @@ int wpcm_extract_chunk_to_wav(struct mp_log *log,
     av_dict_set(&opts, "reconnect", "1", 0);
     av_dict_set(&opts, "reconnect_streamed", "1", 0);
     av_dict_set(&opts, "reconnect_delay_max", "7", 0);
-    av_dict_set(&opts, "multiple_requests", "1", 0);
+    // seekable=0 disables byte-Range requests entirely. Many shared/proxy
+    // servers (alist /dav, some Emby reverse proxies, signed-URL CDNs)
+    // accept the initial GET but 403 on Range. Since we re-open per chunk
+    // and read sequentially anyway, byte-range seeking buys us little --
+    // av_seek_frame will fall back to read-and-discard either way.
+    av_dict_set(&opts, "seekable", "0", 0);
 
     int err = avformat_open_input(&fmt, url, NULL, &opts);
     av_dict_free(&opts);
@@ -145,32 +150,10 @@ int wpcm_extract_chunk_to_wav(struct mp_log *log,
     if (err < 0) {
         char ebuf[128] = {0};
         av_strerror(err, ebuf, sizeof(ebuf));
-        mp_warn(log, "wpcm: open with seek failed (%s); retrying without "
-                "byte-range probes\n", ebuf);
+        mp_err(log, "wpcm: avformat_open_input failed: %s (%d)\n", ebuf, err);
         // avformat_open_input frees fmt on failure.
         fmt = NULL;
-        if (cancel && mp_cancel_test(cancel)) return -2;
-        // Retry with seekable=0 -- some servers (alist/WebDAV) reject the
-        // Range requests demuxers issue during probe.
-        fmt = avformat_alloc_context();
-        if (!fmt) return -1;
-        fmt->interrupt_callback.callback = wpcm_interrupt_cb;
-        fmt->interrupt_callback.opaque = cancel;
-        mp_setup_av_network_options(&opts, NULL, global, log);
-        av_dict_set(&opts, "reconnect", "1", 0);
-        av_dict_set(&opts, "reconnect_streamed", "1", 0);
-        av_dict_set(&opts, "reconnect_delay_max", "7", 0);
-        av_dict_set(&opts, "multiple_requests", "1", 0);
-        av_dict_set(&opts, "seekable", "0", 0);
-        err = avformat_open_input(&fmt, url, NULL, &opts);
-        av_dict_free(&opts);
-        if (err < 0) {
-            av_strerror(err, ebuf, sizeof(ebuf));
-            mp_err(log, "wpcm: avformat_open_input failed: %s (%d)\n",
-                   ebuf, err);
-            fmt = NULL;
-            return cancel && mp_cancel_test(cancel) ? -2 : -1;
-        }
+        return cancel && mp_cancel_test(cancel) ? -2 : -1;
     }
 
     if (cancel && mp_cancel_test(cancel)) { rc = -2; goto cleanup; }

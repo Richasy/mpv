@@ -117,6 +117,13 @@ struct whisper_lookahead {
     // Track auto-selection (only once)
     bool track_selected;
 
+    // Seek-failure recovery: when the secondary demuxer cannot seek to the
+    // initial playback position (e.g. mkv with missing cue index, or HTTP
+    // 403 on a re-resolved CDN URL), the sink will receive EOF with zero
+    // frames. We then retry once from position 0 to keep the pipeline alive.
+    atomic_bool sink_eof_no_frames;
+    bool start_seek_retry_done;
+
     // Debug counters
     int frames_received;
     int frames_with_meta;
@@ -275,6 +282,8 @@ static void sink_process(struct mp_filter *f)
         if (frame.type == MP_FRAME_EOF) {
             MP_INFO(wl, "sink: received EOF after %d frames (%d with meta, %d injected)\n",
                     wl->frames_received, wl->frames_with_meta, wl->subtitles_injected);
+            if (wl->frames_received == 0)
+                atomic_store(&wl->sink_eof_no_frames, true);
             mp_frame_unref(&frame);
             return;
         }
@@ -373,6 +382,22 @@ static MP_THREAD_VOID lookahead_thread(void *ptr)
             mp_filter_reset(wl->root_filter);
             talloc_free(wl->last_text);
             wl->last_text = NULL;
+            wl->lookahead_pts = MP_NOPTS_VALUE;
+            atomic_store(&wl->sink_eof_no_frames, false);
+            wl->start_seek_retry_done = true; // user-initiated seek consumes the retry budget
+        }
+
+        // If the secondary demuxer's initial seek failed (e.g. cue index
+        // missing, or CDN URL 403 on the second connection), the sink will
+        // hit EOF with zero frames. Recover once by re-seeking to 0 so the
+        // pipeline at least produces subtitles from the beginning.
+        if (atomic_load(&wl->sink_eof_no_frames) && !wl->start_seek_retry_done) {
+            MP_WARN(wl, "thread: no frames after initial seek; retrying from 0\n");
+            wl->start_seek_retry_done = true;
+            atomic_store(&wl->sink_eof_no_frames, false);
+            demux_seek(wl->demuxer, 0, SEEK_BLOCK);
+            demux_block_reading(wl->demuxer, false);
+            mp_filter_reset(wl->root_filter);
             wl->lookahead_pts = MP_NOPTS_VALUE;
         }
 

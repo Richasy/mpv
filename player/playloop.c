@@ -1287,7 +1287,29 @@ void run_playloop(struct MPContext *mpctx)
         const char *wl_opts = mpctx->opts->whisper_lookahead;
         bool want_active = wl_opts && wl_opts[0] && mpctx->ao_chain;
         bool is_active = !!mpctx->whisper_lookahead;
-        if (want_active && !is_active && mpctx->restart_complete) {
+
+        // Circuit breaker: if we previously failed to init for these exact
+        // opts, skip the start until the user changes the option (or clears
+        // it). Without this, init failures would cause an infinite restart
+        // loop in the playloop because whisper_lookahead_stop() resets
+        // is_active back to false on every tick.
+        bool blocked_by_failure = want_active &&
+            mpctx->whisper_last_failed_opts &&
+            strcmp(mpctx->whisper_last_failed_opts, wl_opts) == 0;
+
+        // Clear the failure memory once the user picks a different opts
+        // string (or clears the option altogether).
+        if (mpctx->whisper_last_failed_opts &&
+            (!wl_opts || !wl_opts[0] ||
+             strcmp(mpctx->whisper_last_failed_opts, wl_opts) != 0))
+        {
+            talloc_free(mpctx->whisper_last_failed_opts);
+            mpctx->whisper_last_failed_opts = NULL;
+            blocked_by_failure = false;
+        }
+
+        if (want_active && !is_active && !blocked_by_failure &&
+            mpctx->restart_complete) {
             whisper_lookahead_start(mpctx, wl_opts);
             mp_notify_property(mpctx, "whisper-loading");
         } else if (!want_active && is_active) {
@@ -1295,9 +1317,15 @@ void run_playloop(struct MPContext *mpctx)
             mp_notify_property(mpctx, "whisper-loading");
         }
 
-        // If async init failed, clean up silently.
+        // If async init failed, clean up and remember the failed opts so
+        // the next iteration does not immediately restart.
         if (is_active && whisper_lookahead_failed(mpctx)) {
-            MP_WARN(mpctx, "whisper lookahead: async init failed, cleaning up\n");
+            MP_WARN(mpctx, "whisper lookahead: async init failed for opts "
+                    "'%s', will not retry until option changes\n",
+                    wl_opts ? wl_opts : "");
+            talloc_free(mpctx->whisper_last_failed_opts);
+            mpctx->whisper_last_failed_opts =
+                wl_opts ? talloc_strdup(mpctx, wl_opts) : NULL;
             whisper_lookahead_stop(mpctx);
             mp_notify_property(mpctx, "whisper-loading");
         }

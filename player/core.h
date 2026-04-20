@@ -480,6 +480,11 @@ typedef struct MPContext {
     struct mp_als *als_state; // lazily initialized on first use
 
     struct whisper_lookahead *whisper_lookahead;
+    // Circuit breaker: remembers the whisper-lookahead opts string for which
+    // init most recently failed, so the playloop does not infinitely restart
+    // the lookahead pipeline. Cleared (and a fresh attempt allowed) when the
+    // user changes the option to a different value.
+    char *whisper_last_failed_opts;
 } MPContext;
 
 // Contains information about an asynchronous work item, how it can be aborted,

@@ -54,6 +54,7 @@
 #include "osdep/io.h"
 #include "osdep/subprocess.h"
 #include "osdep/threads.h"
+#include "osdep/timer.h"
 #include "misc/bstr.h"
 #include "misc/thread_tools.h"
 #include "stream/stream.h"
@@ -652,9 +653,47 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
     double chunk_t0 = floor(start_pts / chunk_sec) * chunk_sec;
     wl->last_injected_end_ms = (int64_t)(chunk_t0 * 1000.0);
 
+    int preferred_audio_idx = wl->primary_stream
+        ? wl->primary_stream->ff_index : -1;
+
     MP_INFO(wl, "network: starting chunked transcription, duration=%.1f, "
-            "chunk_sec=%.1f, start_t0=%.2f\n",
-            duration, chunk_sec, chunk_t0);
+            "chunk_sec=%.1f, start_t0=%.2f, audio_idx=%d\n",
+            duration, chunk_sec, chunk_t0, preferred_audio_idx);
+
+    // Open one persistent session and amortize the network read across all
+    // chunks. We only re-open on backward seeks (where we cannot rewind
+    // the cursor) or after a fatal session error.
+    struct wpcm_session *sess = wpcm_session_open(wl->log,
+                                                  wl->mpctx->global,
+                                                  wl->cancel,
+                                                  wl->filename,
+                                                  preferred_audio_idx);
+    if (!sess) {
+        MP_ERR(wl, "network: failed to open extractor session\n");
+        return -1;
+    }
+
+    // Skip to start_t0 (this is the slow path on unseekable servers --
+    // happens once at start, not per chunk).
+    int64_t sess_open_t = mp_time_ns();
+    if (chunk_t0 > 0.0) {
+        MP_INFO(wl, "network: advancing session to start_t0=%.2f "
+                "(may take a while on unseekable streams)\n", chunk_t0);
+        int arc = wpcm_session_advance_to(sess, chunk_t0);
+        if (arc == -2) {
+            MP_INFO(wl, "network: aborted while advancing to start\n");
+            wpcm_session_close(sess);
+            return 0;
+        }
+        if (arc < 0) {
+            MP_ERR(wl, "network: advance to start_t0 failed\n");
+            wpcm_session_close(sess);
+            return -1;
+        }
+        MP_INFO(wl, "network: positioned at %.2fs in %.1fs\n",
+                wpcm_session_cursor_sec(sess),
+                (mp_time_ns() - sess_open_t) / 1e9);
+    }
 
     while (!atomic_load(&wl->terminate)) {
         // Honor pending seek.
@@ -663,26 +702,68 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
             double tgt = wl->seek_target;
             wl->seek_pending = false;
             mp_mutex_unlock(&wl->seek_mutex);
-            chunk_t0 = floor(tgt / chunk_sec) * chunk_sec;
-            if (chunk_t0 < 0) chunk_t0 = 0;
+            double new_t0 = floor(tgt / chunk_sec) * chunk_sec;
+            if (new_t0 < 0) new_t0 = 0;
+
+            double cur = wpcm_session_cursor_sec(sess);
+            if (new_t0 < cur) {
+                // Backward seek: must reopen since the session is forward-only.
+                MP_INFO(wl, "network: backward seek %.2f -> %.2f, reopening "
+                        "session\n", cur, new_t0);
+                wpcm_session_close(sess);
+                sess = wpcm_session_open(wl->log, wl->mpctx->global,
+                                         wl->cancel, wl->filename,
+                                         preferred_audio_idx);
+                if (!sess) {
+                    MP_ERR(wl, "network: reopen failed after backward seek\n");
+                    return -1;
+                }
+                if (new_t0 > 0.0) {
+                    int arc = wpcm_session_advance_to(sess, new_t0);
+                    if (arc == -2) { wpcm_session_close(sess); return 0; }
+                    if (arc < 0) {
+                        wpcm_session_close(sess);
+                        return -1;
+                    }
+                }
+            } else if (new_t0 > cur) {
+                // Forward seek: just advance; cheaper than reopening from 0.
+                MP_INFO(wl, "network: forward seek %.2f -> %.2f, "
+                        "fast-forwarding\n", cur, new_t0);
+                int arc = wpcm_session_advance_to(sess, new_t0);
+                if (arc == -2) { wpcm_session_close(sess); return 0; }
+                if (arc < 0) {
+                    wpcm_session_close(sess);
+                    return -1;
+                }
+            }
+            chunk_t0 = new_t0;
             wl->last_injected_end_ms = (int64_t)(chunk_t0 * 1000.0);
-            MP_INFO(wl, "network: seek -> %.2f, chunk_t0 reset to %.2f\n",
-                    tgt, chunk_t0);
         } else {
             mp_mutex_unlock(&wl->seek_mutex);
         }
 
         if (duration > 0 && chunk_t0 >= duration) {
-            MP_INFO(wl, "network: reached EOF\n");
+            MP_INFO(wl, "network: reached EOF (chunk_t0)\n");
+            break;
+        }
+        if (wpcm_session_eof(sess)) {
+            MP_INFO(wl, "network: session EOF\n");
             break;
         }
 
-        // Skip ahead if playhead has raced past us.
+        // Skip ahead if playhead has raced past us by more than two chunks.
         double pp = mpctx->playback_pts;
         if (pp != MP_NOPTS_VALUE && pp > chunk_t0 + 2 * chunk_sec) {
             double new_t0 = floor(pp / chunk_sec) * chunk_sec;
             MP_INFO(wl, "network: playhead at %.2f outpaced chunk_t0 %.2f; "
-                    "skipping to %.2f\n", pp, chunk_t0, new_t0);
+                    "fast-forwarding to %.2f\n", pp, chunk_t0, new_t0);
+            int arc = wpcm_session_advance_to(sess, new_t0);
+            if (arc == -2) { wpcm_session_close(sess); return 0; }
+            if (arc < 0) {
+                wpcm_session_close(sess);
+                return -1;
+            }
             chunk_t0 = new_t0;
             wl->last_injected_end_ms = (int64_t)(chunk_t0 * 1000.0);
         }
@@ -695,10 +776,11 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
         char *out_dir = make_temp_outdir(tctx, wl->log);
         if (!out_dir) {
             talloc_free(tctx);
+            wpcm_session_close(sess);
             return -1;
         }
 
-        // Step 1: extract chunk audio from the URL into a temp WAV.
+        // Step 1: extract chunk audio from the persistent session.
         char *wav_path = talloc_asprintf(tctx, "%s%cchunk.wav", out_dir,
 #ifdef _WIN32
                                          '\\'
@@ -706,12 +788,11 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
                                          '/'
 #endif
                                          );
-        MP_INFO(wl, "network: extracting chunk [%.2f, %.2f] -> %s\n",
-                chunk_t0, chunk_t1, wav_path);
+        int64_t t_extract_start = mp_time_ns();
+        MP_INFO(wl, "network: extracting chunk [%.2f, %.2f]\n",
+                chunk_t0, chunk_t1);
 
-        int prc = wpcm_extract_chunk_to_wav(wl->log, wl->mpctx->global,
-                                            wl->cancel, wl->filename,
-                                            chunk_t0, chunk_t1, wav_path);
+        int prc = wpcm_session_extract_to(sess, chunk_t1, wav_path);
         if (prc == -2) {
             rmtree_quiet(wl->log, out_dir);
             talloc_free(tctx);
@@ -722,10 +803,13 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
             rmtree_quiet(wl->log, out_dir);
             talloc_free(tctx);
             MP_WARN(wl, "network: chunk extraction failed at t=%.2f, "
-                    "skipping chunk\n", chunk_t0);
+                    "skipping\n", chunk_t0);
             chunk_t0 = chunk_t1;
             continue;
         }
+        MP_INFO(wl, "network: chunk extracted in %.2fs (cursor=%.2f)\n",
+                (mp_time_ns() - t_extract_start) / 1e9,
+                wpcm_session_cursor_sec(sess));
 
         // Step 2: transcribe the WAV. No --clip_timestamps needed since the
         // WAV is already trimmed to [chunk_t0, chunk_t1).
@@ -745,6 +829,7 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
             rmtree_quiet(wl->log, out_dir);
             talloc_free(tctx);
             MP_ERR(wl, "network: chunk failed at t=%.2f, stopping\n", chunk_t0);
+            wpcm_session_close(sess);
             return -1;
         }
 
@@ -761,6 +846,8 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
         wl->chunks_processed++;
         chunk_t0 = chunk_t1;
     }
+
+    wpcm_session_close(sess);
     return 0;
 }
 

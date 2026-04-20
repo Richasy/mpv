@@ -455,20 +455,18 @@ struct wpcm_session *wpcm_session_open(struct mp_log *log,
                                        const char *url,
                                        int preferred_audio_idx)
 {
-    // Try with default seekability first; on failure (alist /dav etc.)
-    // retry with seekable=0 which avoids byte-Range probes.
+    // We always use seekable=0 for network sources. Some servers (alist
+    // /dav, signed-URL CDNs) accept the initial GET but 403 on the Range
+    // requests the demuxer issues during probe; those failures don't make
+    // open/find_stream_info return an error (they just print warnings),
+    // so the session ends up with a dead connection that EOFs immediately.
+    // Forcing seekable=0 from the start avoids the Range probes entirely.
+    // We re-open per backward seek anyway, so byte-Range seeking inside
+    // the session would buy little.
     struct wpcm_session *s = try_open_internal(log, global, cancel, url,
-                                               preferred_audio_idx, false);
+                                               preferred_audio_idx, true);
     if (s) {
-        mp_info(log, "wpcm: session opened (audio_idx=%d)\n", s->audio_idx);
-        return s;
-    }
-    if (cancel && mp_cancel_test(cancel))
-        return NULL;
-    s = try_open_internal(log, global, cancel, url,
-                          preferred_audio_idx, true);
-    if (s) {
-        mp_info(log, "wpcm: session opened with seekable=0 (audio_idx=%d)\n",
+        mp_info(log, "wpcm: session opened (audio_idx=%d, seekable=0)\n",
                 s->audio_idx);
     }
     return s;

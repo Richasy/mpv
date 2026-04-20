@@ -64,7 +64,6 @@
 #include "core.h"
 #include "whisper_srt.h"
 #include "whisper_translate.h"
-#include "whisper_pcm.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -653,54 +652,13 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
     double chunk_t0 = floor(start_pts / chunk_sec) * chunk_sec;
     wl->last_injected_end_ms = (int64_t)(chunk_t0 * 1000.0);
 
-    int preferred_audio_idx = wl->primary_stream
-        ? wl->primary_stream->ff_index : -1;
-
-    MP_INFO(wl, "network: starting chunked transcription, duration=%.1f, "
-            "chunk_sec=%.1f, start_t0=%.2f, audio_idx=%d\n",
-            duration, chunk_sec, chunk_t0, preferred_audio_idx);
-
-    // Open one persistent session and amortize the network read across all
-    // chunks. We only re-open on backward seeks (where we cannot rewind
-    // the cursor) or after a fatal session error.
-    struct wpcm_session *sess = wpcm_session_open(wl->log,
-                                                  wl->mpctx->global,
-                                                  wl->cancel,
-                                                  wl->filename,
-                                                  preferred_audio_idx);
-    if (!sess) {
-        MP_ERR(wl, "network: failed to open extractor session\n");
-        return -1;
-    }
-
-    // Skip to start_t0 (this is the slow path on unseekable servers --
-    // happens once at start, not per chunk).
-    int64_t sess_open_t = mp_time_ns();
-    if (chunk_t0 > 0.0) {
-        MP_INFO(wl, "network: advancing session to start_t0=%.2f "
-                "(may take a while on unseekable streams)\n", chunk_t0);
-        int arc = wpcm_session_advance_to(sess, chunk_t0);
-        if (arc == -2) {
-            MP_INFO(wl, "network: aborted while advancing to start\n");
-            wpcm_session_close(sess);
-            return 0;
-        }
-        if (arc < 0) {
-            MP_ERR(wl, "network: advance to start_t0 failed\n");
-            wpcm_session_close(sess);
-            return -1;
-        }
-        MP_INFO(wl, "network: positioned at %.2fs in %.1fs\n",
-                wpcm_session_cursor_sec(sess),
-                (mp_time_ns() - sess_open_t) / 1e9);
-    }
+    MP_INFO(wl, "network: starting cache-dump transcription, duration=%.1f, "
+            "chunk_sec=%.1f, start_t0=%.2f\n",
+            duration, chunk_sec, chunk_t0);
 
     while (!atomic_load(&wl->terminate)) {
-        // Stop if mpv has decided to stop the file (EOF, error, user quit,
-        // playlist next, etc). Avoids spinning in the post-EOF restart
-        // loop and freezes wp from trying to "seek" to phantom positions
-        // (mpv's "seek to last frame" trick post-EOF generates spurious
-        // seek_pending events).
+        // Bail when mpv has decided to stop the file (EOF, error, user
+        // quit, playlist next, etc).
         if (mpctx->stop_play != KEEP_PLAYING) {
             MP_INFO(wl, "network: mpctx->stop_play=%d, exiting\n",
                     (int)mpctx->stop_play);
@@ -714,9 +672,8 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
             wl->seek_pending = false;
             mp_mutex_unlock(&wl->seek_mutex);
 
-            // If the seek target is past (or within one chunk of) the file
-            // end, treat as end-of-content and exit -- this catches mpv's
-            // "seek to last frame" cycle on EOF.
+            // Drop seeks that look like mpv's post-EOF "seek to last frame"
+            // trick.
             if (duration > 0 && tgt >= duration - chunk_sec) {
                 MP_INFO(wl, "network: seek target %.2f at/past EOF "
                         "(duration=%.1f), exiting\n", tgt, duration);
@@ -725,62 +682,16 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
 
             double new_t0 = floor(tgt / chunk_sec) * chunk_sec;
             if (new_t0 < 0) new_t0 = 0;
-
-            double cur = wpcm_session_cursor_sec(sess);
-            if (new_t0 < cur) {
-                // Backward seek: must reopen since the session is forward-only.
-                MP_INFO(wl, "network: backward seek %.2f -> %.2f, reopening "
-                        "session\n", cur, new_t0);
-                wpcm_session_close(sess);
-                sess = wpcm_session_open(wl->log, wl->mpctx->global,
-                                         wl->cancel, wl->filename,
-                                         preferred_audio_idx);
-                if (!sess) {
-                    MP_ERR(wl, "network: reopen failed after backward seek\n");
-                    return -1;
-                }
-                if (new_t0 > 0.0) {
-                    int arc = wpcm_session_advance_to(sess, new_t0);
-                    if (arc == -2) { wpcm_session_close(sess); return 0; }
-                    if (arc < 0) {
-                        wpcm_session_close(sess);
-                        return -1;
-                    }
-                }
-            } else if (new_t0 > cur) {
-                // Forward seek: just advance; cheaper than reopening from 0.
-                // But cap how far we'll skip in one go: huge jumps on
-                // unseekable streams cost real network bandwidth and would
-                // block other I/O for minutes. Better to let the loop catch
-                // up gradually via the "playhead outpaced us" branch below.
-                double max_forward = chunk_sec * 8;  // ~2 min at chunk=15
-                if (new_t0 - cur > max_forward) {
-                    MP_INFO(wl, "network: forward seek %.2f -> %.2f too far "
-                            "(>%.0fs); skipping cursor instead\n",
-                            cur, new_t0, max_forward);
-                    new_t0 = cur + max_forward;
-                }
-                MP_INFO(wl, "network: forward seek -> %.2f, fast-forwarding "
-                        "(cursor=%.2f)\n", new_t0, cur);
-                int arc = wpcm_session_advance_to(sess, new_t0);
-                if (arc == -2) { wpcm_session_close(sess); return 0; }
-                if (arc < 0) {
-                    wpcm_session_close(sess);
-                    return -1;
-                }
-            }
             chunk_t0 = new_t0;
             wl->last_injected_end_ms = (int64_t)(chunk_t0 * 1000.0);
+            MP_INFO(wl, "network: seek -> %.2f, chunk_t0 reset to %.2f\n",
+                    tgt, chunk_t0);
         } else {
             mp_mutex_unlock(&wl->seek_mutex);
         }
 
         if (duration > 0 && chunk_t0 >= duration) {
-            MP_INFO(wl, "network: reached EOF (chunk_t0)\n");
-            break;
-        }
-        if (wpcm_session_eof(sess)) {
-            MP_INFO(wl, "network: session EOF\n");
+            MP_INFO(wl, "network: reached EOF (chunk_t0=%.2f)\n", chunk_t0);
             break;
         }
 
@@ -795,19 +706,8 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
         // Skip ahead if playhead has raced past us by more than two chunks.
         if (pp != MP_NOPTS_VALUE && pp > chunk_t0 + 2 * chunk_sec) {
             double new_t0 = floor(pp / chunk_sec) * chunk_sec;
-            // Same cap as forward-seek above to avoid huge advance bursts.
-            double cur = wpcm_session_cursor_sec(sess);
-            double max_forward = chunk_sec * 8;
-            if (new_t0 - cur > max_forward)
-                new_t0 = cur + max_forward;
             MP_INFO(wl, "network: playhead at %.2f outpaced chunk_t0 %.2f; "
-                    "fast-forwarding to %.2f\n", pp, chunk_t0, new_t0);
-            int arc = wpcm_session_advance_to(sess, new_t0);
-            if (arc == -2) { wpcm_session_close(sess); return 0; }
-            if (arc < 0) {
-                wpcm_session_close(sess);
-                return -1;
-            }
+                    "skipping to %.2f\n", pp, chunk_t0, new_t0);
             chunk_t0 = new_t0;
             wl->last_injected_end_ms = (int64_t)(chunk_t0 * 1000.0);
         }
@@ -816,51 +716,125 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
         if (duration > 0 && chunk_t1 > duration)
             chunk_t1 = duration;
 
+        // Wait until mpv's demuxer cache covers [chunk_t0, chunk_t1].
+        // We feed off mpv's existing network connection; no second HTTP
+        // session, no race with auth/Range/cookies, no double-download.
+        bool covered = false;
+        bool wait_aborted = false;
+        while (!atomic_load(&wl->terminate)) {
+            if (mpctx->stop_play != KEEP_PLAYING) { wait_aborted = true; break; }
+
+            // Re-check seek_pending so a user seek aborts the wait.
+            mp_mutex_lock(&wl->seek_mutex);
+            bool sp = wl->seek_pending;
+            mp_mutex_unlock(&wl->seek_mutex);
+            if (sp) { wait_aborted = true; break; }
+
+            // Re-check playhead racing ahead during the wait.
+            double cur_pp = mpctx->playback_pts;
+            if (cur_pp != MP_NOPTS_VALUE && cur_pp > chunk_t0 + 2 * chunk_sec) {
+                wait_aborted = true;
+                break;
+            }
+
+            struct demux_reader_state st = {0};
+            if (mpctx->demuxer)
+                demux_get_reader_state(mpctx->demuxer, &st);
+            for (int i = 0; i < st.num_seek_ranges; i++) {
+                if (st.seek_ranges[i].start <= chunk_t0 + 0.5 &&
+                    st.seek_ranges[i].end   >= chunk_t1 - 0.5) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (covered) break;
+
+            // EOF reached before chunk_t1 -- accept whatever we have.
+            if (st.eof_cached) {
+                for (int i = 0; i < st.num_seek_ranges; i++) {
+                    if (st.seek_ranges[i].start <= chunk_t0 + 0.5 &&
+                        st.seek_ranges[i].end   >  chunk_t0 + 1.0) {
+                        chunk_t1 = st.seek_ranges[i].end;
+                        if (chunk_t1 > chunk_t0 + chunk_sec)
+                            chunk_t1 = chunk_t0 + chunk_sec;
+                        covered = true;
+                        break;
+                    }
+                }
+                if (covered) break;
+                MP_INFO(wl, "network: cache EOF before chunk_t0=%.2f, "
+                        "exiting\n", chunk_t0);
+                wait_aborted = true;
+                break;
+            }
+
+            mp_sleep_ns(MP_TIME_S_TO_NS(0.5));
+        }
+        if (wait_aborted || !covered)
+            continue;
+
+        if (atomic_load(&wl->terminate)) break;
+
         void *tctx = talloc_new(NULL);
         char *out_dir = make_temp_outdir(tctx, wl->log);
         if (!out_dir) {
             talloc_free(tctx);
-            wpcm_session_close(sess);
             return -1;
         }
 
-        // Step 1: extract chunk audio from the persistent session.
-        char *wav_path = talloc_asprintf(tctx, "%s%cchunk.wav", out_dir,
+        // Step 1: dump the buffered range from mpv's cache to a local mkv.
+        // Internally the recorder rebases timestamps to start at 0, so the
+        // file's own timeline is [0, chunk_t1 - chunk_t0]; we shift back
+        // when injecting subtitles.
+        char sep =
 #ifdef _WIN32
-                                         '\\'
+            '\\';
 #else
-                                         '/'
+            '/';
 #endif
-                                         );
-        int64_t t_extract_start = mp_time_ns();
-        MP_INFO(wl, "network: extracting chunk [%.2f, %.2f]\n",
-                chunk_t0, chunk_t1);
+        char *mkv_path = talloc_asprintf(tctx, "%s%cchunk.mkv", out_dir, sep);
 
-        int prc = wpcm_session_extract_to(sess, chunk_t1, wav_path);
-        if (prc == -2) {
+        int64_t t_dump_start = mp_time_ns();
+        MP_INFO(wl, "network: dumping cache [%.2f, %.2f] -> %s\n",
+                chunk_t0, chunk_t1, mkv_path);
+
+        if (!demux_cache_dump_set(mpctx->demuxer, chunk_t0, chunk_t1,
+                                  mkv_path)) {
+            MP_WARN(wl, "network: demux_cache_dump_set failed\n");
             rmtree_quiet(wl->log, out_dir);
             talloc_free(tctx);
-            MP_INFO(wl, "network: extraction aborted\n");
+            mp_sleep_ns(MP_TIME_S_TO_NS(1));
             continue;
         }
-        if (prc != 0) {
+
+        // The dump is synchronous internally (see comment in demux.c) so it
+        // is normally already done. Poll a few times just in case.
+        int dump_st;
+        for (int i = 0; i < 200; i++) {
+            dump_st = demux_cache_dump_get_status(mpctx->demuxer);
+            if (dump_st <= 0) break;
+            if (atomic_load(&wl->terminate)) {
+                demux_cache_dump_set(mpctx->demuxer, 0, 0, NULL);
+                break;
+            }
+            mp_sleep_ns(MP_TIME_S_TO_NS(0.05));
+        }
+        if (dump_st < 0) {
+            MP_WARN(wl, "network: cache dump errored\n");
             rmtree_quiet(wl->log, out_dir);
             talloc_free(tctx);
-            MP_WARN(wl, "network: chunk extraction failed at t=%.2f, "
-                    "skipping\n", chunk_t0);
-            chunk_t0 = chunk_t1;
             continue;
         }
-        MP_INFO(wl, "network: chunk extracted in %.2fs (cursor=%.2f)\n",
-                (mp_time_ns() - t_extract_start) / 1e9,
-                wpcm_session_cursor_sec(sess));
+        MP_INFO(wl, "network: cache dumped in %.2fs\n",
+                (mp_time_ns() - t_dump_start) / 1e9);
 
-        // Step 2: transcribe the WAV. No --clip_timestamps needed since the
-        // WAV is already trimmed to [chunk_t0, chunk_t1).
+        // Step 2: transcribe. faster-whisper handles the mkv (audio + video)
+        // and pulls out audio internally via ffmpeg. SRT timestamps come
+        // back zero-based because of the recorder's rebase.
         mp_cancel_reset(wl->child_cancel);
 
         char *srt_path = NULL;
-        int rc = run_faster_whisper(wl, tctx, wav_path, out_dir,
+        int rc = run_faster_whisper(wl, tctx, mkv_path, out_dir,
                                     0.0, 0.0, &srt_path);
 
         if (rc == -2) {
@@ -872,8 +846,8 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
         if (rc != 0) {
             rmtree_quiet(wl->log, out_dir);
             talloc_free(tctx);
-            MP_ERR(wl, "network: chunk failed at t=%.2f, stopping\n", chunk_t0);
-            wpcm_session_close(sess);
+            MP_ERR(wl, "network: chunk failed at t=%.2f, stopping\n",
+                   chunk_t0);
             return -1;
         }
 
@@ -891,7 +865,6 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
         chunk_t0 = chunk_t1;
     }
 
-    wpcm_session_close(sess);
     return 0;
 }
 

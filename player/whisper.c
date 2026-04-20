@@ -63,6 +63,7 @@
 #include "core.h"
 #include "whisper_srt.h"
 #include "whisper_translate.h"
+#include "whisper_pcm.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -598,6 +599,172 @@ static int do_local_transcribe(struct whisper_lookahead *wl)
 }
 
 // ----------------------------------------------------------------------------
+// NETWORK mode (chunked, per-chunk PCM extraction via libavformat)
+// ----------------------------------------------------------------------------
+
+// Inject SRT segments produced from a per-chunk WAV.
+// The WAV starts at t=0 (corresponding to chunk_t0_sec on the source
+// timeline), so each segment timestamp must be shifted by +chunk_t0_sec.
+static void inject_segments_shifted(struct whisper_lookahead *wl,
+                                    struct ws_srt_segments *segs,
+                                    double chunk_t0_sec,
+                                    double chunk_t1_sec)
+{
+    if (!segs || segs->count == 0)
+        return;
+    int64_t shift_ms = (int64_t)(chunk_t0_sec * 1000.0);
+    int64_t window_end_ms = (int64_t)(chunk_t1_sec * 1000.0);
+    int injected = 0;
+    for (int i = 0; i < segs->count; i++) {
+        if (atomic_load(&wl->terminate))
+            return;
+        struct ws_srt_segment *s = &segs->items[i];
+        int64_t abs_start = s->start_ms + shift_ms;
+        int64_t abs_end   = s->end_ms   + shift_ms;
+        // Clip extra-long final segments to window end (VAD often extends).
+        if (abs_end > window_end_ms + 2000)
+            abs_end = window_end_ms + 2000;
+        if (abs_start < wl->last_injected_end_ms)
+            continue;
+        double pts = abs_start / 1000.0;
+        double dur = (abs_end - abs_start) / 1000.0;
+        if (dur < 0.1) dur = 0.1;
+        inject_one(wl, s->text, pts, dur);
+        wl->last_injected_end_ms = abs_end;
+        injected++;
+    }
+    if (injected == 0)
+        MP_VERBOSE(wl, "chunk [%.2f,%.2f]: 0 new segments\n",
+                   chunk_t0_sec, chunk_t1_sec);
+}
+
+static int do_network_transcribe(struct whisper_lookahead *wl)
+{
+    struct MPContext *mpctx = wl->mpctx;
+    double duration = mpctx->demuxer ? mpctx->demuxer->duration : -1.0;
+    if (duration <= 0.0)
+        duration = 0.0;  // 0 = unknown / live; loop until terminate.
+
+    double chunk_sec = wl->chunk_sec > 0 ? (double)wl->chunk_sec : 30.0;
+
+    double start_pts = mpctx->playback_pts;
+    if (start_pts == MP_NOPTS_VALUE || start_pts < 0) start_pts = 0;
+    double chunk_t0 = floor(start_pts / chunk_sec) * chunk_sec;
+    wl->last_injected_end_ms = (int64_t)(chunk_t0 * 1000.0);
+
+    MP_INFO(wl, "network: starting chunked transcription, duration=%.1f, "
+            "chunk_sec=%.1f, start_t0=%.2f\n",
+            duration, chunk_sec, chunk_t0);
+
+    while (!atomic_load(&wl->terminate)) {
+        // Honor pending seek.
+        mp_mutex_lock(&wl->seek_mutex);
+        if (wl->seek_pending) {
+            double tgt = wl->seek_target;
+            wl->seek_pending = false;
+            mp_mutex_unlock(&wl->seek_mutex);
+            chunk_t0 = floor(tgt / chunk_sec) * chunk_sec;
+            if (chunk_t0 < 0) chunk_t0 = 0;
+            wl->last_injected_end_ms = (int64_t)(chunk_t0 * 1000.0);
+            MP_INFO(wl, "network: seek -> %.2f, chunk_t0 reset to %.2f\n",
+                    tgt, chunk_t0);
+        } else {
+            mp_mutex_unlock(&wl->seek_mutex);
+        }
+
+        if (duration > 0 && chunk_t0 >= duration) {
+            MP_INFO(wl, "network: reached EOF\n");
+            break;
+        }
+
+        // Skip ahead if playhead has raced past us.
+        double pp = mpctx->playback_pts;
+        if (pp != MP_NOPTS_VALUE && pp > chunk_t0 + 2 * chunk_sec) {
+            double new_t0 = floor(pp / chunk_sec) * chunk_sec;
+            MP_INFO(wl, "network: playhead at %.2f outpaced chunk_t0 %.2f; "
+                    "skipping to %.2f\n", pp, chunk_t0, new_t0);
+            chunk_t0 = new_t0;
+            wl->last_injected_end_ms = (int64_t)(chunk_t0 * 1000.0);
+        }
+
+        double chunk_t1 = chunk_t0 + chunk_sec;
+        if (duration > 0 && chunk_t1 > duration)
+            chunk_t1 = duration;
+
+        void *tctx = talloc_new(NULL);
+        char *out_dir = make_temp_outdir(tctx, wl->log);
+        if (!out_dir) {
+            talloc_free(tctx);
+            return -1;
+        }
+
+        // Step 1: extract chunk audio from the URL into a temp WAV.
+        char *wav_path = talloc_asprintf(tctx, "%s%cchunk.wav", out_dir,
+#ifdef _WIN32
+                                         '\\'
+#else
+                                         '/'
+#endif
+                                         );
+        MP_INFO(wl, "network: extracting chunk [%.2f, %.2f] -> %s\n",
+                chunk_t0, chunk_t1, wav_path);
+
+        int prc = wpcm_extract_chunk_to_wav(wl->log, wl->mpctx->global,
+                                            wl->filename, chunk_t0, chunk_t1,
+                                            wav_path, &wl->terminate);
+        if (prc == -2) {
+            rmtree_quiet(wl->log, out_dir);
+            talloc_free(tctx);
+            MP_INFO(wl, "network: extraction aborted\n");
+            continue;
+        }
+        if (prc != 0) {
+            rmtree_quiet(wl->log, out_dir);
+            talloc_free(tctx);
+            MP_WARN(wl, "network: chunk extraction failed at t=%.2f, "
+                    "skipping chunk\n", chunk_t0);
+            chunk_t0 = chunk_t1;
+            continue;
+        }
+
+        // Step 2: transcribe the WAV. No --clip_timestamps needed since the
+        // WAV is already trimmed to [chunk_t0, chunk_t1).
+        mp_cancel_reset(wl->child_cancel);
+
+        char *srt_path = NULL;
+        int rc = run_faster_whisper(wl, tctx, wav_path, out_dir,
+                                    0.0, 0.0, &srt_path);
+
+        if (rc == -2) {
+            rmtree_quiet(wl->log, out_dir);
+            talloc_free(tctx);
+            MP_INFO(wl, "network: chunk aborted, continuing\n");
+            continue;
+        }
+        if (rc != 0) {
+            rmtree_quiet(wl->log, out_dir);
+            talloc_free(tctx);
+            MP_ERR(wl, "network: chunk failed at t=%.2f, stopping\n", chunk_t0);
+            return -1;
+        }
+
+        if (srt_path) {
+            struct ws_srt_segments *segs =
+                ws_srt_parse_file(tctx, wl->log, srt_path);
+            if (segs && segs->count > 0)
+                inject_segments_shifted(wl, segs, chunk_t0, chunk_t1);
+        }
+
+        rmtree_quiet(wl->log, out_dir);
+        talloc_free(tctx);
+
+        wl->chunks_processed++;
+        chunk_t0 = chunk_t1;
+    }
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
 // Mode detection
 // ----------------------------------------------------------------------------
 
@@ -743,9 +910,7 @@ static MP_THREAD_VOID work_thread_fn(void *ptr)
     if (wl->mode == WL_MODE_LOCAL_FILE) {
         do_local_transcribe(wl);
     } else {
-        MP_ERR(wl, "NETWORK mode is not yet implemented in this build. "
-               "Source '%s' looks like a network URL — please use a local "
-               "file for now.\n", wl->filename);
+        do_network_transcribe(wl);
     }
 
     MP_INFO(wl, "work: thread exiting (%d chunks, %d subs, %d trans)\n",

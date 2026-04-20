@@ -441,6 +441,12 @@ struct demux_stream {
     // for af-sub-meta whisper subtitle injection (demuxer_feed_af_sub)
     struct sh_stream *af_sub;
     bool ignore_eof;        // ignore stream in underrun detection
+    // True for virtual streams whose packets are entirely fed in by
+    // demuxer_feed_caption / demuxer_feed_af_sub. Such streams have no
+    // backing source, so refresh_track() must skip the source-level seek
+    // (otherwise selecting them would trigger an HTTP Range request on
+    // restrictive servers and kill main playback).
+    bool is_virtual;
 };
 
 static void switch_to_fresh_cache_range(struct demux_internal *in);
@@ -1266,6 +1272,7 @@ static struct sh_stream *demuxer_get_cc_track_locked(struct sh_stream *stream)
         stream->ds->cc = sh;
         demux_add_sh_stream_locked(stream->ds->in, sh);
         sh->ds->ignore_eof = true;
+        sh->ds->is_virtual = true;
     }
 
     return sh;
@@ -1332,6 +1339,7 @@ static struct sh_stream *demuxer_get_af_sub_locked(struct sh_stream *stream)
         stream->ds->af_sub = sh;
         demux_add_sh_stream_locked(stream->ds->in, sh);
         sh->ds->ignore_eof = true;
+        sh->ds->is_virtual = true;
     }
 
     return sh;
@@ -4060,6 +4068,12 @@ static void refresh_track(struct demux_internal *in, struct sh_stream *stream,
 {
     struct demux_stream *ds = stream->ds;
     ref_pts = MP_ADD_PTS(ref_pts, -in->ts_offset);
+
+    // Virtual streams (CC, whisper af-sub) have no source packets; a
+    // source-level refresh seek would just hit the network for nothing
+    // (and breaks playback on servers that 4xx/5xx Range requests).
+    if (ds->is_virtual)
+        return;
 
     if (in->back_demuxing)
         ds->back_seek_pos = ref_pts;

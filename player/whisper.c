@@ -333,6 +333,11 @@ static int run_faster_whisper(struct whisper_lookahead *wl,
     MP_TARRAY_APPEND(tctx, args, n, talloc_strdup(tctx, out_dir));
     MP_TARRAY_APPEND(tctx, args, n, talloc_strdup(tctx, "--output_format"));
     MP_TARRAY_APPEND(tctx, args, n, talloc_strdup(tctx, "srt"));
+    // Always transcribe (output in source language). The "translate" task
+    // would force English output regardless of source — we do translation
+    // ourselves in-process via whisper_translator.
+    MP_TARRAY_APPEND(tctx, args, n, talloc_strdup(tctx, "--task"));
+    MP_TARRAY_APPEND(tctx, args, n, talloc_strdup(tctx, "transcribe"));
     if (wl->language && wl->language[0] &&
         strcmp(wl->language, "auto") != 0) {
         MP_TARRAY_APPEND(tctx, args, n, talloc_strdup(tctx, "--language"));
@@ -588,7 +593,7 @@ static bool parse_opts(struct whisper_lookahead *wl, char **errmsg_out)
     wl->model    = talloc_strdup(wl, "small");
     wl->device   = talloc_strdup(wl, "auto");
     wl->language = talloc_strdup(wl, "auto");
-    wl->chunk_sec = 30;
+    wl->chunk_sec = 15;
 
     char *translate_to = NULL;
     enum wt_provider translate_provider = WT_PROVIDER_NONE;

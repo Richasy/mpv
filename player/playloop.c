@@ -1293,6 +1293,20 @@ void run_playloop(struct MPContext *mpctx)
         } else if (!want_active && is_active) {
             whisper_lookahead_stop(mpctx);
             mp_notify_property(mpctx, "whisper-loading");
+        } else if (want_active && is_active) {
+            // Opts string may have been changed by the client. Try a
+            // hot-reconfigure (translator/language only); if that's not
+            // possible (model/dir/device differ), do a full restart.
+            const char *cur = whisper_lookahead_current_opts(mpctx);
+            if (cur && strcmp(cur, wl_opts) != 0) {
+                if (!whisper_lookahead_try_reconfigure(mpctx, wl_opts)) {
+                    MP_INFO(mpctx, "whisper lookahead: heavy opts changed, "
+                            "restarting pipeline\n");
+                    whisper_lookahead_stop(mpctx);
+                    whisper_lookahead_start(mpctx, wl_opts);
+                    mp_notify_property(mpctx, "whisper-loading");
+                }
+            }
         }
 
         // If async init failed, clean up silently.

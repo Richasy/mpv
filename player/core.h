@@ -528,6 +528,9 @@ bool whisper_lookahead_track_selected(struct MPContext *mpctx);
 void whisper_lookahead_set_track_selected(struct MPContext *mpctx, bool val);
 bool whisper_lookahead_ready(struct MPContext *mpctx);
 bool whisper_lookahead_failed(struct MPContext *mpctx);
+const char *whisper_lookahead_current_opts(struct MPContext *mpctx);
+bool whisper_lookahead_try_reconfigure(struct MPContext *mpctx,
+                                       const char *new_opts);
 
 // configfiles.c
 void mp_parse_cfgfiles(struct MPContext *mpctx);

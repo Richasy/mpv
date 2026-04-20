@@ -123,12 +123,35 @@ struct whisper_lookahead {
     int subtitles_injected;
     int translations_injected;
     int chunks_processed;
+    atomic_bool first_sub_injected;
 
     // Chunked work-loop state (LOCAL mode)
     mp_mutex seek_mutex;
     bool seek_pending;
     double seek_target;
     int64_t last_injected_end_ms;  // de-dup across chunk boundaries
+
+    // Hot-reconfig: protects translator + language reads on the inject path
+    // against writes from whisper_lookahead_try_reconfigure().
+    mp_mutex cfg_mutex;
+    // Currently active translate_to/provider (so reconfigure can detect
+    // a no-op and avoid pointless translator rebuilds).
+    char *cur_translate_to;
+    enum wt_provider cur_translate_provider;
+};
+
+// Snapshot of opts string after parsing; used by both initial init and
+// reconfigure paths.
+struct wl_parsed_cfg {
+    char *fastwhisper_dir;
+    char *fastwhisper_exe;
+    char *model;
+    char *device;
+    char *language;
+    int chunk_sec;
+    char *initial_prompt;
+    char *translate_to;
+    enum wt_provider translate_provider;
 };
 
 // ----------------------------------------------------------------------------
@@ -142,8 +165,15 @@ static void inject_one(struct whisper_lookahead *wl,
         return;
 
     char *sub_text = NULL;
-    if (wl->translator) {
-        char *translated = whisper_translate(wl->translator, wl, text);
+
+    // Snapshot translator under cfg_mutex so a concurrent reconfigure
+    // cannot free the translator while we're using it.
+    mp_mutex_lock(&wl->cfg_mutex);
+    struct whisper_translator *tr = wl->translator;
+    mp_mutex_unlock(&wl->cfg_mutex);
+
+    if (tr) {
+        char *translated = whisper_translate(tr, wl, text);
         if (translated) {
             sub_text = talloc_asprintf(wl,
                 "{\\fs72\\c&H00FFFFFF&\\3c&H00000000&\\bord3}%s"
@@ -174,6 +204,7 @@ static void inject_one(struct whisper_lookahead *wl,
         dp->sub_duration = dur;
         demuxer_feed_af_sub(wl->primary_stream, dp);
         wl->subtitles_injected++;
+        atomic_store(&wl->first_sub_injected, true);
         MP_INFO(wl, "subtitle #%d @ %.3f (dur=%.1f): %.40s%s\n",
                 wl->subtitles_injected, pts, dur, text,
                 strlen(text) > 40 ? "..." : "");
@@ -586,24 +617,26 @@ static enum wl_mode detect_mode(const char *path)
 // Options parsing
 // ----------------------------------------------------------------------------
 
-static bool parse_opts(struct whisper_lookahead *wl, char **errmsg_out)
+// Parse opts string into a fresh cfg owned by tctx. exe path is computed
+// but NOT existence-checked (caller may want to check or skip).
+static bool parse_opts_into_cfg(void *tctx, struct wl_parsed_cfg *cfg,
+                                const char *opts, struct mp_log *log,
+                                char **errmsg_out)
 {
     *errmsg_out = NULL;
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->model    = talloc_strdup(tctx, "small");
+    cfg->device   = talloc_strdup(tctx, "auto");
+    cfg->language = talloc_strdup(tctx, "auto");
+    cfg->chunk_sec = 15;
+    cfg->translate_provider = WT_PROVIDER_NONE;
 
-    wl->model    = talloc_strdup(wl, "small");
-    wl->device   = talloc_strdup(wl, "auto");
-    wl->language = talloc_strdup(wl, "auto");
-    wl->chunk_sec = 15;
-
-    char *translate_to = NULL;
-    enum wt_provider translate_provider = WT_PROVIDER_NONE;
-
-    if (!wl->whisper_opts || !wl->whisper_opts[0]) {
-        *errmsg_out = talloc_strdup(wl, "empty whisper-lookahead opts");
+    if (!opts || !opts[0]) {
+        *errmsg_out = talloc_strdup(tctx, "empty whisper-lookahead opts");
         return false;
     }
 
-    char *opts_copy = talloc_strdup(wl, wl->whisper_opts);
+    char *opts_copy = talloc_strdup(tctx, opts);
     char *p = opts_copy;
     while (p && *p) {
         char *comma = strchr(p, ',');
@@ -614,68 +647,83 @@ static bool parse_opts(struct whisper_lookahead *wl, char **errmsg_out)
             const char *key = p;
             const char *val = eq + 1;
             if (!strcmp(key, "fastwhisper_dir")) {
-                talloc_free(wl->fastwhisper_dir);
-                wl->fastwhisper_dir = talloc_strdup(wl, val);
+                cfg->fastwhisper_dir = talloc_strdup(tctx, val);
             } else if (!strcmp(key, "model")) {
-                talloc_free(wl->model);
-                wl->model = talloc_strdup(wl, val);
+                cfg->model = talloc_strdup(tctx, val);
             } else if (!strcmp(key, "device")) {
-                talloc_free(wl->device);
-                wl->device = talloc_strdup(wl, val);
+                cfg->device = talloc_strdup(tctx, val);
             } else if (!strcmp(key, "language")) {
-                talloc_free(wl->language);
-                wl->language = talloc_strdup(wl, val);
+                cfg->language = talloc_strdup(tctx, val);
             } else if (!strcmp(key, "chunk_sec")) {
                 int v = atoi(val);
-                if (v >= 5 && v <= 300) wl->chunk_sec = v;
+                if (v >= 5 && v <= 300) cfg->chunk_sec = v;
             } else if (!strcmp(key, "initial_prompt")) {
-                talloc_free(wl->initial_prompt);
-                wl->initial_prompt = talloc_strdup(wl, val);
+                cfg->initial_prompt = talloc_strdup(tctx, val);
             } else if (!strcmp(key, "translate_to")) {
-                translate_to = talloc_strdup(wl, val);
+                cfg->translate_to = talloc_strdup(tctx, val);
             } else if (!strcmp(key, "translate_provider")) {
                 if (!strcmp(val, "google"))
-                    translate_provider = WT_PROVIDER_GOOGLE;
+                    cfg->translate_provider = WT_PROVIDER_GOOGLE;
                 else if (!strcmp(val, "azure"))
-                    translate_provider = WT_PROVIDER_AZURE;
+                    cfg->translate_provider = WT_PROVIDER_AZURE;
             } else {
-                MP_VERBOSE(wl, "ignoring unknown opt: %s=%s\n", key, val);
+                mp_verbose(log, "ignoring unknown opt: %s=%s\n", key, val);
             }
         }
         p = comma ? comma + 1 : NULL;
     }
 
-    if (!wl->fastwhisper_dir || !wl->fastwhisper_dir[0]) {
-        *errmsg_out = talloc_strdup(wl,
+    if (!cfg->fastwhisper_dir || !cfg->fastwhisper_dir[0]) {
+        *errmsg_out = talloc_strdup(tctx,
             "fastwhisper_dir is required in whisper-lookahead opts");
         return false;
     }
 
 #ifdef _WIN32
-    wl->fastwhisper_exe =
-        talloc_asprintf(wl, "%s\\faster-whisper.exe", wl->fastwhisper_dir);
+    cfg->fastwhisper_exe =
+        talloc_asprintf(tctx, "%s\\faster-whisper.exe", cfg->fastwhisper_dir);
 #else
-    wl->fastwhisper_exe =
-        talloc_asprintf(wl, "%s/faster-whisper", wl->fastwhisper_dir);
+    cfg->fastwhisper_exe =
+        talloc_asprintf(tctx, "%s/faster-whisper", cfg->fastwhisper_dir);
 #endif
+    return true;
+}
 
-    FILE *f = fopen(wl->fastwhisper_exe, "rb");
+static bool parse_opts(struct whisper_lookahead *wl, char **errmsg_out)
+{
+    struct wl_parsed_cfg cfg;
+    if (!parse_opts_into_cfg(wl, &cfg, wl->whisper_opts, wl->log, errmsg_out))
+        return false;
+
+    FILE *f = fopen(cfg.fastwhisper_exe, "rb");
     if (!f) {
         *errmsg_out = talloc_asprintf(wl,
-            "faster-whisper executable not found at %s", wl->fastwhisper_exe);
+            "faster-whisper executable not found at %s", cfg.fastwhisper_exe);
         return false;
     }
     fclose(f);
 
-    if (translate_to && translate_to[0] && translate_provider != WT_PROVIDER_NONE) {
+    wl->fastwhisper_dir = talloc_strdup(wl, cfg.fastwhisper_dir);
+    wl->fastwhisper_exe = talloc_strdup(wl, cfg.fastwhisper_exe);
+    wl->model           = talloc_strdup(wl, cfg.model);
+    wl->device          = talloc_strdup(wl, cfg.device);
+    wl->language        = talloc_strdup(wl, cfg.language);
+    wl->chunk_sec       = cfg.chunk_sec;
+    if (cfg.initial_prompt)
+        wl->initial_prompt = talloc_strdup(wl, cfg.initial_prompt);
+
+    if (cfg.translate_to && cfg.translate_to[0] &&
+        cfg.translate_provider != WT_PROVIDER_NONE) {
         const char *src = wl->language ? wl->language : "auto";
         wl->translator = whisper_translator_create(wl, wl->log,
-                                                   translate_provider,
-                                                   src, translate_to);
+                                                   cfg.translate_provider,
+                                                   src, cfg.translate_to);
         if (wl->translator) {
+            wl->cur_translate_to = talloc_strdup(wl, cfg.translate_to);
+            wl->cur_translate_provider = cfg.translate_provider;
             MP_INFO(wl, "translator enabled (%s -> %s, %s)\n",
-                    src, translate_to,
-                    translate_provider == WT_PROVIDER_GOOGLE ? "google" : "azure");
+                    src, cfg.translate_to,
+                    cfg.translate_provider == WT_PROVIDER_GOOGLE ? "google" : "azure");
         } else {
             MP_WARN(wl, "failed to create translator\n");
         }
@@ -783,6 +831,9 @@ void whisper_lookahead_start(struct MPContext *mpctx, const char *whisper_opts)
     wl->child_cancel = mp_cancel_new(wl);
     mp_cancel_set_parent(wl->child_cancel, wl->cancel);
     mp_mutex_init(&wl->seek_mutex);
+    mp_mutex_init(&wl->cfg_mutex);
+    atomic_store(&wl->first_sub_injected, false);
+    wl->cur_translate_provider = WT_PROVIDER_NONE;
 
     char *path = mp_get_user_path(wl, mpctx->global, mpctx->filename);
     wl->filename = talloc_strdup(wl, path);
@@ -824,11 +875,116 @@ void whisper_lookahead_stop(struct MPContext *mpctx)
     whisper_translator_destroy(&wl->translator);
 
     mp_mutex_destroy(&wl->seek_mutex);
+    mp_mutex_destroy(&wl->cfg_mutex);
 
     mpctx->whisper_lookahead = NULL;
     talloc_free(wl);
 
     MP_INFO(mpctx, "whisper lookahead: stopped\n");
+}
+
+const char *whisper_lookahead_current_opts(struct MPContext *mpctx)
+{
+    struct whisper_lookahead *wl = mpctx->whisper_lookahead;
+    return wl ? wl->whisper_opts : NULL;
+}
+
+// Returns true if the new opts were applied in-place (no restart needed).
+// Returns false if the change requires a full restart (heavy fields differ
+// or parsing failed).
+bool whisper_lookahead_try_reconfigure(struct MPContext *mpctx,
+                                       const char *new_opts)
+{
+    struct whisper_lookahead *wl = mpctx->whisper_lookahead;
+    if (!wl) return false;
+    if (!new_opts || !new_opts[0]) return false;
+    if (wl->whisper_opts && strcmp(new_opts, wl->whisper_opts) == 0)
+        return true;  // identical, nothing to do
+
+    void *tctx = talloc_new(NULL);
+    struct wl_parsed_cfg cfg;
+    char *errmsg = NULL;
+    if (!parse_opts_into_cfg(tctx, &cfg, new_opts, wl->log, &errmsg)) {
+        MP_WARN(wl, "reconfigure: parse failed: %s\n",
+                errmsg ? errmsg : "unknown");
+        talloc_free(tctx);
+        return false;
+    }
+
+    // Heavy fields cannot change without restarting the work_thread /
+    // re-validating the executable. Compare against current state.
+    bool heavy_changed =
+        strcmp(cfg.fastwhisper_dir ? cfg.fastwhisper_dir : "",
+               wl->fastwhisper_dir ? wl->fastwhisper_dir : "") != 0 ||
+        strcmp(cfg.model    ? cfg.model    : "",
+               wl->model    ? wl->model    : "") != 0 ||
+        strcmp(cfg.device   ? cfg.device   : "",
+               wl->device   ? wl->device   : "") != 0 ||
+        cfg.chunk_sec != wl->chunk_sec;
+    if (heavy_changed) {
+        talloc_free(tctx);
+        return false;
+    }
+
+    // Light fields: language, initial_prompt, translator config.
+    // Apply under cfg_mutex so the inject thread sees a consistent state.
+    bool need_new_translator =
+        (cfg.translate_to ? cfg.translate_to : "")[0] != '\0' &&
+        cfg.translate_provider != WT_PROVIDER_NONE &&
+        (strcmp(cfg.translate_to,
+                wl->cur_translate_to ? wl->cur_translate_to : "") != 0 ||
+         cfg.translate_provider != wl->cur_translate_provider ||
+         (wl->language &&
+          strcmp(cfg.language, wl->language) != 0));
+    bool need_drop_translator =
+        wl->translator && (
+            !cfg.translate_to || !cfg.translate_to[0] ||
+            cfg.translate_provider == WT_PROVIDER_NONE);
+
+    struct whisper_translator *new_tr = NULL;
+    if (need_new_translator) {
+        new_tr = whisper_translator_create(wl, wl->log,
+                                           cfg.translate_provider,
+                                           cfg.language, cfg.translate_to);
+        if (!new_tr) {
+            MP_WARN(wl, "reconfigure: failed to build new translator; "
+                        "keeping existing one\n");
+        }
+    }
+
+    mp_mutex_lock(&wl->cfg_mutex);
+
+    // Swap language / initial_prompt strings.
+    talloc_free(wl->language);
+    wl->language = talloc_strdup(wl, cfg.language);
+    talloc_free(wl->initial_prompt);
+    wl->initial_prompt = cfg.initial_prompt
+        ? talloc_strdup(wl, cfg.initial_prompt) : NULL;
+
+    if (new_tr) {
+        whisper_translator_destroy(&wl->translator);
+        wl->translator = new_tr;
+        talloc_free(wl->cur_translate_to);
+        wl->cur_translate_to = talloc_strdup(wl, cfg.translate_to);
+        wl->cur_translate_provider = cfg.translate_provider;
+        MP_INFO(wl, "reconfigure: translator -> %s -> %s (%s)\n",
+                cfg.language, cfg.translate_to,
+                cfg.translate_provider == WT_PROVIDER_GOOGLE ? "google" : "azure");
+    } else if (need_drop_translator) {
+        whisper_translator_destroy(&wl->translator);
+        talloc_free(wl->cur_translate_to);
+        wl->cur_translate_to = NULL;
+        wl->cur_translate_provider = WT_PROVIDER_NONE;
+        MP_INFO(wl, "reconfigure: translator disabled\n");
+    }
+
+    talloc_free(wl->whisper_opts);
+    wl->whisper_opts = talloc_strdup(wl, new_opts);
+
+    mp_mutex_unlock(&wl->cfg_mutex);
+
+    talloc_free(tctx);
+    return true;
 }
 
 void whisper_lookahead_seek(struct MPContext *mpctx, double pts)
@@ -859,7 +1015,8 @@ void whisper_lookahead_set_track_selected(struct MPContext *mpctx, bool val)
 bool whisper_lookahead_ready(struct MPContext *mpctx)
 {
     struct whisper_lookahead *wl = mpctx->whisper_lookahead;
-    return wl && atomic_load(&wl->init_done) && wl->init_ok;
+    return wl && atomic_load(&wl->init_done) && wl->init_ok &&
+           atomic_load(&wl->first_sub_injected);
 }
 
 bool whisper_lookahead_failed(struct MPContext *mpctx)

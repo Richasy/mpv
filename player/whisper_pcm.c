@@ -133,14 +133,44 @@ int wpcm_extract_chunk_to_wav(struct mp_log *log,
 
     // Build network options dict (auth headers, UA, cookies, etc).
     mp_setup_av_network_options(&opts, NULL, global, log);
+    // Mirror what stream_lavf does for resilience against flaky HTTP servers.
+    av_dict_set(&opts, "reconnect", "1", 0);
+    av_dict_set(&opts, "reconnect_streamed", "1", 0);
+    av_dict_set(&opts, "reconnect_delay_max", "7", 0);
+    av_dict_set(&opts, "multiple_requests", "1", 0);
 
     int err = avformat_open_input(&fmt, url, NULL, &opts);
     av_dict_free(&opts);
+    opts = NULL;
     if (err < 0) {
-        mp_err(log, "wpcm: avformat_open_input failed: %d\n", err);
+        char ebuf[128] = {0};
+        av_strerror(err, ebuf, sizeof(ebuf));
+        mp_warn(log, "wpcm: open with seek failed (%s); retrying without "
+                "byte-range probes\n", ebuf);
         // avformat_open_input frees fmt on failure.
         fmt = NULL;
-        return cancel && mp_cancel_test(cancel) ? -2 : -1;
+        if (cancel && mp_cancel_test(cancel)) return -2;
+        // Retry with seekable=0 -- some servers (alist/WebDAV) reject the
+        // Range requests demuxers issue during probe.
+        fmt = avformat_alloc_context();
+        if (!fmt) return -1;
+        fmt->interrupt_callback.callback = wpcm_interrupt_cb;
+        fmt->interrupt_callback.opaque = cancel;
+        mp_setup_av_network_options(&opts, NULL, global, log);
+        av_dict_set(&opts, "reconnect", "1", 0);
+        av_dict_set(&opts, "reconnect_streamed", "1", 0);
+        av_dict_set(&opts, "reconnect_delay_max", "7", 0);
+        av_dict_set(&opts, "multiple_requests", "1", 0);
+        av_dict_set(&opts, "seekable", "0", 0);
+        err = avformat_open_input(&fmt, url, NULL, &opts);
+        av_dict_free(&opts);
+        if (err < 0) {
+            av_strerror(err, ebuf, sizeof(ebuf));
+            mp_err(log, "wpcm: avformat_open_input failed: %s (%d)\n",
+                   ebuf, err);
+            fmt = NULL;
+            return cancel && mp_cancel_test(cancel) ? -2 : -1;
+        }
     }
 
     if (cancel && mp_cancel_test(cancel)) { rc = -2; goto cleanup; }

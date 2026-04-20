@@ -696,12 +696,33 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
     }
 
     while (!atomic_load(&wl->terminate)) {
+        // Stop if mpv has decided to stop the file (EOF, error, user quit,
+        // playlist next, etc). Avoids spinning in the post-EOF restart
+        // loop and freezes wp from trying to "seek" to phantom positions
+        // (mpv's "seek to last frame" trick post-EOF generates spurious
+        // seek_pending events).
+        if (mpctx->stop_play != KEEP_PLAYING) {
+            MP_INFO(wl, "network: mpctx->stop_play=%d, exiting\n",
+                    (int)mpctx->stop_play);
+            break;
+        }
+
         // Honor pending seek.
         mp_mutex_lock(&wl->seek_mutex);
         if (wl->seek_pending) {
             double tgt = wl->seek_target;
             wl->seek_pending = false;
             mp_mutex_unlock(&wl->seek_mutex);
+
+            // If the seek target is past (or within one chunk of) the file
+            // end, treat as end-of-content and exit -- this catches mpv's
+            // "seek to last frame" cycle on EOF.
+            if (duration > 0 && tgt >= duration - chunk_sec) {
+                MP_INFO(wl, "network: seek target %.2f at/past EOF "
+                        "(duration=%.1f), exiting\n", tgt, duration);
+                break;
+            }
+
             double new_t0 = floor(tgt / chunk_sec) * chunk_sec;
             if (new_t0 < 0) new_t0 = 0;
 
@@ -728,8 +749,19 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
                 }
             } else if (new_t0 > cur) {
                 // Forward seek: just advance; cheaper than reopening from 0.
-                MP_INFO(wl, "network: forward seek %.2f -> %.2f, "
-                        "fast-forwarding\n", cur, new_t0);
+                // But cap how far we'll skip in one go: huge jumps on
+                // unseekable streams cost real network bandwidth and would
+                // block other I/O for minutes. Better to let the loop catch
+                // up gradually via the "playhead outpaced us" branch below.
+                double max_forward = chunk_sec * 8;  // ~2 min at chunk=15
+                if (new_t0 - cur > max_forward) {
+                    MP_INFO(wl, "network: forward seek %.2f -> %.2f too far "
+                            "(>%.0fs); skipping cursor instead\n",
+                            cur, new_t0, max_forward);
+                    new_t0 = cur + max_forward;
+                }
+                MP_INFO(wl, "network: forward seek -> %.2f, fast-forwarding "
+                        "(cursor=%.2f)\n", new_t0, cur);
                 int arc = wpcm_session_advance_to(sess, new_t0);
                 if (arc == -2) { wpcm_session_close(sess); return 0; }
                 if (arc < 0) {
@@ -752,10 +784,22 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
             break;
         }
 
-        // Skip ahead if playhead has raced past us by more than two chunks.
+        // Stop if playback has reached end of file naturally.
         double pp = mpctx->playback_pts;
+        if (duration > 0 && pp != MP_NOPTS_VALUE && pp >= duration - 0.5) {
+            MP_INFO(wl, "network: playback at EOF (pp=%.2f, dur=%.1f), "
+                    "exiting\n", pp, duration);
+            break;
+        }
+
+        // Skip ahead if playhead has raced past us by more than two chunks.
         if (pp != MP_NOPTS_VALUE && pp > chunk_t0 + 2 * chunk_sec) {
             double new_t0 = floor(pp / chunk_sec) * chunk_sec;
+            // Same cap as forward-seek above to avoid huge advance bursts.
+            double cur = wpcm_session_cursor_sec(sess);
+            double max_forward = chunk_sec * 8;
+            if (new_t0 - cur > max_forward)
+                new_t0 = cur + max_forward;
             MP_INFO(wl, "network: playhead at %.2f outpaced chunk_t0 %.2f; "
                     "fast-forwarding to %.2f\n", pp, chunk_t0, new_t0);
             int arc = wpcm_session_advance_to(sess, new_t0);

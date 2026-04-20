@@ -203,6 +203,11 @@ static char *make_temp_outdir(void *tctx, struct mp_log *log)
     if (!tmp) tmp = "/tmp";
 
     static atomic_int counter;
+#ifdef _WIN32
+    static const char SEP = '\\';
+#else
+    static const char SEP = '/';
+#endif
     for (int attempt = 0; attempt < 20; attempt++) {
         unsigned pid;
 #ifdef _WIN32
@@ -211,8 +216,8 @@ static char *make_temp_outdir(void *tctx, struct mp_log *log)
         pid = (unsigned)getpid();
 #endif
         int seq = atomic_fetch_add(&counter, 1);
-        char *path = talloc_asprintf(tctx, "%s/mpv-fw-%u-%d-%d", tmp,
-                                     pid, seq, rand());
+        char *path = talloc_asprintf(tctx, "%s%cmpv-fw-%u-%d-%d", tmp,
+                                     SEP, pid, seq, rand());
 #ifdef _WIN32
         if (CreateDirectoryA(path, NULL))
             return path;
@@ -397,7 +402,13 @@ static int run_faster_whisper(struct whisper_lookahead *wl,
     const char *dot = strrchr(base, '.');
     char *stem = dot ? talloc_strndup(tctx, base, dot - base)
                      : talloc_strdup(tctx, base);
-    char *srt = talloc_asprintf(tctx, "%s/%s.srt", out_dir, stem);
+    char *srt = talloc_asprintf(tctx, "%s%c%s.srt", out_dir,
+#ifdef _WIN32
+                                '\\',
+#else
+                                '/',
+#endif
+                                stem);
 
     FILE *f = fopen(srt, "rb");
     if (!f) {

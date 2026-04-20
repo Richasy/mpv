@@ -32,6 +32,7 @@
 #include <libswresample/swresample.h>
 
 #include "common/msg.h"
+#include "misc/thread_tools.h"
 #include "osdep/io.h"
 #include "stream/stream.h"
 
@@ -91,13 +92,19 @@ static int write_wav_header(FILE *f, uint32_t data_size, uint32_t sample_rate)
     return 0;
 }
 
+static int wpcm_interrupt_cb(void *opaque)
+{
+    struct mp_cancel *c = opaque;
+    return c && mp_cancel_test(c) ? 1 : 0;
+}
+
 int wpcm_extract_chunk_to_wav(struct mp_log *log,
                               struct mpv_global *global,
+                              struct mp_cancel *cancel,
                               const char *url,
                               double t0_sec,
                               double t1_sec,
-                              const char *out_wav_path,
-                              atomic_bool *cancel)
+                              const char *out_wav_path)
 {
     int rc = -1;
     AVFormatContext *fmt = NULL;
@@ -111,9 +118,18 @@ int wpcm_extract_chunk_to_wav(struct mp_log *log,
     uint32_t total_samples = 0;
     uint8_t *buf_out = NULL;
     int buf_out_cap = 0;
+    bool swr_inited = false;
 
-    if (cancel && atomic_load(cancel))
+    if (cancel && mp_cancel_test(cancel))
         return -2;
+
+    // Pre-allocate format context so we can attach the interrupt callback
+    // BEFORE network I/O begins (otherwise avformat_open_input itself
+    // can block uncancellably).
+    fmt = avformat_alloc_context();
+    if (!fmt) return -1;
+    fmt->interrupt_callback.callback = wpcm_interrupt_cb;
+    fmt->interrupt_callback.opaque = cancel;
 
     // Build network options dict (auth headers, UA, cookies, etc).
     mp_setup_av_network_options(&opts, NULL, global, log);
@@ -122,10 +138,12 @@ int wpcm_extract_chunk_to_wav(struct mp_log *log,
     av_dict_free(&opts);
     if (err < 0) {
         mp_err(log, "wpcm: avformat_open_input failed: %d\n", err);
-        return -1;
+        // avformat_open_input frees fmt on failure.
+        fmt = NULL;
+        return cancel && mp_cancel_test(cancel) ? -2 : -1;
     }
 
-    if (cancel && atomic_load(cancel)) { rc = -2; goto cleanup; }
+    if (cancel && mp_cancel_test(cancel)) { rc = -2; goto cleanup; }
 
     err = avformat_find_stream_info(fmt, NULL);
     if (err < 0) {
@@ -157,30 +175,7 @@ int wpcm_extract_chunk_to_wav(struct mp_log *log,
         goto cleanup;
     }
 
-    // Configure resampler: -> s16, mono, 16000 Hz.
-    AVChannelLayout out_layout;
-    av_channel_layout_default(&out_layout, 1);
-    AVChannelLayout in_layout;
-    if (cctx->ch_layout.nb_channels > 0) {
-        av_channel_layout_copy(&in_layout, &cctx->ch_layout);
-    } else {
-        av_channel_layout_default(&in_layout, cctx->ch_layout.nb_channels > 0
-                                              ? cctx->ch_layout.nb_channels : 2);
-    }
-
-    err = swr_alloc_set_opts2(&swr,
-                              &out_layout, AV_SAMPLE_FMT_S16, WPCM_SAMPLE_RATE,
-                              &in_layout, cctx->sample_fmt, cctx->sample_rate,
-                              0, NULL);
-    av_channel_layout_uninit(&out_layout);
-    av_channel_layout_uninit(&in_layout);
-    if (err < 0 || !swr || swr_init(swr) < 0) {
-        mp_err(log, "wpcm: swr_init failed\n");
-        goto cleanup;
-    }
-
-    // Seek slightly before t0, decoder will gracefully skip until first
-    // valid frame past it. AV_TIME_BASE = us.
+    // Seek slightly before t0; decoder skips until first valid frame.
     if (t0_sec > 0.0) {
         int64_t ts = (int64_t)((t0_sec - 0.5) * AV_TIME_BASE);
         if (ts < 0) ts = 0;
@@ -195,7 +190,6 @@ int wpcm_extract_chunk_to_wav(struct mp_log *log,
         mp_err(log, "wpcm: cannot open output '%s'\n", out_wav_path);
         goto cleanup;
     }
-    // Reserve header — we backfill once we know data_size.
     if (write_wav_header(out, 0, WPCM_SAMPLE_RATE) < 0)
         goto cleanup;
 
@@ -207,13 +201,17 @@ int wpcm_extract_chunk_to_wav(struct mp_log *log,
     bool eof_input = false;
 
     while (true) {
-        if (cancel && atomic_load(cancel)) { rc = -2; goto cleanup; }
+        if (cancel && mp_cancel_test(cancel)) { rc = -2; goto cleanup; }
 
         if (!eof_input) {
             err = av_read_frame(fmt, pkt);
             if (err == AVERROR_EOF) {
                 eof_input = true;
                 avcodec_send_packet(cctx, NULL);
+            } else if (err == AVERROR_EXIT) {
+                // interrupt callback fired
+                rc = -2;
+                goto cleanup;
             } else if (err < 0) {
                 mp_warn(log, "wpcm: av_read_frame error %d\n", err);
                 break;
@@ -237,7 +235,41 @@ int wpcm_extract_chunk_to_wav(struct mp_log *log,
             if (r == AVERROR_EOF) { eof_input = true; break; }
             if (r < 0) { need_more_input = true; break; }
 
-            // PTS-based clip: skip frames before t0, stop after t1.
+            // Lazy-init swr from the first decoded frame so we use the
+            // *actual* layout/format/rate rather than the codecpar guess
+            // (codecpar can be missing channel layout for some codecs).
+            if (!swr_inited) {
+                AVChannelLayout out_layout;
+                av_channel_layout_default(&out_layout, 1);
+                AVChannelLayout in_layout;
+                if (frame->ch_layout.nb_channels > 0) {
+                    av_channel_layout_copy(&in_layout, &frame->ch_layout);
+                } else {
+                    int nch = frame->ch_layout.nb_channels > 0
+                              ? frame->ch_layout.nb_channels
+                              : (cctx->ch_layout.nb_channels > 0
+                                 ? cctx->ch_layout.nb_channels : 2);
+                    av_channel_layout_default(&in_layout, nch);
+                }
+                int sr = frame->sample_rate > 0 ? frame->sample_rate
+                                                : cctx->sample_rate;
+                int sf = frame->format >= 0 ? frame->format : cctx->sample_fmt;
+                err = swr_alloc_set_opts2(&swr,
+                                          &out_layout, AV_SAMPLE_FMT_S16,
+                                          WPCM_SAMPLE_RATE,
+                                          &in_layout, sf, sr,
+                                          0, NULL);
+                av_channel_layout_uninit(&out_layout);
+                av_channel_layout_uninit(&in_layout);
+                if (err < 0 || !swr || swr_init(swr) < 0) {
+                    mp_err(log, "wpcm: swr_init failed\n");
+                    av_frame_unref(frame);
+                    goto cleanup;
+                }
+                swr_inited = true;
+            }
+
+            // PTS-based clip: skip frames before t0, stop at/after t1.
             int64_t fpts = frame->best_effort_timestamp;
             if (fpts == AV_NOPTS_VALUE) fpts = frame->pts;
             double frame_t = (fpts != AV_NOPTS_VALUE)
@@ -247,14 +279,16 @@ int wpcm_extract_chunk_to_wav(struct mp_log *log,
                 av_frame_unref(frame);
                 continue;
             }
-            if (frame_t >= 0 && fpts > t1_pts_in_st) {
+            if (frame_t >= 0 && fpts >= t1_pts_in_st) {
                 av_frame_unref(frame);
                 goto flush;
             }
 
+            int in_sr = frame->sample_rate > 0 ? frame->sample_rate
+                                               : cctx->sample_rate;
             int64_t out_n = av_rescale_rnd(
-                swr_get_delay(swr, cctx->sample_rate) + frame->nb_samples,
-                WPCM_SAMPLE_RATE, cctx->sample_rate, AV_ROUND_UP);
+                swr_get_delay(swr, in_sr) + frame->nb_samples,
+                WPCM_SAMPLE_RATE, in_sr, AV_ROUND_UP);
             int needed = out_n * WPCM_BYTES_PER_SAMPLE;
             if (needed > buf_out_cap) {
                 uint8_t *nb = av_realloc(buf_out, needed);
@@ -282,21 +316,23 @@ int wpcm_extract_chunk_to_wav(struct mp_log *log,
     }
 
 flush:;
-    // Drain any leftover samples held in swr.
-    int leftover = swr_get_out_samples(swr, 0);
-    if (leftover > 0) {
-        int needed = leftover * WPCM_BYTES_PER_SAMPLE;
-        if (needed > buf_out_cap) {
-            uint8_t *nb = av_realloc(buf_out, needed);
-            if (nb) { buf_out = nb; buf_out_cap = needed; }
-        }
-        if (buf_out) {
-            uint8_t *out_planes[1] = { buf_out };
-            int got = swr_convert(swr, out_planes, leftover, NULL, 0);
-            if (got > 0) {
-                size_t bytes = (size_t)got * WPCM_BYTES_PER_SAMPLE;
-                if (fwrite(buf_out, 1, bytes, out) == bytes)
-                    total_samples += got;
+    // Drain leftover samples held in swr.
+    if (swr_inited) {
+        int leftover = swr_get_out_samples(swr, 0);
+        if (leftover > 0) {
+            int needed = leftover * WPCM_BYTES_PER_SAMPLE;
+            if (needed > buf_out_cap) {
+                uint8_t *nb = av_realloc(buf_out, needed);
+                if (nb) { buf_out = nb; buf_out_cap = needed; }
+            }
+            if (buf_out) {
+                uint8_t *out_planes[1] = { buf_out };
+                int got = swr_convert(swr, out_planes, leftover, NULL, 0);
+                if (got > 0) {
+                    size_t bytes = (size_t)got * WPCM_BYTES_PER_SAMPLE;
+                    if (fwrite(buf_out, 1, bytes, out) == bytes)
+                        total_samples += got;
+                }
             }
         }
     }

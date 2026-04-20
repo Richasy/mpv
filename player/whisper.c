@@ -710,8 +710,8 @@ static int do_network_transcribe(struct whisper_lookahead *wl)
                 chunk_t0, chunk_t1, wav_path);
 
         int prc = wpcm_extract_chunk_to_wav(wl->log, wl->mpctx->global,
-                                            wl->filename, chunk_t0, chunk_t1,
-                                            wav_path, &wl->terminate);
+                                            wl->cancel, wl->filename,
+                                            chunk_t0, chunk_t1, wav_path);
         if (prc == -2) {
             rmtree_quiet(wl->log, out_dir);
             talloc_free(tctx);

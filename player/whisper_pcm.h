@@ -31,17 +31,16 @@
 #ifndef MPV_WHISPER_PCM_H
 #define MPV_WHISPER_PCM_H
 
-#include <stdatomic.h>
-
 struct mp_log;
+struct mp_cancel;
 struct mpv_global;
 
 int wpcm_extract_chunk_to_wav(struct mp_log *log,
                               struct mpv_global *global,
+                              struct mp_cancel *cancel,
                               const char *url,
                               double t0_sec,
                               double t1_sec,
-                              const char *out_wav_path,
-                              atomic_bool *cancel);
+                              const char *out_wav_path);
 
 #endif

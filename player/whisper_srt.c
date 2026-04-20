@@ -38,6 +38,7 @@
 
 #include "mpv_talloc.h"
 #include "common/msg.h"
+#include "osdep/io.h"
 #include "whisper_srt.h"
 
 static char *strip_bom(char *s)

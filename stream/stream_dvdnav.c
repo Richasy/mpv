@@ -804,9 +804,19 @@ const stream_info_t stream_info_ifo_dvdnav = {
 
 static bool dvd_url_has_iso_extension(const char *url)
 {
-    const char *end = strpbrk(url, "?#");
-    size_t len = end ? (size_t)(end - url) : strlen(url);
-    return len >= 4 && strncasecmp(url + len - 4, ".iso", 4) == 0;
+    // Match ".iso" anywhere in the URL as long as it's followed by a URL
+    // boundary character. This handles both plain paths (e.g. ".../movie.iso")
+    // and proxy/redirector URLs that pass the filename via the query string
+    // (e.g. ".../redirect?file_name=movie.iso" or ".../r?name=movie.iso&t=1").
+    size_t n = strlen(url);
+    for (size_t i = 0; i + 4 <= n; i++) {
+        if (strncasecmp(url + i, ".iso", 4) != 0)
+            continue;
+        char c = url[i + 4];
+        if (c == 0 || c == '?' || c == '#' || c == '&' || c == '/')
+            return true;
+    }
+    return false;
 }
 
 static int iso_dvdnav_stream_open(stream_t *stream)

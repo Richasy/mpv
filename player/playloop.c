@@ -989,7 +989,13 @@ void seek_to_last_frame(struct MPContext *mpctx)
 static void handle_keep_open(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
+    // Don't keep the file open after a fatal stream-level error (e.g. mid-
+    // stream HTTP 4xx). handle_eof() may have escalated error_playing to
+    // MPV_ERROR_GENERIC; if we silently reset stop_play here, no
+    // MPV_EVENT_END_FILE is ever delivered and clients (which manage their
+    // own playlist) cannot distinguish a real EOF from a broken stream.
     if (opts->keep_open && mpctx->stop_play == AT_END_OF_FILE &&
+        mpctx->error_playing >= 0 &&
         (opts->keep_open == 2 ||
         (!playlist_get_next(mpctx->playlist, 1) && opts->loop_times == 1)))
     {

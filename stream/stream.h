@@ -149,6 +149,13 @@ typedef struct stream {
 
     int64_t pos;
     int eof; // valid only after read calls that returned a short result
+    // Sticky stream-level error flag set by backends (e.g. stream_lavf when
+    // avio_read_partial / avio_seek / avio_seek_time fail with avio->error).
+    // Distinguishes a real error (HTTP 4xx, EIO, broken pipe, ...) from a
+    // clean EOF. Cleared on successful read/seek. The actual numeric value
+    // is the backend's error code (e.g. an AVERROR), or a non-zero sentinel
+    // when no specific code is available; any non-zero value means error.
+    int error;
     int mode; //STREAM_READ or STREAM_WRITE
     int stream_origin; // any STREAM_ORIGIN_*
     void *priv; // used for DVD, TV, RTSP etc

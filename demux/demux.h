@@ -45,6 +45,7 @@ struct demux_ctrl_ts_info {
 struct demux_reader_state {
     bool eof, underrun, idle;
     bool bof_cached, eof_cached;
+    bool stream_error; // true if any read hit a fatal stream-level error
     struct demux_ctrl_ts_info ts_info;
     struct demux_ctrl_ts_info ts_per_stream[STREAM_TYPE_COUNT];
     int64_t total_bytes;
@@ -238,6 +239,12 @@ typedef struct demuxer {
     bool fully_read;
     bool is_network; // opened directly from a network stream
     bool is_streaming; // implies a "slow" input, such as network or FUSE
+    // Set by the demuxer implementation when packet reading hits a
+    // permanent or repeated stream-level error (e.g. underlying HTTP 4xx,
+    // EIO). The demuxer thread propagates this into demux_internal so
+    // that demux_get_reader_state() exposes it. Used by the player's
+    // EOF handler to escalate AT_END_OF_FILE to MPV_END_FILE_REASON_ERROR.
+    bool stream_error;
     int stream_origin; // any STREAM_ORIGIN_* (set from source stream)
     bool access_references; // allow opening other files/URLs
     int depth; // demuxer depth, 0 for top-level

@@ -87,7 +87,25 @@ static int fill_buffer(stream_t *s, void *buffer, int max_len)
 {
     AVIOContext *avio = s->priv;
     int r = avio_read_partial(avio, buffer, max_len);
-    return (r <= 0) ? -1 : r;
+    if (r <= 0) {
+        // Distinguish a real I/O error from a clean EOF. avio->error is set
+        // by libavformat when the underlying transport (HTTP, file, ...) hit
+        // an error, including HTTP 4xx/5xx mapped to AVERROR_HTTP_*.
+        // Without this propagation, callers see the same return value for
+        // EOF and error, and a mid-stream HTTP 403 (e.g. expired CDN ticket)
+        // gets silently treated as natural end-of-file by demux_lavf.
+        if (avio->error) {
+            s->error = avio->error;
+        } else if (r < 0) {
+            // r itself is an AVERROR; AVERROR_EOF is benign, anything else
+            // is treated as an error.
+            if (r != AVERROR_EOF)
+                s->error = r;
+        }
+        return -1;
+    }
+    s->error = 0;
+    return r;
 }
 
 static int write_buffer(stream_t *s, void *buffer, int len)
@@ -104,8 +122,13 @@ static int seek(stream_t *s, int64_t newpos)
 {
     AVIOContext *avio = s->priv;
     if (avio_seek(avio, newpos, SEEK_SET) < 0) {
+        // Record the error so a subsequent fill_buffer that returns short
+        // because of the failed seek still surfaces it as an error rather
+        // than as benign EOF.
+        s->error = avio->error ? avio->error : AVERROR_EXTERNAL;
         return 0;
     }
+    s->error = 0;
     return 1;
 }
 
@@ -135,9 +158,11 @@ static int control(stream_t *s, int cmd, void *arg)
         struct stream_avseek *c = arg;
         int64_t r = avio_seek_time(avio, c->stream_index, c->timestamp, c->flags);
         if (r >= 0) {
+            s->error = 0;
             stream_drop_buffers(s);
             return 1;
         }
+        s->error = avio->error ? avio->error : AVERROR_EXTERNAL;
         break;
     }
     case STREAM_CTRL_HAS_AVSEEK: {

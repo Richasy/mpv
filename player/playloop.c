@@ -989,7 +989,13 @@ void seek_to_last_frame(struct MPContext *mpctx)
 static void handle_keep_open(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
+    // Don't keep the file open after a fatal stream-level error (e.g. mid-
+    // stream HTTP 4xx). handle_eof() may have escalated error_playing to
+    // MPV_ERROR_GENERIC; if we silently reset stop_play here, no
+    // MPV_EVENT_END_FILE is ever delivered and clients (which manage their
+    // own playlist) cannot distinguish a real EOF from a broken stream.
     if (opts->keep_open && mpctx->stop_play == AT_END_OF_FILE &&
+        mpctx->error_playing >= 0 &&
         (opts->keep_open == 2 ||
         (!playlist_get_next(mpctx->playlist, 1) && opts->loop_times == 1)))
     {
@@ -1258,6 +1264,45 @@ static void handle_eof(struct MPContext *mpctx)
         mpctx->video_status == STATUS_EOF &&
         !mpctx->stop_play)
     {
+        // Before declaring "end of file", check the demuxers actually feeding
+        // the active A/V chains for a sticky stream-level error. If any of
+        // them hit a real error (HTTP 4xx, EIO, ...), an upstream layer in
+        // libavformat may have collapsed it into AVERROR_EOF and we're now
+        // about to misclassify that as benign EOF -> auto-advance to the
+        // next playlist entry. Escalate to MPV_END_FILE_REASON_ERROR via
+        // the existing error_playing -> reason mapping in loadfile.c.
+        // Only check the demuxers backing the current A/V chains so we
+        // don't get false positives from secondary demuxers like the
+        // whisper-lookahead pipeline (see commit c0cb60236d).
+        struct demuxer *check_dmx[3] = {0};
+        int n_check = 0;
+        if (mpctx->vo_chain && mpctx->vo_chain->track &&
+            mpctx->vo_chain->track->demuxer)
+            check_dmx[n_check++] = mpctx->vo_chain->track->demuxer;
+        if (mpctx->ao_chain && mpctx->ao_chain->track &&
+            mpctx->ao_chain->track->demuxer)
+        {
+            struct demuxer *d = mpctx->ao_chain->track->demuxer;
+            bool dup = false;
+            for (int i = 0; i < n_check; i++)
+                if (check_dmx[i] == d) { dup = true; break; }
+            if (!dup)
+                check_dmx[n_check++] = d;
+        }
+        bool fatal_stream_error = false;
+        for (int i = 0; i < n_check; i++) {
+            struct demux_reader_state rst;
+            demux_get_reader_state(check_dmx[i], &rst);
+            if (rst.stream_error) {
+                fatal_stream_error = true;
+                break;
+            }
+        }
+        if (fatal_stream_error && mpctx->error_playing >= 0) {
+            MP_ERR(mpctx, "EOF reached but underlying stream had a fatal "
+                   "error; reporting as MPV_END_FILE_REASON_ERROR.\n");
+            mpctx->error_playing = MPV_ERROR_GENERIC;
+        }
         mpctx->stop_play = AT_END_OF_FILE;
     }
 }

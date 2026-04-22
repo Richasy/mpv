@@ -199,6 +199,8 @@ struct demux_internal {
 
     bool warned_queue_overflow;
     bool eof;                   // whether we're in EOF state
+    bool stream_error;          // sticky: set when demuxer reports a stream-level
+                                // I/O error (e.g. HTTP 4xx). Cleared on seek/flush.
     double min_secs;
     double hyst_secs;           // stop reading till there's hyst_secs remaining
     bool hyst_active;
@@ -2340,6 +2342,16 @@ static bool read_packet(struct demux_internal *in)
     mp_mutex_lock(&in->lock);
     update_cache(in);
 
+    // Propagate any stream-level error the demuxer recorded during the
+    // packet read. This is sticky in in->stream_error (cleared on
+    // seek/flush) so that a single 403 / EIO during the read loop is
+    // preserved until the next seek, even if the read itself returned a
+    // benign EOF afterwards.
+    if (demux->stream_error) {
+        in->stream_error = true;
+        demux->stream_error = false;
+    }
+
     if (pkt) {
         mp_assert(pkt->stream >= 0 && pkt->stream < in->num_streams);
         add_packet_locked(in->streams[pkt->stream], pkt);
@@ -2495,6 +2507,7 @@ static void execute_seek(struct demux_internal *in)
     int flags = in->seek_flags;
     double pts = in->seek_pts;
     in->eof = false;
+    in->stream_error = false;
     in->seeking = false;
     in->seeking_in_progress = pts;
     in->demux_ts = MP_NOPTS_VALUE;
@@ -3616,6 +3629,7 @@ void demux_flush(demuxer_t *demuxer)
         ds->eof = false;
     }
     in->eof = false;
+    in->stream_error = false;
     in->seeking = false;
     mp_mutex_unlock(&in->lock);
 }
@@ -3927,6 +3941,7 @@ static bool queue_seek(struct demux_internal *in, double seek_pts, int flags,
     }
 
     in->eof = false;
+    in->stream_error = false;
     in->reading = false;
     in->back_demuxing = set_backwards;
 
@@ -4600,6 +4615,7 @@ void demux_get_reader_state(struct demuxer *demuxer, struct demux_reader_state *
 
     *r = (struct demux_reader_state){
         .eof = in->eof,
+        .stream_error = in->stream_error,
         .ts_info = {
             .reader = MP_NOPTS_VALUE,
             .end = MP_NOPTS_VALUE,

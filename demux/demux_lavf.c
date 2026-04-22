@@ -1338,10 +1338,33 @@ fail:
     return -1;
 }
 
+// HTTP errors mapped by FFmpeg's http.c. These are permanent for the
+// current request; retrying with the same URL inside the demuxer just
+// burns wall-clock time before mpv would (incorrectly) treat it as EOF.
+// Surface them immediately so the player can react.
+static bool is_permanent_stream_error(int err)
+{
+    switch (err) {
+    case AVERROR_HTTP_BAD_REQUEST:
+    case AVERROR_HTTP_UNAUTHORIZED:
+    case AVERROR_HTTP_FORBIDDEN:
+    case AVERROR_HTTP_NOT_FOUND:
+    case AVERROR_HTTP_OTHER_4XX:
+    case AVERROR_HTTP_SERVER_ERROR:
+        return true;
+    }
+    return false;
+}
+
 static bool demux_lavf_read_packet(struct demuxer *demux,
                                    struct demux_packet **mp_pkt)
 {
     lavf_priv_t *priv = demux->priv;
+
+    // Per-iteration signal: demux.c reads this after we return and ORs it
+    // into the sticky in->stream_error. Always start clean; we set it
+    // below only when this iteration actually saw an error.
+    demux->stream_error = false;
 
     AVPacket *pkt = av_packet_alloc();
     MP_HANDLE_OOM(pkt);
@@ -1349,11 +1372,36 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
     update_read_stats(demux);
     if (r < 0) {
         av_packet_free(&pkt);
-        if (r == AVERROR_EOF)
+        // ffmpeg's mov/mp4 demuxer (and others) collapse short reads from
+        // an underlying transport error into a clean AVERROR_EOF. Look at
+        // the underlying mpv stream's sticky error to recover the real
+        // cause and report it to the player as a fatal stream error.
+        int stream_err = priv->stream ? priv->stream->error : 0;
+        if (r == AVERROR_EOF) {
+            if (stream_err) {
+                MP_ERR(demux, "EOF reported by libavformat is caused by "
+                       "underlying stream error: %s.\n",
+                       av_err2str(stream_err));
+                demux->stream_error = true;
+            }
             return false;
+        }
         MP_WARN(demux, "error reading packet: %s.\n", av_err2str(r));
+        // Don't keep retrying on errors that are permanent for this URL
+        // (HTTP 4xx, server errors, ...). Without this the demuxer will
+        // burn ~10 retries × per-protocol timeout while the user sees a
+        // frozen UI for minutes before the EOF eventually fires.
+        if (is_permanent_stream_error(r) || is_permanent_stream_error(stream_err)) {
+            MP_ERR(demux, "...permanent stream error, treating as fatal.\n");
+            demux->stream_error = true;
+            return false;
+        }
         if (priv->retry_counter >= 10) {
             MP_ERR(demux, "...treating it as fatal error.\n");
+            // Repeated transient errors are also a fatal outcome from the
+            // user's perspective. Mark as stream error so the player does
+            // not silently auto-advance to the next playlist entry.
+            demux->stream_error = true;
             return false;
         }
         priv->retry_counter += 1;

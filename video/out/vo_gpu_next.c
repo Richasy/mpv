@@ -1416,6 +1416,24 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             update_hook_opts_dynamic(p, p->hooks[i], frame->current);
     }
 
+    // Smart auto for --hdr-compute-peak: when the user keeps the default
+    // (`auto`, compute_peak == 0) and both the source and target are HDR,
+    // skip the per-frame peak-detection compute shader. Its result is only
+    // consumed by the tonemapper, which is bypassed in HDR-to-HDR
+    // passthrough, so running it is pure GPU/power waste (especially costly
+    // in d3d11 composition mode where every frame goes through an extra
+    // composition surface). Explicit `--hdr-compute-peak=yes` (== 1) still
+    // forces it on; explicit `=no` (< 0) was already filtered upstream.
+    if (params.peak_detect_params && opts->tone_map.compute_peak == 0 &&
+        frame->current)
+    {
+        if (pl_color_transfer_is_hdr(target.color.transfer) &&
+            pl_color_transfer_is_hdr(frame->current->params.color.transfer))
+        {
+            params.peak_detect_params = NULL;
+        }
+    }
+
     // Render frame
     stats_time_start(p->stats, "render");
     bool render_ok = pl_render_image_mix(p->rr, &mix, &target, &params);

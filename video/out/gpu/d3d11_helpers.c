@@ -675,7 +675,15 @@ static HRESULT create_swapchain_1_2(ID3D11Device *dev, IDXGIFactory2 *factory,
     }
 
     if (opts->window == NULL) {
-        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        // Composition mode requires flip model.  Prefer FLIP_DISCARD on
+        // Win10+ for lower power usage and memory bandwidth; fall back to
+        // FLIP_SEQUENTIAL on older Windows versions.
+        if (!IsWindows10OrGreater())
+            desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        else
+            desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        if (!flip)
+            desc.BufferCount = opts->length;
         hr = IDXGIFactory2_CreateSwapChainForComposition(factory, (IUnknown*)dev,
         &desc, NULL, &swapchain1);
     } else {

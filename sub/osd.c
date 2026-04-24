@@ -521,6 +521,62 @@ static void apply_sub_stack_layout(struct osd_state *osd,
     }
 }
 
+// Reposition subtitles that overlap with a host-defined bottom reserved area
+// (e.g. on-screen player controls). Operates on already-laid-out bitmaps after
+// apply_sub_stack_layout, so it works uniformly for primary/secondary, ASS,
+// text and image subs regardless of --sub-ass-override.
+//
+// reserved_px is in the same coordinate system as res.h (the rendered output
+// size). 0 disables the pass. Subs whose bbox is entirely in the upper half
+// of the frame are treated as top-anchored and left untouched.
+static void apply_sub_avoid_bottom(struct sub_bitmap_list *list,
+                                   struct mp_osd_res res,
+                                   int reserved_px)
+{
+    if (reserved_px <= 0 || res.h <= 0)
+        return;
+
+    // Cap how far we are willing to push subs upward. Prevents pathological
+    // host values from sending subs to the very top of the frame.
+    int max_shift = (int)(res.h * 0.6);
+    int forbidden_top = res.h - reserved_px;
+    int padding = 8; // small breathing room between sub bottom and reserved area
+
+    for (int i = 0; i < list->num_items; i++) {
+        struct sub_bitmaps *sb = list->items[i];
+        if (sb->render_index != OSDTYPE_SUB &&
+            sb->render_index != OSDTYPE_SUB2)
+            continue;
+        if (sb->num_parts == 0)
+            continue;
+
+        int top, bottom;
+        get_sub_bbox_y(sb, &top, &bottom);
+
+        // Skip top-anchored subs (entirely in the upper half of the frame).
+        if (bottom <= res.h / 2)
+            continue;
+
+        // Already clear of the reserved area.
+        int overlap = bottom - forbidden_top;
+        if (overlap <= 0)
+            continue;
+
+        int shift = overlap + padding;
+        if (shift > max_shift)
+            shift = max_shift;
+
+        // Don't push the top of the bbox above the top margin.
+        if (top - shift < res.mt)
+            shift = top - res.mt;
+        if (shift <= 0)
+            continue;
+
+        for (int j = 0; j < sb->num_parts; j++)
+            sb->parts[j].y -= shift;
+    }
+}
+
 // Render OSD to a list of bitmap and return it. The returned object is
 // refcounted. Typically you should hold it only for a short time, and then
 // release it.
@@ -582,6 +638,10 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
     }
 
     apply_sub_stack_layout(osd, list, res);
+
+    m_config_cache_update(osd->sub_shared_opts_cache);
+    apply_sub_avoid_bottom(list, res,
+                           osd->sub_shared_opts->sub_avoid_bottom_px);
 
     double elapsed = MP_TIME_NS_TO_MS(mp_time_ns() - start_time);
     bool slow = elapsed > 5;

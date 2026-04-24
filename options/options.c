@@ -409,6 +409,7 @@ const struct m_sub_options mp_subtitle_shared_sub_opts = {
             {"secondary-edge", SUB_STACK_ORDER_SECONDARY_BOTTOM})},
         {"sub-stack-gap", OPT_INT(sub_stack_gap), M_RANGE(0, 500)},
         {"sub-stack-margin", OPT_FLOAT(sub_stack_margin), M_RANGE(0.0, 150.0)},
+        {"sub-avoid-bottom-px", OPT_INT(sub_avoid_bottom_px), M_RANGE(0, INT_MAX)},
         {0}
     },
     .size = sizeof(OPT_BASE_STRUCT),

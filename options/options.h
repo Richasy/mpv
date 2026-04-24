@@ -162,6 +162,7 @@ struct mp_subtitle_shared_opts {
     int sub_stack_order;        // enum sub_stack_order
     int sub_stack_gap;          // pixels between stacked subs
     float sub_stack_margin;     // overall margin for stacked layout (0-150)
+    int sub_avoid_bottom_px;    // dynamic bottom-area to keep clear of subs (px)
 };
 
 struct mp_osd_render_opts {

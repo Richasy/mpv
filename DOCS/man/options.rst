@@ -2617,6 +2617,28 @@ Subtitles
     bottom position. For ``top`` layout, 100 means the default top position.
     Default: 100.
 
+``--sub-avoid-bottom-px=<size>``
+    Reserve the bottom ``<size>`` pixels of the rendered output as a no-go
+    area for subtitles. After all other subtitle layout (including
+    ``--sub-stack-layout``) has been applied, any subtitle whose bounding box
+    overlaps that area is shifted upward by exactly the amount needed (plus a
+    small padding) to clear it. Subtitles whose bbox lies entirely in the
+    upper half of the frame are treated as top-anchored and left untouched.
+
+    The shift is capped to roughly 60% of the output height and will never
+    push the subtitle above the top margin.
+
+    This is intended for dynamic, host-driven avoidance of UI overlays
+    (e.g. an embedding application popping up a player control bar). For
+    persistent positioning use ``--sub-margin-y`` / ``--sub-pos`` instead.
+    Set to 0 to disable.
+
+    Works uniformly for primary, secondary, ASS, text and image subtitles
+    regardless of ``--sub-ass-override``, because it operates on the rendered
+    bitmap layout.
+
+    Default: 0.
+
 ``--sub-speed=<0.1-10.0>``
     Multiply the subtitle event timestamps with the given value. Can be used
     to fix the playback speed for frame-based subtitle formats. Affects text

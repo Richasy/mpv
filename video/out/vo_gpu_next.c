@@ -370,43 +370,22 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             if (src) {
                 ol->color = src->params.color;
                 if (pl_color_transfer_is_hdr(ol->color.transfer)) {
-                    // Upstream commit 7f81e1ec8c (2025-07) raised the default
-                    // image-subs HDR peak from SDR white (203 nit) to 1000 nit
-                    // per UHD BD spec. That assumption only holds for properly
-                    // authored UHD BD content; the vast majority of re-encoded
-                    // HDR files in the wild still mux plain BT.709 sRGB image
-                    // subtitles. When the target is SDR (Windows desktop in
-                    // SDR mode), feeding libplacebo a 1000 nit HDR PQ overlay
-                    // makes those sRGB-authored subs get tonemapped down to
-                    // ~100 nit and appear noticeably dim/dull.
-                    //
-                    // Restore the pre-2025 behavior for the SDR-target case:
-                    // keep the inferred PQ transfer but cap the luminance at
-                    // SDR white so libplacebo performs an effective identity
-                    // mapping to the SDR target.
-                    bool target_is_hdr = pl_color_transfer_is_hdr(frame->color.transfer);
-                    if (!target_is_hdr) {
+                    bool use_static = p->next_opts->image_subs_hdr_peak == -2;
+                    if (use_static || p->next_opts->image_subs_hdr_peak == -3) {
+                        float max;
+                        pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+                            .color      = &ol->color,
+                            .metadata   = use_static ? PL_HDR_METADATA_HDR10 : PL_HDR_METADATA_ANY,
+                            .scaling    = PL_HDR_NITS,
+                            .out_max    = &max,
+                        ));
                         ol->color.hdr = (struct pl_hdr_metadata) {
-                            .max_luma = PL_COLOR_SDR_WHITE,
+                            .max_luma = max,
                         };
-                    } else {
-                        bool use_static = p->next_opts->image_subs_hdr_peak == -2;
-                        if (use_static || p->next_opts->image_subs_hdr_peak == -3) {
-                            float max;
-                            pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
-                                .color      = &ol->color,
-                                .metadata   = use_static ? PL_HDR_METADATA_HDR10 : PL_HDR_METADATA_ANY,
-                                .scaling    = PL_HDR_NITS,
-                                .out_max    = &max,
-                            ));
-                            ol->color.hdr = (struct pl_hdr_metadata) {
-                                .max_luma = max,
-                            };
-                        } else if (p->next_opts->image_subs_hdr_peak != -1) {
-                            ol->color.hdr = (struct pl_hdr_metadata) {
-                                .max_luma = p->next_opts->image_subs_hdr_peak,
-                            };
-                        }
+                    } else if (p->next_opts->image_subs_hdr_peak != -1) {
+                        ol->color.hdr = (struct pl_hdr_metadata) {
+                            .max_luma = p->next_opts->image_subs_hdr_peak,
+                        };
                     }
                 }
             }

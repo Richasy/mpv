@@ -454,12 +454,22 @@ static void apply_sub_stack_layout(struct osd_state *osd,
     int gap = shared->sub_stack_gap;
     int order = shared->sub_stack_order;
 
-    // Determine which subtitle is the "edge" one (closer to screen edge)
-    // and which is the "inner" one.
-    struct sub_bitmaps *edge_sub = (order == SUB_STACK_ORDER_PRIMARY_BOTTOM)
-                                    ? primary : secondary;
-    struct sub_bitmaps *inner_sub = (order == SUB_STACK_ORDER_PRIMARY_BOTTOM)
-                                    ? secondary : primary;
+    // Determine which subtitle is on top vs. bottom of the stack. By default
+    // (PRIMARY_TOP), the primary sub is always above the secondary one.
+    bool primary_on_top = (order == SUB_STACK_ORDER_PRIMARY_TOP);
+    struct sub_bitmaps *top_sub = primary_on_top ? primary : secondary;
+    struct sub_bitmaps *bottom_sub = primary_on_top ? secondary : primary;
+
+    // Map top/bottom to "edge" (closer to screen edge) and "inner" depending on
+    // the chosen layout.
+    struct sub_bitmaps *edge_sub, *inner_sub;
+    if (layout == SUB_STACK_BOTTOM) {
+        edge_sub = bottom_sub;
+        inner_sub = top_sub;
+    } else {
+        edge_sub = top_sub;
+        inner_sub = bottom_sub;
+    }
 
     int edge_top, edge_bottom, inner_top, inner_bottom;
     get_sub_bbox_y(edge_sub, &edge_top, &edge_bottom);
@@ -531,7 +541,8 @@ static void apply_sub_stack_layout(struct osd_state *osd,
 // of the frame are treated as top-anchored and left untouched.
 static void apply_sub_avoid_bottom(struct sub_bitmap_list *list,
                                    struct mp_osd_res res,
-                                   int reserved_px)
+                                   int reserved_px,
+                                   int stack_layout)
 {
     if (reserved_px <= 0 || res.h <= 0)
         return;
@@ -541,6 +552,54 @@ static void apply_sub_avoid_bottom(struct sub_bitmap_list *list,
     int max_shift = (int)(res.h * 0.6);
     int forbidden_top = res.h - reserved_px;
     int padding = 8; // small breathing room between sub bottom and reserved area
+
+    // For stacked layouts (bottom/top), shift primary + secondary as a single
+    // group so the relative spacing chosen by apply_sub_stack_layout is
+    // preserved. Otherwise the lower sub would be pushed up while the upper
+    // one stays in place, breaking the stack.
+    if (stack_layout == SUB_STACK_BOTTOM || stack_layout == SUB_STACK_TOP) {
+        struct sub_bitmaps *primary = NULL, *secondary = NULL;
+        for (int i = 0; i < list->num_items; i++) {
+            struct sub_bitmaps *sb = list->items[i];
+            if (sb->num_parts == 0)
+                continue;
+            if (sb->render_index == OSDTYPE_SUB)
+                primary = sb;
+            else if (sb->render_index == OSDTYPE_SUB2)
+                secondary = sb;
+        }
+
+        if (primary && secondary) {
+            int p_top, p_bottom, s_top, s_bottom;
+            get_sub_bbox_y(primary, &p_top, &p_bottom);
+            get_sub_bbox_y(secondary, &s_top, &s_bottom);
+            int top = MPMIN(p_top, s_top);
+            int bottom = MPMAX(p_bottom, s_bottom);
+
+            // Skip if the entire group is in the upper half (top-anchored).
+            if (bottom <= res.h / 2)
+                return;
+
+            int overlap = bottom - forbidden_top;
+            if (overlap <= 0)
+                return;
+
+            int shift = overlap + padding;
+            if (shift > max_shift)
+                shift = max_shift;
+            if (top - shift < res.mt)
+                shift = top - res.mt;
+            if (shift <= 0)
+                return;
+
+            for (int j = 0; j < primary->num_parts; j++)
+                primary->parts[j].y -= shift;
+            for (int j = 0; j < secondary->num_parts; j++)
+                secondary->parts[j].y -= shift;
+            return;
+        }
+        // Only one of the two visible: fall through to per-sub handling.
+    }
 
     for (int i = 0; i < list->num_items; i++) {
         struct sub_bitmaps *sb = list->items[i];
@@ -641,7 +700,8 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
 
     m_config_cache_update(osd->sub_shared_opts_cache);
     apply_sub_avoid_bottom(list, res,
-                           osd->sub_shared_opts->sub_avoid_bottom_px);
+                           osd->sub_shared_opts->sub_avoid_bottom_px,
+                           osd->sub_shared_opts->sub_stack_layout);
 
     double elapsed = MP_TIME_NS_TO_MS(mp_time_ns() - start_time);
     bool slow = elapsed > 5;

@@ -2579,9 +2579,9 @@ Subtitles
     ``bottom``
         Both subtitles are stacked at the bottom of the screen. The overall
         position is controlled by ``--sub-stack-margin``, and the spacing
-        between the two subtitles is controlled by ``--sub-stack-gap``. The
-        stacking order (which subtitle is closer to the screen edge) is
-        controlled by ``--sub-stack-order``.
+        between the two subtitles is controlled by ``--sub-stack-gap``. By
+        default the primary subtitle sits on top of the secondary one; this
+        order can be flipped via ``--sub-stack-order``.
 
     ``top``
         Both subtitles are stacked at the top of the screen. Uses the same
@@ -2594,18 +2594,17 @@ Subtitles
         settings. This is semantically the same as ``none`` but can be used as
         a signal for the application layer to indicate intentional split layout.
 
-``--sub-stack-order=<primary-edge|secondary-edge>``
-    When ``--sub-stack-layout`` is ``bottom`` or ``top``, this controls which
-    subtitle is placed closer to the screen edge (bottom for ``bottom`` layout,
-    top for ``top`` layout).
+``--sub-stack-order=<primary-top|secondary-top>``
+    When ``--sub-stack-layout`` is ``bottom`` or ``top``, this controls the
+    vertical order of the two subtitles within the stack.
 
-    ``primary-edge``
-        Primary subtitle is closer to the screen edge, secondary subtitle is
-        placed further inward (default).
+    ``primary-top``
+        Primary subtitle is rendered above the secondary subtitle (default).
+        For ``bottom`` layout the primary ends up in the upper line of the
+        bottom stack; for ``top`` layout it is at the very top of the screen.
 
-    ``secondary-edge``
-        Secondary subtitle is closer to the screen edge, primary subtitle is
-        placed further inward.
+    ``secondary-top``
+        Secondary subtitle is rendered above the primary subtitle.
 
 ``--sub-stack-gap=<0-500>``
     Spacing in pixels between the primary and secondary subtitles when using
@@ -2624,6 +2623,10 @@ Subtitles
     overlaps that area is shifted upward by exactly the amount needed (plus a
     small padding) to clear it. Subtitles whose bbox lies entirely in the
     upper half of the frame are treated as top-anchored and left untouched.
+
+    When ``--sub-stack-layout`` is ``bottom`` or ``top`` and both primary and
+    secondary subtitles are visible, they are shifted as a single group so
+    their relative spacing (controlled by ``--sub-stack-gap``) is preserved.
 
     The shift is capped to roughly 60% of the output height and will never
     push the subtitle above the top margin.

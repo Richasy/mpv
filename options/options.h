@@ -148,8 +148,8 @@ enum sub_stack_layout {
 
 // Sub stack order for stacked layouts.
 enum sub_stack_order {
-    SUB_STACK_ORDER_PRIMARY_BOTTOM = 0, // primary closer to edge, secondary above/below
-    SUB_STACK_ORDER_SECONDARY_BOTTOM,   // secondary closer to edge, primary above/below
+    SUB_STACK_ORDER_PRIMARY_TOP = 0,    // primary subtitle is always above secondary (default)
+    SUB_STACK_ORDER_SECONDARY_TOP,      // secondary subtitle is always above primary
 };
 
 // Options for both primary and secondary subs.

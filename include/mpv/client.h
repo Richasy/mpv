@@ -248,7 +248,7 @@ extern "C" {
  * relational operators (<, >, <=, >=).
  */
 #define MPV_MAKE_VERSION(major, minor) (((major) << 16) | (minor) | 0UL)
-#define MPV_CLIENT_API_VERSION MPV_MAKE_VERSION(2, 5)
+#define MPV_CLIENT_API_VERSION MPV_MAKE_VERSION(2, 6)
 
 /**
  * The API user is allowed to "#define MPV_ENABLE_DEPRECATED 0" before
@@ -1372,6 +1372,14 @@ typedef enum mpv_event_id {
      * See also mpv_event and mpv_event_hook.
      */
     MPV_EVENT_HOOK              = 25,
+    /**
+     * Sent when a track was deselected because of an error (decoder
+     * initialization failure, AO/VO init failure, etc.). The application can
+     * use this to react to playback issues without scraping log messages or
+     * inferring failure from the "aid"/"vid"/"sid" properties going to no.
+     * See also mpv_event and mpv_event_track_failed.
+     */
+    MPV_EVENT_TRACK_FAILED      = 26,
     // Internal note: adjust INTERNAL_EVENT_BASE when adding new events.
 } mpv_event_id;
 
@@ -1621,6 +1629,7 @@ typedef struct mpv_event {
      *  MPV_EVENT_END_FILE:               mpv_event_end_file*
      *  MPV_EVENT_HOOK:                   mpv_event_hook*
      *  MPV_EVENT_COMMAND_REPLY*          mpv_event_command*
+     *  MPV_EVENT_TRACK_FAILED:           mpv_event_track_failed*
      *  other: NULL
      *
      * Note: future enhancements might add new event structs for existing or new
@@ -1628,6 +1637,28 @@ typedef struct mpv_event {
      */
     void *data;
 } mpv_event;
+
+typedef struct mpv_event_track_failed {
+    /**
+     * The user-facing track id (matches the "id" entry in the "track-list"
+     * property and the value of the "aid"/"vid"/"sid" properties). Always >= 1.
+     */
+    int64_t id;
+    /**
+     * Track type as a stable lower-case string. One of:
+     *   "video", "audio", "sub".
+     * Memory valid for the lifetime of the event.
+     */
+    const char *type;
+    /**
+     * Short stable string describing why the track was dropped. Currently one
+     * of: "decoder-init-failed", "ao-init-failed", "vo-init-failed",
+     * "audio-error", "generic". May gain new values in the future; clients
+     * should treat unknown values as a generic failure.
+     * Memory valid for the lifetime of the event.
+     */
+    const char *reason;
+} mpv_event_track_failed;
 
 /**
  * Convert the given src event to a mpv_node, and set *dst to the result. *dst

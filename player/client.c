@@ -689,6 +689,15 @@ static void dup_event_data(struct mpv_event *ev)
     case MPV_EVENT_END_FILE:
         ev->data = talloc_memdup(NULL, ev->data, sizeof(mpv_event_end_file));
         break;
+    case MPV_EVENT_TRACK_FAILED: {
+        mpv_event_track_failed *src = ev->data;
+        mpv_event_track_failed *dst =
+            talloc_memdup(NULL, src, sizeof(mpv_event_track_failed));
+        dst->type = talloc_strdup(dst, src->type);
+        dst->reason = talloc_strdup(dst, src->reason);
+        ev->data = dst;
+        break;
+    }
     default:
         // Doesn't use events with memory allocation.
         if (ev->data)
@@ -2057,6 +2066,17 @@ int mpv_event_to_node(mpv_node *dst, mpv_event *event)
         break;
     }
 
+    case MPV_EVENT_TRACK_FAILED: {
+        mpv_event_track_failed *tf = event->data;
+
+        node_map_add_int64(dst, "track_id", tf->id);
+        if (tf->type)
+            node_map_add_string(dst, "track_type", tf->type);
+        if (tf->reason)
+            node_map_add_string(dst, "reason", tf->reason);
+        break;
+    }
+
     }
     return 0;
 }
@@ -2116,6 +2136,7 @@ static const char *const event_table[] = {
     [MPV_EVENT_PROPERTY_CHANGE] = "property-change",
     [MPV_EVENT_QUEUE_OVERFLOW] = "event-queue-overflow",
     [MPV_EVENT_HOOK] = "hook",
+    [MPV_EVENT_TRACK_FAILED] = "track-failed",
 };
 
 const char *mpv_event_name(mpv_event_id event)

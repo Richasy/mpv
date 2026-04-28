@@ -42,6 +42,7 @@
 #include "stream/stream.h"
 #include "video/out/vo.h"
 
+#include "client.h"
 #include "core.h"
 #include "command.h"
 
@@ -248,6 +249,32 @@ void error_on_track(struct MPContext *mpctx, struct track *track)
 {
     if (!track || !track->selected)
         return;
+
+    // Snapshot identity before deselection so we can broadcast a track-failed
+    // event with the original ids. mpctx->error_playing is normally set at the
+    // call site (e.g. MPV_ERROR_AO_INIT_FAILED, MPV_ERROR_VO_INIT_FAILED) and
+    // gives us a stable reason string. When unset, fall back to a type-derived
+    // generic reason so audio decoder init failures (the common case) still
+    // produce a meaningful payload instead of "success".
+    int64_t failed_tid = track->user_tid;
+    const char *failed_type = stream_type_name(track->type);
+    const char *failed_reason;
+    switch (mpctx->error_playing) {
+    case MPV_ERROR_AO_INIT_FAILED:
+        failed_reason = "ao-init-failed";
+        break;
+    case MPV_ERROR_VO_INIT_FAILED:
+        failed_reason = "vo-init-failed";
+        break;
+    default:
+        switch (track->type) {
+        case STREAM_AUDIO: failed_reason = "decoder-init-failed"; break;
+        case STREAM_VIDEO: failed_reason = "decoder-init-failed"; break;
+        default:           failed_reason = "generic"; break;
+        }
+        break;
+    }
+
     mp_deselect_track(mpctx, track);
     if (track->type == STREAM_AUDIO)
         MP_INFO(mpctx, "Audio: no audio\n");
@@ -262,6 +289,14 @@ void error_on_track(struct MPContext *mpctx, struct track *track)
         if (mpctx->error_playing >= 0)
             mpctx->error_playing = MPV_ERROR_NOTHING_TO_PLAY;
     }
+
+    struct mpv_event_track_failed event = {
+        .id = failed_tid,
+        .type = failed_type,
+        .reason = failed_reason,
+    };
+    mp_client_broadcast_event(mpctx, MPV_EVENT_TRACK_FAILED, &event);
+
     mp_wakeup_core(mpctx);
 }
 

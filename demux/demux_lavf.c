@@ -249,6 +249,12 @@ typedef struct lavf_priv {
 
     int retry_counter;
 
+    // Sticky permanent error captured from the underlying stream during
+    // mp_read / mp_seek, before a subsequent successful operation could
+    // wipe stream->error. Consumed by demux_lavf_read_packet to escalate
+    // mid-stream HTTP 4xx/5xx into a fatal demuxer-level stream error.
+    int pending_stream_error;
+
     AVDictionary *av_opts;
 
     // Proxying nested streams.
@@ -258,6 +264,8 @@ typedef struct lavf_priv {
                            const char *url, int flags, AVDictionary **options);
     int (*default_io_close2)(struct AVFormatContext *s, AVIOContext *pb);
 } lavf_priv_t;
+
+static bool is_permanent_stream_error(int err);
 
 static void update_read_stats(struct demuxer *demuxer)
 {
@@ -300,6 +308,11 @@ static int mp_read(void *opaque, uint8_t *buf, int size)
 
     int ret = stream_read_partial(stream, buf, size);
 
+    // Capture permanent transport errors (HTTP 4xx/5xx, ...) before a later
+    // successful op clears stream->error. Consumed in demux_lavf_read_packet.
+    if (is_permanent_stream_error(stream->error))
+        priv->pending_stream_error = stream->error;
+
     MP_TRACE(demuxer, "%d=mp_read(%p, %p, %d), pos: %"PRId64", eof:%d\n",
              ret, stream, buf, size, stream_tell(stream), stream->eof);
     return ret ? ret : AVERROR_EOF;
@@ -336,7 +349,15 @@ static int64_t mp_seek(void *opaque, int64_t pos, int whence)
     int64_t current_pos = stream_tell(stream);
     if (!priv->is_dvd_bd) {
         if (stream_seek(stream, pos) == 0) {
+            // Capture the failure cause BEFORE the restore stream_seek, which
+            // (when in-buffer or when its underlying avio_seek to the old
+            // position succeeds) wipes stream->error back to 0. Without this
+            // a mid-stream HTTP 4xx (e.g. expired CDN ticket) is later
+            // misclassified as a benign EOF by demux_lavf_read_packet.
+            int saved_err = stream->error;
             stream_seek(stream, current_pos);
+            if (is_permanent_stream_error(saved_err))
+                priv->pending_stream_error = saved_err;
             return -1;
         }
     } else {
@@ -1338,6 +1359,8 @@ fail:
     return -1;
 }
 
+// At least mp4 has name="mov,mp4,m4a,3gp,3g2,mj2", so we split the name
+// on "," in general.
 // HTTP errors mapped by FFmpeg's http.c. These are permanent for the
 // current request; retrying with the same URL inside the demuxer just
 // burns wall-clock time before mpv would (incorrectly) treat it as EOF.
@@ -1377,12 +1400,22 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
         // the underlying mpv stream's sticky error to recover the real
         // cause and report it to the player as a fatal stream error.
         int stream_err = priv->stream ? priv->stream->error : 0;
+        // Fall back to a sticky error captured during mp_read / mp_seek
+        // (and not since wiped by an intervening successful op). This is
+        // the only signal we have when the failing op was a byte-range
+        // seek whose error got cleared by the in-buffer restore seek.
+        if (!is_permanent_stream_error(stream_err) &&
+            is_permanent_stream_error(priv->pending_stream_error))
+        {
+            stream_err = priv->pending_stream_error;
+        }
         if (r == AVERROR_EOF) {
             if (stream_err) {
                 MP_ERR(demux, "EOF reported by libavformat is caused by "
                        "underlying stream error: %s.\n",
                        av_err2str(stream_err));
                 demux->stream_error = true;
+                priv->pending_stream_error = 0;
             }
             return false;
         }
@@ -1394,6 +1427,7 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
         if (is_permanent_stream_error(r) || is_permanent_stream_error(stream_err)) {
             MP_ERR(demux, "...permanent stream error, treating as fatal.\n");
             demux->stream_error = true;
+            priv->pending_stream_error = 0;
             return false;
         }
         if (priv->retry_counter >= 10) {
@@ -1402,12 +1436,17 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
             // user's perspective. Mark as stream error so the player does
             // not silently auto-advance to the next playlist entry.
             demux->stream_error = true;
+            priv->pending_stream_error = 0;
             return false;
         }
         priv->retry_counter += 1;
         return true;
     }
     priv->retry_counter = 0;
+    // A successful packet read means the stream recovered (or the previous
+    // permanent error did not actually break this stream's playback). Drop
+    // the sticky flag so we don't escalate later on a benign EOF.
+    priv->pending_stream_error = 0;
 
     add_new_streams(demux);
     update_metadata(demux);

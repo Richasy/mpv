@@ -24,6 +24,11 @@ ExternalProject_Add(whisper
         -DGGML_VULKAN=ON
         -DGGML_NATIVE=OFF
         -DVulkan_GLSLC_EXECUTABLE=${HOST_GLSLC}
+        # mpv's vulkan package installs libvulkan.a (BUILD_STATIC_LOADER=ON) but
+        # cmake's FindVulkan can't always discover it under mingw cross-compile.
+        # Pin the loader and headers explicitly so ggml-vulkan finds Vulkan::Vulkan.
+        -DVulkan_LIBRARY=${MINGW_INSTALL_PREFIX}/lib/libvulkan.a
+        -DVulkan_INCLUDE_DIR=${MINGW_INSTALL_PREFIX}/include
         -DWHISPER_BUILD_TESTS=OFF
         -DWHISPER_BUILD_EXAMPLES=OFF
         -DWHISPER_BUILD_SERVER=OFF

@@ -118,6 +118,14 @@ build() {
     log "Building libmpv for $ARCH"
     log "=========================================="
 
+    # Preflight: ggml-vulkan needs a HOST glslc (Google shaderc) to compile shaders.
+    # The mingw-cross shaderc dll built for the Windows target is useless here.
+    # Self-hosted runners need /usr/bin/glslc installed (Ubuntu pkg: glslc).
+    if ! command -v glslc >/dev/null 2>&1; then
+        err "host glslc not found in PATH (required by ggml-vulkan). Install Ubuntu pkg 'glslc' on the runner."
+    fi
+    log "Host glslc: $(command -v glslc) ($(glslc --version 2>&1 | head -n1))"
+
     # IMPORTANT: Remove mpv source cache BEFORE cmake configure.
     # custom_steps.cmake's force_rebuild_git() checks if(EXISTS source_dir/.git)
     # at configure time. If the source dir exists, it generates a check-git step

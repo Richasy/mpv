@@ -275,6 +275,26 @@ collect() {
         warn "libmpv-2.pdb not found - crash dumps will not symbolicate"
     fi
 
+    # Copy ggml/whisper shared libraries. whisper.cpp is now built as
+    # BUILD_SHARED_LIBS=ON so af_whisper (static-linked into libmpv-2.dll)
+    # and any externally loaded ggml backend dll (ggml-vulkan.dll /
+    # ggml-cuda.dll) share a single ggml backend registry living inside
+    # ggml-base.dll. These four DLLs MUST be deployed alongside libmpv-2.dll.
+    local MINGW_PREFIX_DIR="$BUILD_DIR/${ARCH}-w64-mingw32"
+    local GGML_BIN_DIR="$MINGW_PREFIX_DIR/bin"
+    local ggml_dll_count=0
+    for dll in libwhisper.dll libggml.dll libggml-base.dll libggml-cpu.dll \
+               whisper.dll ggml.dll ggml-base.dll ggml-cpu.dll; do
+        if [ -f "$GGML_BIN_DIR/$dll" ]; then
+            cp "$GGML_BIN_DIR/$dll" "$ARCH_OUTPUT/"
+            ggml_dll_count=$((ggml_dll_count + 1))
+            log "  $dll copied"
+        fi
+    done
+    if [ "$ggml_dll_count" -lt 4 ]; then
+        err "Only $ggml_dll_count ggml/whisper DLL(s) copied — expected at least 4 (whisper, ggml, ggml-base, ggml-cpu). Check whisper.cmake BUILD_SHARED_LIBS setting."
+    fi
+
     # Copy headers
     local HEADERS_SRC="${MPV_SRC_DIR:-}"
     if [ -z "$HEADERS_SRC" ] || [ ! -d "$HEADERS_SRC/include/mpv" ]; then

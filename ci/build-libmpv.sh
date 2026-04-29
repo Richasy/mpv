@@ -68,7 +68,8 @@ install_deps() {
         libc++-dev libc++abi-dev \
         libgmp-dev libmpfr-dev libmpc-dev libgcrypt-dev \
         gperf ragel texinfo autopoint re2c asciidoc \
-        python3-pip docbook2x unzip p7zip-full curl ccache
+        python3-pip docbook2x unzip p7zip-full curl ccache \
+        glslc
 
     pip3 install --break-system-packages --user rst2pdf meson mako jsonschema 2>/dev/null || \
     pip3 install --user rst2pdf meson mako jsonschema
@@ -299,8 +300,8 @@ collect() {
     local MINGW_PREFIX_DIR="$BUILD_DIR/${ARCH}-w64-mingw32"
     local GGML_BIN_DIR="$MINGW_PREFIX_DIR/bin"
     local ggml_dll_count=0
-    for dll in libwhisper.dll libggml.dll libggml-base.dll libggml-cpu.dll \
-               whisper.dll ggml.dll ggml-base.dll ggml-cpu.dll; do
+    for dll in libwhisper.dll libggml.dll libggml-base.dll libggml-cpu.dll libggml-vulkan.dll \
+               whisper.dll ggml.dll ggml-base.dll ggml-cpu.dll ggml-vulkan.dll; do
         if [ -f "$GGML_BIN_DIR/$dll" ]; then
             cp "$GGML_BIN_DIR/$dll" "$ARCH_OUTPUT/"
             ggml_dll_count=$((ggml_dll_count + 1))

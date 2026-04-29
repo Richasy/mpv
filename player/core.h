@@ -529,6 +529,8 @@ void audio_start_ao(struct MPContext *mpctx);
 void whisper_lookahead_start(struct MPContext *mpctx, const char *whisper_opts);
 void whisper_lookahead_stop(struct MPContext *mpctx);
 void whisper_lookahead_seek(struct MPContext *mpctx, double pts);
+void whisper_lookahead_on_audio_chain_changed(struct MPContext *mpctx);
+void whisper_lookahead_publish(struct MPContext *mpctx);
 bool whisper_lookahead_track_selected(struct MPContext *mpctx);
 void whisper_lookahead_set_track_selected(struct MPContext *mpctx, bool val);
 bool whisper_lookahead_ready(struct MPContext *mpctx);

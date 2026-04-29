@@ -290,6 +290,11 @@ static void ao_chain_uninit(struct ao_chain *ao_c)
 void uninit_audio_chain(struct MPContext *mpctx)
 {
     if (mpctx->ao_chain) {
+        // Detach the whisper aframe observer from the dying decoder before
+        // ao_chain_uninit() free()s it. This blocks until any in-flight
+        // observer callback returns.
+        whisper_lookahead_on_audio_chain_changed(mpctx);
+
         ao_chain_uninit(mpctx->ao_chain);
         mpctx->ao_chain = NULL;
 
@@ -605,6 +610,10 @@ void reinit_audio_chain_src(struct MPContext *mpctx, struct track *track)
 
     if (mpctx->ao)
         audio_update_volume(mpctx);
+
+    // The new audio decoder is fully wired; let the whisper realtime tap (if
+    // any) reattach its observer to it.
+    whisper_lookahead_on_audio_chain_changed(mpctx);
 
     mp_wakeup_core(mpctx);
     return;

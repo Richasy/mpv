@@ -278,6 +278,9 @@ struct demux_internal {
 
     struct mp_recorder *dumper;
     int dumper_status;
+    // dumper_filtered indicates the recorder was created with a stream
+    // whitelist; write_dump_packet silently drops non-included streams.
+    bool dumper_filtered;
 
     bool owns_stream;
 
@@ -1994,14 +1997,33 @@ static void adjust_seek_range_on_packet(struct demux_stream *ds,
 }
 
 static struct mp_recorder *recorder_create(struct demux_internal *in,
-                                           const char *dst)
+                                           const char *dst,
+                                           struct sh_stream **filter,
+                                           int filter_count)
 {
     struct sh_stream **streams = NULL;
     int num_streams = 0;
-    for (int n = 0; n < in->num_streams; n++) {
-        struct sh_stream *stream = in->streams[n];
-        if (stream->ds->selected)
-            MP_TARRAY_APPEND(NULL, streams, num_streams, stream);
+    if (filter && filter_count > 0) {
+        // Caller-supplied whitelist. Only include streams that are both
+        // selected (so the demuxer is actually caching them) and present
+        // in the filter list.
+        for (int n = 0; n < in->num_streams; n++) {
+            struct sh_stream *stream = in->streams[n];
+            if (!stream->ds->selected)
+                continue;
+            for (int k = 0; k < filter_count; k++) {
+                if (filter[k] == stream) {
+                    MP_TARRAY_APPEND(NULL, streams, num_streams, stream);
+                    break;
+                }
+            }
+        }
+    } else {
+        for (int n = 0; n < in->num_streams; n++) {
+            struct sh_stream *stream = in->streams[n];
+            if (stream->ds->selected)
+                MP_TARRAY_APPEND(NULL, streams, num_streams, stream);
+        }
     }
 
     struct demuxer *demuxer = in->d_thread;
@@ -2027,6 +2049,9 @@ static void write_dump_packet(struct demux_internal *in, struct demux_packet *dp
         mp_recorder_get_sink(in->dumper, in->streams[dp->stream]);
     if (sink) {
         mp_recorder_feed_packet(sink, dp);
+    } else if (in->dumper_filtered) {
+        // Stream was deliberately excluded from the recorder (e.g. audio-only
+        // dump). Silently drop its packets instead of failing.
     } else {
         MP_ERR(in, "New stream appeared; stopping recording.\n");
         in->dumper_status = CONTROL_ERROR;
@@ -2043,7 +2068,7 @@ static void record_packet(struct demux_internal *in, struct demux_packet *dp)
         // recorded file.
         in->enable_recording = false;
 
-        in->recorder = recorder_create(in, in->d_user->opts->record_file);
+        in->recorder = recorder_create(in, in->d_user->opts->record_file, NULL, 0);
         if (!in->recorder)
             MP_ERR(in, "Disabling recording.\n");
     }
@@ -4312,6 +4337,7 @@ static void dumper_close(struct demux_internal *in)
     if (in->dumper)
         mp_recorder_destroy(in->dumper);
     in->dumper = NULL;
+    in->dumper_filtered = false;
     if (in->dumper_status == CONTROL_TRUE)
         in->dumper_status = CONTROL_FALSE; // make abort equal to success
 }
@@ -4357,6 +4383,16 @@ static void dump_cache(struct demux_internal *in, double start, double end)
         for (int i = 0; i < r->num_streams; i++) {
             struct demux_queue *q = r->streams[i];
             struct demux_stream *ds = q->ds;
+
+            // For filtered dumps (audio-only etc.), skip streams the recorder
+            // doesn't know about. This avoids needlessly walking those queues
+            // and reading their packets back from the cache.
+            if (in->dumper_filtered &&
+                !mp_recorder_get_sink(in->dumper, in->streams[ds->index]))
+            {
+                ds->dump_pos = NULL;
+                continue;
+            }
 
             ds->dump_pos = find_seek_target(q, pts, flags);
         }
@@ -4457,7 +4493,7 @@ bool demux_cache_dump_set(struct demuxer *demuxer, double start, double end,
     if (file && file[0] && start != MP_NOPTS_VALUE) {
         res = true;
 
-        in->dumper = recorder_create(in, file);
+        in->dumper = recorder_create(in, file, NULL, 0);
 
         // This is not asynchronous and will freeze the shit for a while if the
         // user is unlucky. It could be moved to a thread with some effort.
@@ -4471,6 +4507,168 @@ bool demux_cache_dump_set(struct demuxer *demuxer, double start, double end,
     mp_mutex_unlock(&in->lock);
 
     return res;
+}
+
+// Same as demux_cache_dump_set(), but only writes packets belonging to the
+// streams listed in `streams` (length `num_streams`). Useful for extracting
+// e.g. the audio track from a streamed video without paying the disk-I/O cost
+// of also writing video. Streams not in the list are silently dropped instead
+// of triggering a "new stream appeared" recorder error.
+//
+// `end` must not be MP_NOPTS_VALUE: this is intended for finite-range chunked
+// dumps, not continuous recording.
+bool demux_cache_dump_set_streams(struct demuxer *demuxer,
+                                  struct sh_stream **streams, int num_streams,
+                                  double start, double end, char *file)
+{
+    struct demux_internal *in = demuxer->in;
+    mp_assert(demuxer == in->d_user);
+
+    bool res = false;
+
+    mp_mutex_lock(&in->lock);
+
+    start = MP_ADD_PTS(start, -in->ts_offset);
+    end = MP_ADD_PTS(end, -in->ts_offset);
+
+    dumper_close(in);
+
+    if (file && file[0] && start != MP_NOPTS_VALUE && end != MP_NOPTS_VALUE &&
+        streams && num_streams > 0)
+    {
+        res = true;
+
+        in->dumper_filtered = true;
+        in->dumper = recorder_create(in, file, streams, num_streams);
+
+        // Synchronous; see comment in demux_cache_dump_set(). Caller is
+        // expected to invoke this off the playback thread.
+        dump_cache(in, start, end);
+    }
+
+    mp_mutex_unlock(&in->lock);
+
+    return res;
+}
+
+// Visit cached packets for one stream within the [start, end] PTS range,
+// invoking `cb` for each packet. The packet handed to the callback is a fresh
+// copy owned by the callback (it must talloc_free() it). The callback runs
+// while the demux internal lock is held - keep it cheap and non-blocking.
+//
+// Returns true if at least one packet was visited and writes the actual PTS
+// range covered to *out_start / *out_end (these may differ from the request:
+// iteration starts from the keyframe at-or-before `start`, and ends after the
+// first keyframe at-or-after `end`). Either out pointer may be NULL.
+//
+// Like the dump APIs, this is synchronous and holds the demux lock; call it
+// from a worker thread.
+bool demux_cache_visit_packets(struct demuxer *demuxer,
+                               struct sh_stream *stream,
+                               double start, double end,
+                               double *out_start, double *out_end,
+                               void (*cb)(void *ctx, struct demux_packet *dp),
+                               void *ctx)
+{
+    struct demux_internal *in = demuxer->in;
+    mp_assert(demuxer == in->d_user);
+    mp_assert(stream && cb);
+
+    if (out_start)
+        *out_start = MP_NOPTS_VALUE;
+    if (out_end)
+        *out_end = MP_NOPTS_VALUE;
+
+    if (start == MP_NOPTS_VALUE || end == MP_NOPTS_VALUE || end <= start)
+        return false;
+
+    mp_mutex_lock(&in->lock);
+
+    double q_start = MP_ADD_PTS(start, -in->ts_offset);
+    double q_end   = MP_ADD_PTS(end,   -in->ts_offset);
+
+    bool visited_any = false;
+    double first_pts = MP_NOPTS_VALUE;
+    double last_pts  = MP_NOPTS_VALUE;
+
+    struct demux_cached_range *ranges[MAX_SEEK_RANGES];
+    int num_ranges = 0;
+    for (int n = 0; n < MPMIN(MP_ARRAY_SIZE(ranges), in->num_ranges); n++)
+        ranges[num_ranges++] = in->ranges[n];
+    qsort(ranges, num_ranges, sizeof(ranges[0]), range_time_compare);
+
+    for (int n = 0; n < num_ranges; n++) {
+        struct demux_cached_range *r = ranges[n];
+        if (r->seek_start == MP_NOPTS_VALUE)
+            continue;
+        if (r->seek_end <= q_start)
+            continue;
+        if (r->seek_start >= q_end)
+            continue;
+
+        struct demux_queue *q = NULL;
+        for (int i = 0; i < r->num_streams; i++) {
+            if (r->streams[i]->ds == stream->ds) {
+                q = r->streams[i];
+                break;
+            }
+        }
+        if (!q)
+            continue;
+
+        double pts = q_start;
+        int flags = 0;
+        adjust_cache_seek_target(in, r, &pts, &flags);
+
+        struct demux_packet *cur = find_seek_target(q, pts, flags);
+
+        while (cur) {
+            double pdts = MP_PTS_OR_DEF(cur->dts, cur->pts);
+
+            // Stop once we've crossed the requested end at a keyframe
+            // boundary (matches dump_cache semantics so the slice is
+            // self-decodable from any later seek).
+            if (pdts != MP_NOPTS_VALUE && pdts >= q_end && cur->keyframe)
+                break;
+
+            struct demux_packet *dp = read_packet_from_cache(in, cur);
+            cur = cur->next;
+            if (!dp)
+                continue;
+
+            double rep_pts = MP_PTS_OR_DEF(dp->pts, dp->dts);
+            if (rep_pts != MP_NOPTS_VALUE) {
+                rep_pts = MP_ADD_PTS(rep_pts, in->ts_offset);
+                if (first_pts == MP_NOPTS_VALUE || rep_pts < first_pts)
+                    first_pts = rep_pts;
+                if (last_pts == MP_NOPTS_VALUE || rep_pts > last_pts)
+                    last_pts = rep_pts;
+            }
+
+            // Restore the user-visible (ts_offset adjusted) timestamps so
+            // the callback sees PTS in the same domain as the rest of mpv.
+            if (dp->pts != MP_NOPTS_VALUE)
+                dp->pts = MP_ADD_PTS(dp->pts, in->ts_offset);
+            if (dp->dts != MP_NOPTS_VALUE)
+                dp->dts = MP_ADD_PTS(dp->dts, in->ts_offset);
+
+            visited_any = true;
+            cb(ctx, dp);
+            // Callback owns dp now; it must talloc_free() it.
+        }
+
+        if (visited_any)
+            break; // Don't bridge across multiple cache ranges in one visit.
+    }
+
+    mp_mutex_unlock(&in->lock);
+
+    if (out_start)
+        *out_start = first_pts;
+    if (out_end)
+        *out_end = last_pts;
+
+    return visited_any;
 }
 
 // Returns one of CONTROL_*. CONTROL_TRUE means dumping is in progress.

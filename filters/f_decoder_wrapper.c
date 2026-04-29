@@ -232,6 +232,15 @@ struct priv {
     bool pts_reset;
     int attempt_framedrops; // try dropping this many frames
     int dropped_frames; // total frames _probably_ dropped
+
+    // Audio frame tap (whisper realtime captions). Read/written under
+    // cache_lock so the decoder thread can fetch the snapshot quickly without
+    // racing concurrent install/uninstall on the public thread. Only meaningful
+    // when header->type == STREAM_AUDIO; ignored otherwise.
+    bool aframe_obs_set;
+    struct mp_aframe_observer aframe_obs;
+    int aframe_obs_active;            // in-flight callback count
+    mp_cond aframe_obs_idle;          // broadcast when active hits 0
 };
 
 static int decoder_list_help(struct mp_log *log, const m_option_t *opt,
@@ -542,6 +551,26 @@ bool mp_decoder_wrapper_get_pts_reset(struct mp_decoder_wrapper *d)
     bool res = p->pts_reset;
     mp_mutex_unlock(&p->cache_lock);
     return res;
+}
+
+void mp_decoder_wrapper_set_aframe_observer(struct mp_decoder_wrapper *d,
+                                            const struct mp_aframe_observer *obs)
+{
+    struct priv *p = d->f->priv;
+    mp_mutex_lock(&p->cache_lock);
+    if (obs) {
+        p->aframe_obs = *obs;
+        p->aframe_obs_set = true;
+    } else {
+        // Stop accepting new callback dispatches first, then wait until any
+        // in-flight callback returns. After this point the caller can safely
+        // free the observer's ctx without racing the decoder thread.
+        p->aframe_obs_set = false;
+        while (p->aframe_obs_active > 0)
+            mp_cond_wait(&p->aframe_obs_idle, &p->cache_lock);
+        p->aframe_obs = (struct mp_aframe_observer){0};
+    }
+    mp_mutex_unlock(&p->cache_lock);
 }
 
 void mp_decoder_wrapper_set_play_dir(struct mp_decoder_wrapper *d, int dir)
@@ -1088,6 +1117,32 @@ static void read_frame(struct priv *p)
 
 output_frame:
     process_output_frame(p, frame);
+
+    // Audio frame tap (whisper realtime captions). Snapshot under cache_lock
+    // then call without holding it: the observer is documented as quick and
+    // non-blocking, but it must not be invoked while we hold cache_lock,
+    // otherwise it could deadlock against any path that re-enters the wrapper.
+    // The frame is borrowed; the observer must mp_frame_ref() to keep it.
+    if (p->header->type == STREAM_AUDIO) {
+        struct mp_aframe_observer obs = {0};
+        bool have_obs = false;
+        mp_mutex_lock(&p->cache_lock);
+        if (p->aframe_obs_set) {
+            obs = p->aframe_obs;
+            have_obs = true;
+            p->aframe_obs_active++;
+        }
+        mp_mutex_unlock(&p->cache_lock);
+        if (have_obs) {
+            if (obs.on_frame)
+                obs.on_frame(obs.ctx, frame);
+            mp_mutex_lock(&p->cache_lock);
+            if (--p->aframe_obs_active == 0)
+                mp_cond_broadcast(&p->aframe_obs_idle);
+            mp_mutex_unlock(&p->cache_lock);
+        }
+    }
+
     mp_pin_in_write(pin, frame);
 }
 
@@ -1142,6 +1197,29 @@ static void public_f_reset(struct mp_filter *f)
     struct priv *p = f->priv;
     mp_assert(p->public.f == f);
 
+    // Notify aframe observer of seek/reset BEFORE we tear down the decoder
+    // queue, so it can mark a discontinuity / drop any borrowed frames it
+    // hasn't refed yet. Snapshot to avoid holding cache_lock across callback.
+    if (p->header->type == STREAM_AUDIO) {
+        struct mp_aframe_observer obs = {0};
+        bool have_obs = false;
+        mp_mutex_lock(&p->cache_lock);
+        if (p->aframe_obs_set) {
+            obs = p->aframe_obs;
+            have_obs = true;
+            p->aframe_obs_active++;
+        }
+        mp_mutex_unlock(&p->cache_lock);
+        if (have_obs) {
+            if (obs.on_event)
+                obs.on_event(obs.ctx, MP_AFRAME_TAP_RESET);
+            mp_mutex_lock(&p->cache_lock);
+            if (--p->aframe_obs_active == 0)
+                mp_cond_broadcast(&p->aframe_obs_idle);
+            mp_mutex_unlock(&p->cache_lock);
+        }
+    }
+
     if (p->queue) {
         mp_async_queue_reset(p->queue);
         thread_lock(p);
@@ -1157,6 +1235,30 @@ static void public_f_destroy(struct mp_filter *f)
     struct priv *p = f->priv;
     mp_assert(p->public.f == f);
 
+    // Notify aframe observer first so it can detach and stop touching this
+    // wrapper before we tear down the decoder thread. After this returns the
+    // observer is guaranteed to never be called again.
+    if (p->header->type == STREAM_AUDIO) {
+        struct mp_aframe_observer obs = {0};
+        bool have_obs = false;
+        mp_mutex_lock(&p->cache_lock);
+        if (p->aframe_obs_set) {
+            obs = p->aframe_obs;
+            have_obs = true;
+            p->aframe_obs_set = false;
+            p->aframe_obs_active++;
+        }
+        mp_mutex_unlock(&p->cache_lock);
+        if (have_obs) {
+            if (obs.on_event)
+                obs.on_event(obs.ctx, MP_AFRAME_TAP_DESTROY);
+            mp_mutex_lock(&p->cache_lock);
+            if (--p->aframe_obs_active == 0)
+                mp_cond_broadcast(&p->aframe_obs_idle);
+            mp_mutex_unlock(&p->cache_lock);
+        }
+    }
+
     if (p->dec_thread_valid) {
         mp_assert(p->dec_dispatch);
         thread_lock(p);
@@ -1171,6 +1273,7 @@ static void public_f_destroy(struct mp_filter *f)
 
     talloc_free(p->dec_root_filter);
     talloc_free(p->queue);
+    mp_cond_destroy(&p->aframe_obs_idle);
     mp_mutex_destroy(&p->cache_lock);
 }
 
@@ -1213,6 +1316,7 @@ struct mp_decoder_wrapper *mp_decoder_wrapper_create(struct mp_filter *parent,
     p->public.f = public_f;
 
     mp_mutex_init(&p->cache_lock);
+    mp_cond_init(&p->aframe_obs_idle);
     p->opt_cache = m_config_cache_alloc(p, public_f->global, &dec_wrapper_conf);
     p->opts = p->opt_cache->opts;
     p->header = src;

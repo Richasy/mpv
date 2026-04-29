@@ -1382,6 +1382,13 @@ void run_playloop(struct MPContext *mpctx)
         // via WaitForWhisperTrackAsync and sets SubtitleId. Both paths
         // are safe because mp_switch_track_n checks t->selected.
         // Only attempt after the init thread finishes successfully.
+        if (whisper_lookahead_ready(mpctx)) {
+            // Refresh the snapshot the worker reads from (playback_pts,
+            // cache range, audio_sh, codec params). Cheap; safe to call
+            // every playloop tick.
+            whisper_lookahead_publish(mpctx);
+        }
+
         if (whisper_lookahead_ready(mpctx) &&
             !whisper_lookahead_track_selected(mpctx))
         {

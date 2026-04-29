@@ -88,6 +88,49 @@ void mp_decoder_wrapper_get_video_dec_params(struct mp_decoder_wrapper *d,
 
 bool mp_decoder_wrapper_reinit(struct mp_decoder_wrapper *d);
 
+// Audio frame tap. Used by the whisper realtime caption pipeline so that it can
+// reuse the primary audio decoder's PCM output instead of opening a second
+// demuxer + decoder for the same media (which doubles network traffic on
+// streaming sources like emby/jellyfin and may trigger anti-abuse limits).
+//
+// Lifecycle and threading rules (callers MUST follow):
+// - Observer callbacks may run on the decoder's internal worker thread when
+//   the decoder uses dec_dispatch; otherwise on the user thread driving the
+//   wrapper. Treat them as "unknown thread, must be quick and non-blocking".
+// - on_frame is invoked just before each output frame (audio only) is written
+//   to the wrapper's output pin. The frame is borrowed; if the observer wants
+//   to keep it past the callback, it MUST call mp_frame_ref().
+// - on_event signals lifecycle transitions:
+//     MP_AFRAME_TAP_RESET   - external reset (e.g. seek). Observer should
+//                             discard buffered frames and reset its state.
+//     MP_AFRAME_TAP_DESTROY - wrapper is being destroyed. Observer MUST
+//                             unhook (the pointer becomes invalid after) and
+//                             discard any borrowed frame references.
+// - End of stream propagates as on_frame(MP_FRAME_EOF); there is no separate
+//   EOF event so observers don't have to keep a parallel state machine.
+// - Observer callbacks MUST NOT call any mp_decoder_wrapper_* API on the same
+//   wrapper (would deadlock) and MUST NOT block.
+enum mp_aframe_tap_event {
+    MP_AFRAME_TAP_RESET,
+    MP_AFRAME_TAP_DESTROY,
+};
+
+struct mp_aframe_observer {
+    void *ctx;
+    void (*on_frame)(void *ctx, struct mp_frame frame);
+    void (*on_event)(void *ctx, enum mp_aframe_tap_event ev);
+};
+
+// Install (or replace, when obs != NULL) / remove (obs == NULL) the audio
+// frame observer. Only meaningful for audio decoder wrappers; on video/sub
+// wrappers the observer is silently retained but never called.
+//
+// When called with obs == NULL, this BLOCKS until any in-flight callback has
+// returned. After the call returns the caller is guaranteed that no further
+// callback will be invoked and may safely free the observer's ctx.
+void mp_decoder_wrapper_set_aframe_observer(struct mp_decoder_wrapper *d,
+                                            const struct mp_aframe_observer *obs);
+
 struct mp_decoder {
     // Bidirectional filter; takes MP_FRAME_PACKET for input.
     struct mp_filter *f;

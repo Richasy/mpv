@@ -358,6 +358,24 @@ void demux_update(demuxer_t *demuxer, double playback_pts);
 
 bool demux_cache_dump_set(struct demuxer *demuxer, double start, double end,
                           char *file);
+// Like demux_cache_dump_set(), but only writes packets for the listed streams
+// (used to dump a single audio track without the video). `end` must not be
+// MP_NOPTS_VALUE.
+bool demux_cache_dump_set_streams(struct demuxer *demuxer,
+                                  struct sh_stream **streams, int num_streams,
+                                  double start, double end, char *file);
+// Visit cached packets for one stream within [start, end] PTS. Each packet is
+// passed to `cb` as a fresh copy that the callback owns (it must talloc_free()
+// it). The callback runs while the demux internal lock is held - keep it
+// quick. Returns true if any packets were visited; *out_start/*out_end (may
+// be NULL) are set to the actual PTS range covered. Synchronous like the dump
+// APIs - call from a worker thread.
+bool demux_cache_visit_packets(struct demuxer *demuxer,
+                               struct sh_stream *stream,
+                               double start, double end,
+                               double *out_start, double *out_end,
+                               void (*cb)(void *ctx, struct demux_packet *dp),
+                               void *ctx);
 int demux_cache_dump_get_status(struct demuxer *demuxer);
 
 double demux_probe_cache_dump_target(struct demuxer *demuxer, double pts,

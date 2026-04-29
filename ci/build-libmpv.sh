@@ -146,6 +146,22 @@ build() {
     rm -rf "$SRC_PACKAGES/whisper" 2>/dev/null || true
     rm -rf "$BUILD_DIR/packages/whisper-prefix/src/whisper-stamp" 2>/dev/null || true
     rm -rf "$BUILD_DIR/packages/whisper-prefix/src/whisper-build" 2>/dev/null || true
+    # Wipe stale ggml/whisper install artifacts. Switching whisper.cpp between
+    # BUILD_SHARED_LIBS ON/OFF leaves both libggml.a (static archive) and
+    # libggml.dll.a (import library) in the prefix; the linker may then pick
+    # the wrong one (e.g. linking against libggml.a's ggml-backend-reg.cpp
+    # symbols when ggml-cpu has been moved into ggml-cpu.dll, producing
+    # "undefined symbol: ggml_backend_cpu_reg").
+    log "Wiping stale ggml/whisper install artifacts..."
+    rm -f "$BUILD_DIR/${ARCH}-w64-mingw32/lib/"libwhisper.{a,dll.a} 2>/dev/null || true
+    rm -f "$BUILD_DIR/${ARCH}-w64-mingw32/lib/"whisper.{a,dll.a} 2>/dev/null || true
+    rm -f "$BUILD_DIR/${ARCH}-w64-mingw32/lib/"libggml*.{a,dll.a} 2>/dev/null || true
+    rm -f "$BUILD_DIR/${ARCH}-w64-mingw32/lib/"ggml*.{a,dll.a} 2>/dev/null || true
+    rm -f "$BUILD_DIR/${ARCH}-w64-mingw32/bin/"libwhisper.dll 2>/dev/null || true
+    rm -f "$BUILD_DIR/${ARCH}-w64-mingw32/bin/"whisper.dll 2>/dev/null || true
+    rm -f "$BUILD_DIR/${ARCH}-w64-mingw32/bin/"libggml*.dll 2>/dev/null || true
+    rm -f "$BUILD_DIR/${ARCH}-w64-mingw32/bin/"ggml*.dll 2>/dev/null || true
+    rm -f "$BUILD_DIR/${ARCH}-w64-mingw32/lib/pkgconfig/whisper.pc" 2>/dev/null || true
 
     # Configure CMake
     log "Configuring CMake for $ARCH..."

@@ -29,6 +29,11 @@ ExternalProject_Add(whisper
         # Pin the loader and headers explicitly so ggml-vulkan finds Vulkan::Vulkan.
         -DVulkan_LIBRARY=${MINGW_INSTALL_PREFIX}/lib/libvulkan.a
         -DVulkan_INCLUDE_DIR=${MINGW_INSTALL_PREFIX}/include
+        # The static vulkan loader pulls in loader_windows.c which references
+        # CM_* APIs from cfgmgr32. ggml-vulkan's link line only adds the standard
+        # win32 libs, so inject cfgmgr32 explicitly via the shared-linker flags.
+        -DCMAKE_SHARED_LINKER_FLAGS=-lcfgmgr32
+        -DCMAKE_MODULE_LINKER_FLAGS=-lcfgmgr32
         -DWHISPER_BUILD_TESTS=OFF
         -DWHISPER_BUILD_EXAMPLES=OFF
         -DWHISPER_BUILD_SERVER=OFF

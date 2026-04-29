@@ -95,7 +95,6 @@ jobs:
           ARCH_OUT="$OUTPUT_DIR/${{ matrix.arch }}"
           AZ_DIR="native/${{ matrix.name }}${BUILD_SUFFIX}"
           DLL_PATH="$ARCH_OUT/libmpv-2.dll"
-          PDB_PATH="$ARCH_OUT/libmpv-2.pdb"
           if [ ! -f "$DLL_PATH" ]; then
             echo "ERROR: libmpv-2.dll not found at $DLL_PATH"
             exit 1
@@ -113,18 +112,13 @@ jobs:
               --connection-string "$AZURE_STORAGE_CONNECTION_STRING"
             echo "Uploaded: $AZ_DIR/$name"
           }
-          # libmpv core
-          upload "$DLL_PATH"
-          [ -f "$PDB_PATH" ] && upload "$PDB_PATH"
-          # ggml + whisper shared libraries (BUILD_SHARED_LIBS=ON + GGML_BACKEND_DL=ON)
-          # These all live next to libmpv-2.dll in the consumer app and MUST be
-          # uploaded together — losing any of them breaks whisper realtime captions.
-          for dll in whisper.dll ggml.dll ggml-base.dll ggml-cpu.dll ggml-vulkan.dll; do
-            if [ -f "$ARCH_OUT/$dll" ]; then
-              upload "$ARCH_OUT/$dll"
-            else
-              echo "WARNING: $dll missing under $ARCH_OUT (skipped)"
-            fi
+          # Upload everything in ARCH_OUT — libmpv-2.dll/.pdb plus ggml/whisper
+          # shared libraries (BUILD_SHARED_LIBS=ON + GGML_BACKEND_DL=ON). The
+          # consumer app needs all of them deployed alongside libmpv-2.dll;
+          # missing any breaks whisper realtime captions or libmpv loading.
+          shopt -s nullglob
+          for f in "$ARCH_OUT"/*.dll "$ARCH_OUT"/*.pdb; do
+            upload "$f"
           done
 
       - name: Upload build logs on failure

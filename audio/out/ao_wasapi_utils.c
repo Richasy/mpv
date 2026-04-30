@@ -1013,7 +1013,7 @@ bool wasapi_thread_init(struct ao *ao)
 {
     struct wasapi_state *state = ao->priv;
     MP_DBG(ao, "Init wasapi thread\n");
-    int64_t retry_wait = MP_TIME_US_TO_NS(1);
+    int64_t retry_wait = MP_TIME_MS_TO_NS(20);
     bool align_hack = false;
     HRESULT hr;
 
@@ -1096,12 +1096,12 @@ retry:
         goto retry;
     case AUDCLNT_E_DEVICE_IN_USE:
     case AUDCLNT_E_DEVICE_INVALIDATED:
-        if (retry_wait > MP_TIME_US_TO_NS(8)) {
+        if (retry_wait > MP_TIME_MS_TO_NS(2000)) {
             MP_FATAL(ao, "Bad device retry failed\n");
             return false;
         }
         wasapi_thread_uninit(ao);
-        MP_WARN(ao, "Retrying in %"PRId64" ns\n", retry_wait);
+        MP_WARN(ao, "Retrying in %"PRId64" ms\n", retry_wait / (int64_t)1000000);
         mp_sleep_ns(retry_wait);
         retry_wait *= 2;
         goto retry;

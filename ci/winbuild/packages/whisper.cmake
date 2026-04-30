@@ -9,7 +9,8 @@ endif()
 
 ExternalProject_Add(whisper
     DEPENDS vulkan vulkan-header
-    GIT_REPOSITORY https://github.com/ggml-org/whisper.cpp.git
+    GIT_REPOSITORY https://github.com/Richasy/whisper.cpp.git
+    GIT_TAG fix/win-loadlibrary-search-flags
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--filter=tree:0"
     UPDATE_COMMAND ""

@@ -1091,6 +1091,24 @@ static MP_THREAD_VOID wl_thread(void *ptr)
             end = start + CHUNK_SECONDS;
         }
 
+        /* If the cache window has moved past worker_last_done (e.g. the
+         * demuxer hit EOF then was forced to seek to refill, or the cache
+         * evicted old data while the worker was busy), the data we wanted
+         * is no longer reachable.  Jump forward to cache_start so the
+         * worker doesn't sit forever requesting an interval that the
+         * demuxer can't return any packets for.  Reset the dts dedup
+         * cursor too — the new region's dts values are unrelated to what
+         * we last consumed. */
+        if (cs_known && isfinite(start) && start < snap.cache_start) {
+            MP_INFO(wl, "skip: worker_last_done=%.3f below cache_start=%.3f"
+                        " (likely post-EOF cache refill); jumping forward\n",
+                    start, snap.cache_start);
+            start = snap.cache_start;
+            end = start + (wl->worker_last_done == MP_NOPTS_VALUE
+                           ? FIRST_CHUNK_SECONDS : CHUNK_SECONDS);
+            wl->worker_last_dts = MP_NOPTS_VALUE;
+        }
+
         // Cap end by what's actually cached and by the lookahead bound.
         if (ce_known && end > snap.cache_end)
             end = snap.cache_end;

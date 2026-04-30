@@ -192,6 +192,7 @@ struct whisper_lookahead {
     double worker_next_pts;            // interpolated frame pts fallback
     int chunks_visited;
     int packets_visited;
+    int64_t last_starve_log_ns;  /* rate-limit for INFO-level starvation diag */
     int packets_skipped;
     int frames_decoded;
     // ---- end worker-only state ----
@@ -1101,6 +1102,19 @@ static MP_THREAD_VOID wl_thread(void *ptr)
                        " start=%.3f end=%.3f)\n",
                    snap.playback_pts, snap.cache_start, snap.cache_end,
                    wl->worker_last_done, start, end);
+            /* While we have processed nothing yet, surface the same diagnostic
+             * at INFO level (rate-limited to once every ~5 s) so we can tell
+             * from a user's regular log why the worker is starving. */
+            if (wl->chunks_visited == 0) {
+                int64_t now = mp_time_ns();
+                if (now - wl->last_starve_log_ns > 5LL * 1000 * 1000 * 1000) {
+                    MP_INFO(wl, "starving: pb=%.3f cache=[%.3f,%.3f]"
+                                " last_done=%.3f start=%.3f end=%.3f\n",
+                            snap.playback_pts, snap.cache_start, snap.cache_end,
+                            wl->worker_last_done, start, end);
+                    wl->last_starve_log_ns = now;
+                }
+            }
             // Drive the graph in case the sink still has work.
             while (mp_filter_graph_run(wl->root_filter)) {}
             mp_dispatch_queue_process(wl->graph_dispatch, WORKER_TICK_SEC);
@@ -1122,6 +1136,17 @@ static MP_THREAD_VOID wl_thread(void *ptr)
                                              on_packet, &c);
         if (!any || c.num == 0) {
             talloc_free(c.talloc_parent);
+            if (wl->chunks_visited == 0) {
+                int64_t now = mp_time_ns();
+                if (now - wl->last_starve_log_ns > 5LL * 1000 * 1000 * 1000) {
+                    MP_INFO(wl, "starving: cache visit returned empty for"
+                                " [%.3f,%.3f] (pb=%.3f cache=[%.3f,%.3f] any=%d num=%d)\n",
+                            start, end, snap.playback_pts,
+                            snap.cache_start, snap.cache_end,
+                            (int)any, c.num);
+                    wl->last_starve_log_ns = now;
+                }
+            }
             // Probably outraced cache; small wait.
             mp_dispatch_queue_process(wl->graph_dispatch, WORKER_TICK_SEC);
             continue;

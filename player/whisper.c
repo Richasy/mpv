@@ -101,10 +101,21 @@
 // later chunks are larger so we issue fewer demux-lock takes per second of
 // audio. Bounded by playback_pts + LOOKAHEAD_MAX (don't run too far ahead
 // of the user — saves CPU and matches what's likely cached).
+//
+// LOOKAHEAD_MAX_SEC is intentionally large (10 minutes): the natural
+// backpressure during normal playback comes from MAX_QUEUE_SECONDS (30 s)
+// and from cache_end (the demuxer rarely buffers more than a few minutes
+// ahead anyway).  Keeping the cap loose ensures that:
+//   1) when the player is PAUSED, the worker keeps draining cached audio
+//      into whisper instead of going idle right at playback_pts + 60 s
+//      (otherwise subtitles "freeze" during pause, then resume slowly);
+//   2) when the user seeks deep into the file and the cache initially has
+//      only a small window, the worker doesn't artificially throttle past
+//      what's already cached.
 #define FIRST_CHUNK_SECONDS  6.0
 #define CHUNK_SECONDS       12.0
 #define MIN_CHUNK_SECONDS    1.5
-#define LOOKAHEAD_MAX_SEC   60.0
+#define LOOKAHEAD_MAX_SEC  600.0
 #define WORKER_TICK_SEC      0.05  // tighter wakeups during startup ramp-up
 
 struct frame_item {

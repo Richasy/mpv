@@ -485,6 +485,11 @@ typedef struct MPContext {
     // the lookahead pipeline. Cleared (and a fresh attempt allowed) when the
     // user changes the option to a different value.
     char *whisper_last_failed_opts;
+    // OpenAI-compatible AI translator config JSON (set via the
+    // `whisper-ai-translate` runtime property). Owned by mpctx; passed into
+    // each whisper_lookahead instance on init, and re-applied on the fly
+    // when the property changes while a lookahead is running.
+    char *whisper_ai_translate_json;
 } MPContext;
 
 // Contains information about an asynchronous work item, how it can be aborted,
@@ -535,6 +540,12 @@ bool whisper_lookahead_track_selected(struct MPContext *mpctx);
 void whisper_lookahead_set_track_selected(struct MPContext *mpctx, bool val);
 bool whisper_lookahead_ready(struct MPContext *mpctx);
 bool whisper_lookahead_failed(struct MPContext *mpctx);
+// AI translator runtime control. `json` may be NULL/"" to disable.
+void whisper_lookahead_set_ai_translate(struct MPContext *mpctx, const char *json);
+// Fill out_json with a JSON snapshot describing AI translator status.
+// Returns talloc-allocated string (parented to ta_parent), never NULL.
+char *whisper_lookahead_get_ai_translate_status(struct MPContext *mpctx,
+                                                void *ta_parent);
 
 // configfiles.c
 void mp_parse_cfgfiles(struct MPContext *mpctx);

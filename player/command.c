@@ -1498,6 +1498,95 @@ static int mp_property_whisper_loading(void *ctx, struct m_property *prop,
     return m_property_bool_ro(action, arg, loading);
 }
 
+// Mask "api_key":"..." in a JSON config string before exposing it to clients.
+// Operates on a talloc copy so the returned string can be freely consumed.
+static char *mask_ai_translate_json(const char *json)
+{
+    if (!json || !json[0])
+        return talloc_strdup(NULL, "");
+    char *out = talloc_strdup(NULL, json);
+    char *p = out;
+    while ((p = strstr(p, "\"api_key\""))) {
+        char *colon = strchr(p, ':');
+        if (!colon)
+            break;
+        char *q = colon + 1;
+        while (*q == ' ' || *q == '\t')
+            q++;
+        if (*q != '"') {
+            p = colon + 1;
+            continue;
+        }
+        char *start = q + 1;
+        char *end = start;
+        while (*end && *end != '"') {
+            if (*end == '\\' && end[1])
+                end += 2;
+            else
+                end++;
+        }
+        if (*end != '"')
+            break;
+        // Replace contents between start and end with "***" if non-empty.
+        size_t orig_len = end - start;
+        if (orig_len > 0) {
+            char *rebuilt = talloc_asprintf(NULL, "%.*s***%s",
+                                             (int)(start - out), out, end);
+            talloc_free(out);
+            out = rebuilt;
+            p = strstr(out, "\"api_key\"");
+            if (!p)
+                break;
+            p = strchr(p, ':');
+            if (!p)
+                break;
+        } else {
+            p = end + 1;
+        }
+    }
+    return out;
+}
+
+static int mp_property_whisper_ai_translate(void *ctx, struct m_property *prop,
+                                            int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    switch (action) {
+    case M_PROPERTY_GET_TYPE:
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_STRING};
+        return M_PROPERTY_OK;
+    case M_PROPERTY_GET: {
+        char *masked = mask_ai_translate_json(mpctx->whisper_ai_translate_json);
+        *(char **)arg = masked;
+        return M_PROPERTY_OK;
+    }
+    case M_PROPERTY_SET: {
+        const char *val = *(char **)arg;
+        whisper_lookahead_set_ai_translate(mpctx, val);
+        return M_PROPERTY_OK;
+    }
+    }
+    return M_PROPERTY_NOT_IMPLEMENTED;
+}
+
+static int mp_property_whisper_ai_translate_status(void *ctx,
+                                                   struct m_property *prop,
+                                                   int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    switch (action) {
+    case M_PROPERTY_GET_TYPE:
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_STRING};
+        return M_PROPERTY_OK;
+    case M_PROPERTY_GET: {
+        char *s = whisper_lookahead_get_ai_translate_status(mpctx, NULL);
+        *(char **)arg = s ? s : talloc_strdup(NULL, "");
+        return M_PROPERTY_OK;
+    }
+    }
+    return M_PROPERTY_NOT_IMPLEMENTED;
+}
+
 static int mp_property_playback_abort(void *ctx, struct m_property *prop,
                                       int action, void *arg)
 {
@@ -4547,6 +4636,8 @@ static const struct m_property mp_properties_base[] = {
     {"eof-reached", mp_property_eof_reached},
     {"seeking", mp_property_seeking},
     {"whisper-loading", mp_property_whisper_loading},
+    {"whisper-ai-translate", mp_property_whisper_ai_translate},
+    {"whisper-ai-translate-status", mp_property_whisper_ai_translate_status},
     {"playback-abort", mp_property_playback_abort},
     {"cache-speed", mp_property_cache_speed},
     {"demuxer-cache-duration", mp_property_demuxer_cache_duration},

@@ -18,23 +18,55 @@
 #ifndef MP_WHISPER_TRANSLATE_H
 #define MP_WHISPER_TRANSLATE_H
 
+#include <stdbool.h>
+
 struct mp_log;
 
 enum wt_provider {
     WT_PROVIDER_NONE = 0,
     WT_PROVIDER_GOOGLE,
     WT_PROVIDER_AZURE,
+    WT_PROVIDER_OPENAI,
+};
+
+// OpenAI-compatible Chat Completions configuration. All strings are owned by
+// the caller and copied internally on translator creation.
+struct wt_openai_config {
+    const char *endpoint;       // full URL, e.g. http://127.0.0.1:11434/v1/chat/completions
+    const char *model;          // model name
+    const char *api_key;        // optional, may be NULL or "" for ollama
+    const char *source_lang;    // may be NULL ("auto")
+    const char *target_lang;    // required, e.g. "zh"
+    const char *system_prompt;  // optional. If NULL/empty, mpv built-in fallback.
+    int context_size;           // sliding history pairs; <=0 means default (4)
+    int timeout_ms;             // per-request timeout; <=0 means default (30000)
+    int max_tokens;             // 0 means: don't send max_tokens; <0 means default (128)
+};
+
+// Translator status snapshot, filled by whisper_translator_get_status().
+struct wt_status {
+    bool enabled;
+    bool paused;            // backoff active: skipping requests for retry_after_ms
+    int  fail_count;
+    int  retry_after_ms;    // remaining ms in current backoff window (0 if not paused)
+    char last_error[128];   // short ascii reason; "" if none
 };
 
 struct whisper_translator;
 
-// Create a translator instance. Caller owns the returned pointer.
+// Create a Google/Azure translator. Caller owns the returned pointer.
 // source_lang: source language code (e.g. "auto", "en")
 // target_lang: target language code (e.g. "zh", "ja", "en")
 struct whisper_translator *whisper_translator_create(
     void *talloc_parent, struct mp_log *log,
     enum wt_provider provider,
     const char *source_lang, const char *target_lang);
+
+// Create an OpenAI-compatible translator. Returns NULL on bad config
+// (missing endpoint/model/target_lang, unsupported scheme, etc.).
+struct whisper_translator *whisper_translator_create_openai(
+    void *talloc_parent, struct mp_log *log,
+    const struct wt_openai_config *cfg);
 
 // Destroy a translator instance, closing WinHTTP handles.
 void whisper_translator_destroy(struct whisper_translator **tr);
@@ -43,5 +75,11 @@ void whisper_translator_destroy(struct whisper_translator **tr);
 // or NULL on failure. Safe to call from the lookahead background thread.
 char *whisper_translate(struct whisper_translator *tr,
                         void *talloc_ctx, const char *text);
+
+// Fill in a status snapshot. Safe to call from any thread that holds the
+// caller's translator lifetime (the caller is responsible for serializing
+// access to the translator pointer itself).
+void whisper_translator_get_status(struct whisper_translator *tr,
+                                   struct wt_status *out);
 
 #endif

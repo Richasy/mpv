@@ -81,6 +81,11 @@
 #include "filters/filter.h"
 #include "filters/filter_internal.h"
 #include "misc/dispatch.h"
+#include "misc/json.h"
+#include "misc/node.h"
+#include "misc/bstr.h"
+
+#include <mpv/client.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/dict.h>
@@ -187,13 +192,243 @@ struct whisper_lookahead {
     int frames_with_meta;
     int subtitles_injected;
     int translations_injected;
+    // translator + history are accessed by both the sink (worker) thread and
+    // the core thread (when the AI translator config is changed via the
+    // whisper-ai-translate property). Hold translator_lock for the entire
+    // translate call (so config swap waits for in-flight HTTP).
+    mp_mutex translator_lock;
     struct whisper_translator *translator;
+
+    // ---- Hallucination & repetition filter (sink thread only) ----
+    // Last few normalized texts we've already injected; used to drop whisper
+    // duplicates so we don't burn AI tokens on them.
+    char *recent_text_norm[16];
+    int64_t recent_text_smin[16];
+    int64_t recent_text_smax[16];
+    int recent_text_count;
+    int recent_text_head;
 
     // Captured at start; populated/refreshed by publish. Subtitle injection
     // target (sub_demuxer/sub_stream from snap captured at last publish).
     struct sh_stream *primary_stream;
     struct demuxer *primary_demuxer;
 };
+
+// ---------- Hallucination & dedup helpers ----------
+
+#define WL_RECENT_TEXTS 16
+
+// Normalize a whisper text for dedup/filter: trim, collapse spaces, strip a
+// few common trailing/leading punctuation. Returned pointer is a talloc child
+// of `parent`. Returns NULL if the text is "garbage" we should never inject
+// (empty, whitespace only, music tags, etc.).
+static char *wl_normalize_text(void *parent, const char *text)
+{
+    if (!text || !text[0])
+        return NULL;
+    // Skip leading whitespace.
+    while (*text == ' ' || *text == '\t' || *text == '\n' || *text == '\r')
+        text++;
+    if (!*text)
+        return NULL;
+
+    // Reject pure non-letter content (e.g. "...", "♪♪♪", "(music)", "[Music]").
+    // Cheap heuristic: must contain at least one alphanumeric byte (>=0x30)
+    // OR a UTF-8 leading byte (>=0xC0) for CJK/etc.
+    bool has_real = false;
+    for (const char *p = text; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c >= 0xC0)
+        {
+            has_real = true;
+            break;
+        }
+    }
+    if (!has_real)
+        return NULL;
+
+    // Whisper hallucination tags.
+    static const char *tags[] = {
+        "[Music]", "[music]", "(Music)", "(music)",
+        "[Applause]", "[applause]",
+        "[Laughter]", "[laughter]",
+        "[ Silence ]", "[silence]",
+        NULL,
+    };
+    for (int i = 0; tags[i]; i++) {
+        if (strcmp(text, tags[i]) == 0)
+            return NULL;
+    }
+    // Pure ♪ runs.
+    bool only_music_glyphs = true;
+    for (const char *p = text; *p; ) {
+        if ((unsigned char)*p == 0xE2 && (unsigned char)*(p+1) == 0x99 &&
+            ((unsigned char)*(p+2) == 0xAA || (unsigned char)*(p+2) == 0xAB))
+        {
+            p += 3;
+            continue;
+        }
+        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+            p++;
+            continue;
+        }
+        only_music_glyphs = false;
+        break;
+    }
+    if (only_music_glyphs)
+        return NULL;
+
+    // Build normalized copy: trim trailing whitespace, collapse internal runs.
+    char *out = talloc_strdup(parent, text);
+    size_t len = strlen(out);
+    while (len > 0 && (out[len-1] == ' ' || out[len-1] == '\t' ||
+                        out[len-1] == '\n' || out[len-1] == '\r'))
+    {
+        out[--len] = '\0';
+    }
+    if (len == 0) {
+        talloc_free(out);
+        return NULL;
+    }
+    // Collapse internal whitespace.
+    char *src = out, *dst = out;
+    bool prev_space = false;
+    while (*src) {
+        char c = *src++;
+        if (c == '\t' || c == '\n' || c == '\r')
+            c = ' ';
+        if (c == ' ') {
+            if (prev_space)
+                continue;
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+        *dst++ = c;
+    }
+    *dst = '\0';
+    return out;
+}
+
+// Returns true if (norm, s_ms, e_ms) was recently seen. Always records.
+static bool wl_recent_seen(struct whisper_lookahead *wl,
+                           const char *norm, int64_t s_ms, int64_t e_ms)
+{
+    for (int i = 0; i < wl->recent_text_count; i++) {
+        if (!wl->recent_text_norm[i])
+            continue;
+        if (strcmp(wl->recent_text_norm[i], norm) == 0) {
+            // Same text within ~5s window OR identical timestamps → duplicate.
+            int64_t dmin = llabs(wl->recent_text_smin[i] - s_ms);
+            int64_t dmax = llabs(wl->recent_text_smax[i] - e_ms);
+            if (dmin < 5000 && dmax < 5000)
+                return true;
+            // Update window so subsequent identical texts continue to suppress.
+            wl->recent_text_smin[i] = s_ms;
+            wl->recent_text_smax[i] = e_ms;
+            return false;
+        }
+    }
+    int idx;
+    if (wl->recent_text_count < WL_RECENT_TEXTS) {
+        idx = wl->recent_text_count++;
+    } else {
+        idx = wl->recent_text_head;
+        wl->recent_text_head = (wl->recent_text_head + 1) % WL_RECENT_TEXTS;
+        talloc_free(wl->recent_text_norm[idx]);
+    }
+    wl->recent_text_norm[idx] = talloc_strdup(wl, norm);
+    wl->recent_text_smin[idx] = s_ms;
+    wl->recent_text_smax[idx] = e_ms;
+    return false;
+}
+
+static void wl_recent_clear(struct whisper_lookahead *wl)
+{
+    for (int i = 0; i < WL_RECENT_TEXTS; i++) {
+        talloc_free(wl->recent_text_norm[i]);
+        wl->recent_text_norm[i] = NULL;
+    }
+    wl->recent_text_count = 0;
+    wl->recent_text_head = 0;
+}
+
+// ---------- AI translator config helpers ----------
+
+// Build a wt_openai_config from JSON. Returns true on success and populates
+// out_cfg whose strings are talloc children of `parent`.
+static bool wl_parse_ai_translate_json(void *parent, struct mp_log *log,
+                                       const char *json,
+                                       struct wt_openai_config *out_cfg)
+{
+    memset(out_cfg, 0, sizeof(*out_cfg));
+    if (!json || !json[0])
+        return false;
+
+    void *tmp = talloc_new(NULL);
+    char *src = talloc_strdup(tmp, json);
+    char *cursor = src;
+    struct mpv_node root = {0};
+    if (json_parse(tmp, &root, &cursor, MAX_JSON_DEPTH) < 0 ||
+        root.format != MPV_FORMAT_NODE_MAP)
+    {
+        mp_warn(log, "whisper-ai-translate: invalid JSON\n");
+        talloc_free(tmp);
+        return false;
+    }
+
+    struct mpv_node *n;
+    #define GET_STR(key) ( \
+        (n = node_map_get(&root, key)) && n->format == MPV_FORMAT_STRING \
+            ? talloc_strdup(parent, n->u.string) : NULL )
+    #define GET_INT(key, defv) ( \
+        (n = node_map_get(&root, key)) && n->format == MPV_FORMAT_INT64 \
+            ? (int)n->u.int64 : (defv) )
+
+    out_cfg->endpoint      = GET_STR("endpoint");
+    out_cfg->model         = GET_STR("model");
+    out_cfg->api_key       = GET_STR("api_key");
+    out_cfg->source_lang   = GET_STR("source_lang");
+    out_cfg->target_lang   = GET_STR("target_lang");
+    out_cfg->system_prompt = GET_STR("system_prompt");
+    out_cfg->context_size  = GET_INT("context_size", 0);
+    out_cfg->timeout_ms    = GET_INT("timeout_ms", 0);
+    out_cfg->max_tokens    = GET_INT("max_tokens", -1);
+
+    #undef GET_STR
+    #undef GET_INT
+
+    talloc_free(tmp);
+    return out_cfg->endpoint && out_cfg->model && out_cfg->target_lang;
+}
+
+// Try to (re)create the OpenAI translator from the configured JSON. Must be
+// called with translator_lock held. Returns true if a translator was set.
+// On disable (NULL/empty json), the existing translator is destroyed.
+static bool wl_apply_ai_translator_locked(struct whisper_lookahead *wl,
+                                          const char *json)
+{
+    if (wl->translator)
+        whisper_translator_destroy(&wl->translator);
+    wl_recent_clear(wl);
+
+    if (!json || !json[0])
+        return false;
+
+    void *tmp = talloc_new(NULL);
+    struct wt_openai_config cfg;
+    if (!wl_parse_ai_translate_json(tmp, wl->log, json, &cfg)) {
+        MP_WARN(wl, "whisper-ai-translate: missing endpoint/model/target_lang\n");
+        talloc_free(tmp);
+        return false;
+    }
+    wl->translator = whisper_translator_create_openai(wl, wl->log, &cfg);
+    talloc_free(tmp);
+    return wl->translator != NULL;
+}
+
+
 
 // ---------- Subtitle injection ----------
 
@@ -207,6 +442,7 @@ static void inject_subtitle(struct whisper_lookahead *wl,
         return;
 
     char *sub_text = NULL;
+    mp_mutex_lock(&wl->translator_lock);
     if (wl->translator) {
         char *translated = whisper_translate(wl->translator, wl, text);
         if (translated) {
@@ -222,6 +458,7 @@ static void inject_subtitle(struct whisper_lookahead *wl,
             talloc_free(translated);
         }
     }
+    mp_mutex_unlock(&wl->translator_lock);
 
     if (!sub_text)
         sub_text = talloc_strdup(wl, text);
@@ -330,9 +567,19 @@ static void process_whisper_segments(struct whisper_lookahead *wl,
             // already in mpv's timeline domain — do NOT add the per-session
             // origin offset.
             (void)pts_offset;
+            char *norm = wl_normalize_text(NULL, text_buf);
+            if (!norm) {
+                // Garbage / hallucination; skip.
+                continue;
+            }
+            if (wl_recent_seen(wl, norm, s_ms, e_ms)) {
+                talloc_free(norm);
+                continue;
+            }
             double pts = s_ms / 1000.0;
             double dur = (e_ms - s_ms) / 1000.0;
-            inject_subtitle(wl, text_buf, pts, dur);
+            inject_subtitle(wl, norm, pts, dur);
+            talloc_free(norm);
         }
     }
 }
@@ -1049,7 +1296,22 @@ static MP_THREAD_VOID init_thread_fn(void *ptr)
 
     MP_INFO(wl, "init: pipeline connected\n");
 
-    if (translate_to && translate_to[0] && translate_provider != WT_PROVIDER_NONE) {
+    // Translator selection priority:
+    //   1) AI (OpenAI-compatible) if mpctx->whisper_ai_translate_json is set;
+    //   2) otherwise legacy translate_to + translate_provider (google/azure)
+    //      from the whisper-lookahead opts string.
+    mp_mutex_lock(&wl->translator_lock);
+    const char *ai_json = wl->mpctx->whisper_ai_translate_json;
+    if (ai_json && ai_json[0]) {
+        if (wl_apply_ai_translator_locked(wl, ai_json)) {
+            MP_INFO(wl, "init: AI translator enabled\n");
+        } else {
+            MP_WARN(wl, "init: AI translator config invalid; falling back\n");
+        }
+    }
+    if (!wl->translator && translate_to && translate_to[0] &&
+        translate_provider != WT_PROVIDER_NONE)
+    {
         const char *src_lang = whisper_language ? whisper_language : "auto";
         wl->translator = whisper_translator_create(wl, wl->log,
                                                     translate_provider,
@@ -1062,6 +1324,7 @@ static MP_THREAD_VOID init_thread_fn(void *ptr)
             MP_WARN(wl, "init: failed to create translator\n");
         }
     }
+    mp_mutex_unlock(&wl->translator_lock);
 
     if (mp_thread_create(&wl->thread, wl_thread, wl)) {
         MP_ERR(wl, "init: failed to create worker thread\n");
@@ -1188,6 +1451,7 @@ void whisper_lookahead_start(struct MPContext *mpctx, const char *whisper_opts)
 
     mp_mutex_init(&wl->snap_lock);
     mp_mutex_init(&wl->queue_lock);
+    mp_mutex_init(&wl->translator_lock);
     mp_cond_init(&wl->queue_cv);
 
     mpctx->whisper_lookahead = wl;
@@ -1200,6 +1464,7 @@ void whisper_lookahead_start(struct MPContext *mpctx, const char *whisper_opts)
         MP_ERR(mpctx, "whisper lookahead: failed to create init thread\n");
         mp_mutex_destroy(&wl->queue_lock);
         mp_mutex_destroy(&wl->snap_lock);
+        mp_mutex_destroy(&wl->translator_lock);
         mp_cond_destroy(&wl->queue_cv);
         mpctx->whisper_lookahead = NULL;
         talloc_free(wl);
@@ -1245,11 +1510,14 @@ void whisper_lookahead_stop(struct MPContext *mpctx)
         mp_frame_unref(&wl->queue[i].f);
     wl->num_queue = 0;
 
+    mp_mutex_lock(&wl->translator_lock);
     whisper_translator_destroy(&wl->translator);
+    mp_mutex_unlock(&wl->translator_lock);
 
     mp_cond_destroy(&wl->queue_cv);
     mp_mutex_destroy(&wl->queue_lock);
     mp_mutex_destroy(&wl->snap_lock);
+    mp_mutex_destroy(&wl->translator_lock);
 
     mpctx->whisper_lookahead = NULL;
     talloc_free(wl);
@@ -1302,4 +1570,70 @@ bool whisper_lookahead_failed(struct MPContext *mpctx)
 {
     struct whisper_lookahead *wl = mpctx->whisper_lookahead;
     return wl && atomic_load(&wl->init_done) && !wl->init_ok;
+}
+
+// ---------- AI translate property bridge ----------
+
+void whisper_lookahead_set_ai_translate(struct MPContext *mpctx,
+                                        const char *json)
+{
+    // Cache config on mpctx so a future whisper_lookahead_start() picks it up.
+    talloc_free(mpctx->whisper_ai_translate_json);
+    mpctx->whisper_ai_translate_json =
+        (json && json[0]) ? talloc_strdup(mpctx, json) : NULL;
+
+    struct whisper_lookahead *wl = mpctx->whisper_lookahead;
+    if (!wl)
+        return;
+    // Only swap the live translator after init completes; otherwise init_thread
+    // will pick up the cached JSON itself.
+    if (!atomic_load(&wl->init_done))
+        return;
+
+    mp_mutex_lock(&wl->translator_lock);
+    if (json && json[0]) {
+        if (!wl_apply_ai_translator_locked(wl, json))
+            MP_WARN(wl, "whisper-ai-translate: invalid config; AI disabled\n");
+    } else {
+        // Disable AI translator entirely (legacy provider is NOT auto-restored).
+        whisper_translator_destroy(&wl->translator);
+        wl_recent_clear(wl);
+        MP_INFO(wl, "whisper-ai-translate: disabled\n");
+    }
+    mp_mutex_unlock(&wl->translator_lock);
+}
+
+// Returns a JSON string (talloc child of `ta_parent`) describing the current
+// AI translator status, or NULL if there is no live AI translator.
+char *whisper_lookahead_get_ai_translate_status(struct MPContext *mpctx,
+                                                void *ta_parent)
+{
+    struct whisper_lookahead *wl = mpctx->whisper_lookahead;
+    if (!wl)
+        return NULL;
+
+    char *out = NULL;
+    mp_mutex_lock(&wl->translator_lock);
+    if (wl->translator) {
+        struct wt_status st = {0};
+        whisper_translator_get_status(wl->translator, &st);
+        void *tmp = talloc_new(NULL);
+        struct mpv_node root = {0};
+        node_init(&root, MPV_FORMAT_NODE_MAP, NULL);
+        talloc_steal(tmp, root.u.list);
+
+        node_map_add_flag(&root, "enabled", st.enabled);
+        node_map_add_flag(&root, "paused", st.paused);
+        node_map_add_int64(&root, "fail_count", st.fail_count);
+        node_map_add_int64(&root, "retry_after_ms", st.retry_after_ms);
+        node_map_add_string(&root, "last_error", st.last_error);
+
+        char *buf = NULL;
+        if (json_write(&buf, &root) >= 0 && buf)
+            out = talloc_strdup(ta_parent, buf);
+        talloc_free(buf);
+        talloc_free(tmp);
+    }
+    mp_mutex_unlock(&wl->translator_lock);
+    return out;
 }

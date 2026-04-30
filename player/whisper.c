@@ -148,6 +148,11 @@ struct whisper_lookahead {
     // -------- snap_lock-protected (cross-thread state) --------
     mp_mutex snap_lock;
     struct wl_snap snap;
+    // Highest end-pts the worker has finished processing.  Published from
+    // the worker thread for the main thread (whisper_lookahead_seek) to
+    // decide whether a player seek lands inside already-processed
+    // territory and can therefore skip the generation bump.
+    double pub_processed_end;
     // -------- end snap_lock-protected --------
 
     // -------- queue_lock-protected (frame queue + worker signalling) --------
@@ -1018,6 +1023,9 @@ static MP_THREAD_VOID wl_thread(void *ptr)
     MP_INFO(wl, "thread: started\n");
     wl->worker_last_done = MP_NOPTS_VALUE;
     wl->worker_last_dts = MP_NOPTS_VALUE;
+    mp_mutex_lock(&wl->snap_lock);
+    wl->pub_processed_end = MP_NOPTS_VALUE;
+    mp_mutex_unlock(&wl->snap_lock);
     wl->worker_next_pts = MP_NOPTS_VALUE;
     wl->worker_generation = 0;
 
@@ -1042,6 +1050,9 @@ static MP_THREAD_VOID wl_thread(void *ptr)
             wl->worker_last_done = MP_NOPTS_VALUE;
             wl->worker_last_dts = MP_NOPTS_VALUE;
             wl->worker_next_pts = MP_NOPTS_VALUE;
+            mp_mutex_lock(&wl->snap_lock);
+            wl->pub_processed_end = MP_NOPTS_VALUE;
+            mp_mutex_unlock(&wl->snap_lock);
             if (codec_change) {
                 free_decoder(wl);
             } else if (wl->avctx) {
@@ -1206,8 +1217,14 @@ static MP_THREAD_VOID wl_thread(void *ptr)
             talloc_free(c.pkts[i]);
         talloc_free(c.talloc_parent);
 
-        if (isfinite(actual_e))
+        if (isfinite(actual_e)) {
             wl->worker_last_done = actual_e;
+            // Publish so whisper_lookahead_seek() can short-circuit small
+            // refresh seeks that land inside processed territory.
+            mp_mutex_lock(&wl->snap_lock);
+            wl->pub_processed_end = actual_e;
+            mp_mutex_unlock(&wl->snap_lock);
+        }
 
         if (c.truncated) {
             MP_WARN(wl, "visit truncated at %d packets; advancing anyway\n",
@@ -1500,6 +1517,7 @@ void whisper_lookahead_start(struct MPContext *mpctx, const char *whisper_opts)
     wl->log = mp_log_new(wl, mpctx->log, "whisper-la");
     wl->whisper_opts = talloc_strdup(wl, whisper_opts ? whisper_opts : "");
     wl->snap.generation = 1;
+    wl->pub_processed_end = MP_NOPTS_VALUE;
     atomic_store(&wl->init_done, false);
     atomic_store(&wl->terminate, 0);
 
@@ -1581,10 +1599,46 @@ void whisper_lookahead_stop(struct MPContext *mpctx)
 
 void whisper_lookahead_seek(struct MPContext *mpctx, double pts)
 {
-    (void)pts;
     struct whisper_lookahead *wl = mpctx->whisper_lookahead;
     if (!wl)
         return;
+
+    // Player issues a seek for many reasons besides user scrubbing:
+    // refresh seeks for A-V resync, the demuxer's "adjust seek target"
+    // keyframe alignment (a few seconds backward), subtitle track
+    // changes, etc.  These can fire several times per minute during
+    // normal playback.  Bumping the generation on every one of them
+    // throws away the in-flight ~30s whisper inference and forces a
+    // restart, which under fast playback or short chunks means
+    // subtitles never catch up.
+    //
+    // Heuristic: if the seek lands inside the region the worker has
+    // already processed, the published subtitles for that range are
+    // still valid and the worker is currently working *ahead* of the
+    // new playback position — there is nothing to throw away. Skip the
+    // bump and let the worker keep going.  Only bump for seeks that
+    // jump beyond what we've processed (or backwards far enough to
+    // leave the processed region).
+    double processed = MP_NOPTS_VALUE;
+    mp_mutex_lock(&wl->snap_lock);
+    processed = wl->pub_processed_end;
+    mp_mutex_unlock(&wl->snap_lock);
+
+    // Tolerance: allow the seek target to be slightly past the last
+    // processed end (e.g. into the chunk currently in flight).  Keep it
+    // small so a real forward jump still triggers a reset.
+    const double FORWARD_TOLERANCE = 2.0;
+
+    if (pts != MP_NOPTS_VALUE && processed != MP_NOPTS_VALUE &&
+        isfinite(pts) && isfinite(processed) &&
+        pts <= processed + FORWARD_TOLERANCE)
+    {
+        MP_INFO(wl, "seek to %.3f within processed region "
+                    "(processed_end=%.3f); keeping in-flight chunk\n",
+                pts, processed);
+        return;
+    }
+
     // Bump the generation so the worker drops its in-flight chunk, flushes
     // the decoder, resets the lavfi graph (recreating whisper → clearing its
     // VAD), and starts a fresh window from the new playback position.

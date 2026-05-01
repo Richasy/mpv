@@ -1307,6 +1307,12 @@ static struct sh_stream *demuxer_get_af_sub_locked(struct sh_stream *stream)
         if (!sh)
             return NULL;
         sh->codec->codec = "ass";
+        // Mark as a whisper-generated live caption track so sd_ass can
+        // enable Unicode line wrapping (whisper segments are produced as
+        // a single long line without manual line breaks, and CJK text
+        // contains no spaces — the default libass wrapper would only
+        // break at spaces, causing the subtitle to overflow the window).
+        sh->codec->codec_profile = "whisper";
         sh->title = talloc_strdup(sh, "Whisper");
         sh->default_track = false;
 

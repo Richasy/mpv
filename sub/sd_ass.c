@@ -279,6 +279,18 @@ static void assobjects_init(struct sd *sd)
 
     mp_ass_add_default_styles(sd, ctx->ass_track, opts, shared_opts);
 
+#if LIBASS_VERSION >= 0x01600010
+    // For whisper-generated live captions, enable Unicode-aware line
+    // wrapping so long CJK / no-space segments wrap inside the window
+    // instead of overflowing past the right edge. The whisper track is
+    // tagged via codec_profile in demux.c (demuxer_get_af_sub_locked).
+    {
+        const char *profile = sd->codec->codec_profile;
+        if (profile && strcmp(profile, "whisper") == 0)
+            ass_track_set_feature(ctx->ass_track, ASS_FEATURE_WRAP_UNICODE, 1);
+    }
+#endif
+
 #if LIBASS_VERSION >= 0x01302000
     ass_set_check_readorder(ctx->ass_track, sd->opts->sub_clear_on_seek ? 0 : 1);
 #endif

@@ -4599,12 +4599,6 @@ bool demux_cache_visit_packets(struct demuxer *demuxer,
 
     for (int n = 0; n < num_ranges; n++) {
         struct demux_cached_range *r = ranges[n];
-        if (r->seek_start == MP_NOPTS_VALUE)
-            continue;
-        if (r->seek_end <= q_start)
-            continue;
-        if (r->seek_start >= q_end)
-            continue;
 
         struct demux_queue *q = NULL;
         for (int i = 0; i < r->num_streams; i++) {
@@ -4614,6 +4608,24 @@ bool demux_cache_visit_packets(struct demuxer *demuxer,
             }
         }
         if (!q)
+            continue;
+
+        /* Filter against the per-stream queue's own seek window rather than
+         * the range's cross-stream intersection (r->seek_start/seek_end).
+         *
+         * update_seek_ranges() collapses the range bounds across every
+         * selected eager stream via MP_PTS_MAX/MP_PTS_MIN, so video keyframe
+         * spacing dominates: with audio packets cached from t=214s but the
+         * next video keyframe at t=250s, r->seek_start lands at 250 and any
+         * audio-only visit asking for [214, 220] would be rejected even
+         * though the audio queue clearly holds those packets.  whisper hits
+         * exactly this scenario because snap_collect feeds the worker an
+         * audio-only cache window. */
+        if (q->seek_start == MP_NOPTS_VALUE || q->seek_end == MP_NOPTS_VALUE)
+            continue;
+        if (q->seek_end <= q_start)
+            continue;
+        if (q->seek_start >= q_end)
             continue;
 
         double pts = q_start;

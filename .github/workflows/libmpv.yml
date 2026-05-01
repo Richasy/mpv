@@ -10,7 +10,7 @@ on:
       build_arm64:
         description: 'Build ARM64'
         type: boolean
-        default: true
+        default: false
       upload_target:
         description: 'Upload target'
         type: choice

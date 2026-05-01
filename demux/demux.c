@@ -4626,13 +4626,25 @@ bool demux_cache_visit_packets(struct demuxer *demuxer,
          * audio-only visit asking for [214, 220] would be rejected even
          * though the audio queue clearly holds those packets.  whisper hits
          * exactly this scenario because snap_collect feeds the worker an
-         * audio-only cache window. */
-        if (q->seek_start == MP_NOPTS_VALUE || q->seek_end == MP_NOPTS_VALUE)
-            continue;
-        if (q->seek_end <= q_start)
-            continue;
-        if (q->seek_start >= q_end)
-            continue;
+         * audio-only cache window.
+         *
+         * NOTE: q->seek_start/seek_end are only populated when
+         * seekable_cache=true (see adjust_seek_range_on_packet, which
+         * returns early for non-seekable caches at line 1955). For local
+         * file playback mpv defaults to seekable_cache=false, so the
+         * queue-level bounds stay MP_NOPTS_VALUE forever. Treat the
+         * unset case as "bounds unknown, attempt the visit anyway" —
+         * find_seek_target falls back to queue->head and walks
+         * keyframes via pkt->next which is always linked, so the visit
+         * still works correctly for local files. The bounds check is
+         * just an optimization to skip ranges that clearly don't cover
+         * the requested window. */
+        if (q->seek_start != MP_NOPTS_VALUE && q->seek_end != MP_NOPTS_VALUE) {
+            if (q->seek_end <= q_start)
+                continue;
+            if (q->seek_start >= q_end)
+                continue;
+        }
 
         double pts = q_start;
         int flags = 0;

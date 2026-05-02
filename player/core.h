@@ -490,6 +490,10 @@ typedef struct MPContext {
     // each whisper_lookahead instance on init, and re-applied on the fly
     // when the property changes while a lookahead is running.
     char *whisper_ai_translate_json;
+    // Cost-protection limits JSON (set via the `whisper-translate-limits`
+    // runtime property). Owned by mpctx; pushed into the wt_pipeline on
+    // start and re-applied when the property changes mid-playback.
+    char *whisper_translate_limits_json;
 } MPContext;
 
 // Contains information about an asynchronous work item, how it can be aborted,
@@ -555,6 +559,12 @@ void whisper_lookahead_set_ai_translate(struct MPContext *mpctx, const char *jso
 // Returns talloc-allocated string (parented to ta_parent), never NULL.
 char *whisper_lookahead_get_ai_translate_status(struct MPContext *mpctx,
                                                 void *ta_parent);
+// Push cost-protection limits (JSON map) to the live whisper translation
+// pipeline. See whisper.c::whisper_lookahead_set_translate_limits for the
+// supported keys. Returns 0 on success, -1 on failure (no live pipeline,
+// invalid JSON, etc.).
+int whisper_lookahead_set_translate_limits(struct MPContext *mpctx,
+                                           const char *json_limits);
 
 // configfiles.c
 void mp_parse_cfgfiles(struct MPContext *mpctx);

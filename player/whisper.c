@@ -510,6 +510,39 @@ static bool wl_apply_ai_translator_locked(struct whisper_lookahead *wl,
 #define MIN_TRANSLATE_SLACK_S   1.0
 #define WT_DRAIN_EPSILON_S      0.05
 
+// Cost-protection defaults (apply when limits.enabled and the per-field value
+// is non-zero). Tuned for AI translation; legacy google/azure paths share the
+// same thresholds because the C# settings layer pre-fills wider defaults for
+// those providers before pushing the JSON down.
+#define WT_DEFAULT_HORIZON_SEC          60
+#define WT_DEFAULT_SEEK_DEBOUNCE_MS     1500
+#define WT_DEFAULT_MIN_TEXT_CHARS        2
+#define WT_DEFAULT_REUSE_CACHE_CAP       64
+#define WT_DEFAULT_REUSE_WINDOW_MS    120000
+#define WT_DEFAULT_REPEAT_THRESHOLD       5
+#define WT_DEFAULT_REPEAT_WINDOW_MS   30000
+#define WT_DEFAULT_RPM_LIMIT              0   // 0 = disabled
+#define WT_DEFAULT_SESSION_LIMIT          0   // 0 = unlimited
+
+#define WT_REUSE_CACHE_HARD_CAP         512   // safety bound, regardless of cfg
+
+#define WT_DEFER_SLEEP_MS               200
+
+// Outcome of one task as the worker chose to handle it. Drain uses this to
+// pick the right user-visible path (bilingual ASS vs. original-text fallback)
+// and to keep the WARN-once "translation failed" log limited to genuine
+// provider failures.
+enum wt_result_kind {
+    WT_RESULT_TRANSLATED = 0,    // success: HTTP returned a translation
+    WT_RESULT_REUSED,            // cache hit: reused a prior translation
+    WT_RESULT_FALLBACK_FAILURE,  // HTTP/provider failure or no translator
+    WT_RESULT_FALLBACK_SHORT,    // text too short, skipped translation
+    WT_RESULT_FALLBACK_LOOP,     // hallucination loop detected
+    WT_RESULT_FALLBACK_RPM,      // rate-limit / would-miss-deadline
+    WT_RESULT_FALLBACK_BUDGET,   // session budget exhausted
+    WT_RESULT_FALLBACK_QUEUE,    // queue overflow eviction
+};
+
 struct wt_task {
     uint64_t generation;
     int      seq;
@@ -524,9 +557,43 @@ struct wt_result {
     double   pts;
     double   dur;
     char    *text;          // original (talloc child of result)
-    char    *translated;    // success: talloc child; failure: NULL
+    char    *translated;    // success/reused: talloc child; otherwise NULL
     bool    rate_limited;
     char    *error_brief;   // first-failure-only WARN payload (or NULL)
+    enum wt_result_kind kind;
+};
+
+// Cost-protection limits, loaded from `whisper-translate-limits` JSON. Treat
+// 0/negative on integer fields as "disabled" unless otherwise noted.
+struct wt_limits {
+    bool enabled;
+    int  horizon_sec;             // skip translation for tasks > horizon_sec
+                                   // ahead of playback_pts (they ride along
+                                   // as future re-pops; on file close they
+                                   // stay un-translated → no cost spent)
+    int  seek_debounce_ms;        // wall-clock quiet window after generation
+                                   // bump before workers start translating
+    int  min_text_chars;          // minimum UTF-8 char count to translate
+    int  reuse_cache_capacity;    // LRU size for translation reuse cache
+    int  reuse_cache_window_ms;   // cache entries older than this are stale
+    int  repeat_loop_threshold;   // same-text hits within window → loop
+    int  repeat_loop_window_ms;
+    int  rpm_limit;               // requests/minute token-bucket cap
+                                   // (0 disables bucket, default)
+    int  session_request_limit;   // total HTTP calls per pipeline lifetime
+                                   // (0 = unlimited)
+};
+
+// LRU cache entry for translation reuse / repeat-loop detection. `head` of
+// `wt_pipeline.cache` is the most-recently used entry.
+struct wt_cache_entry {
+    char    *norm_text;
+    char    *translated;          // may be NULL while we still need the
+                                   // entry only for repeat-loop tracking
+    int64_t  inserted_wall_ms;    // when translated was last refreshed
+    int64_t  first_seen_wall_ms;  // when we started counting hits
+    int      hit_count;           // hits inside [first_seen_wall_ms,
+                                   //              first_seen_wall_ms+window]
 };
 
 struct wt_pipeline {
@@ -553,6 +620,29 @@ struct wt_pipeline {
     // ---- per-pipeline state (under pend_lock) ----
     int next_seq;
     bool first_failure_logged;
+
+    // ---- cost-protection state (under limits_lock) ----
+    mp_mutex limits_lock;
+    struct wt_limits cfg;
+    // Wall-clock (mp_time_ns()/1e6) gate: while now < bump_quiet_until_ms,
+    // workers defer translating. Updated by bump_generation() so connected
+    // seek/audio-chain/invalidate paths all benefit without further plumbing.
+    int64_t  bump_quiet_until_ms;
+    // RPM token bucket. Refilled lazily on each take.
+    double   rpm_tokens;
+    int64_t  rpm_last_refill_ms;
+    // Counters surfaced via whisper-translate-status.
+    int      session_req_used;       // committed HTTP issues
+    int      horizon_skipped;        // task put-backs (cumulative)
+    int      cache_reused;
+    int      loop_skipped;
+    int      short_skipped;
+    int      rpm_skipped;
+    int      budget_skipped;
+    bool     budget_exhausted_logged;
+    // LRU translation-reuse cache (head = most-recent).
+    struct wt_cache_entry *cache;
+    int      cache_num;
 };
 
 // Forward declarations.
@@ -572,6 +662,291 @@ static struct whisper_translator *wt_acquire_translator(
         ? whisper_translator_acquire(wl->translator) : NULL;
     mp_mutex_unlock(&wl->translator_lock);
     return tr;
+}
+
+// ---------- Cost-protection helpers ----------
+
+static inline int64_t wt_wall_ms(void)
+{
+    return mp_time_ns() / (int64_t)1000000;
+}
+
+// Default-fill any zero/negative field on `cfg` to a sane built-in. Called
+// after wt_pipeline_create and after every limits-JSON push so callers may
+// omit fields they don't care about.
+static void wt_limits_apply_defaults(struct wt_limits *cfg)
+{
+    if (cfg->horizon_sec <= 0)
+        cfg->horizon_sec = WT_DEFAULT_HORIZON_SEC;
+    if (cfg->seek_debounce_ms < 0)
+        cfg->seek_debounce_ms = WT_DEFAULT_SEEK_DEBOUNCE_MS;
+    if (cfg->min_text_chars < 0)
+        cfg->min_text_chars = WT_DEFAULT_MIN_TEXT_CHARS;
+    if (cfg->reuse_cache_capacity < 0)
+        cfg->reuse_cache_capacity = WT_DEFAULT_REUSE_CACHE_CAP;
+    if (cfg->reuse_cache_capacity > WT_REUSE_CACHE_HARD_CAP)
+        cfg->reuse_cache_capacity = WT_REUSE_CACHE_HARD_CAP;
+    if (cfg->reuse_cache_window_ms < 0)
+        cfg->reuse_cache_window_ms = WT_DEFAULT_REUSE_WINDOW_MS;
+    if (cfg->repeat_loop_threshold < 0)
+        cfg->repeat_loop_threshold = WT_DEFAULT_REPEAT_THRESHOLD;
+    if (cfg->repeat_loop_window_ms < 0)
+        cfg->repeat_loop_window_ms = WT_DEFAULT_REPEAT_WINDOW_MS;
+    if (cfg->rpm_limit < 0)
+        cfg->rpm_limit = 0;
+    if (cfg->session_request_limit < 0)
+        cfg->session_request_limit = 0;
+}
+
+// Count UTF-8 codepoints in `s`. Stops at NUL. Used as a cheap "char count"
+// proxy for the min-text-chars filter; for the protection threshold here we
+// don't need full grapheme awareness.
+static int wt_utf8_chars(const char *s)
+{
+    int n = 0;
+    if (!s) return 0;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        // Count bytes that are NOT UTF-8 continuation bytes (0b10xxxxxx).
+        if ((c & 0xC0) != 0x80)
+            n++;
+    }
+    return n;
+}
+
+// Find a cache entry matching `norm` and move it to the head of the LRU.
+// Returns NULL if not present. Caller must hold `wt->limits_lock`.
+static struct wt_cache_entry *wt_cache_lookup(struct wt_pipeline *wt,
+                                              const char *norm)
+{
+    if (!wt->cache || !norm || wt->cache_num == 0)
+        return NULL;
+    for (int i = 0; i < wt->cache_num; i++) {
+        if (strcmp(wt->cache[i].norm_text, norm) == 0) {
+            if (i > 0) {
+                struct wt_cache_entry tmp = wt->cache[i];
+                memmove(&wt->cache[1], &wt->cache[0],
+                        sizeof(struct wt_cache_entry) * i);
+                wt->cache[0] = tmp;
+            }
+            return &wt->cache[0];
+        }
+    }
+    return NULL;
+}
+
+// Insert (or refresh) a cache entry for `norm` with `translated`. Both
+// strings are duplicated as talloc children of `wt->cache`. Evicts the
+// least-recently-used entry when capacity is reached. Caller must hold
+// `wt->limits_lock`.
+static void wt_cache_put(struct wt_pipeline *wt, const char *norm,
+                         const char *translated)
+{
+    int cap = wt->cfg.reuse_cache_capacity;
+    if (cap <= 0 || !norm || !translated)
+        return;
+
+    struct wt_cache_entry *e = wt_cache_lookup(wt, norm);
+    int64_t now_ms = wt_wall_ms();
+    if (e) {
+        if (e->translated)
+            talloc_free(e->translated);
+        e->translated = talloc_strdup(wt->cache, translated);
+        e->inserted_wall_ms = now_ms;
+        return;
+    }
+
+    if (!wt->cache) {
+        wt->cache = talloc_zero_array(wt, struct wt_cache_entry, cap);
+        wt->cache_num = 0;
+    }
+    if (wt->cache_num < cap) {
+        memmove(&wt->cache[1], &wt->cache[0],
+                sizeof(struct wt_cache_entry) * wt->cache_num);
+        wt->cache_num++;
+    } else {
+        // Evict tail.
+        struct wt_cache_entry *tail = &wt->cache[cap - 1];
+        if (tail->norm_text)   talloc_free(tail->norm_text);
+        if (tail->translated)  talloc_free(tail->translated);
+        memmove(&wt->cache[1], &wt->cache[0],
+                sizeof(struct wt_cache_entry) * (cap - 1));
+    }
+    wt->cache[0] = (struct wt_cache_entry){
+        .norm_text          = talloc_strdup(wt->cache, norm),
+        .translated         = talloc_strdup(wt->cache, translated),
+        .inserted_wall_ms   = now_ms,
+        .first_seen_wall_ms = now_ms,
+        .hit_count          = 1,
+    };
+}
+
+// Bump the per-text hit counter, resetting the window when stale. Returns
+// true when the new count crosses the loop threshold (caller should fall
+// back to original text). Caller must hold `wt->limits_lock`.
+static bool wt_repeat_record_hit(struct wt_pipeline *wt, const char *norm)
+{
+    if (!norm || wt->cfg.repeat_loop_threshold <= 0 ||
+        wt->cfg.repeat_loop_window_ms <= 0)
+    {
+        return false;
+    }
+    int64_t now_ms = wt_wall_ms();
+
+    // Find or create entry; we reuse the LRU table for repeat tracking too,
+    // because the dedup key is the same normalized text. Insertion path here
+    // does NOT yet have a translation; translated stays NULL until the
+    // worker successfully translates and calls wt_cache_put.
+    struct wt_cache_entry *e = wt_cache_lookup(wt, norm);
+    if (!e) {
+        int cap = wt->cfg.reuse_cache_capacity;
+        if (cap <= 0)
+            return false;
+        if (!wt->cache) {
+            wt->cache = talloc_zero_array(wt, struct wt_cache_entry, cap);
+            wt->cache_num = 0;
+        }
+        if (wt->cache_num < cap) {
+            memmove(&wt->cache[1], &wt->cache[0],
+                    sizeof(struct wt_cache_entry) * wt->cache_num);
+            wt->cache_num++;
+        } else {
+            struct wt_cache_entry *tail = &wt->cache[cap - 1];
+            if (tail->norm_text)  talloc_free(tail->norm_text);
+            if (tail->translated) talloc_free(tail->translated);
+            memmove(&wt->cache[1], &wt->cache[0],
+                    sizeof(struct wt_cache_entry) * (cap - 1));
+        }
+        wt->cache[0] = (struct wt_cache_entry){
+            .norm_text          = talloc_strdup(wt->cache, norm),
+            .translated         = NULL,
+            .inserted_wall_ms   = 0,
+            .first_seen_wall_ms = now_ms,
+            .hit_count          = 1,
+        };
+        return false;
+    }
+
+    if (now_ms - e->first_seen_wall_ms > wt->cfg.repeat_loop_window_ms) {
+        e->first_seen_wall_ms = now_ms;
+        e->hit_count = 1;
+        return false;
+    }
+    e->hit_count++;
+    return e->hit_count >= wt->cfg.repeat_loop_threshold;
+}
+
+// Refill the RPM token bucket lazily. Caller must hold `wt->limits_lock`.
+static void wt_refill_tokens(struct wt_pipeline *wt)
+{
+    int rpm = wt->cfg.rpm_limit;
+    if (rpm <= 0)
+        return;
+    int64_t now = wt_wall_ms();
+    if (wt->rpm_last_refill_ms == 0) {
+        wt->rpm_last_refill_ms = now;
+        wt->rpm_tokens = rpm;
+        return;
+    }
+    double elapsed_ms = (double)(now - wt->rpm_last_refill_ms);
+    if (elapsed_ms <= 0)
+        return;
+    wt->rpm_tokens += elapsed_ms * (rpm / 60000.0);
+    if (wt->rpm_tokens > rpm)
+        wt->rpm_tokens = rpm;
+    wt->rpm_last_refill_ms = now;
+}
+
+// Atomic "reserve" of one HTTP slot under both session and RPM caps. Returns
+// true if the worker may proceed to call the translator. On failure, the
+// caller should produce a fallback (kind set via *out_kind). Caller must
+// hold `wt->limits_lock`.
+static bool wt_try_reserve(struct wt_pipeline *wt,
+                           enum wt_result_kind *out_kind)
+{
+    if (wt->cfg.session_request_limit > 0 &&
+        wt->session_req_used >= wt->cfg.session_request_limit)
+    {
+        *out_kind = WT_RESULT_FALLBACK_BUDGET;
+        wt->budget_skipped++;
+        return false;
+    }
+    wt_refill_tokens(wt);
+    if (wt->cfg.rpm_limit > 0) {
+        if (wt->rpm_tokens < 1.0) {
+            *out_kind = WT_RESULT_FALLBACK_RPM;
+            wt->rpm_skipped++;
+            return false;
+        }
+        wt->rpm_tokens -= 1.0;
+    }
+    wt->session_req_used++;
+    return true;
+}
+
+// Roll back a reservation when the call returned without actually issuing
+// HTTP (e.g. local backoff). Caller must hold `wt->limits_lock`.
+static void wt_rollback_reserve(struct wt_pipeline *wt)
+{
+    if (wt->session_req_used > 0)
+        wt->session_req_used--;
+    if (wt->cfg.rpm_limit > 0)
+        wt->rpm_tokens += 1.0;
+}
+
+// Re-insert `task` at the head of pending and signal cv so workers retry on
+// the next wakeup or after WT_DEFER_SLEEP_MS, whichever first. The caller
+// must NOT hold pend_lock; this acquires it.
+static void wt_putback_head(struct wt_pipeline *wt, struct wt_task *task)
+{
+    mp_mutex_lock(&wt->pend_lock);
+    if (wt->pend_num >= wt->pend_cap) {
+        int new_cap = wt->pend_cap ? wt->pend_cap * 2 : 16;
+        if (new_cap > WT_PEND_MAX) new_cap = WT_PEND_MAX;
+        if (new_cap > wt->pend_cap) {
+            wt->pending = talloc_realloc(wt, wt->pending,
+                                          struct wt_task *, new_cap);
+            wt->pend_cap = new_cap;
+        }
+    }
+    if (wt->pend_num >= WT_PEND_MAX) {
+        // No room; drop oldest tail to make space (future-most task).
+        // This should be vanishingly rare under horizon gating.
+        talloc_free(wt->pending[wt->pend_num - 1]);
+        wt->pend_num--;
+    }
+    memmove(&wt->pending[1], &wt->pending[0],
+            sizeof(struct wt_task *) * wt->pend_num);
+    wt->pending[0] = task;
+    wt->pend_num++;
+    mp_mutex_unlock(&wt->pend_lock);
+}
+
+// Read the latest published playback pts (seconds) from the lookahead snap.
+// Returns -INFINITY when not yet known (e.g. before audio starts).
+static double wt_get_playback_pts(struct whisper_lookahead *wl)
+{
+    double pts;
+    mp_mutex_lock(&wl->snap_lock);
+    pts = wl->snap.playback_pts;
+    mp_mutex_unlock(&wl->snap_lock);
+    if (!isfinite(pts))
+        pts = -INFINITY;
+    return pts;
+}
+
+// Sleep for at most `timeout_ms` waiting for new pending or terminate. On
+// return the lock is held by neither side. The cv-based wait keeps the
+// worker responsive to bump events.
+static void wt_worker_sleep(struct wt_pipeline *wt, int timeout_ms)
+{
+    if (timeout_ms <= 0)
+        return;
+    int64_t until_ns = mp_time_ns() + (int64_t)timeout_ms * 1000000;
+    mp_mutex_lock(&wt->pend_lock);
+    if (!atomic_load(&wt->terminate))
+        mp_cond_timedwait_until(&wt->pend_cv, &wt->pend_lock, until_ns);
+    mp_mutex_unlock(&wt->pend_lock);
 }
 
 static MP_THREAD_VOID wt_worker_loop(void *arg)
@@ -594,27 +969,160 @@ static MP_THREAD_VOID wt_worker_loop(void *arg)
         memmove(&wt->pending[0], &wt->pending[1],
                 sizeof(struct wt_task *) * (wt->pend_num - 1));
         wt->pend_num--;
+        // Latest live generation under pend_lock to keep updates ordered with
+        // bump_generation observers; bump path itself does not take pend_lock,
+        // but reading snap.generation here is racy by design — we simply
+        // catch the latest committed value.
         mp_mutex_unlock(&wt->pend_lock);
 
-        // Build a result. Owned by talloc(NULL); pushed into the queue.
+        uint64_t cur_gen;
+        mp_mutex_lock(&wl->snap_lock);
+        cur_gen = wl->snap.generation;
+        mp_mutex_unlock(&wl->snap_lock);
+
+        // ① Stale generation drop (avoid burning tokens on tasks the user
+        //    invalidated by seeking / changing audio chain / swapping
+        //    translators).
+        if (task->generation != cur_gen) {
+            talloc_free(task);
+            continue;
+        }
+
+        // Read limits snapshot once; protection-only fields are integers and
+        // race-tolerant. Take the lock so we observe a consistent struct.
+        struct wt_limits cfg;
+        int64_t bump_quiet_until_ms;
+        mp_mutex_lock(&wt->limits_lock);
+        cfg = wt->cfg;
+        bump_quiet_until_ms = wt->bump_quiet_until_ms;
+        mp_mutex_unlock(&wt->limits_lock);
+
+        int64_t now_ms = wt_wall_ms();
+
+        // ② Seek-debounce gate: hold for the configured wall-clock window
+        //    after the latest generation bump. Putback at head to retry; the
+        //    sleep keeps the spin bounded (~5Hz worst case across workers).
+        if (cfg.enabled && cfg.seek_debounce_ms > 0 &&
+            now_ms < bump_quiet_until_ms)
+        {
+            wt_putback_head(wt, task);
+            wt_worker_sleep(wt, WT_DEFER_SLEEP_MS);
+            continue;
+        }
+
+        // ③ Horizon gate: if the segment is too far ahead of the playback
+        //    cursor, defer. Stale-generation re-check on next pop catches
+        //    cases where the user closes the file while we're sleeping.
+        if (cfg.enabled && cfg.horizon_sec > 0) {
+            double playback_pts = wt_get_playback_pts(wl);
+            if (isfinite(playback_pts) &&
+                task->pts - playback_pts > (double)cfg.horizon_sec)
+            {
+                mp_mutex_lock(&wt->limits_lock);
+                wt->horizon_skipped++;
+                mp_mutex_unlock(&wt->limits_lock);
+                wt_putback_head(wt, task);
+                wt_worker_sleep(wt, WT_DEFER_SLEEP_MS);
+                continue;
+            }
+        }
+
+        // From here on the task will produce a result (translated or
+        // fallback). Build it.
         struct wt_result *r = talloc_zero(NULL, struct wt_result);
         r->generation = task->generation;
         r->seq        = task->seq;
         r->pts        = task->pts;
         r->dur        = task->dur;
         r->text       = talloc_strdup(r, task->text);
+        r->kind       = WT_RESULT_FALLBACK_FAILURE;
 
+        // ④ Min-text-chars filter: feed original directly. This also dampens
+        //    the cost of single-syllable hallucinations that whisper.cpp
+        //    sometimes emits in silence.
+        if (cfg.enabled && cfg.min_text_chars > 0 &&
+            wt_utf8_chars(task->text) < cfg.min_text_chars)
+        {
+            mp_mutex_lock(&wt->limits_lock);
+            wt->short_skipped++;
+            mp_mutex_unlock(&wt->limits_lock);
+            r->kind = WT_RESULT_FALLBACK_SHORT;
+            talloc_free(task);
+            wt_push_result(wt, r);
+            continue;
+        }
+
+        // ⑤ Cache lookup + repeat-loop tracking.
+        char *norm = NULL;
+        if (cfg.enabled)
+            norm = wl_normalize_text(NULL, task->text);
+        if (norm) {
+            mp_mutex_lock(&wt->limits_lock);
+            struct wt_cache_entry *hit = wt_cache_lookup(wt, norm);
+            bool reused = false;
+            if (hit && hit->translated &&
+                cfg.reuse_cache_window_ms > 0 &&
+                (now_ms - hit->inserted_wall_ms) <= cfg.reuse_cache_window_ms)
+            {
+                r->translated = talloc_strdup(r, hit->translated);
+                r->kind = WT_RESULT_REUSED;
+                wt->cache_reused++;
+                reused = true;
+            }
+            bool loop = false;
+            if (!reused) {
+                loop = wt_repeat_record_hit(wt, norm);
+                if (loop) {
+                    wt->loop_skipped++;
+                }
+            }
+            mp_mutex_unlock(&wt->limits_lock);
+
+            if (reused) {
+                talloc_free(norm);
+                talloc_free(task);
+                wt_push_result(wt, r);
+                continue;
+            }
+            if (loop) {
+                r->kind = WT_RESULT_FALLBACK_LOOP;
+                talloc_free(norm);
+                talloc_free(task);
+                wt_push_result(wt, r);
+                continue;
+            }
+        }
+
+        // ⑥ Reserve under session/RPM caps. Failures map to a fallback kind.
+        bool reserved = false;
+        enum wt_result_kind reject_kind = WT_RESULT_FALLBACK_FAILURE;
+        if (cfg.enabled) {
+            mp_mutex_lock(&wt->limits_lock);
+            reserved = wt_try_reserve(wt, &reject_kind);
+            mp_mutex_unlock(&wt->limits_lock);
+        } else {
+            reserved = true;
+        }
+        if (!reserved) {
+            r->kind = reject_kind;
+            talloc_free(norm);
+            talloc_free(task);
+            wt_push_result(wt, r);
+            continue;
+        }
+
+        // ⑦ Issue translation (HTTP). Outside limits_lock so concurrent
+        //    workers may also reserve / commit while one is on the wire.
         struct whisper_translator *tr = wt_acquire_translator(wl);
+        struct wt_call_result call = {0};
+        char *translated = NULL;
         if (!tr) {
             r->error_brief = talloc_strdup(r, "no translator");
         } else {
-            struct wt_call_result call;
-            char *out = NULL;
             void *tmp = talloc_new(NULL);
             whisper_translate_call(tr, tmp, task->text, &call);
             if (call.translated)
-                out = talloc_strdup(r, call.translated);
-            r->translated = out;
+                translated = talloc_strdup(r, call.translated);
             r->rate_limited = call.rate_limited;
             if (!call.translated && call.error[0])
                 r->error_brief = talloc_strdup(r, call.error);
@@ -622,6 +1130,27 @@ static MP_THREAD_VOID wt_worker_loop(void *arg)
             whisper_translator_release(&tr);
         }
 
+        // ⑧ Commit / rollback. If the provider short-circuited (e.g. local
+        //    backoff, build-body failure) it will not have set http_issued —
+        //    don't charge the user for it.
+        if (cfg.enabled) {
+            mp_mutex_lock(&wt->limits_lock);
+            if (!call.http_issued)
+                wt_rollback_reserve(wt);
+            // Refresh cache on success.
+            if (translated && norm)
+                wt_cache_put(wt, norm, translated);
+            mp_mutex_unlock(&wt->limits_lock);
+        }
+
+        if (translated) {
+            r->translated = translated;
+            r->kind = WT_RESULT_TRANSLATED;
+        } else {
+            r->kind = WT_RESULT_FALLBACK_FAILURE;
+        }
+
+        talloc_free(norm);
         talloc_free(task);
         wt_push_result(wt, r);
     }
@@ -706,6 +1235,7 @@ static void wt_enqueue(struct wt_pipeline *wt,
         evicted->dur = t->dur;
         evicted->text = talloc_strdup(evicted, t->text);
         evicted->error_brief = talloc_strdup(evicted, "queue overflow");
+        evicted->kind = WT_RESULT_FALLBACK_QUEUE;
         talloc_free(t);
     }
     wt->pending[wt->pend_num++] = task;
@@ -734,6 +1264,7 @@ static struct wt_pipeline *wt_pipeline_create(struct whisper_lookahead *wl)
     wt->wl = wl;
     mp_mutex_init(&wt->pend_lock);
     mp_mutex_init(&wt->res_lock);
+    mp_mutex_init(&wt->limits_lock);
     mp_cond_init(&wt->pend_cv);
     atomic_init(&wt->terminate, false);
     wt->pending = talloc_zero_array(wt, struct wt_task *, 16);
@@ -741,6 +1272,16 @@ static struct wt_pipeline *wt_pipeline_create(struct whisper_lookahead *wl)
     wt->results = talloc_zero_array(wt, struct wt_result *, 16);
     wt->res_cap = 16;
     wt->next_seq = 1;
+
+    // Default cost-protection config: enabled but with the bucket/budget
+    // disabled (rpm_limit=0, session_request_limit=0). C# pushes the real
+    // values via whisper-translate-limits before playback meaningfully
+    // begins; until then the horizon and seek-debounce already apply.
+    wt->cfg = (struct wt_limits){ .enabled = true };
+    wt_limits_apply_defaults(&wt->cfg);
+    wt->bump_quiet_until_ms = 0;
+    wt->rpm_tokens = 0;
+    wt->rpm_last_refill_ms = 0;
 
     int n = WT_WORKERS_DEFAULT;
     if (n < 1) n = 1;
@@ -757,6 +1298,7 @@ static struct wt_pipeline *wt_pipeline_create(struct whisper_lookahead *wl)
         mp_cond_destroy(&wt->pend_cv);
         mp_mutex_destroy(&wt->pend_lock);
         mp_mutex_destroy(&wt->res_lock);
+        mp_mutex_destroy(&wt->limits_lock);
         talloc_free(wt);
         return NULL;
     }
@@ -783,10 +1325,14 @@ static void wt_pipeline_destroy(struct wt_pipeline **ptr)
         talloc_free(wt->pending[i]);
     for (int i = 0; i < wt->res_num; i++)
         talloc_free(wt->results[i]);
+    // Cache strings are talloc children of `wt`, freed automatically.
+    wt->cache = NULL;
+    wt->cache_num = 0;
 
     mp_cond_destroy(&wt->pend_cv);
     mp_mutex_destroy(&wt->pend_lock);
     mp_mutex_destroy(&wt->res_lock);
+    mp_mutex_destroy(&wt->limits_lock);
     talloc_free(wt);
 }
 
@@ -855,31 +1401,57 @@ void whisper_lookahead_drain_results(struct MPContext *mpctx)
         }
 
         if (r->translated) {
-            // ② Success path: bilingual ASS line.
+            // ② Success / reuse path: bilingual ASS line.
             char *body = talloc_asprintf(NULL,
                 "{\\fs72\\c&H00FFFFFF&\\3c&H00000000&\\bord3}%s"
                 "\\N{\\fs48\\c&H00E0FFFF&\\3c&H00000000&\\bord2}%s",
                 r->translated, r->text);
             wl->translations_injected++;
-            MP_INFO(wl, "translated #%d: %.40s%s\n",
+            const char *tag = r->kind == WT_RESULT_REUSED ? "translated-reused"
+                                                          : "translated";
+            MP_INFO(wl, "%s #%d: %.40s%s\n",
+                    tag,
                     wl->translations_injected,
                     r->translated,
                     strlen(r->translated) > 40 ? "..." : "");
-            wl_feed_subtitle_text(wl, body, r->pts, r->dur, "translated");
+            wl_feed_subtitle_text(wl, body, r->pts, r->dur, tag);
             talloc_free(body);
             any_success = true;
         } else {
-            // ④ Failure path: feed original; first error WARNed.
-            if (!wt->first_failure_logged && r->error_brief) {
+            // Fallback path: feed original. Only genuine HTTP/provider
+            // failures get the first-failure WARN; throttling fallbacks
+            // (short / loop / rpm / budget / queue) are expected and stay
+            // verbose to avoid log spam under heavy use.
+            const char *kind_tag = "original-after-translate-fail";
+            switch (r->kind) {
+            case WT_RESULT_FALLBACK_SHORT:
+                kind_tag = "original-too-short"; break;
+            case WT_RESULT_FALLBACK_LOOP:
+                kind_tag = "original-repeat-loop"; break;
+            case WT_RESULT_FALLBACK_RPM:
+                kind_tag = "original-rpm-cap"; break;
+            case WT_RESULT_FALLBACK_BUDGET:
+                kind_tag = "original-budget"; break;
+            case WT_RESULT_FALLBACK_QUEUE:
+                kind_tag = "original-queue-overflow"; break;
+            case WT_RESULT_FALLBACK_FAILURE:
+            default:
+                kind_tag = "original-after-translate-fail"; break;
+            }
+            if (r->kind == WT_RESULT_FALLBACK_FAILURE &&
+                !wt->first_failure_logged && r->error_brief)
+            {
                 MP_WARN(wl, "translation failed: %s (showing original; "
                             "subsequent failures suppressed until next "
                             "success)\n", r->error_brief);
                 mp_mutex_lock(&wt->pend_lock);
                 wt->first_failure_logged = true;
                 mp_mutex_unlock(&wt->pend_lock);
+            } else if (r->kind != WT_RESULT_FALLBACK_FAILURE) {
+                MP_VERBOSE(wl, "fallback (%s) pts=%.2f dur=%.2f\n",
+                           kind_tag, r->pts, r->dur);
             }
-            wl_feed_subtitle_text(wl, r->text, r->pts, r->dur,
-                                  "original-after-translate-fail");
+            wl_feed_subtitle_text(wl, r->text, r->pts, r->dur, kind_tag);
         }
 
         talloc_free(r);
@@ -1990,6 +2562,27 @@ static void bump_generation(struct whisper_lookahead *wl)
     wl->snap.generation++;
     mp_mutex_unlock(&wl->snap_lock);
 
+    // Update the seek-debounce gate so workers skip translation while the
+    // user keeps banging the timeline. Each bump pushes the quiet window
+    // forward; once the user holds still for `seek_debounce_ms`, workers
+    // release.
+    if (wl->pipeline) {
+        struct wt_pipeline *wt = wl->pipeline;
+        mp_mutex_lock(&wt->limits_lock);
+        if (wt->cfg.enabled && wt->cfg.seek_debounce_ms > 0) {
+            int64_t until = wt_wall_ms() + wt->cfg.seek_debounce_ms;
+            if (until > wt->bump_quiet_until_ms)
+                wt->bump_quiet_until_ms = until;
+        }
+        mp_mutex_unlock(&wt->limits_lock);
+
+        // Wake any workers parked in mp_cond_timedwait so they re-evaluate
+        // the gates immediately (otherwise they sleep up to 200ms longer).
+        mp_mutex_lock(&wt->pend_lock);
+        mp_cond_broadcast(&wt->pend_cv);
+        mp_mutex_unlock(&wt->pend_lock);
+    }
+
     // Wake the worker out of any wait it might be in.
     if (wl->graph_dispatch)
         mp_dispatch_interrupt(wl->graph_dispatch);
@@ -2031,6 +2624,14 @@ void whisper_lookahead_start(struct MPContext *mpctx, const char *whisper_opts)
     wl->pipeline = wt_pipeline_create(wl);
 
     mpctx->whisper_lookahead = wl;
+
+    // Apply previously-configured limits (set before lookahead start by C#).
+    if (mpctx->whisper_translate_limits_json &&
+        mpctx->whisper_translate_limits_json[0])
+    {
+        whisper_lookahead_set_translate_limits(
+            mpctx, mpctx->whisper_translate_limits_json);
+    }
 
     // Publish initial snapshot so the worker has something to do as soon as
     // the init thread finishes.
@@ -2332,6 +2933,49 @@ char *whisper_lookahead_get_ai_translate_status(struct MPContext *mpctx,
         node_map_add_int64(&root, "retry_after_ms", st.retry_after_ms);
         node_map_add_string(&root, "last_error", st.last_error);
 
+        // Throttle counters from the wt_pipeline. These stay valid even if
+        // the underlying translator is paused, so they don't depend on
+        // whisper_translator_get_status.
+        if (wl->pipeline) {
+            struct wt_pipeline *wt = wl->pipeline;
+            mp_mutex_lock(&wt->limits_lock);
+            int session_used   = wt->session_req_used;
+            int session_limit  = wt->cfg.session_request_limit;
+            int rpm_limit      = wt->cfg.rpm_limit;
+            double rpm_tokens  = wt->rpm_tokens;
+            int horizon_skip   = wt->horizon_skipped;
+            int cache_reused   = wt->cache_reused;
+            int loop_skip      = wt->loop_skipped;
+            int short_skip     = wt->short_skipped;
+            int rpm_skip       = wt->rpm_skipped;
+            int budget_skip    = wt->budget_skipped;
+            int horizon_sec    = wt->cfg.horizon_sec;
+            int debounce_ms    = wt->cfg.seek_debounce_ms;
+            int reuse_cap      = wt->cfg.reuse_cache_capacity;
+            int cache_num      = wt->cache_num;
+            bool budget_done   = session_limit > 0 &&
+                                 session_used >= session_limit;
+            mp_mutex_unlock(&wt->limits_lock);
+
+            node_map_add_int64(&root, "session_req_used", session_used);
+            node_map_add_int64(&root, "session_request_limit", session_limit);
+            node_map_add_int64(&root, "rpm_limit", rpm_limit);
+            node_map_add_int64(&root, "rpm_tokens",
+                               (int64_t)(rpm_tokens + 0.5));
+            node_map_add_int64(&root, "horizon_skipped", horizon_skip);
+            node_map_add_int64(&root, "cache_reused", cache_reused);
+            node_map_add_int64(&root, "loop_skipped", loop_skip);
+            node_map_add_int64(&root, "short_skipped", short_skip);
+            node_map_add_int64(&root, "rpm_skipped", rpm_skip);
+            node_map_add_int64(&root, "budget_skipped", budget_skip);
+            node_map_add_int64(&root, "horizon_sec", horizon_sec);
+            node_map_add_int64(&root, "seek_debounce_ms", debounce_ms);
+            node_map_add_int64(&root, "reuse_cache_capacity", reuse_cap);
+            node_map_add_int64(&root, "reuse_cache_size", cache_num);
+            node_map_add_string(&root, "pause_reason",
+                                budget_done ? "budget_exhausted" : "");
+        }
+
         char *buf = NULL;
         if (json_write(&buf, &root) >= 0 && buf)
             out = talloc_strdup(ta_parent, buf);
@@ -2340,4 +2984,78 @@ char *whisper_lookahead_get_ai_translate_status(struct MPContext *mpctx,
     }
     mp_mutex_unlock(&wl->translator_lock);
     return out;
+}
+
+// Apply a JSON limits payload to the live pipeline. Unknown keys are
+// ignored; missing keys keep their current value (caller-side merge is
+// not required). On failure, returns -1 and leaves config untouched.
+//
+// Counters are NOT reset; users may tighten the cap mid-session and the
+// already-spent budget continues to apply.
+int whisper_lookahead_set_translate_limits(struct MPContext *mpctx,
+                                           const char *json_limits)
+{
+    struct whisper_lookahead *wl = mpctx->whisper_lookahead;
+    if (!wl || !wl->pipeline || !json_limits || !json_limits[0])
+        return -1;
+
+    void *tmp = talloc_new(NULL);
+    struct mpv_node root = {0};
+    char *cursor = talloc_strdup(tmp, json_limits);
+    if (json_parse(tmp, &root, &cursor, MAX_JSON_DEPTH) < 0 ||
+        root.format != MPV_FORMAT_NODE_MAP)
+    {
+        talloc_free(tmp);
+        return -1;
+    }
+
+    struct wt_pipeline *wt = wl->pipeline;
+    mp_mutex_lock(&wt->limits_lock);
+    struct wt_limits next = wt->cfg;
+    for (int i = 0; i < root.u.list->num; i++) {
+        const char *k = root.u.list->keys[i];
+        struct mpv_node *v = &root.u.list->values[i];
+        int64_t iv = 0;
+        bool has_int = false, has_bool = false, bv = false;
+        if (v->format == MPV_FORMAT_INT64) {
+            iv = v->u.int64; has_int = true;
+        } else if (v->format == MPV_FORMAT_DOUBLE) {
+            iv = (int64_t)v->u.double_; has_int = true;
+        } else if (v->format == MPV_FORMAT_FLAG) {
+            bv = v->u.flag; has_bool = true;
+        }
+        if (!has_int && !has_bool)
+            continue;
+        if (strcmp(k, "enabled") == 0 && has_bool)
+            next.enabled = bv;
+        else if (strcmp(k, "horizon_sec") == 0 && has_int)
+            next.horizon_sec = (int)iv;
+        else if (strcmp(k, "seek_debounce_ms") == 0 && has_int)
+            next.seek_debounce_ms = (int)iv;
+        else if (strcmp(k, "min_text_chars") == 0 && has_int)
+            next.min_text_chars = (int)iv;
+        else if (strcmp(k, "reuse_cache_capacity") == 0 && has_int)
+            next.reuse_cache_capacity = (int)iv;
+        else if (strcmp(k, "reuse_cache_window_ms") == 0 && has_int)
+            next.reuse_cache_window_ms = (int)iv;
+        else if (strcmp(k, "repeat_loop_threshold") == 0 && has_int)
+            next.repeat_loop_threshold = (int)iv;
+        else if (strcmp(k, "repeat_loop_window_ms") == 0 && has_int)
+            next.repeat_loop_window_ms = (int)iv;
+        else if (strcmp(k, "rpm_limit") == 0 && has_int)
+            next.rpm_limit = (int)iv;
+        else if (strcmp(k, "session_request_limit") == 0 && has_int)
+            next.session_request_limit = (int)iv;
+    }
+    wt_limits_apply_defaults(&next);
+    wt->cfg = next;
+    // Tighter rpm bucket: cap tokens to the new ceiling so a smaller cap
+    // takes effect immediately.
+    if (wt->rpm_tokens > next.rpm_limit)
+        wt->rpm_tokens = next.rpm_limit;
+    mp_mutex_unlock(&wt->limits_lock);
+
+    talloc_free(tmp);
+    mp_wakeup_core(mpctx);
+    return 0;
 }

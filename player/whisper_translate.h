@@ -85,6 +85,11 @@ struct wt_call_result {
     char *translated;        // success: talloc string. failure: NULL.
     int   http_status;       // 0 if no HTTP was issued (e.g. backoff)
     bool  rate_limited;      // 429 / equivalent
+    bool  http_issued;       // true iff an HTTP request was actually sent
+                             // out the wire (used by callers to distinguish
+                             // local short-circuits like backoff / config
+                             // errors from real provider calls; only the
+                             // latter should consume cost-protection budget)
     int   retry_after_ms;    // parsed from Retry-After header (0 if absent)
     char  error[256];        // short reason on failure ("" on success)
 };

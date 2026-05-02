@@ -18,6 +18,7 @@ local o = {
     key_page_3 = "3",
     key_page_4 = "4",
     key_page_5 = "5",
+    key_page_6 = "6",
     key_page_0 = "0",
     -- For pages which support scrolling
     key_scroll_up = "UP",
@@ -1520,6 +1521,101 @@ end
 cache_recorder_timer = mp.add_periodic_timer(0.25, record_cache_stats)
 cache_recorder_timer:kill()
 
+local function whisper_translate_stats()
+    local stats = {}
+
+    eval_ass_formatting()
+    add_header(stats)
+    append(stats, "", {prefix="Whisper Translation:", nl="", indent=""})
+
+    local raw = mp.get_property("whisper-ai-translate-status")
+    if raw == nil or raw == "" then
+        append(stats, "Translator not active.", {})
+        return finalize_page({}, stats, false)
+    end
+
+    local info = utils.parse_json(raw)
+    if type(info) ~= "table" then
+        append(stats, "Status payload unavailable.", {})
+        return finalize_page({}, stats, false)
+    end
+
+    local function n(v) return v == nil and 0 or v end
+    local enabled = info["enabled"] == true
+    local paused = info["paused"] == true
+    local pause_reason = info["pause_reason"] or ""
+    local last_error = info["last_error"] or ""
+    local fail_count = n(info["fail_count"])
+    local retry_after_ms = n(info["retry_after_ms"])
+
+    local state = enabled and "active" or "disabled"
+    if paused then
+        state = "paused"
+        if pause_reason ~= "" then
+            state = state .. " (" .. pause_reason .. ")"
+        end
+    end
+    append(stats, state, {prefix = "State:"})
+
+    if last_error ~= "" or fail_count > 0 then
+        append(stats, format("%d (%s)", fail_count,
+                              last_error ~= "" and last_error or "no recent error"),
+               {prefix = "Failures:"})
+    end
+    if retry_after_ms > 0 then
+        append(stats, format("%d ms", retry_after_ms), {prefix = "Retry After:"})
+    end
+
+    -- Cost-protection counters from wt_pipeline.
+    local session_used  = n(info["session_req_used"])
+    local session_limit = n(info["session_request_limit"])
+    local rpm_limit     = n(info["rpm_limit"])
+    local rpm_tokens    = n(info["rpm_tokens"])
+    local horizon_skip  = n(info["horizon_skipped"])
+    local cache_reused  = n(info["cache_reused"])
+    local loop_skip     = n(info["loop_skipped"])
+    local short_skip    = n(info["short_skipped"])
+    local rpm_skip      = n(info["rpm_skipped"])
+    local budget_skip   = n(info["budget_skipped"])
+    local horizon_sec   = n(info["horizon_sec"])
+    local debounce_ms   = n(info["seek_debounce_ms"])
+    local reuse_cap     = n(info["reuse_cache_capacity"])
+    local reuse_size    = n(info["reuse_cache_size"])
+
+    append(stats, "", {prefix = "HTTP Calls:", nl = "", indent = ""})
+    append(stats, session_limit > 0
+                    and format("%d / %d", session_used, session_limit)
+                    or  format("%d (no cap)", session_used),
+           {prefix = "  Issued:"})
+    if rpm_limit > 0 then
+        append(stats, format("%d / %d req/min  (tokens left: %d)",
+                              rpm_limit, rpm_limit, rpm_tokens),
+               {prefix = "  RPM Bucket:"})
+    else
+        append(stats, "disabled", {prefix = "  RPM Bucket:"})
+    end
+
+    append(stats, "", {prefix = "Skips & Reuse:", nl = "", indent = ""})
+    append(stats, format("%d", horizon_skip),
+           {prefix = format("  Horizon (>%ds):", horizon_sec)})
+    append(stats, format("%d / %d entries", reuse_size, reuse_cap),
+           {prefix = format("  Cache Reused (%d hit):", cache_reused)})
+    append(stats, format("%d", loop_skip),  {prefix = "  Repeat-loop:"})
+    append(stats, format("%d", short_skip), {prefix = "  Too-short:"})
+    if rpm_limit > 0 then
+        append(stats, format("%d", rpm_skip), {prefix = "  RPM-cap:"})
+    end
+    if session_limit > 0 then
+        append(stats, format("%d", budget_skip), {prefix = "  Budget:"})
+    end
+
+    append(stats, "", {prefix = "Knobs:", nl = "", indent = ""})
+    append(stats, format("%d s", horizon_sec),  {prefix = "  Horizon:"})
+    append(stats, format("%d ms", debounce_ms), {prefix = "  Seek debounce:"})
+
+    return finalize_page({}, stats, false)
+end
+
 -- Current page and <page key>:<page function> mapping
 curr_page = o.key_page_1
 pages = {
@@ -1528,6 +1624,7 @@ pages = {
     [o.key_page_3] = { idx = 3, f = cache_stats, desc = "Cache Statistics" },
     [o.key_page_4] = { idx = 4, f = keybinding_info, desc = "Active Key Bindings", scroll = true },
     [o.key_page_5] = { idx = 5, f = track_info, desc = "Tracks Info", scroll = true },
+    [o.key_page_6] = { idx = 6, f = whisper_translate_stats, desc = "Whisper Translation" },
     [o.key_page_0] = { idx = 0, f = perf_stats, desc = "Internal Performance Info", scroll = true },
 }
 

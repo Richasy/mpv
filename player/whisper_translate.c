@@ -444,6 +444,7 @@ static char *translate_google(struct whisper_translator *tr,
         out->http_status = status;
         out->rate_limited = rate_limited;
         out->retry_after_ms = retry_after_ms;
+        out->http_issued = true;
     }
 
     if (!html) {
@@ -532,6 +533,7 @@ static char *azure_refresh_token(struct whisper_translator *tr,
             out->http_status = status;
             out->rate_limited = rate_limited;
             out->retry_after_ms = retry_after_ms;
+            out->http_issued = true;
         }
         set_err(out, "azure: token fetch HTTP %d", status);
         mp_warn(tr->log, "translate: azure token fetch failed\n");
@@ -648,6 +650,7 @@ static char *translate_azure(struct whisper_translator *tr,
         out->http_status = status;
         out->rate_limited = rate_limited;
         out->retry_after_ms = retry_after_ms;
+        out->http_issued = true;
     }
 
     if (!response) {
@@ -1027,6 +1030,7 @@ static char *translate_openai(struct whisper_translator *tr,
         out->http_status = status;
         out->rate_limited = rate_limited;
         out->retry_after_ms = retry_after_ms;
+        out->http_issued = true;
     }
 
     if (!response) {

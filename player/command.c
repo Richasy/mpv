@@ -1587,6 +1587,37 @@ static int mp_property_whisper_ai_translate_status(void *ctx,
     return M_PROPERTY_NOT_IMPLEMENTED;
 }
 
+// Cost-protection limits for the whisper AI translation pipeline. The value
+// is a JSON map; see whisper.c::whisper_lookahead_set_translate_limits for
+// the supported keys. Empty value clears the override (built-in defaults
+// take effect on the next pipeline create).
+static int mp_property_whisper_translate_limits(void *ctx,
+                                                struct m_property *prop,
+                                                int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    switch (action) {
+    case M_PROPERTY_GET_TYPE:
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_STRING};
+        return M_PROPERTY_OK;
+    case M_PROPERTY_GET:
+        *(char **)arg = talloc_strdup(NULL,
+            mpctx->whisper_translate_limits_json
+                ? mpctx->whisper_translate_limits_json : "");
+        return M_PROPERTY_OK;
+    case M_PROPERTY_SET: {
+        const char *val = *(char **)arg;
+        talloc_free(mpctx->whisper_translate_limits_json);
+        mpctx->whisper_translate_limits_json =
+            val && val[0] ? talloc_strdup(mpctx, val) : NULL;
+        if (val && val[0])
+            whisper_lookahead_set_translate_limits(mpctx, val);
+        return M_PROPERTY_OK;
+    }
+    }
+    return M_PROPERTY_NOT_IMPLEMENTED;
+}
+
 static int mp_property_playback_abort(void *ctx, struct m_property *prop,
                                       int action, void *arg)
 {
@@ -4638,6 +4669,7 @@ static const struct m_property mp_properties_base[] = {
     {"whisper-loading", mp_property_whisper_loading},
     {"whisper-ai-translate", mp_property_whisper_ai_translate},
     {"whisper-ai-translate-status", mp_property_whisper_ai_translate_status},
+    {"whisper-translate-limits", mp_property_whisper_translate_limits},
     {"playback-abort", mp_property_playback_abort},
     {"cache-speed", mp_property_cache_speed},
     {"demuxer-cache-duration", mp_property_demuxer_cache_duration},

@@ -558,7 +558,8 @@ struct wt_pipeline {
 // Forward declarations.
 static void wl_feed_subtitle_text(struct whisper_lookahead *wl,
                                   const char *body,
-                                  double pts, double dur);
+                                  double pts, double dur,
+                                  const char *kind);
 static void wt_push_result(struct wt_pipeline *wt, struct wt_result *r);
 
 // Reads `wl->translator` and bumps its refcount; caller must release.
@@ -864,7 +865,7 @@ void whisper_lookahead_drain_results(struct MPContext *mpctx)
                     wl->translations_injected,
                     r->translated,
                     strlen(r->translated) > 40 ? "..." : "");
-            wl_feed_subtitle_text(wl, body, r->pts, r->dur);
+            wl_feed_subtitle_text(wl, body, r->pts, r->dur, "translated");
             talloc_free(body);
             any_success = true;
         } else {
@@ -877,7 +878,8 @@ void whisper_lookahead_drain_results(struct MPContext *mpctx)
                 wt->first_failure_logged = true;
                 mp_mutex_unlock(&wt->pend_lock);
             }
-            wl_feed_subtitle_text(wl, r->text, r->pts, r->dur);
+            wl_feed_subtitle_text(wl, r->text, r->pts, r->dur,
+                                  "original-after-translate-fail");
         }
 
         talloc_free(r);
@@ -900,9 +902,15 @@ void whisper_lookahead_drain_results(struct MPContext *mpctx)
 // (no-translator) sink path and the asynchronous (translator drain) core
 // path. Caller already filtered out NULL/empty text and validated that
 // wl->primary_stream / primary_demuxer are non-NULL.
+//
+// `kind` is a short tag (no spaces) describing which path produced this
+// subtitle. It is logged at INFO so the operator can tell from the log
+// whether a given subtitle came from the translator, was a slack-skip
+// fallback, or a translation failure.
 static void wl_feed_subtitle_text(struct whisper_lookahead *wl,
                                   const char *body,
-                                  double pts, double dur)
+                                  double pts, double dur,
+                                  const char *kind)
 {
     if (!wl->primary_stream || !wl->primary_demuxer || !body || !body[0])
         return;
@@ -922,9 +930,10 @@ static void wl_feed_subtitle_text(struct whisper_lookahead *wl,
 
         demuxer_feed_af_sub(wl->primary_stream, dp);
         wl->subtitles_injected++;
-        MP_INFO(wl, "subtitle #%d @ %.3f (dur=%.1f): %.40s%s\n",
-                wl->subtitles_injected, pts, dur, body,
-                strlen(body) > 40 ? "..." : "");
+        MP_INFO(wl, "subtitle #%d @ %.3f (dur=%.1f) [%s]: %.40s%s\n",
+                wl->subtitles_injected, pts, dur,
+                kind ? kind : "?",
+                body, strlen(body) > 40 ? "..." : "");
 
         mp_wakeup_core(wl->mpctx);
     }
@@ -953,7 +962,8 @@ static void inject_subtitle(struct whisper_lookahead *wl,
 
     if (!have_translator || !wl->pipeline) {
         // ① Plain feed (no AI translation in play).
-        wl_feed_subtitle_text(wl, text, pts, dur);
+        wl_feed_subtitle_text(wl, text, pts, dur,
+                              "original-no-translator");
         return;
     }
 
@@ -970,9 +980,9 @@ static void inject_subtitle(struct whisper_lookahead *wl,
 
     double slack = pts + dur - now_pts;
     if (isfinite(now_pts) && slack < MIN_TRANSLATE_SLACK_S) {
-        MP_INFO(wl, "translate skipped (slack=%.2fs < %.2fs); "
-                    "showing original\n", slack, MIN_TRANSLATE_SLACK_S);
-        wl_feed_subtitle_text(wl, text, pts, dur);
+        char tag[64];
+        snprintf(tag, sizeof(tag), "original-slack-skip(%.2fs)", slack);
+        wl_feed_subtitle_text(wl, text, pts, dur, tag);
         return;
     }
 

@@ -901,6 +901,17 @@ static char *oa_build_request_body(void *talloc_ctx,
     if (tr->oa_max_tokens > 0)
         node_map_add_int64(&root, "max_tokens", tr->oa_max_tokens);
 
+    // Disable model "reasoning" / chain-of-thought for low-latency subtitle
+    // translation by adding `{"thinking": {"type": "disabled"}}`. Backends
+    // that don't recognize the field will ignore it; backends that reject
+    // unknown fields surface as a per-call HTTP error and the failure path
+    // falls back to the original text.
+    {
+        struct mpv_node *th = node_map_add(&root, "thinking",
+                                           MPV_FORMAT_NODE_MAP);
+        node_map_add_string(th, "type", "disabled");
+    }
+
     char *out = NULL;
     int n = json_write(&out, &root);
     char *result = NULL;

@@ -1379,6 +1379,41 @@ void demuxer_feed_af_sub(struct sh_stream *stream, demux_packet_t *dp)
     mp_mutex_unlock(&in->lock);
 }
 
+// Public helper: purge in-flight af_sub captions for `audio_stream` across
+// every cached range. Used when something invalidates already-published
+// captions (whisper recognition language change, AI translator change, etc.)
+// but we don't want to tear down the whole demuxer.
+void demux_clear_af_sub_queue(struct sh_stream *audio_stream)
+{
+    if (!audio_stream || !audio_stream->ds || !audio_stream->ds->in)
+        return;
+    struct demux_internal *in = audio_stream->ds->in;
+
+    mp_mutex_lock(&in->lock);
+    struct sh_stream *sh = audio_stream->ds->af_sub;
+    if (sh && sh->ds) {
+        struct demux_stream *ds = sh->ds;
+        // Clear the queue in every cached range that has an entry for this
+        // stream. clear_queue() restores last_pos / last_dts / keyframe
+        // pointers / range bounds back to the initial state.
+        for (int n = 0; n < in->num_ranges; n++) {
+            struct demux_cached_range *r = in->ranges[n];
+            if (ds->index < r->num_streams && r->streams[ds->index]) {
+                clear_queue(r->streams[ds->index]);
+                update_seek_ranges(r);
+            }
+        }
+        // Reset reader-side state so the next add_packet_locked() for this
+        // stream is treated as a fresh first packet rather than a refresh.
+        ds_clear_reader_state(ds, false);
+        // The af_sub virtual stream should never enter refreshing mode, but
+        // some demuxer paths set ds->refreshing globally — be explicit.
+        ds->refreshing = false;
+        wakeup_ds(ds);
+    }
+    mp_mutex_unlock(&in->lock);
+}
+
 static void error_on_backward_demuxing(struct demux_internal *in)
 {
     if (!in->back_demuxing)

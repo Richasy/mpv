@@ -1360,6 +1360,19 @@ void run_playloop(struct MPContext *mpctx)
         } else if (!want_active && is_active) {
             whisper_lookahead_stop(mpctx);
             mp_notify_property(mpctx, "whisper-loading");
+        } else if (want_active && is_active && !blocked_by_failure &&
+                   mpctx->restart_complete &&
+                   !whisper_lookahead_opts_match(mpctx, wl_opts)) {
+            // Active opts changed mid-playback (e.g. user switched
+            // recognition language ja->zh, swapped models, changed VAD
+            // settings). Without this branch the new opts string sits in
+            // mpctx->opts but is never reapplied, so the running whisper
+            // keeps using the old language. stop() purges visible/queued
+            // captions internally, then we start fresh.
+            MP_INFO(mpctx, "whisper lookahead: opts changed, restarting\n");
+            whisper_lookahead_stop(mpctx);
+            whisper_lookahead_start(mpctx, wl_opts);
+            mp_notify_property(mpctx, "whisper-loading");
         }
 
         // If async init failed, clean up and remember the failed opts so

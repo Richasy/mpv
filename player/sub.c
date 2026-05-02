@@ -71,6 +71,43 @@ void reset_subtitle_state(struct MPContext *mpctx)
     term_osd_clear_subs(mpctx);
 }
 
+// Reset the auto-generated whisper subtitle track (lazy af_sub child of the
+// active audio stream, exposed as a sub track tagged with codec_profile
+// "whisper"). Drops the dec_sub packet cache and currently displayed text.
+// Pairs with demux_clear_af_sub_queue when invalidating in-flight whisper
+// captions due to language / translator change. Safe to call from core
+// thread; no-op if no whisper sub track is present.
+void reset_whisper_subtitle_track(struct MPContext *mpctx)
+{
+    bool any = false;
+    for (int n = 0; n < mpctx->num_tracks; n++) {
+        struct track *t = mpctx->tracks[n];
+        if (t && t->type == STREAM_SUB && t->stream &&
+            t->stream->codec && t->stream->codec->codec_profile &&
+            strcmp(t->stream->codec->codec_profile, "whisper") == 0)
+        {
+            if (t->d_sub) {
+                // SD_CTRL_RESET_SOFT forces sd_ass to ass_flush_events()
+                // even when sub-clear-on-seek is false (its default). A
+                // plain sub_reset() would only drop dec_sub's packet cache
+                // but leave already-decoded events sitting in the libass
+                // ASS_Track, so playing into a previously-translated PTS
+                // would render the stale caption.
+                sub_control(t->d_sub, SD_CTRL_RESET_SOFT, NULL);
+                sub_reset(t->d_sub);
+                sub_set_play_dir(t->d_sub, mpctx->play_dir);
+            }
+            t->redraw_subs = true;
+            any = true;
+        }
+    }
+    if (any) {
+        term_osd_clear_subs(mpctx);
+        redraw_subs(mpctx);
+        mp_wakeup_core(mpctx);
+    }
+}
+
 void uninit_sub(struct MPContext *mpctx, struct track *track)
 {
     if (track && track->d_sub) {

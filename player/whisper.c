@@ -944,16 +944,42 @@ static void wl_feed_subtitle_text(struct whisper_lookahead *wl,
 // the player's timeline domain (seconds). V3.1 produces accurate PTS so no
 // shift hack is required.
 //
+// `producer_gen` is the generation the worker captured when it began
+// processing the audio chunk that produced this segment. If the live
+// generation has moved on (seek / lang change / translator swap), the
+// segment is considered stale and dropped — both for the synchronous
+// no-translator / slack-skip feed paths AND for the wt_enqueue path,
+// because invalidate may have raced with this in-flight segment.
+//
 // Three paths:
 //   ① No translator → feed original synchronously here.
 //   ⑤ Translator configured but slack too tight → feed original here too.
 //   Otherwise → enqueue to wt_pipeline; drain feeds (translated or original
 //   fallback) on the core thread.
 static void inject_subtitle(struct whisper_lookahead *wl,
-                            const char *text, double pts, double dur)
+                            const char *text, double pts, double dur,
+                            uint64_t producer_gen)
 {
     if (!wl->primary_stream || !wl->primary_demuxer || !text || !text[0])
         return;
+
+    // Generation gate: if invalidate / seek / chain-change bumped while this
+    // chunk was inflight in the worker, drop the segment to avoid re-polluting
+    // the freshly-cleared af_sub queue with stale captions.
+    uint64_t cur_gen;
+    double now_pts;
+    mp_mutex_lock(&wl->snap_lock);
+    cur_gen = wl->snap.generation;
+    now_pts = wl->snap.playback_pts;
+    mp_mutex_unlock(&wl->snap_lock);
+    if (producer_gen != cur_gen) {
+        MP_INFO(wl, "drop stale segment (producer_gen=%llu cur_gen=%llu)\n",
+                (unsigned long long)producer_gen,
+                (unsigned long long)cur_gen);
+        return;
+    }
+    if (!isfinite(now_pts))
+        now_pts = -INFINITY;
 
     bool have_translator;
     mp_mutex_lock(&wl->translator_lock);
@@ -969,15 +995,6 @@ static void inject_subtitle(struct whisper_lookahead *wl,
 
     // ⑤ Slack check at enqueue time; avoid burning API tokens on subtitles
     // that are already too close to playback to land in time.
-    uint64_t gen;
-    double now_pts;
-    mp_mutex_lock(&wl->snap_lock);
-    gen = wl->snap.generation;
-    now_pts = wl->snap.playback_pts;
-    mp_mutex_unlock(&wl->snap_lock);
-    if (!isfinite(now_pts))
-        now_pts = -INFINITY;
-
     double slack = pts + dur - now_pts;
     if (isfinite(now_pts) && slack < MIN_TRANSLATE_SLACK_S) {
         char tag[64];
@@ -986,7 +1003,7 @@ static void inject_subtitle(struct whisper_lookahead *wl,
         return;
     }
 
-    wt_enqueue(wl->pipeline, gen, text, pts, dur);
+    wt_enqueue(wl->pipeline, producer_gen, text, pts, dur);
 }
 
 // Parse JSON segments array: [{"s":ms,"e":ms,"t":"text"}, ...]
@@ -994,7 +1011,8 @@ static void inject_subtitle(struct whisper_lookahead *wl,
 // in the current "session" (i.e. since last filter graph reset). Whisper's
 // per-segment timestamps are relative to that origin.
 static void process_whisper_segments(struct whisper_lookahead *wl,
-                                     const char *json, double pts_offset)
+                                     const char *json, double pts_offset,
+                                     uint64_t producer_gen)
 {
     if (!json || json[0] != '[')
         return;
@@ -1078,7 +1096,7 @@ static void process_whisper_segments(struct whisper_lookahead *wl,
             }
             double pts = s_ms / 1000.0;
             double dur = (e_ms - s_ms) / 1000.0;
-            inject_subtitle(wl, norm, pts, dur);
+            inject_subtitle(wl, norm, pts, dur, producer_gen);
             talloc_free(norm);
         }
     }
@@ -1149,7 +1167,8 @@ static void sink_process(struct mp_filter *f)
                     wl->last_text = talloc_strdup(wl, segments_json);
                     double origin = p->session_origin_pts != MP_NOPTS_VALUE
                                         ? p->session_origin_pts : 0;
-                    process_whisper_segments(wl, segments_json, origin);
+                    process_whisper_segments(wl, segments_json, origin,
+                                             wl->worker_generation);
                 }
             }
         }
@@ -2062,6 +2081,15 @@ void whisper_lookahead_stop(struct MPContext *mpctx)
     // hold acquired refs on the translator; destroy() blocks for them.
     wt_pipeline_destroy(&wl->pipeline);
 
+    // Purge any captions previously fed into the af_sub virtual sub stream
+    // and reset the dec_sub renderer cache. Without this, layer-3 stale
+    // subtitles (already enqueued for future PTS) keep showing for ~30s
+    // after stop / lang restart / disable. Done now that worker threads
+    // are joined so no new packets can land in between.
+    if (wl->primary_stream)
+        demux_clear_af_sub_queue(wl->primary_stream);
+    reset_whisper_subtitle_track(mpctx);
+
     if (wl->root_filter) {
         talloc_free(wl->root_filter);
         wl->root_filter = NULL;
@@ -2138,6 +2166,15 @@ void whisper_lookahead_seek(struct MPContext *mpctx, double pts)
     // inside workers will simply be discarded by the drain.
     if (wl->pipeline)
         wt_clear_pending(wl->pipeline);
+
+    // Soft refresh seeks (A-V resync, keyframe alignment, etc.) don't run
+    // through mpv's reset_subtitle_state path, so they leave layer-3 stale
+    // captions in the af_sub queue. Hard seeks already clear the demuxer
+    // queues but cost nothing extra here. Only runs on the bump branch
+    // (early-return above keeps in-flight chunks for in-region seeks).
+    if (wl->primary_stream)
+        demux_clear_af_sub_queue(wl->primary_stream);
+    reset_whisper_subtitle_track(mpctx);
 }
 
 void whisper_lookahead_on_audio_chain_changed(struct MPContext *mpctx)
@@ -2145,13 +2182,67 @@ void whisper_lookahead_on_audio_chain_changed(struct MPContext *mpctx)
     struct whisper_lookahead *wl = mpctx->whisper_lookahead;
     if (!wl)
         return;
+
+    // Capture the OLD audio stream before publish swaps it. Its af_sub queue
+    // still holds captions tied to the previous audio chain; flush them
+    // before they end up on the wrong stream's display.
+    struct sh_stream *old_audio_sh = NULL;
+    mp_mutex_lock(&wl->snap_lock);
+    old_audio_sh = wl->primary_stream;
+    mp_mutex_unlock(&wl->snap_lock);
+
     // Bump first, THEN publish: any drain that wakes during this window
     // sees a generation that does not match in-flight tasks, so old
     // translations cannot leak onto the new audio chain.
     bump_generation(wl);
+    if (old_audio_sh)
+        demux_clear_af_sub_queue(old_audio_sh);
+    reset_whisper_subtitle_track(mpctx);
     whisper_lookahead_publish(mpctx);
     if (wl->pipeline)
         wt_clear_pending(wl->pipeline);
+}
+
+// Force-purge whisper subtitles already published / queued (layers 1, 2, and
+// 3 in the lookahead pipeline) without tearing down the recognizer. Use when
+// the audio stream is unchanged but the *content* of previously-emitted
+// captions is now considered invalid (e.g. user changed translator config).
+void whisper_lookahead_invalidate(struct MPContext *mpctx, const char *reason)
+{
+    struct whisper_lookahead *wl = mpctx->whisper_lookahead;
+    if (!wl)
+        return;
+
+    MP_INFO(wl, "invalidate: %s\n", reason ? reason : "(no reason)");
+
+    // Layer 1+2: bump generation so any in-flight worker output (whisper
+    // segment about to inject_subtitle, or wt_result waiting for drain) gets
+    // dropped on its way out. wt_clear_pending drops not-yet-sent translation
+    // tasks immediately.
+    bump_generation(wl);
+    if (wl->pipeline)
+        wt_clear_pending(wl->pipeline);
+
+    // Layer 3: drop already-published ASS packets that are sitting in the
+    // af_sub demuxer queue + reset the dec_sub renderer cache so currently
+    // displayed text disappears.
+    struct sh_stream *audio_sh = NULL;
+    mp_mutex_lock(&wl->snap_lock);
+    audio_sh = wl->primary_stream;
+    mp_mutex_unlock(&wl->snap_lock);
+    if (audio_sh)
+        demux_clear_af_sub_queue(audio_sh);
+    reset_whisper_subtitle_track(mpctx);
+}
+
+bool whisper_lookahead_opts_match(struct MPContext *mpctx, const char *opts)
+{
+    struct whisper_lookahead *wl = mpctx->whisper_lookahead;
+    if (!wl)
+        return false;
+    const char *cur = wl->whisper_opts ? wl->whisper_opts : "";
+    const char *cmp = opts ? opts : "";
+    return strcmp(cur, cmp) == 0;
 }
 
 bool whisper_lookahead_track_selected(struct MPContext *mpctx)
@@ -2209,11 +2300,11 @@ void whisper_lookahead_set_ai_translate(struct MPContext *mpctx,
     }
     mp_mutex_unlock(&wl->translator_lock);
 
-    // Translator identity changed: drop any pending tasks and bump the
-    // generation so in-flight worker results are discarded by the drain.
-    if (wl->pipeline)
-        wt_clear_pending(wl->pipeline);
-    bump_generation(wl);
+    // Translator identity changed: drop pipeline state AND visible/queued
+    // captions. Without the visible-caption purge, subtitles previously
+    // emitted under the OLD translator (already shown or sitting in the
+    // af_sub queue with future PTS) keep showing for ~30s.
+    whisper_lookahead_invalidate(mpctx, "ai-translate-changed");
 }
 
 // Returns a JSON string (talloc child of `ta_parent`) describing the current

@@ -537,6 +537,14 @@ void whisper_lookahead_seek(struct MPContext *mpctx, double pts);
 void whisper_lookahead_on_audio_chain_changed(struct MPContext *mpctx);
 void whisper_lookahead_publish(struct MPContext *mpctx);
 void whisper_lookahead_drain_results(struct MPContext *mpctx);
+// Force-purge all in-flight whisper subtitles (pipeline tasks/results +
+// af_sub demux queue + dec_sub renderer cache). Call when something
+// invalidates the existing captions but the audio stream itself is not
+// changing — e.g. translator config swap. `reason` is logged. Core thread.
+void whisper_lookahead_invalidate(struct MPContext *mpctx, const char *reason);
+// Returns true iff active wl was started with the same opts string. False
+// if no wl is running (caller should treat as "needs (re)start").
+bool whisper_lookahead_opts_match(struct MPContext *mpctx, const char *opts);
 bool whisper_lookahead_track_selected(struct MPContext *mpctx);
 void whisper_lookahead_set_track_selected(struct MPContext *mpctx, bool val);
 bool whisper_lookahead_ready(struct MPContext *mpctx);
@@ -691,6 +699,7 @@ int64_t mp_load_user_script(struct MPContext *mpctx, const char *fname);
 // sub.c
 void redraw_subs(struct MPContext *mpctx);
 void reset_subtitle_state(struct MPContext *mpctx);
+void reset_whisper_subtitle_track(struct MPContext *mpctx);
 void reinit_sub(struct MPContext *mpctx, struct track *track);
 void reinit_sub_all(struct MPContext *mpctx);
 void uninit_sub(struct MPContext *mpctx, struct track *track);

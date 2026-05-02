@@ -303,6 +303,14 @@ bool demux_free_async_finish(struct demux_free_async_state *state);
 void demuxer_feed_caption(struct sh_stream *stream, demux_packet_t *dp);
 void demuxer_feed_af_sub(struct sh_stream *stream, demux_packet_t *dp);
 
+// Drop all queued packets from the af_sub virtual subtitle stream attached to
+// `audio_stream` (created lazily on first demuxer_feed_af_sub call). Resets
+// queue / reader state across every cached range so the next
+// demuxer_feed_af_sub lands as the first packet of a fresh sequence. No-op
+// if no af_sub stream has been created yet. Locks audio_stream's demuxer
+// internal lock; safe to call from any user-side thread.
+void demux_clear_af_sub_queue(struct sh_stream *audio_stream);
+
 int demux_read_packet_async(struct sh_stream *sh, struct demux_packet **out_pkt);
 int demux_read_packet_async_until(struct sh_stream *sh, double min_pts,
                                   struct demux_packet **out_pkt);

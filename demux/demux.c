@@ -130,6 +130,8 @@ const struct m_sub_options demux_conf = {
         {"metadata-codepage", OPT_STRING(meta_cp)},
         {"autocreate-playlist", OPT_CHOICE(autocreate_playlist,
             {"no", 0}, {"filter", 1}, {"same", 2})},
+        {"demuxer-cache-preserve-on-track-switch",
+            OPT_BOOL(preserve_cache_on_track_switch)},
         {0}
     },
     .size = sizeof(struct demux_opts),
@@ -446,6 +448,13 @@ struct demux_stream {
     // for af-sub-meta whisper subtitle injection (demuxer_feed_af_sub)
     struct sh_stream *af_sub;
     bool ignore_eof;        // ignore stream in underrun detection
+    // True for streams whose packets are pushed in externally rather than
+    // produced by the source demuxer (e.g. CC tracks fed via
+    // demuxer_feed_caption(), whisper sub tracks fed via
+    // demuxer_feed_af_sub()). These must NOT be involved in refresh
+    // seeks: a source-level seek cannot replay their packets, and putting
+    // them into refreshing mode would drop the next externally-fed packet.
+    bool is_virtual;
 };
 
 static void switch_to_fresh_cache_range(struct demux_internal *in);
@@ -1271,6 +1280,7 @@ static struct sh_stream *demuxer_get_cc_track_locked(struct sh_stream *stream)
         stream->ds->cc = sh;
         demux_add_sh_stream_locked(stream->ds->in, sh);
         sh->ds->ignore_eof = true;
+        sh->ds->is_virtual = true;
     }
 
     return sh;
@@ -1343,6 +1353,7 @@ static struct sh_stream *demuxer_get_af_sub_locked(struct sh_stream *stream)
         stream->ds->af_sub = sh;
         demux_add_sh_stream_locked(stream->ds->in, sh);
         sh->ds->ignore_eof = true;
+        sh->ds->is_virtual = true;
     }
 
     return sh;
@@ -2248,6 +2259,11 @@ static void mark_stream_eof(struct demux_stream *ds)
 {
     if (!ds->eof) {
         ds->eof = true;
+        // A refreshing stream that hits EOF will never see the
+        // "catch-up" packet that would clear refreshing in
+        // add_packet_locked(); make sure we don't keep refresh_more
+        // perpetually true in read_packet().
+        ds->refreshing = false;
         adjust_seek_range_on_packet(ds, NULL);
         back_demux_see_packets(ds);
         wakeup_ds(ds);
@@ -4062,9 +4078,84 @@ static void initiate_refresh_seek(struct demux_internal *in,
             return;
         }
 
+        // Cache preservation across track switches is opt-in: it removes
+        // the multi-second loading stall for network sources but introduces
+        // a transient "no audio / no subtitle" window for the newly-
+        // selected track while the source backfills (the existing
+        // bystander queues keep video/other audio playing in the
+        // meantime). Users who prefer the synchronous "everything
+        // re-buffers together" behaviour leave it off.
+        bool preserve_opt = in->d_user->opts->preserve_cache_on_track_switch;
+
+        // Decide which "bystander" streams (selected, non-toggled) we can
+        // preserve across the upcoming source seek instead of throwing
+        // away their forward cache. A bystander qualifies for cache-
+        // preserving refresh when ALL of:
+        //   - it's not the toggled stream,
+        //   - it's selected and eager (sparse subtitle queues are
+        //     skipped because the source might never emit a packet
+        //     past their tail, leaving refreshing stuck forever),
+        //   - it's not virtual (virtual stream packets are fed via
+        //     demuxer_feed_*; setting refreshing would drop the next
+        //     externally-fed packet),
+        //   - its queue is non-empty (we need a tail to anchor on),
+        //   - it has a valid monotonic invariant (correct_dts/pos),
+        //   - the queue isn't already at EOF on this range,
+        //   - we're not in back-demuxing mode.
+        // Cache-budget gate: only preserve when the resulting forward
+        // bytes leave at least 1/4 of max_bytes free for the toggled
+        // stream's backfill, otherwise read_packet() may stop reading
+        // and prematurely EOF.
+        uint64_t preserved_bytes = 0;
+        bool can_preserve = preserve_opt && !in->back_demuxing;
+        if (can_preserve) {
+            for (int n = 0; n < in->num_streams; n++) {
+                struct demux_stream *ds = in->streams[n]->ds;
+                if (ds == stream || !ds->selected || !ds->eager ||
+                    ds->is_virtual || !ds->queue->head ||
+                    ds->queue->is_eof ||
+                    !(ds->queue->correct_dts || ds->queue->correct_pos))
+                    continue;
+                preserved_bytes += get_forward_buffered_bytes(ds);
+            }
+        }
+        size_t budget_cap = in->max_bytes - in->max_bytes / 4;
+        bool budget_ok = can_preserve && preserved_bytes <= (uint64_t)budget_cap;
+
+        int preserved = 0, virt = 0;
         for (int n = 0; n < in->num_streams; n++) {
             struct demux_stream *ds = in->streams[n]->ds;
 
+            // Bucket: virtual bystanders. Leave queue completely alone
+            // and do NOT enter refreshing mode, so the next packet fed
+            // via demuxer_feed_caption() / demuxer_feed_af_sub() lands
+            // normally instead of being dropped by the refresh-skip.
+            if (ds != stream && ds->selected && ds->is_virtual) {
+                update_seek_ranges(in->current_range);
+                virt++;
+                continue;
+            }
+
+            // Bucket: eligible non-virtual bystander -> preserve queue.
+            // queue->last_pos / last_dts already point at the most
+            // recent cached packet (queue tail), so add_packet_locked()
+            // will drop arriving duplicates from the source seek until
+            // a strictly-greater packet shows up, then resume appending
+            // seamlessly. correct_dts/correct_pos are preserved because
+            // the equality packet is also dropped (drop is unconditional
+            // inside the refreshing block).
+            if (budget_ok && ds != stream && ds->selected && ds->eager &&
+                !ds->is_virtual && ds->queue->head && !ds->queue->is_eof &&
+                (ds->queue->correct_dts || ds->queue->correct_pos))
+            {
+                ds->refreshing = true;
+                update_seek_ranges(in->current_range);
+                preserved++;
+                continue;
+            }
+
+            // Bucket: toggled stream / unselected / disqualified
+            // bystander -> behave as before.
             bool correct_pos = ds->queue->correct_pos;
             bool correct_dts = ds->queue->correct_dts;
 
@@ -4091,6 +4182,17 @@ static void initiate_refresh_seek(struct demux_internal *in,
             update_seek_ranges(in->current_range);
         }
 
+        if (preserved || virt) {
+            MP_VERBOSE(in, "refresh seek: preserved %d bystander queue(s), "
+                       "%d virtual stream(s) untouched (preserved %zu bytes, "
+                       "budget cap %zu)\n",
+                       preserved, virt, (size_t)preserved_bytes, budget_cap);
+        } else if (can_preserve && !budget_ok) {
+            MP_VERBOSE(in, "refresh seek: preservation skipped "
+                       "(would-be %zu bytes exceeds budget %zu)\n",
+                       (size_t)preserved_bytes, budget_cap);
+        }
+
         start_ts -= 1.0; // small offset to get correct overlap
     }
 
@@ -4109,6 +4211,12 @@ static void refresh_track(struct demux_internal *in, struct sh_stream *stream,
 
     if (in->back_demuxing)
         ds->back_seek_pos = ref_pts;
+    // Virtual streams (CC, whisper af-sub) are fed externally; the source
+    // demuxer cannot replay their packets, so a refresh seek is at best
+    // pointless work and at worst fatal (some HTTP servers reject the
+    // backward Range request and the demuxer EOFs).
+    if (ds->is_virtual)
+        return;
     // Avoid refresh seek for video streams except when immediately after a seek
     // to ensure a correct seek position.
     bool avoid_refresh = false;

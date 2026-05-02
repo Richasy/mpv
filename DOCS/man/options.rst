@@ -4317,6 +4317,42 @@ Demuxer
     same, even if you seek back within the cache. This is because the back
     buffer is only reduced when new data is read.
 
+``--demuxer-cache-preserve-on-track-switch=<yes|no>``
+    Whether to preserve already-cached forward packets of unrelated streams
+    when a track is toggled mid-playback (default: no).
+
+    By default, switching an audio track or selecting an additional subtitle
+    track on a multi-stream demuxer triggers a low-level source seek and
+    discards every selected stream's packet queue, then re-reads the bytes
+    from the source. For network or HLS sources this can cause a multi-
+    second loading stall while the cache refills.
+
+    With this option set to ``yes``, the demuxer keeps the existing forward
+    cache of "bystander" streams (the streams whose selection state did not
+    change) instead of clearing them. The source seek still happens — it has
+    to, because libavformat can only seek the whole container — but
+    duplicate packets returned for the bystanders are dropped on arrival,
+    and readers continue draining the preserved cache uninterrupted.
+
+    The trade-off: the newly-selected track has no packets until the source
+    catches up to the current play position, so users will perceive a brief
+    period of silence (for an audio switch) or no subtitles (for a sub
+    switch) on that track, while the rest of playback continues smoothly.
+    With the option disabled, all streams stall together until the cache
+    refills.
+
+    Preservation is automatically skipped in cases where it would be unsafe
+    or counterproductive: backwards demuxing, sparse subtitle streams,
+    streams with no monotonic invariant, queues that are already at EOF,
+    and when keeping the cache would leave too little headroom for the new
+    track's backfill (the demuxer reserves at least one quarter of
+    ``--demuxer-max-bytes`` for the toggled stream).
+
+    Independently of this option, virtual subtitle streams whose packets
+    are pushed in by external producers (closed captions, whisper live
+    captions) always skip the source seek entirely on selection, and their
+    queues are never cleared when other tracks are toggled.
+
 ``--demuxer-seekable-cache=<yes|no|auto>``
     Debugging option to control whether seeking can use the demuxer cache
     (default: auto). Normally you don't ever need to set this; the default

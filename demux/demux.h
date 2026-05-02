@@ -88,6 +88,7 @@ struct demux_opts {
     char *meta_cp;
     bool force_retry_eof;
     int autocreate_playlist;
+    bool preserve_cache_on_track_switch;
 };
 
 #define SEEK_FACTOR   (1 << 1)      // argument is in range [0,1]

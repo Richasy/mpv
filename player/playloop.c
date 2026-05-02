@@ -1387,6 +1387,9 @@ void run_playloop(struct MPContext *mpctx)
             // cache range, audio_sh, codec params). Cheap; safe to call
             // every playloop tick.
             whisper_lookahead_publish(mpctx);
+            // Feed any completed AI translations into the subtitle stream
+            // on the core thread (avoids racing seek/audio chain change).
+            whisper_lookahead_drain_results(mpctx);
         }
 
         if (whisper_lookahead_ready(mpctx) &&

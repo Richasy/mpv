@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #include <windows.h>
 #include <winhttp.h>
@@ -35,21 +36,17 @@
 #include "misc/bstr.h"
 #include "misc/json.h"
 #include "misc/node.h"
+#include "osdep/threads.h"
 #include "whisper_translate.h"
 
 // --- struct definition ---
 
-#define WT_DEFAULT_CONTEXT_SIZE   4
-#define WT_DEFAULT_TIMEOUT_MS     30000
+#define WT_DEFAULT_TIMEOUT_MS     5000
+#define WT_MAX_TIMEOUT_MS         5000
 #define WT_DEFAULT_MAX_TOKENS     128
 #define WT_BACKOFF_FAIL_THRESHOLD 5
 #define WT_BACKOFF_MS             30000
-#define WT_HISTORY_MAX_PAIRS      32
-
-struct wt_history_pair {
-    char *src;
-    char *dst;
-};
+#define WT_RATE_LIMIT_BACKOFF_MS  15000
 
 struct whisper_translator {
     struct mp_log *log;
@@ -59,11 +56,7 @@ struct whisper_translator {
     HINTERNET session;          // shared session for google/azure (default proxy)
     HINTERNET session_noproxy;  // dedicated NO_PROXY session for openai (loopback safe)
 
-    // Azure-only
-    char *azure_token;
-    int64_t azure_token_expires;
-
-    // OpenAI-only
+    // OpenAI-only (immutable after init)
     char *oa_scheme;            // "http" | "https"
     char *oa_host;              // hostname or IP (literal, no brackets)
     int   oa_port;
@@ -72,18 +65,25 @@ struct whisper_translator {
     char *oa_model;
     char *oa_api_key;           // may be ""
     char *oa_system_prompt;     // already-rendered final string (or "")
-    int   oa_context_size;
-    int   oa_timeout_ms;
+    int   oa_timeout_ms;        // hard-clamped <= WT_MAX_TIMEOUT_MS at init
     int   oa_max_tokens;
-    struct wt_history_pair *oa_history;
-    int   oa_history_count;
-    int   oa_history_head;      // ring head; oldest entry
-    int   oa_history_cap;
+
+    // Refcount: pipeline workers acquire while a translation is in flight,
+    // so destroy can't race with HTTP. >=1 means alive.
+    atomic_int refcount;
+
+    // state_lock guards everything below. HTTP calls must NEVER be performed
+    // while holding this lock (release before, re-acquire after).
+    mp_mutex state_lock;
+
+    // Azure-only mutable state (refreshed lazily under state_lock).
+    char *azure_token;
+    int64_t azure_token_expires;
+    bool azure_token_refresh_in_flight;
 
     // Common: failure / backoff state
     int fail_count;
     int64_t backoff_until_ms;   // GetTickCount64 epoch
-    char last_error[128];
 };
 
 // --- Helpers ---
@@ -93,11 +93,13 @@ static int64_t wt_now_ms(void)
     return (int64_t)GetTickCount64();
 }
 
-static void wt_set_error(struct whisper_translator *tr, const char *fmt, ...)
+static void set_err(struct wt_call_result *out, const char *fmt, ...)
 {
+    if (!out)
+        return;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(tr->last_error, sizeof(tr->last_error), fmt, ap);
+    vsnprintf(out->error, sizeof(out->error), fmt, ap);
     va_end(ap);
 }
 
@@ -259,6 +261,14 @@ static bool parse_endpoint_url(void *parent, const char *url,
 //
 // Pass session=NULL to fall back to tr's default session. `secure` only
 // matters when path is for https vs http; pass false for plain http.
+//
+// Outputs:
+//   *out_status         HTTP status (0 if no response was received).
+//   *out_rate_limited   true if status==429 (or status>=500 with Retry-After).
+//   *out_retry_after_ms Retry-After header in milliseconds (0 if absent or
+//                       malformed). Honors both seconds and HTTP-date forms,
+//                       but only the seconds form is parsed precisely; date
+//                       form yields 0 (caller falls back to default backoff).
 static char *winhttp_request(void *talloc_ctx, struct mp_log *log,
                              HINTERNET session,
                              const WCHAR *host, int port, bool secure,
@@ -266,10 +276,16 @@ static char *winhttp_request(void *talloc_ctx, struct mp_log *log,
                              const WCHAR *path,
                              const WCHAR *headers,
                              const char *body, size_t body_len,
-                             int *out_status)
+                             int *out_status,
+                             bool *out_rate_limited,
+                             int *out_retry_after_ms)
 {
     if (out_status)
         *out_status = 0;
+    if (out_rate_limited)
+        *out_rate_limited = false;
+    if (out_retry_after_ms)
+        *out_retry_after_ms = 0;
 
     HINTERNET conn = WinHttpConnect(session, host, port, 0);
     if (!conn) {
@@ -327,6 +343,33 @@ static char *winhttp_request(void *talloc_ctx, struct mp_log *log,
     if (out_status)
         *out_status = (int)status_code;
 
+    // Parse Retry-After (seconds form). Date form is left as 0; callers fall
+    // back to a sensible default in that case.
+    if (out_retry_after_ms) {
+        WCHAR ra_buf[64];
+        DWORD ra_size = sizeof(ra_buf);
+        if (WinHttpQueryHeaders(req, WINHTTP_QUERY_RETRY_AFTER,
+                                 WINHTTP_HEADER_NAME_BY_INDEX,
+                                 ra_buf, &ra_size, WINHTTP_NO_HEADER_INDEX))
+        {
+            // Only parse pure-number seconds form.
+            int seconds = 0;
+            bool digits_only = ra_buf[0] != L'\0';
+            for (DWORD i = 0; i < ra_size / sizeof(WCHAR) && ra_buf[i]; i++) {
+                if (ra_buf[i] < L'0' || ra_buf[i] > L'9') {
+                    digits_only = false;
+                    break;
+                }
+                seconds = seconds * 10 + (ra_buf[i] - L'0');
+                if (seconds > 600) { seconds = 600; break; } // cap 10 minutes
+            }
+            if (digits_only && seconds > 0)
+                *out_retry_after_ms = seconds * 1000;
+        }
+    }
+    if (out_rate_limited && status_code == 429)
+        *out_rate_limited = true;
+
     char *result = talloc_strdup(talloc_ctx, "");
     DWORD bytes_available = 0;
     while (WinHttpQueryDataAvailable(req, &bytes_available) && bytes_available > 0) {
@@ -363,34 +406,48 @@ static const char *google_normalize_lang(const char *lang)
 }
 
 static char *translate_google(struct whisper_translator *tr,
-                              void *talloc_ctx, const char *text)
+                              void *talloc_ctx, const char *text,
+                              struct wt_call_result *out)
 {
     const char *sl = google_normalize_lang(tr->source_lang);
     const char *tl = google_normalize_lang(tr->target_lang);
     char *encoded = url_encode(NULL, text);
-    if (!encoded)
+    if (!encoded) {
+        set_err(out, "google: url_encode failed");
         return NULL;
+    }
 
     char *path_utf8 = talloc_asprintf(NULL, "/m?tl=%s&sl=%s&q=%s", tl, sl, encoded);
     talloc_free(encoded);
 
     WCHAR *path_wide = utf8_to_wide(NULL, path_utf8);
     talloc_free(path_utf8);
-    if (!path_wide)
+    if (!path_wide) {
+        set_err(out, "google: utf8_to_wide failed");
         return NULL;
+    }
 
     WCHAR *ua = L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 L"AppleWebKit/537.36\r\n";
 
     int status = 0;
+    bool rate_limited = false;
+    int retry_after_ms = 0;
     char *html = winhttp_request(NULL, tr->log, tr->session,
                                   L"translate.google.com",
                                   INTERNET_DEFAULT_HTTPS_PORT, true,
-                                  L"GET", path_wide, ua, NULL, 0, &status);
+                                  L"GET", path_wide, ua, NULL, 0,
+                                  &status, &rate_limited, &retry_after_ms);
     talloc_free(path_wide);
 
+    if (out) {
+        out->http_status = status;
+        out->rate_limited = rate_limited;
+        out->retry_after_ms = retry_after_ms;
+    }
+
     if (!html) {
-        wt_set_error(tr, "google: HTTP %d", status);
+        set_err(out, "google: HTTP %d", status);
         return NULL;
     }
 
@@ -398,14 +455,14 @@ static char *translate_google(struct whisper_translator *tr,
     char *start = strstr(html, marker);
     if (!start) {
         mp_warn(tr->log, "translate: google response parse failed\n");
-        wt_set_error(tr, "google: parse failed");
+        set_err(out, "google: parse failed");
         talloc_free(html);
         return NULL;
     }
     start += strlen(marker);
     char *end = strchr(start, '<');
     if (!end) {
-        wt_set_error(tr, "google: parse failed");
+        set_err(out, "google: parse failed");
         talloc_free(html);
         return NULL;
     }
@@ -434,32 +491,61 @@ static const char *azure_normalize_lang(const char *lang, bool *is_auto)
     return lang;
 }
 
-static bool azure_refresh_token(struct whisper_translator *tr)
+// Refresh azure token under the per-call state_lock discipline:
+//   - lock state, check freshness; if fresh return cached token (strdup'd).
+//   - if stale, mark refresh_in_flight=true, unlock, do HTTP, relock,
+//     install new token, clear refresh_in_flight.
+//   - returns a talloc-strdup'd token (parented to talloc_ctx), or NULL on
+//     failure (with `out` populated).
+static char *azure_refresh_token(struct whisper_translator *tr,
+                                 void *talloc_ctx,
+                                 struct wt_call_result *out)
 {
     time_t now = time(NULL);
-    if (tr->azure_token && now < tr->azure_token_expires)
-        return true;
 
-    talloc_free(tr->azure_token);
-    tr->azure_token = NULL;
+    mp_mutex_lock(&tr->state_lock);
+    if (tr->azure_token && now < tr->azure_token_expires) {
+        char *cached = talloc_strdup(talloc_ctx, tr->azure_token);
+        mp_mutex_unlock(&tr->state_lock);
+        return cached;
+    }
+    tr->azure_token_refresh_in_flight = true;
+    mp_mutex_unlock(&tr->state_lock);
 
     int status = 0;
+    bool rate_limited = false;
+    int retry_after_ms = 0;
     char *token = winhttp_request(NULL, tr->log, tr->session,
                                    L"edge.microsoft.com",
                                    INTERNET_DEFAULT_HTTPS_PORT, true,
                                    L"GET", L"/translate/auth",
                                    L"User-Agent: Mozilla/5.0\r\n",
-                                   NULL, 0, &status);
+                                   NULL, 0,
+                                   &status, &rate_limited, &retry_after_ms);
+
+    mp_mutex_lock(&tr->state_lock);
+    tr->azure_token_refresh_in_flight = false;
+
     if (!token || !token[0]) {
+        mp_mutex_unlock(&tr->state_lock);
+        if (out) {
+            out->http_status = status;
+            out->rate_limited = rate_limited;
+            out->retry_after_ms = retry_after_ms;
+        }
+        set_err(out, "azure: token fetch HTTP %d", status);
         mp_warn(tr->log, "translate: azure token fetch failed\n");
-        wt_set_error(tr, "azure: token fetch HTTP %d", status);
         talloc_free(token);
-        return false;
+        return NULL;
     }
 
-    tr->azure_token = talloc_steal(tr, token);
-    tr->azure_token_expires = now + 8 * 60;
-    return true;
+    talloc_free(tr->azure_token);
+    tr->azure_token = talloc_strdup(tr, token);
+    tr->azure_token_expires = (int64_t)(now + 8 * 60);
+    char *result = talloc_strdup(talloc_ctx, tr->azure_token);
+    mp_mutex_unlock(&tr->state_lock);
+    talloc_free(token);
+    return result;
 }
 
 // Extract the value of the first "text":"..." in a JSON string (azure).
@@ -495,10 +581,15 @@ static char *azure_json_extract_text(void *talloc_ctx, const char *json)
 }
 
 static char *translate_azure(struct whisper_translator *tr,
-                             void *talloc_ctx, const char *text)
+                             void *talloc_ctx, const char *text,
+                             struct wt_call_result *out)
 {
-    if (!azure_refresh_token(tr))
+    void *tmp = talloc_new(NULL);
+    char *token = azure_refresh_token(tr, tmp, out);
+    if (!token) {
+        talloc_free(tmp);
         return NULL;
+    }
 
     bool is_auto = false;
     const char *tl = azure_normalize_lang(tr->target_lang, &is_auto);
@@ -507,26 +598,27 @@ static char *translate_azure(struct whisper_translator *tr,
 
     char *path_utf8;
     if (src_auto) {
-        path_utf8 = talloc_asprintf(NULL,
+        path_utf8 = talloc_asprintf(tmp,
             "/translate?api-version=3.0&to=%s", tl);
     } else {
-        path_utf8 = talloc_asprintf(NULL,
+        path_utf8 = talloc_asprintf(tmp,
             "/translate?api-version=3.0&to=%s&from=%s", tl, sl);
     }
 
-    WCHAR *path_wide = utf8_to_wide(NULL, path_utf8);
-    talloc_free(path_utf8);
-    if (!path_wide)
+    WCHAR *path_wide = utf8_to_wide(tmp, path_utf8);
+    if (!path_wide) {
+        set_err(out, "azure: path encode failed");
+        talloc_free(tmp);
         return NULL;
+    }
 
-    char *headers_utf8 = talloc_asprintf(NULL,
+    char *headers_utf8 = talloc_asprintf(tmp,
         "Authorization: Bearer %s\r\n"
         "Content-Type: application/json\r\n",
-        tr->azure_token);
-    WCHAR *headers_wide = utf8_to_wide(NULL, headers_utf8);
-    talloc_free(headers_utf8);
+        token);
+    WCHAR *headers_wide = utf8_to_wide(tmp, headers_utf8);
 
-    char *escaped = talloc_strdup(NULL, "");
+    char *escaped = talloc_strdup(tmp, "");
     for (const char *p = text; *p; p++) {
         switch (*p) {
         case '"':  escaped = talloc_asprintf_append(escaped, "\\\""); break;
@@ -539,34 +631,43 @@ static char *translate_azure(struct whisper_translator *tr,
             break;
         }
     }
-    char *body = talloc_asprintf(NULL, "[{\"Text\":\"%s\"}]", escaped);
-    talloc_free(escaped);
+    char *body = talloc_asprintf(tmp, "[{\"Text\":\"%s\"}]", escaped);
     size_t body_len = strlen(body);
 
     int status = 0;
+    bool rate_limited = false;
+    int retry_after_ms = 0;
     char *response = winhttp_request(NULL, tr->log, tr->session,
                                       L"api-edge.cognitive.microsofttranslator.com",
                                       INTERNET_DEFAULT_HTTPS_PORT, true,
                                       L"POST", path_wide, headers_wide,
-                                      body, body_len, &status);
-    talloc_free(path_wide);
-    talloc_free(headers_wide);
-    talloc_free(body);
+                                      body, body_len,
+                                      &status, &rate_limited, &retry_after_ms);
+
+    if (out) {
+        out->http_status = status;
+        out->rate_limited = rate_limited;
+        out->retry_after_ms = retry_after_ms;
+    }
 
     if (!response) {
-        wt_set_error(tr, "azure: HTTP %d", status);
-        // Token might be expired, clear cache and retry next call.
+        set_err(out, "azure: HTTP %d", status);
+        // Token might be expired; clear cache and let the next call refresh.
+        mp_mutex_lock(&tr->state_lock);
         talloc_free(tr->azure_token);
         tr->azure_token = NULL;
         tr->azure_token_expires = 0;
+        mp_mutex_unlock(&tr->state_lock);
+        talloc_free(tmp);
         return NULL;
     }
 
     char *result = azure_json_extract_text(talloc_ctx, response);
     talloc_free(response);
+    talloc_free(tmp);
 
     if (!result) {
-        wt_set_error(tr, "azure: parse failed");
+        set_err(out, "azure: parse failed");
         mp_warn(tr->log, "translate: azure response parse failed\n");
     }
     return result;
@@ -602,38 +703,9 @@ static char *oa_render_fallback_prompt(void *parent, const char *target_lang)
     return out;
 }
 
-// Push (src,dst) to the ring history (oldest evicted automatically).
-static void oa_history_push(struct whisper_translator *tr,
-                            const char *src, const char *dst)
-{
-    if (tr->oa_history_cap <= 0)
-        return;
-    int idx;
-    if (tr->oa_history_count < tr->oa_history_cap) {
-        idx = (tr->oa_history_head + tr->oa_history_count) % tr->oa_history_cap;
-        tr->oa_history_count++;
-    } else {
-        idx = tr->oa_history_head;
-        tr->oa_history_head = (tr->oa_history_head + 1) % tr->oa_history_cap;
-        talloc_free(tr->oa_history[idx].src);
-        talloc_free(tr->oa_history[idx].dst);
-    }
-    tr->oa_history[idx].src = talloc_strdup(tr->oa_history, src);
-    tr->oa_history[idx].dst = talloc_strdup(tr->oa_history, dst);
-}
-
-static void oa_history_clear(struct whisper_translator *tr)
-{
-    for (int i = 0; i < tr->oa_history_count; i++) {
-        int idx = (tr->oa_history_head + i) % tr->oa_history_cap;
-        talloc_free(tr->oa_history[idx].src);
-        talloc_free(tr->oa_history[idx].dst);
-        tr->oa_history[idx].src = NULL;
-        tr->oa_history[idx].dst = NULL;
-    }
-    tr->oa_history_count = 0;
-    tr->oa_history_head = 0;
-}
+// (OpenAI history feature removed: translator is stateless to enable parallel
+// in-flight requests from multiple worker threads. The `context_size` config
+// field is still accepted for backward compatibility but ignored.)
 
 // Strip pairs of leading/trailing matching quotes (ASCII " ', curly “”, 「」, 『』).
 static void oa_strip_outer_quotes(char *s)
@@ -813,19 +885,7 @@ static char *oa_build_request_body(void *talloc_ctx,
         node_map_add_string(m, "content", prompt);
     }
 
-    // History pairs (oldest first)
-    for (int i = 0; i < tr->oa_history_count; i++) {
-        int idx = (tr->oa_history_head + i) % tr->oa_history_cap;
-        struct wt_history_pair *h = &tr->oa_history[idx];
-        if (!h->src || !h->dst)
-            continue;
-        struct mpv_node *u = node_array_add(messages, MPV_FORMAT_NODE_MAP);
-        node_map_add_string(u, "role", "user");
-        node_map_add_string(u, "content", h->src);
-        struct mpv_node *a = node_array_add(messages, MPV_FORMAT_NODE_MAP);
-        node_map_add_string(a, "role", "assistant");
-        node_map_add_string(a, "content", h->dst);
-    }
+    // (No conversational history: translator is stateless.)
 
     // Current user turn
     {
@@ -894,21 +954,28 @@ static char *oa_extract_content(void *talloc_ctx, struct mp_log *log,
 }
 
 static char *translate_openai(struct whisper_translator *tr,
-                              void *talloc_ctx, const char *text)
+                              void *talloc_ctx, const char *text,
+                              struct wt_call_result *out)
 {
-    // Backoff check
+    // Backoff check (under state_lock to coordinate with other workers).
     int64_t now = wt_now_ms();
-    if (tr->backoff_until_ms && now < tr->backoff_until_ms)
+    mp_mutex_lock(&tr->state_lock);
+    if (tr->backoff_until_ms && now < tr->backoff_until_ms) {
+        int remain = (int)(tr->backoff_until_ms - now);
+        mp_mutex_unlock(&tr->state_lock);
+        set_err(out, "openai: in backoff (%dms left)", remain);
         return NULL;
+    }
     if (tr->backoff_until_ms && now >= tr->backoff_until_ms) {
         tr->backoff_until_ms = 0;
         tr->fail_count = 0;
         mp_info(tr->log, "translate: openai backoff window ended, retrying\n");
     }
+    mp_mutex_unlock(&tr->state_lock);
 
     char *body = oa_build_request_body(NULL, tr, text);
     if (!body) {
-        wt_set_error(tr, "openai: build body failed");
+        set_err(out, "openai: build body failed");
         return NULL;
     }
     size_t body_len = strlen(body);
@@ -932,18 +999,27 @@ static char *translate_openai(struct whisper_translator *tr,
     WCHAR *path_wide = utf8_to_wide(NULL, tr->oa_path);
 
     int status = 0;
+    bool rate_limited = false;
+    int retry_after_ms = 0;
     char *response = winhttp_request(NULL, tr->log, tr->session_noproxy,
                                       host_wide, tr->oa_port, tr->oa_is_secure,
                                       L"POST", path_wide, headers_wide,
-                                      body, body_len, &status);
+                                      body, body_len,
+                                      &status, &rate_limited, &retry_after_ms);
 
     talloc_free(host_wide);
     talloc_free(path_wide);
     talloc_free(headers_wide);
     talloc_free(body);
 
+    if (out) {
+        out->http_status = status;
+        out->rate_limited = rate_limited;
+        out->retry_after_ms = retry_after_ms;
+    }
+
     if (!response) {
-        wt_set_error(tr, "openai: HTTP %d", status);
+        set_err(out, "openai: HTTP %d", status);
         return NULL;
     }
 
@@ -951,7 +1027,7 @@ static char *translate_openai(struct whisper_translator *tr,
     talloc_free(response);
 
     if (!content || !content[0]) {
-        wt_set_error(tr, "openai: empty content");
+        set_err(out, "openai: empty content");
         if (content)
             talloc_free(content);
         return NULL;
@@ -959,13 +1035,11 @@ static char *translate_openai(struct whisper_translator *tr,
 
     oa_clean_response(content);
     if (!content[0]) {
-        wt_set_error(tr, "openai: empty after clean");
+        set_err(out, "openai: empty after clean");
         talloc_free(content);
         return NULL;
     }
 
-    // Push to history (best-effort).
-    oa_history_push(tr, text, content);
     return content;
 }
 
@@ -984,6 +1058,8 @@ struct whisper_translator *whisper_translator_create(
     tr->provider = provider;
     tr->source_lang = talloc_strdup(tr, source_lang ? source_lang : "auto");
     tr->target_lang = talloc_strdup(tr, target_lang);
+    mp_mutex_init(&tr->state_lock);
+    atomic_init(&tr->refcount, 1);
 
     WCHAR *ua = utf8_to_wide(NULL, "mpv-whisper/1.0");
     tr->session = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -993,11 +1069,14 @@ struct whisper_translator *whisper_translator_create(
 
     if (!tr->session) {
         mp_err(log, "translate: WinHttpOpen failed (%lu)\n", GetLastError());
+        mp_mutex_destroy(&tr->state_lock);
         talloc_free(tr);
         return NULL;
     }
 
-    WinHttpSetTimeouts(tr->session, 5000, 5000, 10000, 10000);
+    // Hard-clamp receive timeout to WT_MAX_TIMEOUT_MS so stop/seek can
+    // interrupt any in-flight HTTP within bounded time.
+    WinHttpSetTimeouts(tr->session, 5000, 5000, WT_MAX_TIMEOUT_MS, WT_MAX_TIMEOUT_MS);
 
     mp_info(log, "translate: created %s translator (%s -> %s)\n",
             provider == WT_PROVIDER_GOOGLE ? "google" : "azure",
@@ -1025,6 +1104,8 @@ struct whisper_translator *whisper_translator_create_openai(
     tr->source_lang = talloc_strdup(tr, cfg->source_lang && cfg->source_lang[0]
                                     ? cfg->source_lang : "auto");
     tr->target_lang = talloc_strdup(tr, cfg->target_lang);
+    mp_mutex_init(&tr->state_lock);
+    atomic_init(&tr->refcount, 1);
 
     if (!parse_endpoint_url(tr, cfg->endpoint,
                              &tr->oa_scheme, &tr->oa_host,
@@ -1032,6 +1113,7 @@ struct whisper_translator *whisper_translator_create_openai(
                              &tr->oa_is_secure))
     {
         mp_err(log, "translate: openai endpoint URL invalid: %s\n", cfg->endpoint);
+        mp_mutex_destroy(&tr->state_lock);
         talloc_free(tr);
         return NULL;
     }
@@ -1040,12 +1122,10 @@ struct whisper_translator *whisper_translator_create_openai(
     tr->oa_api_key       = talloc_strdup(tr, cfg->api_key ? cfg->api_key : "");
     tr->oa_system_prompt = talloc_strdup(tr,
         cfg->system_prompt ? cfg->system_prompt : "");
-    tr->oa_context_size  = cfg->context_size > 0
-                            ? cfg->context_size : WT_DEFAULT_CONTEXT_SIZE;
-    if (tr->oa_context_size > WT_HISTORY_MAX_PAIRS)
-        tr->oa_context_size = WT_HISTORY_MAX_PAIRS;
-    tr->oa_timeout_ms    = cfg->timeout_ms > 0
-                            ? cfg->timeout_ms : WT_DEFAULT_TIMEOUT_MS;
+    // cfg->context_size is ignored (history removed); see header comment.
+    int t = cfg->timeout_ms > 0 ? cfg->timeout_ms : WT_DEFAULT_TIMEOUT_MS;
+    if (t > WT_MAX_TIMEOUT_MS) t = WT_MAX_TIMEOUT_MS;
+    tr->oa_timeout_ms    = t;
     if (cfg->max_tokens == 0) {
         tr->oa_max_tokens = 0;
     } else if (cfg->max_tokens < 0) {
@@ -1053,10 +1133,6 @@ struct whisper_translator *whisper_translator_create_openai(
     } else {
         tr->oa_max_tokens = cfg->max_tokens;
     }
-
-    tr->oa_history_cap = tr->oa_context_size;
-    tr->oa_history = talloc_zero_array(tr, struct wt_history_pair,
-                                        tr->oa_history_cap);
 
     // Default-proxy session is unused for openai but kept NULL-safe.
     // Use NO_PROXY for loopback / local services.
@@ -1069,82 +1145,134 @@ struct whisper_translator *whisper_translator_create_openai(
     if (!tr->session_noproxy) {
         mp_err(log, "translate: WinHttpOpen (NO_PROXY) failed (%lu)\n",
                GetLastError());
+        mp_mutex_destroy(&tr->state_lock);
         talloc_free(tr);
         return NULL;
     }
 
     int recv_to = tr->oa_timeout_ms;
     if (recv_to < 1000) recv_to = 1000;
-    WinHttpSetTimeouts(tr->session_noproxy, 5000, 5000, 10000, recv_to);
+    WinHttpSetTimeouts(tr->session_noproxy, 5000, 5000, recv_to, recv_to);
 
     mp_info(log, "translate: created openai translator (model=%s, %s -> %s, "
-                 "context=%d, timeout=%dms, %s://%s:%d%s)\n",
+                 "timeout=%dms, %s://%s:%d%s)\n",
             tr->oa_model, tr->source_lang, tr->target_lang,
-            tr->oa_context_size, tr->oa_timeout_ms,
+            tr->oa_timeout_ms,
             tr->oa_scheme, tr->oa_host, tr->oa_port, tr->oa_path);
     return tr;
 }
 
-void whisper_translator_destroy(struct whisper_translator **tr)
+struct whisper_translator *whisper_translator_acquire(
+    struct whisper_translator *tr)
 {
-    if (!tr || !*tr)
-        return;
-    struct whisper_translator *t = *tr;
+    if (!tr)
+        return NULL;
+    atomic_fetch_add_explicit(&tr->refcount, 1, memory_order_acq_rel);
+    return tr;
+}
+
+static void whisper_translator_real_destroy(struct whisper_translator *t)
+{
     if (t->session)
         WinHttpCloseHandle(t->session);
     if (t->session_noproxy)
         WinHttpCloseHandle(t->session_noproxy);
-    if (t->oa_history && t->oa_history_cap > 0)
-        oa_history_clear(t);
+    mp_mutex_destroy(&t->state_lock);
     talloc_free(t);
+}
+
+void whisper_translator_release(struct whisper_translator **tr)
+{
+    if (!tr || !*tr)
+        return;
+    struct whisper_translator *t = *tr;
     *tr = NULL;
+    if (atomic_fetch_sub_explicit(&t->refcount, 1, memory_order_acq_rel) == 1)
+        whisper_translator_real_destroy(t);
+}
+
+void whisper_translator_destroy(struct whisper_translator **tr)
+{
+    // Equivalent to a final release of the creator's initial refcount. If
+    // pipeline workers still hold acquired refs, real teardown is deferred
+    // until they release.
+    whisper_translator_release(tr);
+}
+
+void whisper_translate_call(struct whisper_translator *tr,
+                            void *talloc_ctx, const char *text,
+                            struct wt_call_result *out)
+{
+    if (out)
+        memset(out, 0, sizeof(*out));
+    if (!tr || !text || !text[0]) {
+        set_err(out, "invalid args");
+        return;
+    }
+
+    char *result = NULL;
+    switch (tr->provider) {
+    case WT_PROVIDER_GOOGLE:
+        result = translate_google(tr, talloc_ctx, text, out);
+        break;
+    case WT_PROVIDER_AZURE:
+        result = translate_azure(tr, talloc_ctx, text, out);
+        break;
+    case WT_PROVIDER_OPENAI:
+        result = translate_openai(tr, talloc_ctx, text, out);
+        break;
+    default:
+        set_err(out, "unknown provider");
+        break;
+    }
+
+    mp_mutex_lock(&tr->state_lock);
+    if (result) {
+        tr->fail_count = 0;
+        tr->backoff_until_ms = 0;
+    } else {
+        tr->fail_count++;
+        // Backoff applies only to the OpenAI provider (where each failure is
+        // an outbound API call that may be rate-limited or expensive).
+        if (tr->provider == WT_PROVIDER_OPENAI) {
+            int64_t now_ms = wt_now_ms();
+            if (out && out->rate_limited && !tr->backoff_until_ms) {
+                int wait = out->retry_after_ms > 0
+                            ? out->retry_after_ms
+                            : WT_RATE_LIMIT_BACKOFF_MS;
+                tr->backoff_until_ms = now_ms + wait;
+                mp_warn(tr->log, "translate: openai paused %dms (HTTP 429"
+                                 " retry-after)\n", wait);
+            } else if (tr->fail_count >= WT_BACKOFF_FAIL_THRESHOLD &&
+                       !tr->backoff_until_ms)
+            {
+                tr->backoff_until_ms = now_ms + WT_BACKOFF_MS;
+                mp_warn(tr->log, "translate: openai paused for %dms after %d "
+                                 "failures\n", WT_BACKOFF_MS, tr->fail_count);
+            }
+        }
+    }
+    mp_mutex_unlock(&tr->state_lock);
+
+    if (out)
+        out->translated = result;
 }
 
 char *whisper_translate(struct whisper_translator *tr,
                         void *talloc_ctx, const char *text)
 {
-    if (!tr || !text || !text[0])
-        return NULL;
-
-    char *result = NULL;
-    switch (tr->provider) {
-    case WT_PROVIDER_GOOGLE:
-        result = translate_google(tr, talloc_ctx, text);
-        break;
-    case WT_PROVIDER_AZURE:
-        result = translate_azure(tr, talloc_ctx, text);
-        break;
-    case WT_PROVIDER_OPENAI:
-        result = translate_openai(tr, talloc_ctx, text);
-        break;
-    default:
-        break;
+    struct wt_call_result r;
+    whisper_translate_call(tr, talloc_ctx, text, &r);
+    if (!r.translated && r.error[0]) {
+        // Preserve the previous behaviour of logging WARN on failure for
+        // sync callers that do not inspect wt_call_result themselves.
+        mp_mutex_lock(&tr->state_lock);
+        int fc = tr->fail_count;
+        mp_mutex_unlock(&tr->state_lock);
+        if (fc <= 3 || fc % 10 == 0)
+            mp_warn(tr->log, "translate: failed (count=%d, %s)\n", fc, r.error);
     }
-
-    if (result) {
-        tr->fail_count = 0;
-        tr->backoff_until_ms = 0;
-        tr->last_error[0] = '\0';
-    } else {
-        tr->fail_count++;
-        if (tr->fail_count <= 3 || tr->fail_count % 10 == 0)
-            mp_warn(tr->log, "translate: failed (count=%d, last=%s)\n",
-                    tr->fail_count,
-                    tr->last_error[0] ? tr->last_error : "?");
-
-        // Backoff applies only to the OpenAI provider (where each failure is
-        // an outbound API call that may be rate-limited or expensive).
-        if (tr->provider == WT_PROVIDER_OPENAI &&
-            tr->fail_count >= WT_BACKOFF_FAIL_THRESHOLD &&
-            !tr->backoff_until_ms)
-        {
-            tr->backoff_until_ms = wt_now_ms() + WT_BACKOFF_MS;
-            mp_warn(tr->log, "translate: openai paused for %dms after %d "
-                             "failures\n", WT_BACKOFF_MS, tr->fail_count);
-        }
-    }
-
-    return result;
+    return r.translated;
 }
 
 void whisper_translator_get_status(struct whisper_translator *tr,
@@ -1156,11 +1284,16 @@ void whisper_translator_get_status(struct whisper_translator *tr,
     if (!tr)
         return;
     out->enabled = true;
+    mp_mutex_lock(&tr->state_lock);
     out->fail_count = tr->fail_count;
     int64_t now = wt_now_ms();
     if (tr->backoff_until_ms && now < tr->backoff_until_ms) {
         out->paused = true;
         out->retry_after_ms = (int)(tr->backoff_until_ms - now);
     }
-    snprintf(out->last_error, sizeof(out->last_error), "%s", tr->last_error);
+    mp_mutex_unlock(&tr->state_lock);
+    // last_error is no longer tracked at the translator level (it is
+    // per-call). Keep the field in wt_status for ABI/JSON compat but emit
+    // an empty string.
+    out->last_error[0] = '\0';
 }

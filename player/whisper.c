@@ -123,6 +123,8 @@ struct frame_item {
     uint64_t generation;
 };
 
+struct wt_pipeline;
+
 // Snapshot of core-thread state visible to the worker. Updated by
 // whisper_lookahead_publish(); read by the worker under snap_lock.
 struct wl_snap {
@@ -215,6 +217,11 @@ struct whisper_lookahead {
     // translate call (so config swap waits for in-flight HTTP).
     mp_mutex translator_lock;
     struct whisper_translator *translator;
+
+    // Async AI translation pipeline. Lives for the entire whisper_lookahead
+    // lifetime; workers idle when wl->translator is NULL. Created in
+    // whisper_lookahead_start(), destroyed in whisper_lookahead_stop().
+    struct wt_pipeline *pipeline;
 
     // ---- Hallucination & repetition filter (sink thread only) ----
     // Last few normalized texts we've already injected; used to drop whisper
@@ -447,44 +454,462 @@ static bool wl_apply_ai_translator_locked(struct whisper_lookahead *wl,
 
 
 
-// ---------- Subtitle injection ----------
+// ---------- Async AI translation pipeline ----------
+//
+// Background:
+//   `inject_subtitle()` runs in the lookahead worker (sink filter) thread.
+//   With AI translators (OpenAI-compatible), each translation is a 2–5s
+//   HTTP round-trip. Doing it inline serializes whisper segments behind
+//   network IO, so by the time a translated subtitle reaches the demuxer
+//   (`pts + sub_duration < playback_pts`), `dec_sub` silently drops it
+//   (sub/dec_sub.c:306). The user sees no subtitle while the log shows
+//   "translated #N: ...".
+//
+// Design:
+//   - Sink thread enqueues a task (text + pts + dur + generation snapshot)
+//     into wt_pipeline.pending, instead of calling the translator inline.
+//   - N (default 3) worker threads pop tasks and run whisper_translate_call.
+//   - Workers push results into wt_pipeline.results and wake the core.
+//   - The playloop calls whisper_lookahead_drain_results() each tick. The
+//     core thread is the *only* writer of subtitle packets; this avoids
+//     racing with seek/audio-chain-change.
+//   - Generation gating: each task records the current generation at enqueue.
+//     If the generation changes (seek / audio chain change / translator
+//     swap), drained results with stale generations are dropped.
+//
+// Fallback / failure model:
+//   ① No translator                     → sink thread feeds the original
+//                                         text synchronously (legacy path).
+//   ② Translation succeeds, on-time     → drain feeds bilingual ASS line.
+//   ③ Translation succeeds, but late
+//      (pts + dur + EPSILON < now)      → dropped (timing must remain
+//                                         accurate; partial subtitles
+//                                         disrupt viewing more than missing
+//                                         ones).
+//   ④ Translation fails / backoff       → drain feeds original text. The
+//                                         first error message is logged at
+//                                         WARN level; subsequent errors are
+//                                         counted but suppressed until a
+//                                         success resets the marker.
+//   ⑤ Slack < MIN_TRANSLATE_SLACK at
+//      enqueue time                     → sink feeds original immediately
+//                                         (cheap; avoids burning API calls
+//                                         on subtitles that are already too
+//                                         close to playback to land in time).
+//   ⑥ Result queue overflow             → push the *most-future* pending
+//                                         task back as an original-fallback
+//                                         result (we never drop the
+//                                         soonest-needed task, that one is
+//                                         the most likely to actually get
+//                                         displayed in time).
 
-// Inject a single subtitle with the given text, pts, and duration. PTS is in
-// the player's timeline domain (seconds). V3.1 produces accurate PTS so no
-// shift hack is required.
-static void inject_subtitle(struct whisper_lookahead *wl,
-                            const char *text, double pts, double dur)
+#define WT_WORKERS_DEFAULT      3
+#define WT_WORKERS_MAX          8
+#define WT_PEND_MAX             64
+#define WT_RES_MAX              128
+#define MIN_TRANSLATE_SLACK_S   1.0
+#define WT_DRAIN_EPSILON_S      0.05
+
+struct wt_task {
+    uint64_t generation;
+    int      seq;
+    double   pts;
+    double   dur;
+    char    *text;          // talloc child of task
+};
+
+struct wt_result {
+    uint64_t generation;
+    int      seq;
+    double   pts;
+    double   dur;
+    char    *text;          // original (talloc child of result)
+    char    *translated;    // success: talloc child; failure: NULL
+    bool    rate_limited;
+    char    *error_brief;   // first-failure-only WARN payload (or NULL)
+};
+
+struct wt_pipeline {
+    struct whisper_lookahead *wl;   // back ref (no ownership)
+
+    // ---- pending queue (sink producer; workers consumer) ----
+    mp_mutex pend_lock;
+    mp_cond  pend_cv;
+    struct wt_task **pending;
+    int pend_num;
+    int pend_cap;
+
+    // ---- result queue (workers producer; core consumer) ----
+    mp_mutex res_lock;
+    struct wt_result **results;
+    int res_num;
+    int res_cap;
+
+    // ---- worker threads ----
+    mp_thread workers[WT_WORKERS_MAX];
+    int       worker_count;
+    atomic_bool terminate;
+
+    // ---- per-pipeline state (under pend_lock) ----
+    int next_seq;
+    bool first_failure_logged;
+};
+
+// Forward declarations.
+static void wl_feed_subtitle_text(struct whisper_lookahead *wl,
+                                  const char *body,
+                                  double pts, double dur);
+static void wt_push_result(struct wt_pipeline *wt, struct wt_result *r);
+
+// Reads `wl->translator` and bumps its refcount; caller must release.
+// Returns NULL if no translator is set.
+static struct whisper_translator *wt_acquire_translator(
+    struct whisper_lookahead *wl)
 {
-    if (!wl->primary_stream || !wl->primary_demuxer || !text || !text[0])
+    mp_mutex_lock(&wl->translator_lock);
+    struct whisper_translator *tr = wl->translator
+        ? whisper_translator_acquire(wl->translator) : NULL;
+    mp_mutex_unlock(&wl->translator_lock);
+    return tr;
+}
+
+static MP_THREAD_VOID wt_worker_loop(void *arg)
+{
+    struct wt_pipeline *wt = arg;
+    struct whisper_lookahead *wl = wt->wl;
+    mp_thread_set_name("whisper-trans");
+
+    for (;;) {
+        // Wait for a task or terminate.
+        mp_mutex_lock(&wt->pend_lock);
+        while (!atomic_load(&wt->terminate) && wt->pend_num == 0)
+            mp_cond_wait(&wt->pend_cv, &wt->pend_lock);
+        if (atomic_load(&wt->terminate)) {
+            mp_mutex_unlock(&wt->pend_lock);
+            break;
+        }
+        // Pop the front (oldest = most-needed-soon).
+        struct wt_task *task = wt->pending[0];
+        memmove(&wt->pending[0], &wt->pending[1],
+                sizeof(struct wt_task *) * (wt->pend_num - 1));
+        wt->pend_num--;
+        mp_mutex_unlock(&wt->pend_lock);
+
+        // Build a result. Owned by talloc(NULL); pushed into the queue.
+        struct wt_result *r = talloc_zero(NULL, struct wt_result);
+        r->generation = task->generation;
+        r->seq        = task->seq;
+        r->pts        = task->pts;
+        r->dur        = task->dur;
+        r->text       = talloc_strdup(r, task->text);
+
+        struct whisper_translator *tr = wt_acquire_translator(wl);
+        if (!tr) {
+            r->error_brief = talloc_strdup(r, "no translator");
+        } else {
+            struct wt_call_result call;
+            char *out = NULL;
+            void *tmp = talloc_new(NULL);
+            whisper_translate_call(tr, tmp, task->text, &call);
+            if (call.translated)
+                out = talloc_strdup(r, call.translated);
+            r->translated = out;
+            r->rate_limited = call.rate_limited;
+            if (!call.translated && call.error[0])
+                r->error_brief = talloc_strdup(r, call.error);
+            talloc_free(tmp);
+            whisper_translator_release(&tr);
+        }
+
+        talloc_free(task);
+        wt_push_result(wt, r);
+    }
+
+    MP_THREAD_RETURN();
+}
+
+// Push a result. Bounded by WT_RES_MAX; under overflow we drop the oldest
+// untranslated entries (worst case: translator hammered + drain stalled,
+// playback already moved past). The drain itself decides timing/generation.
+static void wt_push_result(struct wt_pipeline *wt, struct wt_result *r)
+{
+    mp_mutex_lock(&wt->res_lock);
+    if (wt->res_num >= wt->res_cap) {
+        int new_cap = wt->res_cap ? wt->res_cap * 2 : 16;
+        if (new_cap > WT_RES_MAX)
+            new_cap = WT_RES_MAX;
+        if (new_cap > wt->res_cap) {
+            wt->results = talloc_realloc(wt, wt->results,
+                                          struct wt_result *, new_cap);
+            wt->res_cap = new_cap;
+        }
+    }
+    if (wt->res_num >= WT_RES_MAX) {
+        // Hard cap; drop the oldest result (it is the most likely already
+        // past its display window if drain is this far behind).
+        talloc_free(wt->results[0]);
+        memmove(&wt->results[0], &wt->results[1],
+                sizeof(struct wt_result *) * (wt->res_num - 1));
+        wt->res_num--;
+    }
+    wt->results[wt->res_num++] = r;
+    mp_mutex_unlock(&wt->res_lock);
+    mp_wakeup_core(wt->wl->mpctx);
+}
+
+// Allocate a task and enqueue it. If the pending queue is full, the
+// most-future pending task is evicted and demoted to a fallback (original-
+// text) result.
+static void wt_enqueue(struct wt_pipeline *wt,
+                       uint64_t generation,
+                       const char *text, double pts, double dur)
+{
+    struct wt_task *task = talloc_zero(NULL, struct wt_task);
+    task->generation = generation;
+    task->pts = pts;
+    task->dur = dur;
+    task->text = talloc_strdup(task, text);
+
+    struct wt_result *evicted = NULL;
+
+    mp_mutex_lock(&wt->pend_lock);
+    task->seq = wt->next_seq++;
+    if (wt->pend_num >= wt->pend_cap) {
+        int new_cap = wt->pend_cap ? wt->pend_cap * 2 : 16;
+        if (new_cap > WT_PEND_MAX)
+            new_cap = WT_PEND_MAX;
+        if (new_cap > wt->pend_cap) {
+            wt->pending = talloc_realloc(wt, wt->pending,
+                                          struct wt_task *, new_cap);
+            wt->pend_cap = new_cap;
+        }
+    }
+    if (wt->pend_num >= WT_PEND_MAX) {
+        // Pick the largest-pts task to evict (safest to convert to a
+        // fallback because it has the most slack remaining for the user
+        // to actually see the original text).
+        int worst = 0;
+        for (int i = 1; i < wt->pend_num; i++) {
+            if (wt->pending[i]->pts > wt->pending[worst]->pts)
+                worst = i;
+        }
+        struct wt_task *t = wt->pending[worst];
+        memmove(&wt->pending[worst], &wt->pending[worst + 1],
+                sizeof(struct wt_task *) * (wt->pend_num - worst - 1));
+        wt->pend_num--;
+
+        evicted = talloc_zero(NULL, struct wt_result);
+        evicted->generation = t->generation;
+        evicted->seq = t->seq;
+        evicted->pts = t->pts;
+        evicted->dur = t->dur;
+        evicted->text = talloc_strdup(evicted, t->text);
+        evicted->error_brief = talloc_strdup(evicted, "queue overflow");
+        talloc_free(t);
+    }
+    wt->pending[wt->pend_num++] = task;
+    mp_cond_signal(&wt->pend_cv);
+    mp_mutex_unlock(&wt->pend_lock);
+
+    if (evicted)
+        wt_push_result(wt, evicted);
+}
+
+// Drop all pending tasks (e.g. on seek / generation bump). In-flight tasks
+// inside workers are NOT cancelled; their results will be discarded by the
+// drain when their generation no longer matches.
+static void wt_clear_pending(struct wt_pipeline *wt)
+{
+    mp_mutex_lock(&wt->pend_lock);
+    for (int i = 0; i < wt->pend_num; i++)
+        talloc_free(wt->pending[i]);
+    wt->pend_num = 0;
+    mp_mutex_unlock(&wt->pend_lock);
+}
+
+static struct wt_pipeline *wt_pipeline_create(struct whisper_lookahead *wl)
+{
+    struct wt_pipeline *wt = talloc_zero(wl, struct wt_pipeline);
+    wt->wl = wl;
+    mp_mutex_init(&wt->pend_lock);
+    mp_mutex_init(&wt->res_lock);
+    mp_cond_init(&wt->pend_cv);
+    atomic_init(&wt->terminate, false);
+    wt->pending = talloc_zero_array(wt, struct wt_task *, 16);
+    wt->pend_cap = 16;
+    wt->results = talloc_zero_array(wt, struct wt_result *, 16);
+    wt->res_cap = 16;
+    wt->next_seq = 1;
+
+    int n = WT_WORKERS_DEFAULT;
+    if (n < 1) n = 1;
+    if (n > WT_WORKERS_MAX) n = WT_WORKERS_MAX;
+    for (int i = 0; i < n; i++) {
+        if (mp_thread_create(&wt->workers[i], wt_worker_loop, wt) == 0)
+            wt->worker_count++;
+        else
+            MP_WARN(wl, "wt_pipeline: failed to spawn worker %d\n", i);
+    }
+    if (wt->worker_count == 0) {
+        MP_ERR(wl, "wt_pipeline: no workers; AI translation disabled\n");
+        // Tear down so callers don't enqueue tasks that nobody will drain.
+        mp_cond_destroy(&wt->pend_cv);
+        mp_mutex_destroy(&wt->pend_lock);
+        mp_mutex_destroy(&wt->res_lock);
+        talloc_free(wt);
+        return NULL;
+    }
+    MP_INFO(wl, "wt_pipeline: started with %d worker(s)\n", wt->worker_count);
+    return wt;
+}
+
+static void wt_pipeline_destroy(struct wt_pipeline **ptr)
+{
+    if (!ptr || !*ptr)
+        return;
+    struct wt_pipeline *wt = *ptr;
+    *ptr = NULL;
+
+    atomic_store(&wt->terminate, true);
+    mp_mutex_lock(&wt->pend_lock);
+    mp_cond_broadcast(&wt->pend_cv);
+    mp_mutex_unlock(&wt->pend_lock);
+
+    for (int i = 0; i < wt->worker_count; i++)
+        mp_thread_join(wt->workers[i]);
+
+    for (int i = 0; i < wt->pend_num; i++)
+        talloc_free(wt->pending[i]);
+    for (int i = 0; i < wt->res_num; i++)
+        talloc_free(wt->results[i]);
+
+    mp_cond_destroy(&wt->pend_cv);
+    mp_mutex_destroy(&wt->pend_lock);
+    mp_mutex_destroy(&wt->res_lock);
+    talloc_free(wt);
+}
+
+// Drain ready translation results on the core thread and feed them as
+// subtitle packets. Called from the playloop. Safe to call when wl/pipeline
+// is NULL.
+void whisper_lookahead_drain_results(struct MPContext *mpctx)
+{
+    struct whisper_lookahead *wl = mpctx->whisper_lookahead;
+    if (!wl || !wl->pipeline || !wl->primary_stream || !wl->primary_demuxer)
+        return;
+    struct wt_pipeline *wt = wl->pipeline;
+
+    // Snapshot results.
+    struct wt_result **batch = NULL;
+    int n = 0;
+    mp_mutex_lock(&wt->res_lock);
+    if (wt->res_num > 0) {
+        batch = talloc_array(NULL, struct wt_result *, wt->res_num);
+        memcpy(batch, wt->results, sizeof(*batch) * wt->res_num);
+        n = wt->res_num;
+        wt->res_num = 0;
+    }
+    mp_mutex_unlock(&wt->res_lock);
+    if (n == 0)
         return;
 
-    char *sub_text = NULL;
-    mp_mutex_lock(&wl->translator_lock);
-    if (wl->translator) {
-        char *translated = whisper_translate(wl->translator, wl, text);
-        if (translated) {
-            sub_text = talloc_asprintf(wl,
+    // Sort by seq so ASS ReadOrder remains monotonic.
+    for (int i = 1; i < n; i++) {
+        struct wt_result *cur = batch[i];
+        int j = i - 1;
+        while (j >= 0 && batch[j]->seq > cur->seq) {
+            batch[j + 1] = batch[j];
+            j--;
+        }
+        batch[j + 1] = cur;
+    }
+
+    // Latest generation + playback time (single thread; no lock for these).
+    uint64_t cur_gen;
+    double now_pts;
+    mp_mutex_lock(&wl->snap_lock);
+    cur_gen = wl->snap.generation;
+    now_pts = wl->snap.playback_pts;
+    mp_mutex_unlock(&wl->snap_lock);
+    if (!isfinite(now_pts))
+        now_pts = -INFINITY;
+
+    bool any_success = false;
+    for (int i = 0; i < n; i++) {
+        struct wt_result *r = batch[i];
+
+        // ⑤ Generation mismatch (seek / audio chain change / translator
+        // swap happened after enqueue): silently drop.
+        if (r->generation != cur_gen) {
+            talloc_free(r);
+            continue;
+        }
+
+        // ③ Already past the display window: drop.
+        if (r->pts + r->dur + WT_DRAIN_EPSILON_S < now_pts) {
+            MP_INFO(wl, "translation arrived late, dropped (pts=%.3f "
+                        "dur=%.2f, now=%.3f)\n", r->pts, r->dur, now_pts);
+            talloc_free(r);
+            continue;
+        }
+
+        if (r->translated) {
+            // ② Success path: bilingual ASS line.
+            char *body = talloc_asprintf(NULL,
                 "{\\fs72\\c&H00FFFFFF&\\3c&H00000000&\\bord3}%s"
                 "\\N{\\fs48\\c&H00E0FFFF&\\3c&H00000000&\\bord2}%s",
-                translated, text);
+                r->translated, r->text);
             wl->translations_injected++;
             MP_INFO(wl, "translated #%d: %.40s%s\n",
                     wl->translations_injected,
-                    translated,
-                    strlen(translated) > 40 ? "..." : "");
-            talloc_free(translated);
+                    r->translated,
+                    strlen(r->translated) > 40 ? "..." : "");
+            wl_feed_subtitle_text(wl, body, r->pts, r->dur);
+            talloc_free(body);
+            any_success = true;
+        } else {
+            // ④ Failure path: feed original; first error WARNed.
+            if (!wt->first_failure_logged && r->error_brief) {
+                MP_WARN(wl, "translation failed: %s (showing original; "
+                            "subsequent failures suppressed until next "
+                            "success)\n", r->error_brief);
+                mp_mutex_lock(&wt->pend_lock);
+                wt->first_failure_logged = true;
+                mp_mutex_unlock(&wt->pend_lock);
+            }
+            wl_feed_subtitle_text(wl, r->text, r->pts, r->dur);
         }
-    }
-    mp_mutex_unlock(&wl->translator_lock);
 
-    if (!sub_text)
-        sub_text = talloc_strdup(wl, text);
+        talloc_free(r);
+    }
+    talloc_free(batch);
+
+    // Clear the suppression flag once any translation succeeded so a new
+    // failure burst will be logged again.
+    if (any_success) {
+        mp_mutex_lock(&wt->pend_lock);
+        wt->first_failure_logged = false;
+        mp_mutex_unlock(&wt->pend_lock);
+    }
+}
+
+// ---------- Subtitle injection ----------
+
+// Build the ASS line for `body` and feed it as a subtitle packet for the
+// currently published primary sub stream. Used by both the synchronous
+// (no-translator) sink path and the asynchronous (translator drain) core
+// path. Caller already filtered out NULL/empty text and validated that
+// wl->primary_stream / primary_demuxer are non-NULL.
+static void wl_feed_subtitle_text(struct whisper_lookahead *wl,
+                                  const char *body,
+                                  double pts, double dur)
+{
+    if (!wl->primary_stream || !wl->primary_demuxer || !body || !body[0])
+        return;
 
     char *ass_line = talloc_asprintf(wl,
         "%d,0,Default,,0,0,0,,%s",
-        wl->subtitles_injected, sub_text);
-    talloc_free(sub_text);
-
+        wl->subtitles_injected, body);
     size_t ass_len = strlen(ass_line);
     struct demux_packet *dp = new_demux_packet_from(
         wl->primary_demuxer->packet_pool,
@@ -498,12 +923,60 @@ static void inject_subtitle(struct whisper_lookahead *wl,
         demuxer_feed_af_sub(wl->primary_stream, dp);
         wl->subtitles_injected++;
         MP_INFO(wl, "subtitle #%d @ %.3f (dur=%.1f): %.40s%s\n",
-                wl->subtitles_injected, pts, dur, text,
-                strlen(text) > 40 ? "..." : "");
+                wl->subtitles_injected, pts, dur, body,
+                strlen(body) > 40 ? "..." : "");
 
         mp_wakeup_core(wl->mpctx);
     }
     talloc_free(ass_line);
+}
+
+// Inject a single subtitle with the given text, pts, and duration. PTS is in
+// the player's timeline domain (seconds). V3.1 produces accurate PTS so no
+// shift hack is required.
+//
+// Three paths:
+//   ① No translator → feed original synchronously here.
+//   ⑤ Translator configured but slack too tight → feed original here too.
+//   Otherwise → enqueue to wt_pipeline; drain feeds (translated or original
+//   fallback) on the core thread.
+static void inject_subtitle(struct whisper_lookahead *wl,
+                            const char *text, double pts, double dur)
+{
+    if (!wl->primary_stream || !wl->primary_demuxer || !text || !text[0])
+        return;
+
+    bool have_translator;
+    mp_mutex_lock(&wl->translator_lock);
+    have_translator = wl->translator != NULL;
+    mp_mutex_unlock(&wl->translator_lock);
+
+    if (!have_translator || !wl->pipeline) {
+        // ① Plain feed (no AI translation in play).
+        wl_feed_subtitle_text(wl, text, pts, dur);
+        return;
+    }
+
+    // ⑤ Slack check at enqueue time; avoid burning API tokens on subtitles
+    // that are already too close to playback to land in time.
+    uint64_t gen;
+    double now_pts;
+    mp_mutex_lock(&wl->snap_lock);
+    gen = wl->snap.generation;
+    now_pts = wl->snap.playback_pts;
+    mp_mutex_unlock(&wl->snap_lock);
+    if (!isfinite(now_pts))
+        now_pts = -INFINITY;
+
+    double slack = pts + dur - now_pts;
+    if (isfinite(now_pts) && slack < MIN_TRANSLATE_SLACK_S) {
+        MP_INFO(wl, "translate skipped (slack=%.2fs < %.2fs); "
+                    "showing original\n", slack, MIN_TRANSLATE_SLACK_S);
+        wl_feed_subtitle_text(wl, text, pts, dur);
+        return;
+    }
+
+    wt_enqueue(wl->pipeline, gen, text, pts, dur);
 }
 
 // Parse JSON segments array: [{"s":ms,"e":ms,"t":"text"}, ...]
@@ -1526,6 +1999,8 @@ void whisper_lookahead_start(struct MPContext *mpctx, const char *whisper_opts)
     mp_mutex_init(&wl->translator_lock);
     mp_cond_init(&wl->queue_cv);
 
+    wl->pipeline = wt_pipeline_create(wl);
+
     mpctx->whisper_lookahead = wl;
 
     // Publish initial snapshot so the worker has something to do as soon as
@@ -1572,6 +2047,10 @@ void whisper_lookahead_stop(struct MPContext *mpctx)
     if (wl->thread_valid)
         mp_thread_join(wl->thread);
     wl->thread_valid = false;
+
+    // Tear down translation pipeline before the translator: workers may
+    // hold acquired refs on the translator; destroy() blocks for them.
+    wt_pipeline_destroy(&wl->pipeline);
 
     if (wl->root_filter) {
         talloc_free(wl->root_filter);
@@ -1643,6 +2122,12 @@ void whisper_lookahead_seek(struct MPContext *mpctx, double pts)
     // the decoder, resets the lavfi graph (recreating whisper → clearing its
     // VAD), and starts a fresh window from the new playback position.
     bump_generation(wl);
+
+    // Drop pending translation tasks queued before the seek; they would
+    // produce subtitles for now-stale positions. In-flight translations
+    // inside workers will simply be discarded by the drain.
+    if (wl->pipeline)
+        wt_clear_pending(wl->pipeline);
 }
 
 void whisper_lookahead_on_audio_chain_changed(struct MPContext *mpctx)
@@ -1650,9 +2135,13 @@ void whisper_lookahead_on_audio_chain_changed(struct MPContext *mpctx)
     struct whisper_lookahead *wl = mpctx->whisper_lookahead;
     if (!wl)
         return;
-    // Re-publish first (so the new audio_sh / codec is visible), then bump.
-    whisper_lookahead_publish(mpctx);
+    // Bump first, THEN publish: any drain that wakes during this window
+    // sees a generation that does not match in-flight tasks, so old
+    // translations cannot leak onto the new audio chain.
     bump_generation(wl);
+    whisper_lookahead_publish(mpctx);
+    if (wl->pipeline)
+        wt_clear_pending(wl->pipeline);
 }
 
 bool whisper_lookahead_track_selected(struct MPContext *mpctx)
@@ -1709,6 +2198,12 @@ void whisper_lookahead_set_ai_translate(struct MPContext *mpctx,
         MP_INFO(wl, "whisper-ai-translate: disabled\n");
     }
     mp_mutex_unlock(&wl->translator_lock);
+
+    // Translator identity changed: drop any pending tasks and bump the
+    // generation so in-flight worker results are discarded by the drain.
+    if (wl->pipeline)
+        wt_clear_pending(wl->pipeline);
+    bump_generation(wl);
 }
 
 // Returns a JSON string (talloc child of `ta_parent`) describing the current

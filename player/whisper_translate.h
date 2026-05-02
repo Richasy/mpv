@@ -38,8 +38,14 @@ struct wt_openai_config {
     const char *source_lang;    // may be NULL ("auto")
     const char *target_lang;    // required, e.g. "zh"
     const char *system_prompt;  // optional. If NULL/empty, mpv built-in fallback.
-    int context_size;           // sliding history pairs; <=0 means default (4)
-    int timeout_ms;             // per-request timeout; <=0 means default (30000)
+    int context_size;           // accepted for backward compat; ignored.
+                                // OpenAI history was removed to make the
+                                // translator stateless and safely callable
+                                // from multiple worker threads in parallel.
+    int timeout_ms;             // per-request timeout; <=0 means default.
+                                // Hard-clamped to <= 5000 ms internally so
+                                // stop/seek can reliably interrupt within a
+                                // bounded delay.
     int max_tokens;             // 0 means: don't send max_tokens; <0 means default (128)
 };
 
@@ -71,8 +77,40 @@ struct whisper_translator *whisper_translator_create_openai(
 // Destroy a translator instance, closing WinHTTP handles.
 void whisper_translator_destroy(struct whisper_translator **tr);
 
+// Per-call result of whisper_translate_call(). Caller does NOT need to free
+// any field individually; `translated` is a talloc child of the talloc_ctx
+// passed to whisper_translate_call(). All numeric fields are value types
+// and `error` is an inline buffer.
+struct wt_call_result {
+    char *translated;        // success: talloc string. failure: NULL.
+    int   http_status;       // 0 if no HTTP was issued (e.g. backoff)
+    bool  rate_limited;      // 429 / equivalent
+    int   retry_after_ms;    // parsed from Retry-After header (0 if absent)
+    char  error[256];        // short reason on failure ("" on success)
+};
+
+// Translate text synchronously into `out`. Safe to call concurrently from
+// multiple threads on the same translator: internal mutable state is guarded
+// by a per-translator state_lock; the HTTP call itself is performed without
+// any lock held so multiple in-flight requests can run in parallel.
+//
+// `talloc_ctx` parents the returned `translated` string (if any).
+void whisper_translate_call(struct whisper_translator *tr,
+                            void *talloc_ctx,
+                            const char *text,
+                            struct wt_call_result *out);
+
+// Acquire / release a refcount on the translator. Use these when keeping a
+// translator pointer alive across an unlocked HTTP call while another thread
+// might destroy the translator. `whisper_translator_destroy()` is equivalent
+// to a final release.
+struct whisper_translator *whisper_translator_acquire(
+    struct whisper_translator *tr);
+void whisper_translator_release(struct whisper_translator **tr);
+
 // Translate text synchronously. Returns a talloc-allocated string on success,
-// or NULL on failure. Safe to call from the lookahead background thread.
+// or NULL on failure. Thin wrapper around whisper_translate_call(); kept for
+// backward source compatibility with non-pipelined callers.
 char *whisper_translate(struct whisper_translator *tr,
                         void *talloc_ctx, const char *text);
 

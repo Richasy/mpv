@@ -77,6 +77,12 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 #define rect_h(r) ((r).bottom - (r).top)
 
 #define WM_SHOWMENU (WM_USER + 1)
+// Posted to the embedded mpv child window when the parent (host) window's
+// location changes. The hook callbacks run on the parent's UI thread, so we
+// hop back to the vo thread by posting this message and refresh display info
+// there. Needed because a child HWND never receives WM_WINDOWPOSCHANGED /
+// WM_DISPLAYCHANGE when only the parent moves between monitors.
+#define WM_PARENT_LOCATION_CHANGED (WM_USER + 2)
 
 struct w32_api {
     BOOLEAN (WINAPI *pShouldAppsUseDarkMode)(void);
@@ -675,6 +681,13 @@ static void update_display_info(struct vo_w32_state *w32)
 
     update_dpi(w32);
 
+    // Window may now intersect a different set of monitors, so the
+    // display-names property must be re-queried even if the refresh rate is
+    // identical (common with two monitors at the same Hz). Without this,
+    // observers on display-names never fire after a parent-driven monitor
+    // move in --wid embedding mode.
+    signal_events(w32, VO_EVENT_WIN_STATE);
+
     MONITORINFOEXW mi = { .cbSize = sizeof mi };
     GetMonitorInfoW(monitor, (MONITORINFO*)&mi);
 
@@ -691,7 +704,6 @@ static void update_display_info(struct vo_w32_state *w32)
         if (freq == 0.0)
             MP_WARN(w32, "Couldn't determine monitor refresh rate\n");
         w32->display_fps = freq;
-        signal_events(w32, VO_EVENT_WIN_STATE);
     }
 
     char *color_profile = get_color_profile(w32, mi.szDevice);
@@ -1471,6 +1483,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         subtract_window_borders(w32, w32->window, &w32->current_rect);
         window_resize(w32);
         break;
+    case WM_PARENT_LOCATION_CHANGED:
+        // Posted by the parent-window hooks when the host window moves /
+        // resizes. Force-refresh display info so observers of display-names,
+        // display-fps, ICC etc. see updates after a host-driven monitor move.
+        force_update_display_info(w32);
+        break;
     case WM_CLOSE:
         // Don't destroy the window yet to not lose wakeup events.
         mp_input_put_key(w32->input_ctx, MP_KEY_CLOSE_WIN);
@@ -1776,6 +1794,13 @@ static void resize_child_win(HWND parent)
     // Make sure the window was created by this instance
     if (GetWindowLongPtrW(child, GWLP_HINSTANCE) != (LONG_PTR)HINST_THISCOMPONENT)
         return;
+
+    // The parent moved or resized. Even when the size is unchanged (parent
+    // dragged across monitors) we need the child's vo thread to refresh
+    // monitor-derived state (display-fps, ICC, display-names). The child
+    // never sees WM_WINDOWPOSCHANGED in that case because we only call
+    // SetWindowPos below when the size actually differs.
+    PostMessageW(child, WM_PARENT_LOCATION_CHANGED, 0, 0);
 
     // Resize the mpv window to match its parent window's size
     RECT rm, rp;

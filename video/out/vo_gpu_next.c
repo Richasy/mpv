@@ -990,14 +990,17 @@ static bool set_colorspace_hint(struct priv *p, struct pl_color_space *hint)
         },
     };
 
+    bool external = false;
     if (sw->fns->set_color && sw->fns->set_color(sw, hint ? &params : NULL)) {
         if (hint) {
             *hint = params.color;
-            return true;
+            external = true;
         }
+    } else {
+        pl_swapchain_colorspace_hint(p->sw, hint);
     }
-    pl_swapchain_colorspace_hint(p->sw, hint);
-    return false;
+
+    return external;
 }
 
 static void update_tm_viz(struct pl_color_map_params *params,

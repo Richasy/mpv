@@ -17,8 +17,10 @@
 
 #include "common/msg.h"
 #include "options/m_config.h"
+#include "osdep/io.h"
 #include "osdep/timer.h"
 #include "osdep/windows_utils.h"
+#include "ta/ta_talloc.h"
 
 #include "video/out/gpu/context.h"
 #include "video/out/gpu/d3d11_helpers.h"
@@ -491,13 +493,67 @@ static void composition_get_display_res(struct priv *p, int res[2])
     res[1] = mi.rcMonitor.bottom - mi.rcMonitor.top;
 }
 
+// Build a display-name list for the composition HWND.
+//
+// Unlike the vo_w32_common path, our HWND is the host application's
+// top-level window (set via the d3d11-composition-hwnd option), not a
+// child window owned by mpv whose client rect equals the visible video
+// area. The host HWND's client rect can be much larger than the actual
+// SwapChainPanel that mpv renders to, so EnumDisplayMonitors over it can
+// trivially intersect every monitor and produce a misleading multi-monitor
+// list. Use only the monitor Windows associates with the host HWND, so
+// "display-names" reflects the screen the user perceives the player on.
+static char **composition_get_disp_names(struct ra_ctx *ctx, struct priv *p)
+{
+    HWND hwnd = composition_get_hwnd(p);
+    HMONITOR assoc = composition_get_monitor(p);
+    if (!assoc)
+        return NULL;
+
+    MONITORINFOEXW mi = { .cbSize = sizeof mi };
+    if (!GetMonitorInfoW(assoc, (MONITORINFO *)&mi))
+        return NULL;
+
+    char assoc_dev[64] = "<unknown>";
+    WideCharToMultiByte(CP_UTF8, 0, mi.szDevice, -1, assoc_dev,
+                        sizeof assoc_dev, NULL, NULL);
+
+    MP_VERBOSE(ctx, "composition_get_disp_names: hwnd=%p assoc=%p (%s)\n",
+               (void *)hwnd, (void *)assoc, assoc_dev);
+
+    char **names = NULL;
+    int count = 0;
+    MP_TARRAY_APPEND(NULL, names, count, mp_to_utf8(NULL, mi.szDevice));
+    MP_TARRAY_APPEND(NULL, names, count, NULL);
+    return names;
+}
+
 // Poll the monitor hosting the composition HWND and flag VO_EVENT_WIN_STATE
-// when it changes, so the core re-queries display FPS / DPI / ICC.
+// when it changes, so the core re-queries display FPS / DPI / ICC /
+// display-names. Composition mode has no Win32 message loop hooked up here, so
+// this is the only signal callers get for monitor moves.
 static void composition_poll_monitor(struct ra_ctx *ctx, int *events)
 {
     struct priv *p = ctx->priv;
     HMONITOR mon = composition_get_monitor(p);
     if (mon != p->composition_monitor) {
+        // Log new monitor's GDI device name so we can confirm in -v output
+        // that the composition window's host monitor actually changes when
+        // the user drags the window across screens. Without this it's very
+        // hard to tell whether MonitorFromWindow / the host hwnd is wrong,
+        // or whether the core just isn't re-querying display-names.
+        wchar_t dev_w[32] = {0};
+        char dev[64] = "<unknown>";
+        if (mon) {
+            MONITORINFOEXW mi = { .cbSize = sizeof mi };
+            if (GetMonitorInfoW(mon, (MONITORINFO *)&mi)) {
+                wcsncpy(dev_w, mi.szDevice, 31);
+                WideCharToMultiByte(CP_UTF8, 0, dev_w, -1, dev,
+                                    sizeof dev, NULL, NULL);
+            }
+        }
+        MP_VERBOSE(ctx, "composition: host monitor changed to %p (%s), "
+                   "signalling VO_EVENT_WIN_STATE\n", (void *)mon, dev);
         p->composition_monitor = mon;
         if (events)
             *events |= VO_EVENT_WIN_STATE;
@@ -532,6 +588,13 @@ static int composition_control(struct ra_ctx *ctx, int *events, int request,
             return VO_NOTAVAIL;
         ((int *)arg)[0] = res[0];
         ((int *)arg)[1] = res[1];
+        break;
+    }
+    case VOCTRL_GET_DISPLAY_NAMES: {
+        char **names = composition_get_disp_names(ctx, p);
+        if (!names)
+            return VO_NOTAVAIL;
+        *(char ***)arg = names;
         break;
     }
     case VOCTRL_CHECK_EVENTS:

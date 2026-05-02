@@ -3046,7 +3046,7 @@ static int mp_property_display_names(void *ctx, struct m_property *prop,
 {
     MPContext *mpctx = ctx;
     struct vo *vo = mpctx->video_out;
-    if (!vo || vo->display_swapchain)
+    if (!vo)
         return M_PROPERTY_UNAVAILABLE;
 
     switch (action) {

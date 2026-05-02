@@ -1874,6 +1874,20 @@ local function update_property_cache(name, value)
     property_cache[name] = value
 end
 
+-- display-names is a STRING_LIST property. Observing it with format 'string'
+-- relies on mpv's STRING_LIST -> string conversion in the observer, which in
+-- composition / multi-monitor setups doesn't reliably fire when the list
+-- contents change (e.g. window dragged across screens). Observe it as
+-- 'native' (a Lua array) and join here so the cache always reflects the
+-- current monitor list.
+local function update_display_names_cache(name, value)
+    if type(value) == 'table' then
+        property_cache[name] = table.concat(value, ',')
+    else
+        property_cache[name] = value
+    end
+end
+
 mp.observe_property('current-window-scale', 'native', update_property_cache)
-mp.observe_property('display-names', 'string', update_property_cache)
+mp.observe_property('display-names', 'native', update_display_names_cache)
 mp.observe_property('hwdec-current', 'string', update_property_cache)

@@ -102,20 +102,22 @@
 // audio. Bounded by playback_pts + LOOKAHEAD_MAX (don't run too far ahead
 // of the user — saves CPU and matches what's likely cached).
 //
-// LOOKAHEAD_MAX_SEC is intentionally large (10 minutes): the natural
-// backpressure during normal playback comes from MAX_QUEUE_SECONDS (30 s)
-// and from cache_end (the demuxer rarely buffers more than a few minutes
-// ahead anyway).  Keeping the cap loose ensures that:
-//   1) when the player is PAUSED, the worker keeps draining cached audio
-//      into whisper instead of going idle right at playback_pts + 60 s
-//      (otherwise subtitles "freeze" during pause, then resume slowly);
-//   2) when the user seeks deep into the file and the cache initially has
-//      only a small window, the worker doesn't artificially throttle past
-//      what's already cached.
+// LOOKAHEAD_MAX_SEC bounds how far ahead of playback_pts the worker is
+// allowed to pre-transcribe.  Earlier this was raised to 600 s so PAUSED /
+// deep-seek did not stall, but in practice that lets large-v3 + CUDA keep
+// the GPU at 100% for minutes at a time on long videos (the worker simply
+// chases cache_end, which itself can be several minutes ahead).
+//
+// 120 s is a compromise:
+//   - covers normal pause (user takes a phone call, scrubs around) without
+//     letting the worker idle right at the cursor;
+//   - bounds GPU utilisation so heavy models don't run unbounded;
+//   - MAX_QUEUE_SECONDS (30 s) provides the secondary backpressure on the
+//     af_whisper async queue regardless.
 #define FIRST_CHUNK_SECONDS  6.0
 #define CHUNK_SECONDS       12.0
 #define MIN_CHUNK_SECONDS    1.5
-#define LOOKAHEAD_MAX_SEC  600.0
+#define LOOKAHEAD_MAX_SEC  120.0
 #define WORKER_TICK_SEC      0.05  // tighter wakeups during startup ramp-up
 
 struct frame_item {
@@ -505,7 +507,20 @@ static bool wl_apply_ai_translator_locked(struct whisper_lookahead *wl,
 
 #define WT_WORKERS_DEFAULT      3
 #define WT_WORKERS_MAX          8
-#define WT_PEND_MAX             64
+// Pending queue cap. The recognition side (af_whisper) on a fast GPU can
+// race far ahead of playback (limited only by the demuxer cache, often a
+// few minutes' worth of audio). Tasks beyond `horizon_sec` simply sit in
+// pending until the playback cursor catches up, so the cap mainly serves as
+// a memory bound. 1024 covers the common case (~10 min of typical 3-5 s
+// segments) with comfortable headroom; far-future cleanup below kicks in
+// before we ever reach this hard limit.
+#define WT_PEND_MAX             1024
+// (Removed: WT_PEND_HIGH_WATER + WT_FAR_FUTURE_HORIZON_MULT used to drive a
+// silent high-water cleanup in wt_enqueue. That path was retired because
+// (a) the worker's non-blocking horizon scan now leaves far-future tasks in
+// pending until playback advances, and (b) demoting them to fallback would
+// have injected future-PTS subtitle packets ahead of upcoming earlier
+// translations and made the out-of-order drop problem worse.)
 #define WT_RES_MAX              128
 #define MIN_TRANSLATE_SLACK_S   1.0
 #define WT_DRAIN_EPSILON_S      0.05
@@ -517,7 +532,7 @@ static bool wl_apply_ai_translator_locked(struct whisper_lookahead *wl,
 #define WT_DEFAULT_HORIZON_SEC          60
 #define WT_DEFAULT_SEEK_DEBOUNCE_MS     1500
 #define WT_DEFAULT_MIN_TEXT_CHARS        2
-#define WT_DEFAULT_REUSE_CACHE_CAP       64
+#define WT_DEFAULT_REUSE_CACHE_CAP      256
 #define WT_DEFAULT_REUSE_WINDOW_MS    120000
 #define WT_DEFAULT_REPEAT_THRESHOLD       5
 #define WT_DEFAULT_REPEAT_WINDOW_MS   30000
@@ -527,6 +542,15 @@ static bool wl_apply_ai_translator_locked(struct whisper_lookahead *wl,
 #define WT_REUSE_CACHE_HARD_CAP         512   // safety bound, regardless of cfg
 
 #define WT_DEFER_SLEEP_MS               200
+
+// Subtitle duration clamp. whisper.cpp occasionally emits a segment whose
+// duration spans most of the chunk (~30 s under some VAD-less fallback
+// paths in af_whisper), so a single line can squat on screen long after
+// later segments have already been transcribed and overlap it. Clamping
+// at the inject site bounds the "stuck subtitle" symptom regardless of
+// which producer or translator path led here. 10 s is below CHUNK_SECONDS
+// (12 s), so any natural segment under normal segmentation passes through.
+#define WT_MAX_SUBTITLE_DUR_S          10.0
 
 // Outcome of one task as the worker chose to handle it. Drain uses this to
 // pick the right user-visible path (bilingual ASS vs. original-text fallback)
@@ -639,6 +663,8 @@ struct wt_pipeline {
     int      short_skipped;
     int      rpm_skipped;
     int      budget_skipped;
+    int      far_future_dropped;   // silent drops by high-water cleanup
+    int      queue_overflow;       // hard-cap evictions to fallback
     bool     budget_exhausted_logged;
     // LRU translation-reuse cache (head = most-recent).
     struct wt_cache_entry *cache;
@@ -894,34 +920,6 @@ static void wt_rollback_reserve(struct wt_pipeline *wt)
         wt->rpm_tokens += 1.0;
 }
 
-// Re-insert `task` at the head of pending and signal cv so workers retry on
-// the next wakeup or after WT_DEFER_SLEEP_MS, whichever first. The caller
-// must NOT hold pend_lock; this acquires it.
-static void wt_putback_head(struct wt_pipeline *wt, struct wt_task *task)
-{
-    mp_mutex_lock(&wt->pend_lock);
-    if (wt->pend_num >= wt->pend_cap) {
-        int new_cap = wt->pend_cap ? wt->pend_cap * 2 : 16;
-        if (new_cap > WT_PEND_MAX) new_cap = WT_PEND_MAX;
-        if (new_cap > wt->pend_cap) {
-            wt->pending = talloc_realloc(wt, wt->pending,
-                                          struct wt_task *, new_cap);
-            wt->pend_cap = new_cap;
-        }
-    }
-    if (wt->pend_num >= WT_PEND_MAX) {
-        // No room; drop oldest tail to make space (future-most task).
-        // This should be vanishingly rare under horizon gating.
-        talloc_free(wt->pending[wt->pend_num - 1]);
-        wt->pend_num--;
-    }
-    memmove(&wt->pending[1], &wt->pending[0],
-            sizeof(struct wt_task *) * wt->pend_num);
-    wt->pending[0] = task;
-    wt->pend_num++;
-    mp_mutex_unlock(&wt->pend_lock);
-}
-
 // Read the latest published playback pts (seconds) from the lookahead snap.
 // Returns -INFINITY when not yet known (e.g. before audio starts).
 static double wt_get_playback_pts(struct whisper_lookahead *wl)
@@ -933,6 +931,18 @@ static double wt_get_playback_pts(struct whisper_lookahead *wl)
     if (!isfinite(pts))
         pts = -INFINITY;
     return pts;
+}
+
+// Read the latest committed generation. Workers compare it to a task's
+// captured generation to skip work that the user has invalidated by
+// seeking, swapping translators, or changing language.
+static uint64_t wt_get_generation(struct whisper_lookahead *wl)
+{
+    uint64_t g;
+    mp_mutex_lock(&wl->snap_lock);
+    g = wl->snap.generation;
+    mp_mutex_unlock(&wl->snap_lock);
+    return g;
 }
 
 // Sleep for at most `timeout_ms` waiting for new pending or terminate. On
@@ -956,40 +966,12 @@ static MP_THREAD_VOID wt_worker_loop(void *arg)
     mp_thread_set_name("whisper-trans");
 
     for (;;) {
-        // Wait for a task or terminate.
-        mp_mutex_lock(&wt->pend_lock);
-        while (!atomic_load(&wt->terminate) && wt->pend_num == 0)
-            mp_cond_wait(&wt->pend_cv, &wt->pend_lock);
-        if (atomic_load(&wt->terminate)) {
-            mp_mutex_unlock(&wt->pend_lock);
+        if (atomic_load(&wt->terminate))
             break;
-        }
-        // Pop the front (oldest = most-needed-soon).
-        struct wt_task *task = wt->pending[0];
-        memmove(&wt->pending[0], &wt->pending[1],
-                sizeof(struct wt_task *) * (wt->pend_num - 1));
-        wt->pend_num--;
-        // Latest live generation under pend_lock to keep updates ordered with
-        // bump_generation observers; bump path itself does not take pend_lock,
-        // but reading snap.generation here is racy by design — we simply
-        // catch the latest committed value.
-        mp_mutex_unlock(&wt->pend_lock);
 
-        uint64_t cur_gen;
-        mp_mutex_lock(&wl->snap_lock);
-        cur_gen = wl->snap.generation;
-        mp_mutex_unlock(&wl->snap_lock);
+        // ---- Snapshot live state outside any pipeline lock ----
+        uint64_t cur_gen = wt_get_generation(wl);
 
-        // ① Stale generation drop (avoid burning tokens on tasks the user
-        //    invalidated by seeking / changing audio chain / swapping
-        //    translators).
-        if (task->generation != cur_gen) {
-            talloc_free(task);
-            continue;
-        }
-
-        // Read limits snapshot once; protection-only fields are integers and
-        // race-tolerant. Take the lock so we observe a consistent struct.
         struct wt_limits cfg;
         int64_t bump_quiet_until_ms;
         mp_mutex_lock(&wt->limits_lock);
@@ -999,36 +981,92 @@ static MP_THREAD_VOID wt_worker_loop(void *arg)
 
         int64_t now_ms = wt_wall_ms();
 
-        // ② Seek-debounce gate: hold for the configured wall-clock window
-        //    after the latest generation bump. Putback at head to retry; the
-        //    sleep keeps the spin bounded (~5Hz worst case across workers).
+        // ① Seek-debounce gate: a global wall-clock pause after the last
+        //    generation bump. Park ALL workers without touching pending so
+        //    in-flight bursts settle before we charge the translator. The
+        //    sleep is bounded so workers stay responsive to terminate /
+        //    new generations.
         if (cfg.enabled && cfg.seek_debounce_ms > 0 &&
             now_ms < bump_quiet_until_ms)
         {
-            wt_putback_head(wt, task);
+            int64_t left = bump_quiet_until_ms - now_ms;
+            int sleep_ms = left > WT_DEFER_SLEEP_MS
+                                ? WT_DEFER_SLEEP_MS : (int)left;
+            wt_worker_sleep(wt, sleep_ms);
+            continue;
+        }
+
+        double playback_pts = wt_get_playback_pts(wl);
+        bool horizon_active = cfg.enabled && cfg.horizon_sec > 0 &&
+                              isfinite(playback_pts);
+        double horizon_cutoff = horizon_active
+            ? playback_pts + (double)cfg.horizon_sec
+            : INFINITY;
+
+        // ② Pick first eligible task. Sweep stale-generation entries inline
+        //    (so other workers don't keep re-scanning them) and SKIP IN
+        //    PLACE far-future tasks — they remain in pending until playback
+        //    advances, instead of being bounced out and back in via
+        //    putback_head, which used to head-of-line block all N workers
+        //    whenever the front of the queue was beyond the horizon.
+        struct wt_task *task = NULL;
+        bool saw_future = false;
+
+        mp_mutex_lock(&wt->pend_lock);
+        while (wt->pend_num == 0 && !atomic_load(&wt->terminate))
+            mp_cond_wait(&wt->pend_cv, &wt->pend_lock);
+        if (atomic_load(&wt->terminate)) {
+            mp_mutex_unlock(&wt->pend_lock);
+            break;
+        }
+
+        for (int i = 0; i < wt->pend_num; ) {
+            struct wt_task *t = wt->pending[i];
+            if (t->generation != cur_gen) {
+                talloc_free(t);
+                memmove(&wt->pending[i], &wt->pending[i + 1],
+                        sizeof(struct wt_task *) * (wt->pend_num - i - 1));
+                wt->pend_num--;
+                continue;
+            }
+            if (horizon_active && t->pts > horizon_cutoff) {
+                saw_future = true;
+                i++;
+                continue;
+            }
+            task = t;
+            memmove(&wt->pending[i], &wt->pending[i + 1],
+                    sizeof(struct wt_task *) * (wt->pend_num - i - 1));
+            wt->pend_num--;
+            break;
+        }
+        mp_mutex_unlock(&wt->pend_lock);
+
+        if (!task) {
+            // Either pending was wiped by stale sweep, or every remaining
+            // entry is far-future. Account once per scan (not per task) so
+            // horizon_skipped reflects "deferred work cycles", not pending
+            // entry count.
+            if (saw_future) {
+                mp_mutex_lock(&wt->limits_lock);
+                wt->horizon_skipped++;
+                mp_mutex_unlock(&wt->limits_lock);
+            }
             wt_worker_sleep(wt, WT_DEFER_SLEEP_MS);
             continue;
         }
 
-        // ③ Horizon gate: if the segment is too far ahead of the playback
-        //    cursor, defer. Stale-generation re-check on next pop catches
-        //    cases where the user closes the file while we're sleeping.
-        if (cfg.enabled && cfg.horizon_sec > 0) {
-            double playback_pts = wt_get_playback_pts(wl);
-            if (isfinite(playback_pts) &&
-                task->pts - playback_pts > (double)cfg.horizon_sec)
-            {
-                mp_mutex_lock(&wt->limits_lock);
-                wt->horizon_skipped++;
-                mp_mutex_unlock(&wt->limits_lock);
-                wt_putback_head(wt, task);
-                wt_worker_sleep(wt, WT_DEFER_SLEEP_MS);
-                continue;
-            }
+        // ③ Defense in depth: generation may have advanced between the
+        //    snapshot above and the pop. Re-check before doing real work.
+        if (task->generation != wt_get_generation(wl)) {
+            talloc_free(task);
+            continue;
         }
 
-        // From here on the task will produce a result (translated or
-        // fallback). Build it.
+        // ---- From here on the task will produce a result. ----
+        // Refresh wall clock; the worker may have parked at the cv above.
+        now_ms = wt_wall_ms();
+
         struct wt_result *r = talloc_zero(NULL, struct wt_result);
         r->generation = task->generation;
         r->seq        = task->seq;
@@ -1163,6 +1201,17 @@ static MP_THREAD_VOID wt_worker_loop(void *arg)
 // playback already moved past). The drain itself decides timing/generation.
 static void wt_push_result(struct wt_pipeline *wt, struct wt_result *r)
 {
+    // Filter stale results before they ever reach the result queue. Without
+    // this, a generation bump (seek / language / translator swap) followed
+    // by a fresh translation burst can let stale far-future results occupy
+    // the WT_RES_MAX hard-cap and evict the new generation's valid entries
+    // via the FIFO drop below. Drain still re-checks generation as a final
+    // safety net.
+    if (r->generation != wt_get_generation(wt->wl)) {
+        talloc_free(r);
+        return;
+    }
+
     mp_mutex_lock(&wt->res_lock);
     if (wt->res_num >= wt->res_cap) {
         int new_cap = wt->res_cap ? wt->res_cap * 2 : 16;
@@ -1214,6 +1263,17 @@ static void wt_enqueue(struct wt_pipeline *wt,
             wt->pend_cap = new_cap;
         }
     }
+
+    // (Previously: a 75% high-water cleanup silently freed tasks whose pts
+    // exceeded `playback + 4 * horizon`. That path was removed because (a)
+    // worker-side horizon scanning now leaves far-future tasks in pending
+    // until playback advances, and (b) immediately demoting them to fallback
+    // would have injected future-PTS subtitle packets ahead of upcoming
+    // earlier translations, making the out-of-order drop problem worse.
+    // The hard-cap eviction below is the only safety net now; under A's
+    // non-blocking horizon gate plus the lower LOOKAHEAD_MAX_SEC it should
+    // essentially never fire.)
+
     if (wt->pend_num >= WT_PEND_MAX) {
         // Pick the largest-pts task to evict (safest to convert to a
         // fallback because it has the most slack remaining for the user
@@ -1237,6 +1297,10 @@ static void wt_enqueue(struct wt_pipeline *wt,
         evicted->error_brief = talloc_strdup(evicted, "queue overflow");
         evicted->kind = WT_RESULT_FALLBACK_QUEUE;
         talloc_free(t);
+
+        mp_mutex_lock(&wt->limits_lock);
+        wt->queue_overflow++;
+        mp_mutex_unlock(&wt->limits_lock);
     }
     wt->pending[wt->pend_num++] = task;
     mp_cond_signal(&wt->pend_cv);
@@ -1487,6 +1551,17 @@ static void wl_feed_subtitle_text(struct whisper_lookahead *wl,
     if (!wl->primary_stream || !wl->primary_demuxer || !body || !body[0])
         return;
 
+    // Clamp pathological per-segment durations from af_whisper. See
+    // WT_MAX_SUBTITLE_DUR_S for rationale.
+    bool dur_clamped = false;
+    if (isfinite(dur) && dur > WT_MAX_SUBTITLE_DUR_S) {
+        dur_clamped = true;
+        dur = WT_MAX_SUBTITLE_DUR_S;
+    } else if (!isfinite(dur) || dur < 0.0) {
+        dur = WT_MAX_SUBTITLE_DUR_S;
+        dur_clamped = true;
+    }
+
     char *ass_line = talloc_asprintf(wl,
         "%d,0,Default,,0,0,0,,%s",
         wl->subtitles_injected, body);
@@ -1502,8 +1577,9 @@ static void wl_feed_subtitle_text(struct whisper_lookahead *wl,
 
         demuxer_feed_af_sub(wl->primary_stream, dp);
         wl->subtitles_injected++;
-        MP_INFO(wl, "subtitle #%d @ %.3f (dur=%.1f) [%s]: %.40s%s\n",
+        MP_INFO(wl, "subtitle #%d @ %.3f (dur=%.1f%s) [%s]: %.40s%s\n",
                 wl->subtitles_injected, pts, dur,
+                dur_clamped ? ",clamped" : "",
                 kind ? kind : "?",
                 body, strlen(body) > 40 ? "..." : "");
 
@@ -2949,6 +3025,8 @@ char *whisper_lookahead_get_ai_translate_status(struct MPContext *mpctx,
             int short_skip     = wt->short_skipped;
             int rpm_skip       = wt->rpm_skipped;
             int budget_skip    = wt->budget_skipped;
+            int far_dropped    = wt->far_future_dropped;
+            int q_overflow     = wt->queue_overflow;
             int horizon_sec    = wt->cfg.horizon_sec;
             int debounce_ms    = wt->cfg.seek_debounce_ms;
             int reuse_cap      = wt->cfg.reuse_cache_capacity;
@@ -2968,6 +3046,8 @@ char *whisper_lookahead_get_ai_translate_status(struct MPContext *mpctx,
             node_map_add_int64(&root, "short_skipped", short_skip);
             node_map_add_int64(&root, "rpm_skipped", rpm_skip);
             node_map_add_int64(&root, "budget_skipped", budget_skip);
+            node_map_add_int64(&root, "far_future_dropped", far_dropped);
+            node_map_add_int64(&root, "queue_overflow", q_overflow);
             node_map_add_int64(&root, "horizon_sec", horizon_sec);
             node_map_add_int64(&root, "seek_debounce_ms", debounce_ms);
             node_map_add_int64(&root, "reuse_cache_capacity", reuse_cap);

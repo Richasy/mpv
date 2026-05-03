@@ -1577,12 +1577,14 @@ local function whisper_translate_stats()
     local short_skip    = n(info["short_skipped"])
     local rpm_skip      = n(info["rpm_skipped"])
     local budget_skip   = n(info["budget_skipped"])
+    local far_dropped   = n(info["far_future_dropped"])
+    local q_overflow    = n(info["queue_overflow"])
     local horizon_sec   = n(info["horizon_sec"])
     local debounce_ms   = n(info["seek_debounce_ms"])
     local reuse_cap     = n(info["reuse_cache_capacity"])
     local reuse_size    = n(info["reuse_cache_size"])
 
-    append(stats, "", {prefix = "HTTP Calls:", nl = "", indent = ""})
+    append(stats, "", {prefix = "HTTP Calls:", indent = ""})
     append(stats, session_limit > 0
                     and format("%d / %d", session_used, session_limit)
                     or  format("%d (no cap)", session_used),
@@ -1595,13 +1597,17 @@ local function whisper_translate_stats()
         append(stats, "disabled", {prefix = "  RPM Bucket:"})
     end
 
-    append(stats, "", {prefix = "Skips & Reuse:", nl = "", indent = ""})
+    append(stats, "", {prefix = "Skips & Reuse:", indent = ""})
     append(stats, format("%d", horizon_skip),
            {prefix = format("  Horizon (>%ds):", horizon_sec)})
     append(stats, format("%d / %d entries", reuse_size, reuse_cap),
            {prefix = format("  Cache Reused (%d hit):", cache_reused)})
     append(stats, format("%d", loop_skip),  {prefix = "  Repeat-loop:"})
     append(stats, format("%d", short_skip), {prefix = "  Too-short:"})
+    append(stats, format("%d", far_dropped),
+           {prefix = "  Far-future drop:"})
+    append(stats, format("%d", q_overflow),
+           {prefix = "  Queue overflow:"})
     if rpm_limit > 0 then
         append(stats, format("%d", rpm_skip), {prefix = "  RPM-cap:"})
     end
@@ -1609,7 +1615,7 @@ local function whisper_translate_stats()
         append(stats, format("%d", budget_skip), {prefix = "  Budget:"})
     end
 
-    append(stats, "", {prefix = "Knobs:", nl = "", indent = ""})
+    append(stats, "", {prefix = "Knobs:", indent = ""})
     append(stats, format("%d s", horizon_sec),  {prefix = "  Horizon:"})
     append(stats, format("%d ms", debounce_ms), {prefix = "  Seek debounce:"})
 

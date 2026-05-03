@@ -47,11 +47,17 @@
  *   - The demuxer/sh_stream pointers are guaranteed live for the worker's
  *     lifetime: stop() joins the worker before returning, and loadfile.c
  *     calls stop() before tearing down the demuxer.
- *   - On audio chain change / seek / start, snap.generation is bumped under
- *     snap_lock. The worker discards in-flight work that started under an
- *     older generation, rebuilds the AVCodecContext if codec params changed,
- *     resets the lavfi graph (which re-creates whisper, clearing its VAD),
- *     and resumes from the new playback position.
+ *   - On audio chain change / seek / start, snap.graph_generation AND
+ *     snap.generation are both bumped under snap_lock. The worker
+ *     discards in-flight work that started under an older graph
+ *     generation, rebuilds the AVCodecContext if codec params changed,
+ *     resets the lavfi graph (which re-creates whisper, clearing its
+ *     VAD), and resumes from the new playback position.
+ *   - On translator-only invalidate (AI translator config / language
+ *     change for the SAME audio), only snap.generation is bumped — the
+ *     wt pipeline drops in-flight translation tasks/results, but the
+ *     recognition graph is preserved (avoids a multi-second whisper
+ *     model reload that would burn a few GB of VRAM).
  *
  * Backpressure: wl->queue is bounded (MAX_QUEUE_*); the worker waits on a
  * condition variable when full and is woken by source consumption,
@@ -130,7 +136,18 @@ struct wt_pipeline;
 // Snapshot of core-thread state visible to the worker. Updated by
 // whisper_lookahead_publish(); read by the worker under snap_lock.
 struct wl_snap {
+    // Bumped on ALL invalidation events (seek, audio-chain change,
+    // translator/subtitle config change). The translator pipeline uses
+    // this to drop in-flight tasks/results that no longer match the
+    // current configuration.
     uint64_t generation;
+    // Bumped only on events that require the recognition graph itself
+    // to be reset (seek, audio-chain change). Translator-only invalidate
+    // does NOT bump this — re-running the whisper model on the same
+    // audio just to redo translation would cost ~3 GB VRAM and ~10 s of
+    // CUDA reinit on large-v3. The worker uses this to decide whether
+    // to call worker_signal_reset() / mp_filter_reset(root_filter).
+    uint64_t graph_generation;
     bool valid;
     struct demuxer *demuxer;
     struct sh_stream *audio_sh;
@@ -196,6 +213,7 @@ struct whisper_lookahead {
     int worker_extradata_size;
     uint8_t worker_extradata_hash[16];
     uint64_t worker_generation;        // last gen worker observed
+    uint64_t worker_graph_generation;  // last graph-gen worker observed
     double worker_last_done;           // last visited end-pts (NOPTS = none)
     double worker_last_dts;            // last decoded packet's dts (dedupe)
     double worker_next_pts;            // interpolated frame pts fallback
@@ -204,6 +222,13 @@ struct whisper_lookahead {
     int64_t last_starve_log_ns;  /* rate-limit for INFO-level starvation diag */
     int packets_skipped;
     int frames_decoded;
+    // True once the worker has pushed at least one audio frame into the
+    // lavfi graph since the last graph reset. Used to skip the expensive
+    // mp_filter_reset() (which would tear down af_whisper and reload the
+    // model) when no audio has reached the recognition graph yet — e.g.
+    // initial startup, or a generation bump that fires before the worker
+    // produced its first frame.
+    bool worker_graph_seen_audio;
     // ---- end worker-only state ----
 
     // Sink-side dedup of last segments JSON (sink thread only)
@@ -1592,12 +1617,19 @@ static void wl_feed_subtitle_text(struct whisper_lookahead *wl,
 // the player's timeline domain (seconds). V3.1 produces accurate PTS so no
 // shift hack is required.
 //
-// `producer_gen` is the generation the worker captured when it began
-// processing the audio chunk that produced this segment. If the live
-// generation has moved on (seek / lang change / translator swap), the
-// segment is considered stale and dropped — both for the synchronous
-// no-translator / slack-skip feed paths AND for the wt_enqueue path,
-// because invalidate may have raced with this in-flight segment.
+// `producer_gen` is the generation tag the worker carried when this segment
+// was produced. `producer_graph_gen` is the corresponding recognition-graph
+// generation. The two are split so that a translator-only invalidate (which
+// bumps snap.generation but NOT snap.graph_generation) does not cause us to
+// throw away recognition work that's still valid for the same audio:
+//
+//   - If producer_graph_gen != current snap.graph_generation → audio chain
+//     was reset (seek / chain change) under us; the segment refers to audio
+//     that is no longer relevant. Drop it.
+//   - Otherwise the audio is still the live audio. Re-tag the segment with
+//     the CURRENT snap.generation when we hand it to wt_enqueue, so the
+//     wt pipeline associates it with the live translator config; any
+//     subsequent translator-only bump will then drop it correctly.
 //
 // Three paths:
 //   ① No translator → feed original synchronously here.
@@ -1606,26 +1638,29 @@ static void wl_feed_subtitle_text(struct whisper_lookahead *wl,
 //   fallback) on the core thread.
 static void inject_subtitle(struct whisper_lookahead *wl,
                             const char *text, double pts, double dur,
-                            uint64_t producer_gen)
+                            uint64_t producer_gen,
+                            uint64_t producer_graph_gen)
 {
     if (!wl->primary_stream || !wl->primary_demuxer || !text || !text[0])
         return;
 
-    // Generation gate: if invalidate / seek / chain-change bumped while this
-    // chunk was inflight in the worker, drop the segment to avoid re-polluting
-    // the freshly-cleared af_sub queue with stale captions.
-    uint64_t cur_gen;
+    // Generation gate: only true graph resets (seek / audio-chain change)
+    // make a recognized segment stale. Translator-only bumps leave the
+    // audio intact and we want to keep the recognition work.
+    uint64_t cur_gen, cur_graph_gen;
     double now_pts;
     mp_mutex_lock(&wl->snap_lock);
     cur_gen = wl->snap.generation;
+    cur_graph_gen = wl->snap.graph_generation;
     now_pts = wl->snap.playback_pts;
     mp_mutex_unlock(&wl->snap_lock);
-    if (producer_gen != cur_gen) {
-        MP_INFO(wl, "drop stale segment (producer_gen=%llu cur_gen=%llu)\n",
-                (unsigned long long)producer_gen,
-                (unsigned long long)cur_gen);
+    if (producer_graph_gen != cur_graph_gen) {
+        MP_INFO(wl, "drop stale segment (producer_graph_gen=%llu cur_graph_gen=%llu)\n",
+                (unsigned long long)producer_graph_gen,
+                (unsigned long long)cur_graph_gen);
         return;
     }
+    (void)producer_gen; // superseded by cur_gen below for wt tagging
     if (!isfinite(now_pts))
         now_pts = -INFINITY;
 
@@ -1651,7 +1686,9 @@ static void inject_subtitle(struct whisper_lookahead *wl,
         return;
     }
 
-    wt_enqueue(wl->pipeline, producer_gen, text, pts, dur);
+    // Tag the wt task with the LIVE generation so the wt pipeline drops it
+    // correctly if a future translator-only bump fires while it's queued.
+    wt_enqueue(wl->pipeline, cur_gen, text, pts, dur);
 }
 
 // Parse JSON segments array: [{"s":ms,"e":ms,"t":"text"}, ...]
@@ -1660,7 +1697,8 @@ static void inject_subtitle(struct whisper_lookahead *wl,
 // per-segment timestamps are relative to that origin.
 static void process_whisper_segments(struct whisper_lookahead *wl,
                                      const char *json, double pts_offset,
-                                     uint64_t producer_gen)
+                                     uint64_t producer_gen,
+                                     uint64_t producer_graph_gen)
 {
     if (!json || json[0] != '[')
         return;
@@ -1744,7 +1782,7 @@ static void process_whisper_segments(struct whisper_lookahead *wl,
             }
             double pts = s_ms / 1000.0;
             double dur = (e_ms - s_ms) / 1000.0;
-            inject_subtitle(wl, norm, pts, dur, producer_gen);
+            inject_subtitle(wl, norm, pts, dur, producer_gen, producer_graph_gen);
             talloc_free(norm);
         }
     }
@@ -1816,7 +1854,8 @@ static void sink_process(struct mp_filter *f)
                     double origin = p->session_origin_pts != MP_NOPTS_VALUE
                                         ? p->session_origin_pts : 0;
                     process_whisper_segments(wl, segments_json, origin,
-                                             wl->worker_generation);
+                                             wl->worker_generation,
+                                             wl->worker_graph_generation);
                 }
             }
         }
@@ -2159,6 +2198,7 @@ static void worker_decode_packet(struct whisper_lookahead *wl,
         }
 
         worker_push_aframe(wl, af, gen);
+        wl->worker_graph_seen_audio = true;
         mp_filter_wakeup(wl->source);
         mp_filter_wakeup(wl->sink);
         mp_dispatch_interrupt(wl->graph_dispatch);
@@ -2178,6 +2218,8 @@ static MP_THREAD_VOID wl_thread(void *ptr)
     mp_mutex_unlock(&wl->snap_lock);
     wl->worker_next_pts = MP_NOPTS_VALUE;
     wl->worker_generation = 0;
+    wl->worker_graph_generation = 0;
+    wl->worker_graph_seen_audio = false;
 
     while (!atomic_load(&wl->terminate)) {
         struct wl_snap snap;
@@ -2190,13 +2232,38 @@ static MP_THREAD_VOID wl_thread(void *ptr)
         }
 
         bool gen_change = (snap.generation != wl->worker_generation);
-        bool codec_change = gen_change && codec_changed(wl, &snap);
+        bool graph_change = (snap.graph_generation != wl->worker_graph_generation);
+        // worker_generation == 0 / worker_graph_generation == 0 are initial
+        // sentinels before any iteration ran (bump_*_generation() start at 1).
+        // Likewise, worker_graph_seen_audio == false means the lavfi/whisper
+        // graph has not yet consumed any audio (either we're at startup, or
+        // a previous reset cleared it and no frames have been pushed since).
+        // In both cases there is no stale graph state to discard, and firing
+        // worker_signal_reset() would call mp_filter_reset(root_filter),
+        // which destroys the af_whisper instance (free_graph) and forces a
+        // second whisper_init_from_file + CUDA backend init on the next
+        // graph run — wasting ~3 GB VRAM (the new context overlaps the
+        // old one before being collected) and ~10 s of startup time. With
+        // large-v3 on a 6 GB GPU this is enough to exhaust VRAM and stall
+        // both video decoding and recognition.
+        bool initial_start = (wl->worker_graph_generation == 0);
+        bool graph_dirty = wl->worker_graph_seen_audio;
+        bool codec_change = graph_change && !initial_start &&
+                            codec_changed(wl, &snap);
         if (gen_change) {
-            MP_INFO(wl, "gen change: %llu -> %llu (codec_change=%d)\n",
-                    (unsigned long long)wl->worker_generation,
-                    (unsigned long long)snap.generation,
-                    (int)codec_change);
+            // Always adopt the new generation tag so frames/tasks the worker
+            // produces from now on carry the up-to-date generation, even on
+            // translator-only bumps that don't touch the graph.
             wl->worker_generation = snap.generation;
+        }
+        if (graph_change) {
+            MP_INFO(wl, "graph gen change: %llu -> %llu (codec_change=%d, initial=%d, graph_dirty=%d)\n",
+                    (unsigned long long)wl->worker_graph_generation,
+                    (unsigned long long)snap.graph_generation,
+                    (int)codec_change,
+                    (int)initial_start,
+                    (int)graph_dirty);
+            wl->worker_graph_generation = snap.graph_generation;
             wl->worker_last_done = MP_NOPTS_VALUE;
             wl->worker_last_dts = MP_NOPTS_VALUE;
             wl->worker_next_pts = MP_NOPTS_VALUE;
@@ -2208,7 +2275,19 @@ static MP_THREAD_VOID wl_thread(void *ptr)
             } else if (wl->avctx) {
                 avcodec_flush_buffers(wl->avctx);
             }
-            worker_signal_reset(wl);
+            // Skip the filter-graph reset when there's nothing to reset.
+            // After a real reset the graph is empty again, so clear the
+            // dirty flag too.
+            if (graph_dirty) {
+                worker_signal_reset(wl);
+                wl->worker_graph_seen_audio = false;
+            }
+        } else if (gen_change) {
+            // Translator-only bump: keep recognizer/graph intact. Just log
+            // it so the timing is visible alongside the wt pipeline's
+            // generation-mismatch drops.
+            MP_INFO(wl, "translator gen change: -> %llu (graph kept)\n",
+                    (unsigned long long)snap.generation);
         }
 
         if (!wl->avctx && !build_decoder(wl, snap.audio_sh->codec)) {
@@ -2332,11 +2411,15 @@ static MP_THREAD_VOID wl_thread(void *ptr)
         }
         wl->chunks_visited++;
 
-        // Recheck generation: if it moved while we were under demux lock,
+        // Recheck graph generation: if a graph-resetting bump (seek /
+        // audio-chain change) moved it while we were under demux lock,
         // skip processing this batch — the worker_loop top will replay.
+        // Translator-only bumps (which move snap.generation but not
+        // snap.graph_generation) leave recognition untouched and don't
+        // need a replay.
         struct wl_snap snap2;
         worker_get_snap(wl, &snap2);
-        if (snap2.generation != wl->worker_generation) {
+        if (snap2.graph_generation != wl->worker_graph_generation) {
             for (int i = 0; i < c.num; i++)
                 talloc_free(c.pkts[i]);
             talloc_free(c.talloc_parent);
@@ -2619,6 +2702,7 @@ void whisper_lookahead_publish(struct MPContext *mpctx)
 
     mp_mutex_lock(&wl->snap_lock);
     s.generation = wl->snap.generation; // preserved
+    s.graph_generation = wl->snap.graph_generation; // preserved
     wl->snap = s;
     // Keep injection pointers in sync with the published snapshot.
     wl->primary_stream = s.sub_stream;
@@ -2632,10 +2716,22 @@ void whisper_lookahead_publish(struct MPContext *mpctx)
     mp_mutex_unlock(&wl->queue_lock);
 }
 
-static void bump_generation(struct whisper_lookahead *wl)
+// Bump generation. `reset_graph` controls whether the recognition filter
+// graph is also invalidated:
+//   - true  (seek, audio-chain change): the worker tears down af_whisper
+//           and the audio decoder, drops its queue, and starts fresh.
+//   - false (translator-only invalidate): only snap.generation moves so
+//           the wt pipeline drops in-flight translations / pending tasks
+//           tied to the old translator config; the worker keeps decoding
+//           and recognizing without touching af_whisper. This avoids
+//           burning ~3 GB VRAM and ~10 s of CUDA reinit on large-v3 just
+//           because the user toggled an AI-translator option.
+static void bump_generation_ex(struct whisper_lookahead *wl, bool reset_graph)
 {
     mp_mutex_lock(&wl->snap_lock);
     wl->snap.generation++;
+    if (reset_graph)
+        wl->snap.graph_generation++;
     mp_mutex_unlock(&wl->snap_lock);
 
     // Update the seek-debounce gate so workers skip translation while the
@@ -2667,6 +2763,17 @@ static void bump_generation(struct whisper_lookahead *wl)
     mp_mutex_unlock(&wl->queue_lock);
 }
 
+// Convenience wrappers. Call sites should pick the right semantic.
+static void bump_generation(struct whisper_lookahead *wl)
+{
+    bump_generation_ex(wl, /*reset_graph*/ true);
+}
+
+static void bump_generation_translate_only(struct whisper_lookahead *wl)
+{
+    bump_generation_ex(wl, /*reset_graph*/ false);
+}
+
 // ---------- Public API ----------
 
 void whisper_lookahead_start(struct MPContext *mpctx, const char *whisper_opts)
@@ -2688,6 +2795,7 @@ void whisper_lookahead_start(struct MPContext *mpctx, const char *whisper_opts)
     wl->log = mp_log_new(wl, mpctx->log, "whisper-la");
     wl->whisper_opts = talloc_strdup(wl, whisper_opts ? whisper_opts : "");
     wl->snap.generation = 1;
+    wl->snap.graph_generation = 1;
     wl->pub_processed_end = MP_NOPTS_VALUE;
     atomic_store(&wl->init_done, false);
     atomic_store(&wl->terminate, 0);
@@ -2892,11 +3000,15 @@ void whisper_lookahead_invalidate(struct MPContext *mpctx, const char *reason)
 
     MP_INFO(wl, "invalidate: %s\n", reason ? reason : "(no reason)");
 
-    // Layer 1+2: bump generation so any in-flight worker output (whisper
-    // segment about to inject_subtitle, or wt_result waiting for drain) gets
-    // dropped on its way out. wt_clear_pending drops not-yet-sent translation
-    // tasks immediately.
-    bump_generation(wl);
+    // Layer 1+2: bump translator generation only — any in-flight worker
+    // output (whisper segment about to inject_subtitle, or wt_result
+    // waiting for drain) gets dropped on its way out, and wt_clear_pending
+    // drops not-yet-sent translation tasks immediately. Critically we do
+    // NOT bump graph_generation here: the audio stream / recognized text
+    // are still valid, and a graph reset would force af_whisper to
+    // re-init (~3 GB VRAM + ~10 s CUDA reload on large-v3) just because
+    // the user toggled an AI-translator option.
+    bump_generation_translate_only(wl);
     if (wl->pipeline)
         wt_clear_pending(wl->pipeline);
 

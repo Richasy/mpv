@@ -19,31 +19,131 @@ for _, property in pairs(mp.get_property_native("property-list")) do
     property_set[property] = true
 end
 
+-- === Rodel.Player fork: targeted Restore debounce =========================
+-- Background:
+--   `video-target-params` is fired on MPV_EVENT_TICK (player/command.c). The
+--   value is recomputed every draw_frame from the swapchain hint negotiation
+--   in vo_gpu_next.c. While a vf chain reconfig is in flight (especially with
+--   hwdec=*-copy on Windows d3d11), `video-target-params/max-luma` briefly
+--   becomes nil / SDR_WHITE / HDR(1000) in rapid succession. Profiles whose
+--   condition reads this property therefore see TRUE↔FALSE flips per frame.
+--   When `apply-profile` itself triggers vf reconfig (e.g. profile sets vf-pre
+--   to enable nvidia-true-hdr), this becomes a positive feedback loop that
+--   never converges — observed on customer logs as 167+ Apply/Restore cycles.
+--
+-- Fix: asymmetric hysteresis on Restore for profiles that depend on
+-- `video-target-params`:
+--   * FALSE -> TRUE: Apply immediately (no regression for first activation).
+--   * TRUE  -> FALSE on a video-target-params-dependent profile: schedule a
+--     RESTORE_STABILITY_DELAY-second timer. On expiry, re-evaluate cond.
+--     If still FALSE -> Restore. If TRUE again -> cancel, no-op.
+--   * Profiles that don't read video-target-params keep upstream behavior
+--     (immediate Apply/Restore) so path/resolution-driven profiles stay
+--     instant.
+--
+-- Tuning: 1.0s covers the longest observed first-cycle reconfig window
+-- (~1.45s on hwdec=d3d11va-copy, but that's first-frame init; subsequent
+-- per-cycle reconfig is <300ms in customer logs).
+local RESTORE_STABILITY_DELAY = 1.0
+
+local function profile_uses_target_params(profile)
+    if not profile.properties then
+        return false
+    end
+    for name, _ in pairs(profile.properties) do
+        if name == "video-target-params" or
+           name:find("^video%-target%-params/") then
+            return true
+        end
+    end
+    return false
+end
+
+local function cancel_restore_timer(profile)
+    if profile.restore_timer then
+        profile.restore_timer:kill()
+        profile.restore_timer = nil
+    end
+end
+
+local function do_apply(profile)
+    msg.info("Applying auto profile: " .. profile.name)
+    mp.commandv("apply-profile", profile.name)
+    profile.status = true
+end
+
+local function do_restore(profile)
+    msg.info("Restoring profile: " .. profile.name)
+    mp.commandv("apply-profile", profile.name, "restore")
+    profile.status = false
+end
+
+-- Re-run the profile condition. Returns true/false (errors counted as false,
+-- matching upstream evaluate() semantics).
+local function eval_cond(profile)
+    current_profile = profile
+    local ok, res = pcall(profile.cond)
+    current_profile = nil
+    if not ok then
+        msg.verbose("Profile condition error on evaluating: " .. res)
+        return false
+    end
+    return not not res
+end
+
 local function evaluate(profile)
     msg.verbose("Re-evaluating auto profile " .. profile.name)
 
-    current_profile = profile
-    local status, res = pcall(profile.cond)
-    current_profile = nil
+    local res = eval_cond(profile)
 
-    if not status then
-        -- errors can be "normal", e.g. in case properties are unavailable
-        msg.verbose("Profile condition error on evaluating: " .. res)
-        res = false
-    end
-    res = not not res
-    if res ~= profile.status then
-        if res == true then
-            msg.info("Applying auto profile: " .. profile.name)
-            mp.commandv("apply-profile", profile.name)
-        elseif profile.status == true and profile.has_restore_opt then
-            msg.info("Restoring profile: " .. profile.name)
-            mp.commandv("apply-profile", profile.name, "restore")
+    if res then
+        -- TRUE: cancel any pending restore (cond came back before timer fired).
+        if profile.restore_timer then
+            msg.verbose("Cancelling pending restore for profile " .. profile.name
+                        .. " (condition recovered)")
+            cancel_restore_timer(profile)
         end
+        if profile.status ~= true then
+            do_apply(profile)
+        end
+    elseif profile.status == true and profile.has_restore_opt then
+        if profile_uses_target_params(profile) then
+            -- Debounce: only commit Restore if cond stays FALSE for the full
+            -- delay window. This breaks the apply/restore feedback loop for
+            -- profiles that read transient vo target params.
+            if not profile.restore_timer then
+                msg.verbose("Scheduling restore check for profile "
+                            .. profile.name .. " in "
+                            .. RESTORE_STABILITY_DELAY .. "s")
+                profile.restore_timer = mp.add_timeout(RESTORE_STABILITY_DELAY,
+                    function()
+                        profile.restore_timer = nil
+                        if profile.status ~= true then
+                            return
+                        end
+                        if not eval_cond(profile) then
+                            do_restore(profile)
+                        else
+                            msg.verbose("Restore deferred check for "
+                                        .. profile.name
+                                        .. ": condition true again, no-op")
+                        end
+                    end)
+            end
+        else
+            -- Profile doesn't depend on volatile target params; preserve
+            -- upstream immediate-restore semantics.
+            do_restore(profile)
+        end
+    else
+        -- profile.status was nil (initial) or already false; just settle to
+        -- false without firing Restore (matches upstream behavior).
+        profile.status = false
     end
-    profile.status = res
+
     profile.dirty = false
 end
+-- === end Rodel.Player fork ================================================
 
 local function on_property_change(name, val)
     cached_properties[name] = val
@@ -110,6 +210,10 @@ function get(name, default)
             properties_to_profiles[name] = map
         end
         map[current_profile] = true
+        -- Rodel.Player fork: also record the dependency on the profile itself
+        -- so profile_uses_target_params() can quickly check without iterating
+        -- the global properties_to_profiles map.
+        current_profile.properties[name] = true
     end
     local val = cached_properties[name]
     if val == nil then
@@ -185,6 +289,12 @@ local function load_profiles(profiles_property)
 end
 
 mp.observe_property("profile-list", "native", function (_, profiles_property)
+    -- Rodel.Player fork: kill any pending restore timers from the previous
+    -- profile set; the profile tables themselves are about to be replaced.
+    for _, profile in ipairs(profiles) do
+        cancel_restore_timer(profile)
+    end
+
     profiles = {}
     watched_properties = {}
     cached_properties = {}

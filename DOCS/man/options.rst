@@ -120,6 +120,25 @@ Track Selection
     to ``auto`` (the default), mpv will choose the first edition declared as a
     default, or if there is no default, the first edition defined.
 
+``--flatten-editions=<yes|no>``
+    Some container formats (such as HLS or MPEG-TS with multiple programs)
+    expose multiple programs or rendition groups. By default, mpv respects the
+    format and groups tracks into editions, filtering the track list to only
+    show tracks belonging to the currently selected edition.
+
+    Setting this option to ``yes`` ignores the program structure of the file.
+    No editions are created, and all tracks from all programs are shown as a
+    flat list. Note that depending on the file, tracks from different programs
+    may be completely unrelated to each other.
+
+``--show-dependent-tracks=<yes|no>``
+    Show dependent tracks in the track list (default: no). Dependent tracks
+    carry coded data that is not independently decodable. For example, the
+    tile sub-streams that make up a tiled HEIF image, the raw coded layers of
+    an IAMF audio element, or the enhancement stream in an LCEVC group. They
+    are hidden by default because exposing them would clutter the track list
+    with entries that cannot be meaningfully selected on their own.
+
 ``--track-auto-selection=<yes|no>``
     Enable the default track auto-selection (default: yes). Enabling this will
     make the player select streams according to ``--aid``, ``--alang``, and
@@ -926,7 +945,7 @@ Program Behavior
 
     ``all_formats=<yes|no>``
         If 'yes' will attempt to add all formats found reported by youtube-dl
-        (default: no). Each format is added as a separate track. In addition,
+        (default: yes). Each format is added as a separate track. In addition,
         they are delay-loaded, and actually opened only when a track is selected
         (this should keep load times as low as without this option).
 
@@ -938,11 +957,6 @@ Program Behavior
         Tracks which represent formats that were selected by youtube-dl as
         default will have the default flag set. This means mpv should generally
         still select formats chosen with ``--ytdl-format`` by default.
-
-        Although this mechanism makes it possible to switch streams at runtime,
-        it's not suitable for this purpose for various technical reasons. (It's
-        slow, which can't be really fixed.) In general, this option is not
-        useful, and was only added to show that it's possible.
 
         There are two cases that must be considered when doing quality/bandwidth
         selection:
@@ -3527,13 +3541,12 @@ Window
     (Windows only) Snap the player window to screen edges.
 
 ``--drag-and-drop=<no|auto|replace|append|insert-next>``
-    Controls the default behavior of drag and drop on platforms that support
-    this. ``auto`` will obey what the underlying os/platform gives mpv.
-    Typically, holding shift during the drag and drop will append the item to
-    the playlist. Otherwise, it will completely replace it. ``replace``,
-    ``append``, and ``insert-next`` always force replacing, appending to, and
-    inserting next into the playlist respectively. ``no`` disables all drag and
-    drop behavior.
+    Controls the default built-in drag-and-drop behavior
+    (``--input-builtin-drag-and-drop``).
+    ``auto`` will obey the ``action`` value in ``dropped-files`` property.
+    ``replace``, ``append``, and ``insert-next`` always force replacing,
+    appending to, and inserting next into the playlist respectively.
+    ``no`` disables all drag and drop behavior.
 
 ``--ontop``
     Makes the player window stay on top of other windows.
@@ -4550,6 +4563,10 @@ Input
     disables the built-in dragging behavior. Note that unlike the ``window-dragging``
     option, this option only affects VOs which support the ``begin-vo-dragging``
     command, and does not disable window dragging initialized with the command.
+
+``--input-builtin-drag-and-drop=<yes|no>``
+    Enable the built-in drag-and-drop behavior (default: yes). Setting it to no
+    disables the built-in drag-and-drop handling.
 
 ``--input-cmdlist``
     Prints all commands that can be bound to keys.
@@ -6469,6 +6486,11 @@ them.
     frame presentation if it is supported by the compositor (default: ``yes``).
     This only has an effect if ``--video-sync=display-...`` is being used.
 
+``--wayland-session=<string>``
+    Set the wayland session name for window restoration (default: unset).
+    Not setting this or setting it to the empty string disables session
+    management.
+
 ``--spirv-compiler=<compiler>``
     Controls which compiler is used to translate GLSL to SPIR-V. This is
     only relevant for ``--gpu-api=d3d11`` with ``--vo=gpu``.
@@ -6569,7 +6591,8 @@ them.
         qualified parameter body lists all the possible enumeration values
         separated by newlines. These values are assigned integer values starting
         from 0 incremented by 1. Each enumeration will also be emitted as a
-        preprocessor define. ``MINIMUM`` and ``MAXIMUM`` are ignored.
+        preprocessor define and will be accessible within RPN expressions.
+        ``MINIMUM`` and ``MAXIMUM`` are ignored.
 
     MINIMUM <value>
         Minimum allowed value for this parameter.
@@ -6587,8 +6610,7 @@ them.
         ``vo=gpu`` supports only a subset of the parameter features available in
         ``vo=gpu-next``. See libplacebo documentation for more detailed
         information about PARAM features supported in ``vo=gpu-next``. Notably
-        ``uint``, ``DYNAMIC``, and ``CONSTANT`` types are not available, and
-        parameters cannot be referenced in ``WHEN`` expression.
+        ``uint``, ``DYNAMIC``, and ``CONSTANT`` types are not available.
 
     A ``HOOK`` block can set the following options:
 
@@ -6617,11 +6639,11 @@ them.
     WIDTH <szexpr>, HEIGHT <szexpr>
         Specifies the size of the resulting texture for this pass. ``szexpr``
         refers to an expression in RPN (reverse polish notation), using the
-        operators + - * / > < !, floating point literals, and references to
+        operators + - * / > < ! = %, floating point literals, and references to
         sizes of existing texture (such as MAIN.width or CHROMA.height),
-        OUTPUT, or NATIVE_CROPPED (size of an input texture cropped after
-        pan-and-scan, video-align-x/y, video-pan-x/y, etc. and possibly
-        prescaled). By default, these are set to HOOKED.w and HOOKED.h,
+        OUTPUT, tunable parameters, or NATIVE_CROPPED (size of an input texture
+        cropped after pan-and-scan, video-align-x/y, video-pan-x/y, etc. and
+        possibly prescaled). By default, these are set to HOOKED.w and HOOKED.h,
         espectively.
 
     WHEN <szexpr>

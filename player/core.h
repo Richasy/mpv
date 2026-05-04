@@ -32,6 +32,7 @@
 #include "video/mp_image.h"
 #include "video/out/vo.h"
 #include "osdep/als.h"
+#include "demux/stheader.h"
 
 // definitions used internally by the core player code
 
@@ -97,7 +98,6 @@ struct frame_info {
     double pts;
     double duration;        // PTS difference to next frame
     double approx_duration; // possibly fixed/smoothed out duration
-    double av_diff;         // A/V diff at time of scheduling
     int num_vsyncs;         // scheduled vsyncs, if using display-sync
 };
 
@@ -115,7 +115,6 @@ struct track {
     int demuxer_id; // same as stream->demuxer_id. -1 if not set.
     int ff_index; // same as stream->ff_index, or 0.
     int hls_bitrate; // same as stream->hls_bitrate. 0 if not set.
-    int program_id; // same as stream->program_id. -1 if not set.
 
     char *title;
     bool default_track, forced_track, dependent_track;
@@ -153,6 +152,12 @@ struct track {
     struct ao_chain *ao_c;
     struct mp_pin *sink;
 };
+
+// Returns true if the track belongs to the given program.
+static inline bool track_has_program(const struct track *track, int program_id)
+{
+    return track->stream && sh_stream_has_program(track->stream, program_id);
+}
 
 // Summarizes video filtering and output.
 struct vo_chain {
@@ -350,7 +355,8 @@ typedef struct MPContext {
     // update_playback_speed() updates them from the other fields.
     double audio_speed, video_speed;
     bool display_sync_active;
-    int display_sync_drift_dir;
+    double audio_drift_compensation;
+    double avd_filtered;
     // Timing error (in seconds) due to rounding on vsync boundaries
     double display_sync_error;
     // Number of mistimed frames.
@@ -604,7 +610,7 @@ struct playlist_entry *mp_next_file(struct MPContext *mpctx, int direction,
 void mp_set_playlist_entry(struct MPContext *mpctx, struct playlist_entry *e);
 void mp_play_files(struct MPContext *mpctx);
 void update_demuxer_properties(struct MPContext *mpctx);
-bool track_in_current_edition(struct MPContext *mpctx, struct track *track);
+bool track_is_visible(struct MPContext *mpctx, struct track *track);
 void print_track_list(struct MPContext *mpctx, const char *msg);
 void reselect_demux_stream(struct MPContext *mpctx, struct track *track,
                            bool refresh_only);

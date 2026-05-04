@@ -336,8 +336,10 @@ g-e
     Select an MKV edition or DVD/Blu-ray title.
 
 g-l
-    Select a subtitle line to seek to. This currently requires ``ffmpeg`` in
-    ``PATH``, or in the same folder as mpv on Windows.
+    Select a subtitle line to seek to.
+
+g-L
+    Select a secondary subtitle line to seek to.
 
 g-d
     Select an audio device.
@@ -1518,7 +1520,7 @@ The profile is currently defined as follows:
     [builtin-pseudo-gui]
     terminal=no
     force-window=yes
-    idle=once
+    idle=yes
     screenshot-directory=~~desktop/
 
 The ``pseudo-gui`` profile exists for compatibility. The options in the

@@ -976,7 +976,6 @@ struct sh_stream *demux_alloc_sh_stream(enum stream_type type)
         .index = -1,
         .ff_index = -1,     // may be overwritten by demuxer
         .demuxer_id = -1,   // ... same
-        .program_id = -1,   // ... same
         .codec = talloc_zero(sh, struct mp_codec_params),
         .tags = talloc_zero(sh, struct mp_tags),
     };
@@ -1265,6 +1264,76 @@ const char *stream_type_name(enum stream_type type)
     }
 }
 
+static void append_field(void *ta_ctx, bstr *dst, const char *skip_dup,
+                         const char *value)
+{
+    if (skip_dup && skip_dup[0] && strstr(skip_dup, value))
+        return;
+    bstr_xappend_asprintf(ta_ctx, dst, " %s", value);
+}
+
+void demux_append_codec_desc(void *ta_ctx, bstr *dst, struct sh_stream *sh,
+                             const char *skip_dup)
+{
+    struct mp_codec_params *c = sh->codec;
+
+    bstr_xappend0(ta_ctx, dst, c->codec ? c->codec : "<unknown>");
+
+    if (c->codec_profile)
+        bstr_xappend_asprintf(ta_ctx, dst, " [%s]", c->codec_profile);
+    if (c->disp_w)
+        append_field(ta_ctx, dst, skip_dup,
+                     mp_tprintf(32, "%dx%d", c->disp_w, c->disp_h));
+    if (c->fps && !sh->image) {
+        char *fps = mp_format_double(ta_ctx, c->fps, 4, false, false, true);
+        append_field(ta_ctx, dst, skip_dup, mp_tprintf(32, "%s fps", fps));
+    }
+    if (c->channels.num)
+        bstr_xappend_asprintf(ta_ctx, dst, " %dch", c->channels.num);
+    if (c->samplerate)
+        bstr_xappend_asprintf(ta_ctx, dst, " %d Hz", c->samplerate);
+    int bitrate = 0;
+    if (c->bitrate > 0 && c->bitrate < INT_MAX - 500) {
+        bitrate = (c->bitrate + 500) / 1000;
+    } else if (sh->hls_bitrate > 0 && sh->hls_bitrate < INT_MAX - 500) {
+        bitrate = (sh->hls_bitrate + 500) / 1000;
+    }
+    if (bitrate)
+        append_field(ta_ctx, dst, skip_dup, mp_tprintf(32, "%d kbps", bitrate));
+}
+
+char *demux_compose_edition_title(void *ta_ctx, struct demuxer *demuxer,
+                                  int program_id, const char *prefix)
+{
+    struct sh_stream *vsh = NULL, *ash = NULL;
+    int video_count = 0, audio_count = 0;
+    int num = demux_get_num_stream(demuxer);
+    for (int i = 0; i < num; i++) {
+        struct sh_stream *s = demux_get_stream(demuxer, i);
+        if (!sh_stream_has_program(s, program_id))
+            continue;
+        if (s->type == STREAM_VIDEO) { video_count++; vsh = s; }
+        else if (s->type == STREAM_AUDIO) { audio_count++; ash = s; }
+    }
+
+    bstr dst = {0};
+    if (prefix && prefix[0])
+        bstr_xappend0(ta_ctx, &dst, prefix);
+    if (video_count == 1) {
+        bstr_xappend0(ta_ctx, &dst, dst.len ? " (" : "(");
+        demux_append_codec_desc(ta_ctx, &dst, vsh, prefix);
+        bstr_xappend0(ta_ctx, &dst, ")");
+    }
+    if (audio_count == 1) {
+        bstr_xappend0(ta_ctx, &dst, dst.len ? " (" : "(");
+        demux_append_codec_desc(ta_ctx, &dst, ash, prefix);
+        bstr_xappend0(ta_ctx, &dst, ")");
+    }
+    if (!dst.len)
+        return NULL;
+    return bstrto0(ta_ctx, dst);
+}
+
 static struct sh_stream *demuxer_get_cc_track_locked(struct sh_stream *stream)
 {
     struct sh_stream *sh = stream->ds->cc;
@@ -1276,7 +1345,8 @@ static struct sh_stream *demuxer_get_cc_track_locked(struct sh_stream *stream)
         sh->codec->codec = "eia_608";
         sh->default_track = true;
         sh->hls_bitrate = stream->hls_bitrate;
-        sh->program_id = stream->program_id;
+        for (int i = 0; i < stream->num_program_ids; i++)
+            MP_TARRAY_APPEND(sh, sh->program_ids, sh->num_program_ids, stream->program_ids[i]);
         stream->ds->cc = sh;
         demux_add_sh_stream_locked(stream->ds->in, sh);
         sh->ds->ignore_eof = true;

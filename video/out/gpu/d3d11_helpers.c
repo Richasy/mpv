@@ -289,7 +289,21 @@ static bool query_output_format_and_colorspace(struct mp_log *log,
         return false;
 
     if (!mp_dxgi_output_desc_from_swapchain(NULL, swapchain, &desc)) {
-        mp_err(log, "Failed to query swap chain's output information\n");
+        // Composition swapchains (created via CreateSwapChainForComposition,
+        // e.g. when hosted in a WinUI/XAML SwapChainPanel through the
+        // `d3d11-composition-hwnd` option) don't have a real OutputWindow,
+        // so HWND-based monitor lookup will always fail. The caller treats
+        // this as "no probed format/colorspace" and falls back to defaults,
+        // so demote it to a verbose message instead of a hard error.
+        DXGI_SWAP_CHAIN_DESC swap_desc = { 0 };
+        if (SUCCEEDED(IDXGISwapChain_GetDesc(swapchain, &swap_desc)) &&
+            swap_desc.OutputWindow == NULL)
+        {
+            mp_verbose(log, "Skipping swap chain output query: composition "
+                            "swapchain has no OutputWindow.\n");
+        } else {
+            mp_err(log, "Failed to query swap chain's output information\n");
+        }
         goto done;
     }
 

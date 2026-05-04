@@ -120,11 +120,30 @@
 //   - bounds GPU utilisation so heavy models don't run unbounded;
 //   - MAX_QUEUE_SECONDS (30 s) provides the secondary backpressure on the
 //     af_whisper async queue regardless.
-#define FIRST_CHUNK_SECONDS  6.0
-#define CHUNK_SECONDS       12.0
-#define MIN_CHUNK_SECONDS    1.5
-#define LOOKAHEAD_MAX_SEC  120.0
-#define WORKER_TICK_SEC      0.05  // tighter wakeups during startup ramp-up
+//
+// When an asynchronous translator pipeline is active with a finite cost-guard
+// horizon, we further tighten the recognition cap to roughly the translator's
+// horizon. Rationale: before d8339acec5, AI translation was a synchronous
+// HTTP call inside inject_subtitle(), which transitively throttled the
+// lookahead worker via the sink filter. After the async N-worker pipeline
+// landed, recognition is no longer rate-limited by translation throughput
+// and the worker happily chases playback+LOOKAHEAD_MAX_SEC even though the
+// translator's horizon (default 60 s) means tasks beyond that just sit in
+// the pending queue without producing any user-visible captions. That
+// surplus recognition keeps either the CUDA compute engine or the Vulkan
+// compute queue busy, contends with the player's swapchain for SMs / VRAM
+// bandwidth, and surfaces as render stutter when translation falls behind.
+// Capping at horizon * 1.2 keeps a small safety buffer for the translator
+// without paying the GPU cost of speculative recognition that the
+// translator will never serve.
+#define FIRST_CHUNK_SECONDS              6.0
+#define CHUNK_SECONDS                   12.0
+#define MIN_CHUNK_SECONDS                1.5
+#define LOOKAHEAD_MAX_SEC              120.0
+#define LOOKAHEAD_MIN_TRANSLATE_SEC     30.0  // floor when horizon-gated
+#define LOOKAHEAD_TRANSLATE_MARGIN     1.2    // fraction of horizon_sec we
+                                              // allow recognition to lead
+#define WORKER_TICK_SEC                  0.05 // tighter wakeups during startup ramp-up
 
 struct frame_item {
     struct mp_frame f;
@@ -2350,9 +2369,29 @@ static MP_THREAD_VOID wl_thread(void *ptr)
         }
 
         // Cap end by what's actually cached and by the lookahead bound.
+        // When an async translator pipeline is active with a finite
+        // cost-guard horizon, tighten the cap so recognition doesn't run
+        // far past what the translator will translate (see commentary
+        // above LOOKAHEAD_MAX_SEC).
         if (ce_known && end > snap.cache_end)
             end = snap.cache_end;
-        double cap = pb_known ? snap.playback_pts + LOOKAHEAD_MAX_SEC : INFINITY;
+        double effective_lookahead = LOOKAHEAD_MAX_SEC;
+        if (wl->pipeline) {
+            int horizon_sec = 0;
+            bool gate_enabled = false;
+            mp_mutex_lock(&wl->pipeline->limits_lock);
+            gate_enabled = wl->pipeline->cfg.enabled;
+            horizon_sec = wl->pipeline->cfg.horizon_sec;
+            mp_mutex_unlock(&wl->pipeline->limits_lock);
+            if (gate_enabled && horizon_sec > 0) {
+                double horizon_cap = horizon_sec * LOOKAHEAD_TRANSLATE_MARGIN;
+                if (horizon_cap < LOOKAHEAD_MIN_TRANSLATE_SEC)
+                    horizon_cap = LOOKAHEAD_MIN_TRANSLATE_SEC;
+                if (horizon_cap < effective_lookahead)
+                    effective_lookahead = horizon_cap;
+            }
+        }
+        double cap = pb_known ? snap.playback_pts + effective_lookahead : INFINITY;
         if (end > cap) end = cap;
 
         if (!isfinite(start) || !isfinite(end) || end - start < MIN_CHUNK_SECONDS) {

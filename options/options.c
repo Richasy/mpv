@@ -410,7 +410,6 @@ const struct m_sub_options mp_subtitle_shared_sub_opts = {
             {"secondary-top", SUB_STACK_ORDER_SECONDARY_TOP})},
         {"sub-stack-gap", OPT_INT(sub_stack_gap), M_RANGE(0, 500)},
         {"sub-stack-margin", OPT_FLOAT(sub_stack_margin), M_RANGE(0.0, 150.0)},
-        {"sub-avoid-bottom-px", OPT_INT(sub_avoid_bottom_px), M_RANGE(0, INT_MAX)},
         {0}
     },
     .size = sizeof(OPT_BASE_STRUCT),
@@ -426,6 +425,20 @@ const struct m_sub_options mp_subtitle_shared_sub_opts = {
         .sub_stack_margin = 100,
     },
     .change_flags = UPDATE_OSD,
+};
+
+#undef OPT_BASE_STRUCT
+#define OPT_BASE_STRUCT struct mp_subtitle_avoid_opts
+
+// Runtime-only sub geometry knobs that must NOT trigger any sub option-change
+// callback when written. See struct mp_subtitle_avoid_opts in options.h for
+// rationale. .change_flags is intentionally left empty.
+const struct m_sub_options mp_subtitle_avoid_sub_opts = {
+    .opts = (const struct m_option[]){
+        {"sub-avoid-bottom-px", OPT_INT(sub_avoid_bottom_px), M_RANGE(0, INT_MAX)},
+        {0}
+    },
+    .size = sizeof(OPT_BASE_STRUCT),
 };
 
 #undef OPT_BASE_STRUCT
@@ -763,6 +776,7 @@ static const m_option_t mp_opts[] = {
 
     {"", OPT_SUBSTRUCT(subs_rend, mp_subtitle_sub_opts)},
     {"", OPT_SUBSTRUCT(subs_shared, mp_subtitle_shared_sub_opts)},
+    {"", OPT_SUBSTRUCT(subs_avoid, mp_subtitle_avoid_sub_opts)},
     {"sub-filter", OPT_SUBSTRUCT(subs_filt, mp_sub_filter_opts)},
     {"", OPT_SUBSTRUCT(osd_rend, mp_osd_render_sub_opts)},
 

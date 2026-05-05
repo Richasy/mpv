@@ -80,6 +80,8 @@ struct osd_state {
     struct mp_osd_render_opts *opts;
     struct m_config_cache *sub_shared_opts_cache;
     struct mp_subtitle_shared_opts *sub_shared_opts;
+    struct m_config_cache *sub_avoid_opts_cache;
+    struct mp_subtitle_avoid_opts *sub_avoid_opts;
     struct mpv_global *global;
     struct mp_log *log;
     struct stats_ctx *stats;

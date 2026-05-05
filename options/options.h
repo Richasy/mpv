@@ -163,6 +163,16 @@ struct mp_subtitle_shared_opts {
     int sub_stack_order;        // enum sub_stack_order
     int sub_stack_gap;          // pixels between stacked subs
     float sub_stack_margin;     // overall margin for stacked layout (0-150)
+};
+
+// Runtime-only sub geometry knobs that must NOT trigger any sub option-change
+// callback (e.g. ass_configured = false in sd_ass) when written. Kept in their
+// own m_sub_options group with empty change_flags. The host application
+// (libmpv embedder) writes sub-avoid-bottom-px on every UI overlay
+// show/hide; routing it through the same group as sub-pos/sub-stack-* would
+// force a libass reconfigure on each toggle and visibly drop user-applied
+// styles / re-trigger initial-frame layout glitches.
+struct mp_subtitle_avoid_opts {
     int sub_avoid_bottom_px;    // dynamic bottom-area to keep clear of subs (px)
 };
 
@@ -248,6 +258,7 @@ typedef struct MPOpts {
 
     struct mp_subtitle_opts *subs_rend;
     struct mp_subtitle_shared_opts *subs_shared;
+    struct mp_subtitle_avoid_opts *subs_avoid;
     struct mp_sub_filter_opts *subs_filt;
     struct mp_osd_render_opts *osd_rend;
 
@@ -467,6 +478,7 @@ extern const struct m_sub_options vo_sub_opts;
 extern const struct m_sub_options cuda_conf;
 extern const struct m_sub_options mp_subtitle_sub_opts;
 extern const struct m_sub_options mp_subtitle_shared_sub_opts;
+extern const struct m_sub_options mp_subtitle_avoid_sub_opts;
 extern const struct m_sub_options mp_osd_render_sub_opts;
 extern const struct m_sub_options filter_conf;
 extern const struct m_sub_options resample_conf;

@@ -164,6 +164,7 @@ struct osd_state *osd_create(struct mpv_global *global)
     *osd = (struct osd_state) {
         .opts_cache = m_config_cache_alloc(osd, global, &mp_osd_render_sub_opts),
         .sub_shared_opts_cache = m_config_cache_alloc(osd, global, &mp_subtitle_shared_sub_opts),
+        .sub_avoid_opts_cache = m_config_cache_alloc(osd, global, &mp_subtitle_avoid_sub_opts),
         .global = global,
         .log = mp_log_new(osd, global->log, "osd"),
         .force_video_pts = MP_NOPTS_VALUE,
@@ -172,6 +173,7 @@ struct osd_state *osd_create(struct mpv_global *global)
     mp_mutex_init(&osd->lock);
     osd->opts = osd->opts_cache->opts;
     osd->sub_shared_opts = osd->sub_shared_opts_cache->opts;
+    osd->sub_avoid_opts = osd->sub_avoid_opts_cache->opts;
 
     for (int n = 0; n < MAX_OSD_PARTS; n++) {
         struct osd_object *obj = talloc(osd, struct osd_object);
@@ -698,9 +700,10 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
 
     apply_sub_stack_layout(osd, list, res);
 
+    m_config_cache_update(osd->sub_avoid_opts_cache);
     m_config_cache_update(osd->sub_shared_opts_cache);
     apply_sub_avoid_bottom(list, res,
-                           osd->sub_shared_opts->sub_avoid_bottom_px,
+                           osd->sub_avoid_opts->sub_avoid_bottom_px,
                            osd->sub_shared_opts->sub_stack_layout);
 
     double elapsed = MP_TIME_NS_TO_MS(mp_time_ns() - start_time);

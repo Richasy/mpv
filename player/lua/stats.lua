@@ -1252,10 +1252,11 @@ end
 local kbinfo_lines = nil
 local function keybinding_info(after_scroll, bindlist)
     local header = {}
-    local page = pages[o.key_page_4]
+    -- Page 4 (Active Key Bindings) is no longer mapped to an OSD page; this function
+    -- is kept only for `--script-opts=stats-bindlist=yes` startup mode.
     eval_ass_formatting()
     add_header(header)
-    local prefix = bindlist and page.desc or page.desc .. ":" .. scroll_hint(true)
+    local prefix = bindlist and "Active Key Bindings" or "Active Key Bindings:" .. scroll_hint(true)
     append(header, "", {prefix=prefix, nl="", indent=""})
     header = {table.concat(header)}
 
@@ -1378,7 +1379,7 @@ local function track_info()
     local h, c = {}, {}
     eval_ass_formatting()
     add_header(h)
-    local desc = pages[o.key_page_5].desc
+    local desc = pages[o.key_page_4].desc
     append(h, "", {prefix=format("%s:%s", desc, scroll_hint()), nl="", indent=""})
     h = {table.concat(h)}
     table.insert(c, o.nl .. o.nl)
@@ -1628,9 +1629,10 @@ pages = {
     [o.key_page_1] = { idx = 1, f = default_stats, desc = "Default" },
     [o.key_page_2] = { idx = 2, f = vo_stats, desc = "Extended Frame Timings", scroll = true },
     [o.key_page_3] = { idx = 3, f = cache_stats, desc = "Cache Statistics" },
-    [o.key_page_4] = { idx = 4, f = keybinding_info, desc = "Active Key Bindings", scroll = true },
-    [o.key_page_5] = { idx = 5, f = track_info, desc = "Tracks Info", scroll = true },
-    [o.key_page_6] = { idx = 6, f = whisper_translate_stats, desc = "Whisper Translation" },
+    -- Page 4 was "Active Key Bindings" upstream; merged out so OSD page 4/5
+    -- match the WinUI stats overlay (Rodel.Player) numbering.
+    [o.key_page_4] = { idx = 4, f = track_info, desc = "Tracks Info", scroll = true },
+    [o.key_page_5] = { idx = 5, f = whisper_translate_stats, desc = "Whisper Translation" },
     [o.key_page_0] = { idx = 0, f = perf_stats, desc = "Internal Performance Info", scroll = true },
 }
 
@@ -1808,11 +1810,9 @@ local function update_scroll_bindings(k)
         unbind_scroll()
     end
 
-    if k == o.key_page_4 then
-        bind_search()
-    else
-        unbind_search()
-    end
+    -- Search binding was page 4 (keybinding info) only; page 4 is now Tracks Info,
+    -- which doesn't need search.
+    unbind_search()
 end
 
 -- Add keybindings for every page

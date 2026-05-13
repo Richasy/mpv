@@ -497,6 +497,22 @@ static int open_f(stream_t *stream)
     stream->streaming = true;
     if (stream->info->stream_origin == STREAM_ORIGIN_NET)
         stream->is_network = true;
+
+    // Opt in to the byte-range LRU cache for HTTP-like protocols where
+    // every backend seek pays a TLS-handshake-and-redirect-chain cost.
+    // The stream layer makes the final decision based on seekability,
+    // file size and user options. Local file:// / pipe / data:// etc.
+    // pass through unchanged.
+    if (stream->mode == STREAM_READ && stream->seekable) {
+        bstr proto = mp_split_proto(bstr0(stream->url), NULL);
+        for (int i = 0; http_like[i]; i++) {
+            if (bstr_equals0(proto, http_like[i])) {
+                stream->wants_lru_cache = true;
+                break;
+            }
+        }
+    }
+
     res = STREAM_OK;
 
 out:

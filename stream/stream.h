@@ -116,6 +116,7 @@ struct stream_avseek {
 
 struct stream;
 struct stream_open_args;
+struct stream_lru_cache;
 typedef struct stream_info_st {
     const char *name;
     // opts is set from ->opts
@@ -173,6 +174,8 @@ typedef struct stream {
     bool is_regular : 1; // regular file
     bool access_references : 1; // open other streams
     bool allow_partial_read : 1; // allows partial read with stream_read_file()
+    bool wants_lru_cache : 1; // backend opts in to byte-range LRU cache (set in open_f)
+    struct stream_lru_cache *lru_cache; // optional, owned by talloc parent (this stream)
     struct mp_log *log;
     struct mpv_global *global;
 

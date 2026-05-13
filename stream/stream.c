@@ -708,8 +708,11 @@ void stream_drop_buffers(stream_t *s)
 static bool stream_seek_unbuffered(stream_t *s, int64_t newpos)
 {
     if (newpos != s->pos) {
+        int64_t old_pos = s->pos;
+        double t0 = mp_time_sec();
+
         MP_VERBOSE(s, "stream level seek from %" PRId64 " to %" PRId64 "\n",
-                   s->pos, newpos);
+                   old_pos, newpos);
 
         s->total_stream_seeks++;
 
@@ -729,6 +732,13 @@ static bool stream_seek_unbuffered(stream_t *s, int64_t newpos)
         }
         stream_drop_buffers(s);
         s->pos = newpos;
+
+        double elapsed = mp_time_sec() - t0;
+        MP_VERBOSE(s,
+                   "stream level seek done: %" PRId64 " -> %" PRId64
+                   " (delta=%+" PRId64 ", %.0f ms, total_seeks=%" PRIu64 ")\n",
+                   old_pos, newpos, newpos - old_pos,
+                   elapsed * 1000.0, s->total_stream_seeks);
     }
     return true;
 }

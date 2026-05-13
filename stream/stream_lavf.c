@@ -433,6 +433,14 @@ static int open_f(stream_t *stream)
 
     av_dict_set(&dict, "reconnect", "1", 0);
     av_dict_set(&dict, "reconnect_delay_max", "7", 0);
+    /* Persistent HTTP connections. Lets ffmpeg send Connection: keep-alive
+     * and reuse the socket for adjacent / short seeks instead of forcing a
+     * fresh TCP + TLS handshake on every byte-range request. For large
+     * cross-byte seeks where the previous response body has not been
+     * drained, ffmpeg still opens a new connection, but the option remains
+     * a strict net positive for typical seek-heavy MP4 / MKV playback over
+     * HTTPS. Can be overridden via --stream-lavf-o=multiple_requests=0. */
+    av_dict_set(&dict, "multiple_requests", "1", 0);
 
     mp_setup_av_network_options(&dict, NULL, stream->global, stream->log);
 

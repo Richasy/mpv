@@ -3,6 +3,28 @@
  *
  * See cache_lru.h for the public contract and threading model.
  *
+ * Design summary (rev 3):
+ *   - At most ONE fill_buffer per stream_lru_cache_read call. The cache is
+ *     latency-transparent: a miss costs exactly one backend round-trip, the
+ *     same as the no-cache path.
+ *   - One bucket per bucket-index. A bucket caches a contiguous byte range
+ *     [start_offset, start_offset+valid_size) where start_offset lies inside
+ *     [bidx*bucket_size, (bidx+1)*bucket_size). The range never crosses a
+ *     bucket boundary (we cap fetches at the boundary).
+ *   - A miss within an already-cached bidx REPLACES the bucket entry. We
+ *     don't try to merge non-contiguous sub-ranges. Contiguous forward reads
+ *     therefore share a single bucket; jumping back into a partially-cached
+ *     bucket at a different offset trades the old slice for the new one.
+ *
+ * Rationale for "no read-ahead, no fill loop":
+ *   Earlier revisions tried to be clever and fill the entire bucket on the
+ *   first miss. On a slow remote (CDN pull origin with multi-second TTFB
+ *   AND per-GET throughput caps) "loop fill_buffer until 64 KiB" inflated
+ *   single-call latency from 1-2 s to 30-60 s. By keeping fetches single-
+ *   shot we restore the original mpv timing characteristics; yo-yo seek
+ *   hit rate is preserved because every byte that crossed the cache stays
+ *   cached for next time.
+ *
  * This file is part of mpv.
  *
  * mpv is free software; you can redistribute it and/or
@@ -35,11 +57,6 @@
 #define LRU_MIN_BUCKET_SIZE       (4u * 1024u)
 #define LRU_MAX_BUCKET_SIZE       (1u * 1024u * 1024u)
 
-// Hard ceiling on how many buckets one fetch_buckets() call may insert.
-// Combined with the capacity/4 cap below this prevents H4 (a single fetch
-// from evicting its own freshly inserted buckets).
-#define LRU_MAX_FETCH_BUCKETS     64
-
 // Self-disable after this many consecutive backend failures, so that a dead
 // connection or a non-byte-range server doesn't keep generating useless
 // per-fetch retries forever. Caller should then fall back to the direct
@@ -47,11 +64,11 @@
 #define LRU_DISABLE_AFTER_FAIL    8
 
 struct bucket_entry {
-    uint64_t bucket_idx;            // file_offset >> bucket_shift
-    int64_t  file_offset;           // bucket_idx << bucket_shift
-    uint32_t valid_size;            // <= bucket_size; last bucket may be short
-    bool     is_eof_bucket;         // hitting end of this bucket = clean EOF
-    uint8_t *data;                  // talloc child of this entry
+    uint64_t bucket_idx;            // (start_offset >> bucket_shift); also hash key
+    int64_t  start_offset;          // first cached byte; in [bidx*bsz, (bidx+1)*bsz)
+    uint32_t valid_size;            // bytes from start_offset; never crosses bsz boundary
+    bool     is_eof_bucket;         // hitting end of cached range = clean EOF
+    uint8_t *data;                  // talloc child of this entry, size == bucket_size
     struct bucket_entry *prev_lru, *next_lru;
     struct bucket_entry *next_hash;
 };
@@ -84,13 +101,6 @@ struct stream_lru_cache {
     uint64_t bytes_served;          // bytes returned to caller (hit + miss)
     uint64_t bytes_read_from_backend;
     uint64_t backend_seeks;
-};
-
-enum fetch_result {
-    FETCH_OK_DATA,                  // at least one full bucket inserted
-    FETCH_EOF,                      // backend signalled clean EOF
-    FETCH_ERROR,                    // backend reported error (s->error set)
-    FETCH_CANCELED,                 // mp_cancel fired during the fetch
 };
 
 // ---- splitmix64 hashing (L3) -----------------------------------------------
@@ -204,120 +214,77 @@ static void bucket_touch(struct stream_lru_cache *c, struct bucket_entry *e)
 }
 
 // ---- fetch -----------------------------------------------------------------
+//
+// At most ONE fill_buffer per call. Latency-transparent.
 
-// Decide how many consecutive missing buckets starting at start_idx to fetch
-// in one round. Bounded by:
-//   - LRU_MAX_FETCH_BUCKETS                : protect demux thread responsiveness
-//   - capacity_buckets / 4                 : prevent same-fetch eviction (H4)
-//   - first already-cached bucket in run   : avoid useless re-read
-//   - wanted (caller's residual byte need) : don't over-read
-static int plan_fetch(struct stream_lru_cache *c, uint64_t start_idx, int wanted)
+static void cache_drop_bidx(struct stream_lru_cache *c, uint64_t bidx)
 {
-    int max = LRU_MAX_FETCH_BUCKETS;
-    int cap_max = (int)(c->capacity_buckets / 4);
-    if (cap_max < 1)
-        cap_max = 1;
-    if (max > cap_max)
-        max = cap_max;
-    if (wanted > 0 && max > wanted)
-        max = wanted;
-    if (max < 1)
-        max = 1;
-
-    for (int i = 1; i < max; i++) {
-        if (table_find(c, start_idx + i))
-            return i;
-    }
-    return max;
+    struct bucket_entry *e = table_find(c, bidx);
+    if (!e)
+        return;
+    lru_unlink(c, e);
+    table_remove(c, e);
+    talloc_free(e);
+    c->used_buckets--;
 }
 
-static enum fetch_result fetch_buckets(struct stream_lru_cache *c,
-                                       struct stream *s,
-                                       uint64_t start_idx,
-                                       int n_max,
-                                       int64_t file_size)
+// Fetch from the backend at exactly `pos`, into a freshly-allocated bucket
+// for `bidx`. On success returns the inserted entry (caller can read its
+// .data and .valid_size); on EOF/error/cancel returns NULL.
+//
+// The fetch is bounded so that the cached range never crosses a bucket
+// boundary: at most `bucket_size - (pos - bidx*bucket_size)` bytes.
+static struct bucket_entry *fetch_at(struct stream_lru_cache *c,
+                                     struct stream *s,
+                                     uint64_t bidx, int64_t pos,
+                                     int max_want, int64_t file_size)
 {
-    int64_t off = (int64_t)start_idx << c->bucket_shift;
+    int64_t bucket_off = (int64_t)bidx << c->bucket_shift;
+    int max_fit = (int)c->bucket_size - (int)(pos - bucket_off);
+    if (max_fit <= 0)
+        return NULL;
+    if (max_want > max_fit)
+        max_want = max_fit;
+    if (max_want < 1)
+        max_want = 1;
 
-    // L2: always issue the seek; the backend is expected to no-op for matching
-    // pos (avio_seek does this), so this is essentially free when we are
-    // already in the right place and avoids the H1 shadow-pos bug.
-    if (s->seek(s, off) <= 0) {
+    // L2: always issue the seek; avio_seek no-ops on matching pos. This
+    // avoids any backend-pos drift introduced by out-of-band seeks
+    // (e.g. STREAM_CTRL_AVSEEK).
+    if (s->seek(s, pos) <= 0) {
         c->backend_pos = -1;
-        if (mp_cancel_test(s->cancel))
-            return FETCH_CANCELED;
-        return FETCH_ERROR;
+        return NULL;
     }
-    c->backend_pos = off;
+    c->backend_pos = pos;
     c->backend_seeks++;
 
-    int filled = 0;
+    struct bucket_entry *e = bucket_alloc(c);
+    e->bucket_idx   = bidx;
+    e->start_offset = pos;
+    e->valid_size   = 0;
+    e->is_eof_bucket = false;
 
-    for (int i = 0; i < n_max; i++) {
-        struct bucket_entry *e = bucket_alloc(c);
-        e->bucket_idx  = start_idx + i;
-        e->file_offset = off + (int64_t)i * (int64_t)c->bucket_size;
-
-        // Read up to one full bucket. Loop because backends may short-read
-        // (e.g. one TCP segment per fill_buffer call) without indicating EOF.
-        int got_in_bucket = 0;
-        bool short_read = false;
-        while (got_in_bucket < (int)c->bucket_size) {
-            int got = s->fill_buffer(s, e->data + got_in_bucket,
-                                     (int)c->bucket_size - got_in_bucket);
-            if (got <= 0) {
-                short_read = true;
-                break;
-            }
-            got_in_bucket += got;
-            c->backend_pos += got;
-            c->bytes_read_from_backend += got;
-        }
-
-        if (got_in_bucket == 0) {
-            // Couldn't read anything for this bucket. Discard and report.
-            talloc_free(e);
-            if (filled > 0)
-                return FETCH_OK_DATA;       // earlier buckets are valid
-            if (mp_cancel_test(s->cancel))
-                return FETCH_CANCELED;
-            if (s->error)
-                return FETCH_ERROR;
-            return FETCH_EOF;               // intentionally do NOT cache
-                                            // anything for "EOF before any
-                                            // data" -- avoids C2 poisoning.
-        }
-
-        e->valid_size = (uint32_t)got_in_bucket;
-
-        if (short_read) {
-            // C2: only cache as a "real" EOF bucket when we can prove from
-            // file_size that this is genuinely the end. Otherwise (transport
-            // hiccup, server cut us off mid-body, unknown size) we throw the
-            // partial bucket away -- a transient error must NOT poison future
-            // reads as fake EOF.
-            bool real_eof = (s->error == 0)
-                         && (file_size > 0)
-                         && (e->file_offset + got_in_bucket >= file_size);
-
-            if (real_eof) {
-                e->is_eof_bucket = true;
-                cache_insert(c, e);
-                return FETCH_EOF;
-            }
-
-            talloc_free(e);
-            if (s->error)
-                return filled > 0 ? FETCH_OK_DATA : FETCH_ERROR;
-            return filled > 0 ? FETCH_OK_DATA : FETCH_EOF;
-        }
-
-        // Full bucket
-        cache_insert(c, e);
-        filled++;
+    int got = s->fill_buffer(s, e->data, max_want);
+    if (got <= 0) {
+        talloc_free(e);
+        return NULL;
     }
 
-    return FETCH_OK_DATA;
+    c->bytes_read_from_backend += got;
+    c->backend_pos += got;
+    e->valid_size = (uint32_t)got;
+
+    // C2: only mark as a "true" EOF bucket when no error AND we have reached
+    // the known file size. Transient short reads must not be cached as fake
+    // EOF.
+    if (s->error == 0 && file_size > 0
+        && (pos + (int64_t)got) >= file_size)
+    {
+        e->is_eof_bucket = true;
+    }
+
+    cache_insert(c, e);
+    return e;
 }
 
 // ---- public API ------------------------------------------------------------
@@ -429,93 +396,73 @@ int stream_lru_cache_read(struct stream_lru_cache *c, struct stream *s,
     if (!c || c->disabled || len <= 0 || pos < 0)
         return 0;
 
+    if (mp_cancel_test(s->cancel))
+        return 0;
+
     int64_t file_size = stream_get_size(s);
-    int total = 0;
-    int iter = 0;
+    uint64_t bidx = (uint64_t)pos >> c->bucket_shift;
 
-    while (total < len) {
-        // M5: keep cancellation responsive even on long all-hit runs.
-        if ((++iter & 0xF) == 0 && mp_cancel_test(s->cancel))
-            break;
+    struct bucket_entry *e = table_find(c, bidx);
 
-        int64_t cur = pos + total;
-        uint64_t bidx = (uint64_t)cur >> c->bucket_shift;
-        uint32_t off  = (uint32_t)((uint64_t)cur & c->bucket_mask);
+    // ---- HIT ----
+    // Bucket exists AND the cached range covers `pos`.
+    if (e && pos >= e->start_offset
+        && pos < e->start_offset + (int64_t)e->valid_size)
+    {
+        c->hit_count++;
+        bucket_touch(c, e);
 
-        struct bucket_entry *e = table_find(c, bidx);
-        if (!e) {
-            // How many additional bucket-aligned bytes the caller still wants.
-            int wanted_bytes = len - total;
-            int wanted = (wanted_bytes + (int)c->bucket_mask)
-                         >> c->bucket_shift;
-            if (wanted < 1)
-                wanted = 1;
-            int n = plan_fetch(c, bidx, wanted);
+        int avail = (int)(e->start_offset + (int64_t)e->valid_size - pos);
+        int copy = avail < len ? avail : len;
+        memcpy(buf, e->data + (pos - e->start_offset), (size_t)copy);
+        c->bytes_served += copy;
 
-            enum fetch_result r = fetch_buckets(c, s, bidx, n, file_size);
-
-            if (r == FETCH_ERROR || r == FETCH_CANCELED) {
-                c->consecutive_failures++;
-                if (c->consecutive_failures >= LRU_DISABLE_AFTER_FAIL) {
-                    MP_WARN(c,
-                            "lru_cache: disabled after %d consecutive backend"
-                            " failures (last fetch at bucket %" PRIu64 ")\n",
-                            c->consecutive_failures, bidx);
-                    c->disabled = true;
-                }
-                if (total == 0) {
-                    // Surface to caller via 0-return; s->error is set by
-                    // backend (stream_lavf::seek/fill_buffer write s->error
-                    // for hard errors; cancel leaves it 0 -> caller treats
-                    // as EOF, which is the established mpv contract).
-                    return 0;
-                }
-                break;
-            }
-
-            // Any successful fetch (OK_DATA or EOF) is good news.
-            c->consecutive_failures = 0;
-
-            e = table_find(c, bidx);
-            if (!e) {
-                // FETCH_EOF without inserting any bucket at bidx
-                // (e.g. EOF reached before reading any bytes for this idx,
-                // or partial bucket from a transport hiccup that we refused
-                // to cache). Stop reading.
-                break;
-            }
-            c->miss_count++;
-        } else {
-            c->hit_count++;
-            bucket_touch(c, e);
-        }
-
-        if (off >= e->valid_size) {
-            // Reading past the end of an EOF bucket
-            break;
-        }
-
-        int from_bucket = (int)e->valid_size - (int)off;
-        int remaining = len - total;
-        if (from_bucket > remaining)
-            from_bucket = remaining;
-
-        memcpy((uint8_t *)buf + total, e->data + off, (size_t)from_bucket);
-        total += from_bucket;
-        c->bytes_served += from_bucket;
-
-        if (e->is_eof_bucket && (uint32_t)off + (uint32_t)from_bucket
-                                >= e->valid_size)
-            break;
+        // C3: success clears s->error to match the fill_buffer contract.
+        s->error = 0;
+        return copy;
     }
 
-    // C3: a successful read clears s->error to match the contract that
-    // demux_lavf::pending_stream_error relies on. Without this, a transient
-    // backend error during one fetch would persist as "fatal stream error"
-    // even after the cache served plenty of valid data and the file reached
-    // a clean EOF.
-    if (total > 0)
-        s->error = 0;
+    // Confirmed-EOF bucket past its valid range -> nothing to read.
+    if (e && e->is_eof_bucket
+        && pos >= e->start_offset + (int64_t)e->valid_size)
+    {
+        return 0;
+    }
 
-    return total;
+    // ---- MISS ----
+    c->miss_count++;
+
+    // The existing bucket (if any) caches a different sub-range of this bidx.
+    // Drop it; we replace with one starting at `pos`.
+    if (e)
+        cache_drop_bidx(c, bidx);
+
+    struct bucket_entry *fresh = fetch_at(c, s, bidx, pos, len, file_size);
+    if (!fresh) {
+        bool is_error  = (s->error != 0);
+        bool is_cancel = mp_cancel_test(s->cancel);
+        if (is_error || is_cancel) {
+            c->consecutive_failures++;
+            if (c->consecutive_failures >= LRU_DISABLE_AFTER_FAIL) {
+                MP_WARN(c,
+                        "lru_cache: disabled after %d consecutive backend"
+                        " failures (last fetch at bucket %" PRIu64
+                        " pos=%" PRId64 ")\n",
+                        c->consecutive_failures, bidx, pos);
+                c->disabled = true;
+            }
+        } else {
+            // Clean EOF: no data, no error.
+            c->consecutive_failures = 0;
+        }
+        return 0;
+    }
+
+    c->consecutive_failures = 0;
+
+    int copy = (int)fresh->valid_size < len ? (int)fresh->valid_size : len;
+    memcpy(buf, fresh->data, (size_t)copy);
+    c->bytes_served += copy;
+    s->error = 0;
+    return copy;
 }

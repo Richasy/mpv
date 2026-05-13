@@ -18,6 +18,7 @@
 #include <libavformat/avformat.h>
 #include <libavformat/avio.h>
 #include <libavutil/opt.h>
+#include <inttypes.h>
 
 #include "options/path.h"
 #include "common/common.h"
@@ -30,6 +31,7 @@
 #include "stream.h"
 #include "options/m_config.h"
 #include "options/m_option.h"
+#include "osdep/timer.h"
 
 #include "cookies.h"
 
@@ -121,7 +123,14 @@ static int write_buffer(stream_t *s, void *buffer, int len)
 static int seek(stream_t *s, int64_t newpos)
 {
     AVIOContext *avio = s->priv;
-    if (avio_seek(avio, newpos, SEEK_SET) < 0) {
+    MP_INFO(s, "stream_lavf seek: avio_seek begin newpos=%" PRId64 "\n", newpos);
+    double t0 = mp_time_sec();
+    int64_t r = avio_seek(avio, newpos, SEEK_SET);
+    double elapsed_ms = (mp_time_sec() - t0) * 1000.0;
+    MP_INFO(s, "stream_lavf seek: avio_seek end newpos=%" PRId64 " ret=%" PRId64
+            " avio->error=%d (%.0f ms)\n",
+            newpos, r, avio->error, elapsed_ms);
+    if (r < 0) {
         // Record the error so a subsequent fill_buffer that returns short
         // because of the failed seek still surfaces it as an error rather
         // than as benign EOF.

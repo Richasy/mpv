@@ -18,6 +18,7 @@
 #include <libavformat/avformat.h>
 #include <libavformat/avio.h>
 #include <libavutil/opt.h>
+#include <inttypes.h>
 
 #include "options/path.h"
 #include "common/common.h"
@@ -121,7 +122,9 @@ static int write_buffer(stream_t *s, void *buffer, int len)
 static int seek(stream_t *s, int64_t newpos)
 {
     AVIOContext *avio = s->priv;
-    if (avio_seek(avio, newpos, SEEK_SET) < 0) {
+    MP_INFO(s, "stream_lavf seek to %" PRId64 "\n", newpos);
+    int64_t r = avio_seek(avio, newpos, SEEK_SET);
+    if (r < 0) {
         // Record the error so a subsequent fill_buffer that returns short
         // because of the failed seek still surfaces it as an error rather
         // than as benign EOF.
@@ -433,6 +436,14 @@ static int open_f(stream_t *stream)
 
     av_dict_set(&dict, "reconnect", "1", 0);
     av_dict_set(&dict, "reconnect_delay_max", "7", 0);
+    /* Persistent HTTP connections. Lets ffmpeg send Connection: keep-alive
+     * and reuse the socket for adjacent / short seeks instead of forcing a
+     * fresh TCP + TLS handshake on every byte-range request. For large
+     * cross-byte seeks where the previous response body has not been
+     * drained, ffmpeg still opens a new connection, but the option remains
+     * a strict net positive for typical seek-heavy MP4 / MKV playback over
+     * HTTPS. Can be overridden via --stream-lavf-o=multiple_requests=0. */
+    av_dict_set(&dict, "multiple_requests", "1", 0);
 
     mp_setup_av_network_options(&dict, NULL, stream->global, stream->log);
 
@@ -480,6 +491,22 @@ static int open_f(stream_t *stream)
     stream->streaming = true;
     if (stream->info->stream_origin == STREAM_ORIGIN_NET)
         stream->is_network = true;
+
+    // Opt in to the byte-range LRU cache for HTTP-like protocols where
+    // every backend seek pays a TLS-handshake-and-redirect-chain cost.
+    // The stream layer makes the final decision based on seekability,
+    // file size and user options. Local file:// / pipe / data:// etc.
+    // pass through unchanged.
+    if (stream->mode == STREAM_READ && stream->seekable) {
+        bstr proto = mp_split_proto(bstr0(stream->url), NULL);
+        for (int i = 0; http_like[i]; i++) {
+            if (bstr_equals0(proto, http_like[i])) {
+                stream->wants_lru_cache = true;
+                break;
+            }
+        }
+    }
+
     res = STREAM_OK;
 
 out:

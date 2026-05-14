@@ -38,6 +38,7 @@
 #include "options/path.h"
 #include "osdep/timer.h"
 #include "stream.h"
+#include "cache_lru.h"
 
 #include "options/m_option.h"
 #include "options/m_config.h"
@@ -118,6 +119,11 @@ static const stream_info_t *const stream_list[] = {
 struct stream_opts {
     int64_t buffer_size;
     bool load_unsafe_playlists;
+    int64_t lru_cache_size;
+    int64_t lru_cache_bucket;
+    int64_t lru_cache_min_fetch;
+    int64_t lru_cache_tail_prefetch;
+    int64_t lru_cache_tail_threshold;
 };
 
 #define OPT_BASE_STRUCT struct stream_opts
@@ -127,11 +133,69 @@ const struct m_sub_options stream_conf = {
         {"stream-buffer-size", OPT_BYTE_SIZE(buffer_size),
             M_RANGE(STREAM_MIN_BUFFER_SIZE, STREAM_MAX_BUFFER_SIZE)},
         {"load-unsafe-playlists", OPT_BOOL(load_unsafe_playlists)},
+        // Byte-range LRU cache, layered between stream backend and stream
+        // ring buffer. Only active for backends that opt in (currently
+        // stream_lavf for http/https/mmsh/mmshttp/httproxy). Designed to
+        // absorb pathological yo-yo seek patterns from demuxers (e.g. mov
+        // demuxer hopping between mdat at the head and moov/sample table
+        // at the tail of an mp4) over high-latency network streams where
+        // every backend seek costs a full TLS handshake + redirect chain.
+        {"stream-lru-cache", OPT_BYTE_SIZE(lru_cache_size),
+            M_RANGE(0, 2LL * 1024 * 1024 * 1024)},
+        {"stream-lru-cache-bucket", OPT_BYTE_SIZE(lru_cache_bucket),
+            M_RANGE(4 * 1024, 1024 * 1024)},
+        // Target bytes per miss before the per-fetch fill_buffer loop bails
+        // out. 0 = legacy single-shot fetch (one fill_buffer per miss). With
+        // a non-zero value the cache keeps reading on the same backend
+        // connection until at least N bytes are accumulated or a hard
+        // iteration cap is hit, with no extra seek / TLS handshake. Helps
+        // demuxers whose forward step size (typical for mp4 sample table
+        // scans in moov, ~1-2 KiB) exceeds whatever a single TCP recv()
+        // returns on a slow CDN.
+        {"stream-lru-cache-min-fetch", OPT_BYTE_SIZE(lru_cache_min_fetch),
+            M_RANGE(0, 1024 * 1024)},
+        // Tail prefetch: bytes to pull forward on every miss landing
+        // inside [file_size - tail_threshold, file_size). This is a
+        // heuristic for non-faststart mp4 where the moov atom sits at
+        // the end of the file: the mov demuxer would otherwise bounce
+        // seek between mdat at the head and the sample table at the
+        // tail, each round-trip costing a fresh TLS handshake + 30x
+        // redirect chain on some CDNs. The cache itself rate-limits
+        // re-triggering: once a window has been prefetched, subsequent
+        // reads inside it hit and do not re-fire. Only a miss in a
+        // previously-uncached tail region triggers a new prefetch.
+        // Set to 0 to disable. Capped internally at (cache_size - bucket).
+        {"stream-lru-cache-tail-prefetch",
+            OPT_BYTE_SIZE(lru_cache_tail_prefetch),
+            M_RANGE(0, 64 * 1024 * 1024)},
+        // Size of the "tail region" used by the heuristic above. Any miss
+        // whose absolute position is within this many bytes of EOF is
+        // treated as a (probable) moov probe.
+        {"stream-lru-cache-tail-threshold",
+            OPT_BYTE_SIZE(lru_cache_tail_threshold),
+            M_RANGE(0, 1024LL * 1024 * 1024)},
         {0}
     },
     .size = sizeof(struct stream_opts),
     .defaults = &(const struct stream_opts){
         .buffer_size = 128 * 1024,
+        // 256 MiB cache, 64 KiB bucket: defaults sized for desktop
+        // playback of typical 4K mp4 (covers tail moov + a chunk of mdat).
+        // Set --stream-lru-cache=0 to disable.
+        .lru_cache_size = 256 * 1024 * 1024,
+        .lru_cache_bucket = 64 * 1024,
+        // 16 KiB per-miss byte target: large enough to absorb mp4 sample
+        // table scans (~1-2 KiB step) on connections where a single TCP
+        // recv only returns 1-4 KiB, small enough to keep worst-case
+        // per-fetch latency bounded on per-GET-throttled CDNs.
+        .lru_cache_min_fetch = 16 * 1024,
+        // 4 MiB tail prefetch window pulled in on each miss in the last
+        // 64 MiB of the file. Empirically this covers the moov atom of
+        // typical 4K H.264/HEVC mp4 (well under 1 MiB for 1080p, 1-3
+        // MiB for 4K) in 1-2 prefetches and converts the subsequent
+        // mdat<->moov yo-yo into normal forward reads + cache hits.
+        .lru_cache_tail_prefetch = 4 * 1024 * 1024,
+        .lru_cache_tail_threshold = 64 * 1024 * 1024,
     },
 };
 
@@ -428,6 +492,39 @@ static int stream_create_instance(const stream_info_t *sinfo,
 
     mp_assert(s->seekable == !!s->seek);
 
+    // Initialise byte-range LRU cache when the backend opts in and the
+    // stream is suitable. Conditions:
+    //   - backend set wants_lru_cache (currently stream_lavf for http-like)
+    //   - stream is seekable and read-only
+    //   - we know the file size (live streams: no LRU)
+    //   - user hasn't disabled it via --stream-lru-cache=0
+    if (s->wants_lru_cache && s->seekable && s->mode == STREAM_READ
+        && opts->lru_cache_size > 0)
+    {
+        int64_t fsize = s->get_size ? s->get_size(s) : -1;
+        if (fsize > 0) {
+            s->lru_cache = stream_lru_cache_create(s, s->log,
+                                                   (size_t)opts->lru_cache_size,
+                                                   (uint32_t)opts->lru_cache_bucket,
+                                                   (uint32_t)opts->lru_cache_min_fetch,
+                                                   (uint32_t)opts->lru_cache_tail_prefetch,
+                                                   (uint64_t)opts->lru_cache_tail_threshold);
+            if (s->lru_cache) {
+                MP_VERBOSE(s, "byte-range LRU cache enabled: "
+                           "size=%" PRId64 "B bucket=%" PRId64 "B "
+                           "min_fetch=%" PRId64 "B "
+                           "tail_prefetch=%" PRId64 "B "
+                           "tail_threshold=%" PRId64 "B "
+                           "filesize=%" PRId64 "B\n",
+                           opts->lru_cache_size, opts->lru_cache_bucket,
+                           opts->lru_cache_min_fetch,
+                           opts->lru_cache_tail_prefetch,
+                           opts->lru_cache_tail_threshold,
+                           fsize);
+            }
+        }
+    }
+
     if (s->mime_type)
         MP_VERBOSE(s, "Mime-type: '%s'\n", s->mime_type);
 
@@ -517,9 +614,15 @@ static int stream_read_unbuffered(stream_t *s, void *buf, int len)
         return 0;
 
     int res = 0;
-    // we will retry even if we already reached EOF previously.
-    if (s->fill_buffer && !mp_cancel_test(s->cancel))
+    if (s->lru_cache && !stream_lru_cache_is_disabled(s->lru_cache)) {
+        // Route through the LRU cache. It handles seeking the backend on
+        // misses and clears s->error on success (matches fill_buffer
+        // contract). On 0-return, s->error tells us EOF vs hard error.
+        res = stream_lru_cache_read(s->lru_cache, s, s->pos, buf, len);
+    } else if (s->fill_buffer && !mp_cancel_test(s->cancel)) {
+        // we will retry even if we already reached EOF previously.
         res = s->fill_buffer(s, buf, len);
+    }
     if (res <= 0) {
         s->eof = 1;
         return 0;
@@ -708,8 +811,11 @@ void stream_drop_buffers(stream_t *s)
 static bool stream_seek_unbuffered(stream_t *s, int64_t newpos)
 {
     if (newpos != s->pos) {
+        int64_t old_pos = s->pos;
+        double t0 = mp_time_sec();
+
         MP_VERBOSE(s, "stream level seek from %" PRId64 " to %" PRId64 "\n",
-                   s->pos, newpos);
+                   old_pos, newpos);
 
         s->total_stream_seeks++;
 
@@ -721,6 +827,36 @@ static bool stream_seek_unbuffered(stream_t *s, int64_t newpos)
             MP_ERR(s, "Cannot seek backward in linear streams!\n");
             return false;
         }
+
+        if (s->lru_cache && !stream_lru_cache_is_disabled(s->lru_cache)) {
+            // C1: with LRU active we deliberately do NOT push the seek to
+            // the backend. The next stream_read_unbuffered will look up the
+            // bucket; on a hit the backend is never touched, on a miss the
+            // cache issues its own backend seek (potentially merging it
+            // with read-ahead). This is the entire point of the cache --
+            // collapsing yo-yo demuxer hops into cache lookups.
+            //
+            // Reset the ring buffer manually instead of calling
+            // stream_drop_buffers(): the latter would compute
+            // s->pos = stream_tell(s) which uses buf_cur/buf_end and
+            // overwrite our intended logical pos. (Compare original path
+            // below where stream_drop_buffers is OK only because s->pos is
+            // re-assigned right after.)
+            s->buf_start = s->buf_cur = s->buf_end = 0;
+            s->pos = newpos;
+            s->eof = 0;
+            // ring buffer payload memory is preserved across logical seeks
+            double elapsed = mp_time_sec() - t0;
+            MP_VERBOSE(s,
+                       "stream level seek done (lru, no backend seek): "
+                       "%" PRId64 " -> %" PRId64
+                       " (delta=%+" PRId64 ", %.0f ms,"
+                       " total_seeks=%" PRIu64 ")\n",
+                       old_pos, newpos, newpos - old_pos,
+                       elapsed * 1000.0, s->total_stream_seeks);
+            return true;
+        }
+
         if (s->seek(s, newpos) <= 0) {
             int level = mp_cancel_test(s->cancel) ? MSGL_V : MSGL_ERR;
             MP_MSG(s, level, "Seek failed (to %lld, size %lld)\n",
@@ -729,6 +865,13 @@ static bool stream_seek_unbuffered(stream_t *s, int64_t newpos)
         }
         stream_drop_buffers(s);
         s->pos = newpos;
+
+        double elapsed = mp_time_sec() - t0;
+        MP_VERBOSE(s,
+                   "stream level seek done: %" PRId64 " -> %" PRId64
+                   " (delta=%+" PRId64 ", %.0f ms, total_seeks=%" PRIu64 ")\n",
+                   old_pos, newpos, newpos - old_pos,
+                   elapsed * 1000.0, s->total_stream_seeks);
     }
     return true;
 }
@@ -798,6 +941,15 @@ void free_stream(stream_t *s)
 {
     if (!s)
         return;
+
+    if (s->lru_cache) {
+        stream_lru_cache_log_stats(s->lru_cache);
+        // Drop the cache before close: close may invalidate the backend in
+        // ways that would make later cache reads UB. The cache itself is
+        // talloc-owned by s, so this is just an explicit destroy for stats.
+        stream_lru_cache_destroy(s->lru_cache);
+        s->lru_cache = NULL;
+    }
 
     if (s->close)
         s->close(s);

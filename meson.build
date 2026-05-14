@@ -185,6 +185,7 @@ sources = files(
     'player/clipboard/clipboard-vo.c',
 
     ## Streams
+    'stream/cache_lru.c',
     'stream/cookies.c',
     'stream/stream.c',
     'stream/stream_avdevice.c',

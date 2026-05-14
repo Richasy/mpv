@@ -147,6 +147,19 @@ typedef struct stream {
     int (*control)(struct stream *s, int cmd, void *arg);
     // Close
     void (*close)(struct stream *s);
+    // Optional: tear down and reopen the underlying transport in place.
+    // Used by the byte-range LRU cache when it needs to abandon a keep-alive
+    // HTTP socket that the server / CDN has likely closed (typical case: the
+    // previous Range response was drained all the way to EOF, after which
+    // many CDNs close the socket; reusing it for the next backward Range
+    // silently returns EOF). Backends that don't implement this leave it
+    // NULL and the cache falls back to the legacy behaviour. On success the
+    // backend must be in a state equivalent to a freshly-opened stream
+    // (priv re-initialised, fill_buffer / seek / etc. still set, internal
+    // byte cursor at 0). Returns STREAM_OK on success or a STREAM_ERROR_*
+    // code on failure; on failure the backend may be left in an unusable
+    // state and the caller should treat the stream as broken.
+    int (*reconnect)(struct stream *s);
 
     int64_t pos;
     int eof; // valid only after read calls that returned a short result

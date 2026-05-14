@@ -153,6 +153,34 @@ static void close_f(stream_t *stream)
         avio_close(avio);
 }
 
+// Tear down and reopen the AVIOContext in place. Used by the LRU cache to
+// recover from EOF-induced keep-alive socket death (see stream.h::reconnect
+// for full rationale). open_f() is idempotent for our purposes: it re-runs
+// the URL parse + avio_open2 + option dict construction, repopulating
+// stream->seek / fill_buffer / get_size / control / close / wants_lru_cache
+// / streaming / is_network with the same values it set the first time. The
+// stream-layer LRU cache pointer (stream->lru_cache) lives outside open_f
+// and is preserved across the call.
+//
+// On open failure stream->priv is left NULL and STREAM_* error code is
+// returned; the caller (cache_lru.c) treats this as "backend dead" and
+// disables itself so the demuxer surfaces the error rather than spinning.
+static int reconnect_f(stream_t *stream)
+{
+    AVIOContext *avio = stream->priv;
+    if (avio) {
+        avio_close(avio);
+        stream->priv = NULL;
+    }
+    int res = open_f(stream);
+    if (res != STREAM_OK) {
+        MP_WARN(stream, "stream_lavf reconnect failed (res=%d)\n", res);
+    } else {
+        MP_VERBOSE(stream, "stream_lavf reconnect ok\n");
+    }
+    return res;
+}
+
 static int control(stream_t *s, int cmd, void *arg)
 {
     AVIOContext *avio = s->priv;
@@ -506,6 +534,12 @@ static int open_f(stream_t *stream)
             }
         }
     }
+
+    // Only LRU-cached HTTP-like backends need the reconnect hook (see
+    // stream.h::reconnect). Setting it for non-network backends would be
+    // harmless but pointless, and we want a NULL value to signal "this
+    // backend cannot recover" to the cache.
+    stream->reconnect = stream->wants_lru_cache ? reconnect_f : NULL;
 
     res = STREAM_OK;
 

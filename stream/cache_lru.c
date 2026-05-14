@@ -124,6 +124,9 @@ struct stream_lru_cache {
     uint64_t bytes_served;          // bytes returned to caller (hit + miss)
     uint64_t bytes_read_from_backend;
     uint64_t backend_seeks;
+    uint64_t backend_reconnects;    // forced backend reopen because backend
+                                    // had been read all the way to file_size
+                                    // (CDN keep-alive socket likely dead)
 };
 
 // ---- splitmix64 hashing (L3) -----------------------------------------------
@@ -274,6 +277,56 @@ static struct bucket_entry *fetch_at(struct stream_lru_cache *c,
         max_want = max_fit;
     if (max_want < 1)
         max_want = 1;
+
+    // Recover from stale-keep-alive sockets before issuing the seek.
+    //
+    // Background: many CDNs / origin servers (Emby reverse-proxied through
+    // nginx, S3 front-ends, anything with `keepalive_requests` set on a
+    // closed Range response) close the keep-alive HTTP socket as soon as
+    // the previous Range response has been drained all the way to EOF.
+    // ffmpeg's http_seek_internal cannot tell the difference between a
+    // healthy socket and a half-closed one and will happily reuse the
+    // dead socket via its soft-seek path, at which point the very next
+    // fill_buffer returns clean EOF (avio->error stays 0). The demuxer
+    // then mistakes the stream for a single-image / zero-length file and
+    // playback dies on init.
+    //
+    // We detect this exact case here: the LRU cache tracks the backend
+    // byte cursor in c->backend_pos, and we know file_size from the
+    // outer stream layer. When the cursor sits exactly on file_size and
+    // we're about to reopen a fresh backend conversation anyway (the
+    // whole point of fetch_at), ask the backend to tear down + reopen
+    // its transport once. The next s->seek() below then runs against a
+    // freshly-handshaken socket and behaves as a normal cache miss.
+    //
+    // Why lazy (here) instead of eager (right after tail prefetch hits
+    // EOF)? Tail prefetch's primary win is keeping moov-at-end mp4
+    // playback in cache: those playbacks issue many backward seeks that
+    // hit the cache and never reach fetch_at. Reconnecting eagerly would
+    // burn a TLS handshake per session even when we never actually need
+    // a fresh backend conversation. Doing it lazily means the worst case
+    // is one extra TLS handshake on the first post-EOF cache miss, and
+    // the common case (full-cache playback) pays nothing.
+    if (s->reconnect && file_size > 0 && c->backend_pos == file_size) {
+        MP_VERBOSE(s, "lru_cache: backend at EOF (pos=%" PRId64 "), "
+                   "reconnecting before fetch_at(bidx=%" PRIu64
+                   ", pos=%" PRId64 ")\n",
+                   c->backend_pos, bidx, pos);
+        if (s->reconnect(s) != STREAM_OK) {
+            // Backend failed to reopen: it may have left s->priv NULL or
+            // otherwise unusable. Self-disable so the stream layer
+            // surfaces the error rather than spin re-entering us. The
+            // miss path below will treat this as a hard backend failure.
+            MP_WARN(s, "lru_cache: backend reconnect failed, disabling "
+                    "cache (bidx=%" PRIu64 ", pos=%" PRId64 ")\n",
+                    bidx, pos);
+            c->disabled = true;
+            c->backend_pos = -1;
+            return NULL;
+        }
+        c->backend_pos = -1;
+        c->backend_reconnects++;
+    }
 
     // L2: always issue the seek; avio_seek no-ops on matching pos. This
     // avoids any backend-pos drift introduced by out-of-band seeks
@@ -751,10 +804,11 @@ void stream_lru_cache_log_stats(struct stream_lru_cache *c)
             "lru_cache: hits=%" PRIu64 " misses=%" PRIu64
             " evictions=%" PRIu64 " hit_ratio=%.2f%%"
             " served=%" PRIu64 "B from_backend=%" PRIu64 "B"
-            " backend_seeks=%" PRIu64 " disabled=%d\n",
+            " backend_seeks=%" PRIu64 " reconnects=%" PRIu64
+            " disabled=%d\n",
             c->hit_count, c->miss_count, c->evict_count, hit_ratio,
             c->bytes_served, c->bytes_read_from_backend,
-            c->backend_seeks, (int)c->disabled);
+            c->backend_seeks, c->backend_reconnects, (int)c->disabled);
 }
 
 int stream_lru_cache_read(struct stream_lru_cache *c, struct stream *s,

@@ -122,7 +122,8 @@ static int write_buffer(stream_t *s, void *buffer, int len)
 static int seek(stream_t *s, int64_t newpos)
 {
     AVIOContext *avio = s->priv;
-    MP_INFO(s, "stream_lavf seek to %" PRId64 "\n", newpos);
+    if (newpos != avio_tell(avio))
+        MP_VERBOSE(s, "stream_lavf seek to %" PRId64 "\n", newpos);
     int64_t r = avio_seek(avio, newpos, SEEK_SET);
     if (r < 0) {
         // Record the error so a subsequent fill_buffer that returns short

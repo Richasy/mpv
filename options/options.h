@@ -370,6 +370,14 @@ typedef struct MPOpts {
     bool cache_pause_initial;
     float cache_pause_wait;
 
+    // Auto-recovery for "decoder appears stuck after first frame" on
+    // network streams: when playback_pts hasn't advanced for this many
+    // seconds (while restart_complete=true and not paused), issue an
+    // internal seek to the current pts to flush the decoder pipeline.
+    // 0 disables the watchdog.
+    float decoder_stall_recovery_timeout;
+    int decoder_stall_recovery_attempts;
+
     struct image_writer_opts *screenshot_image_opts;
     char *screenshot_template;
     char *screenshot_dir;

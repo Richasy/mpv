@@ -697,6 +697,10 @@ static const m_option_t mp_opts[] = {
     {"cache-pause", OPT_BOOL(cache_pause)},
     {"cache-pause-initial", OPT_BOOL(cache_pause_initial)},
     {"cache-pause-wait", OPT_FLOAT(cache_pause_wait), M_RANGE(0, FLT_MAX)},
+    {"decoder-stall-recovery-timeout",
+        OPT_FLOAT(decoder_stall_recovery_timeout), M_RANGE(0, FLT_MAX)},
+    {"decoder-stall-recovery-attempts",
+        OPT_INT(decoder_stall_recovery_attempts), M_RANGE(0, 100)},
 
 #if HAVE_DVBIN
     {"dvbin", OPT_SUBSTRUCT(stream_dvb_opts, stream_dvb_conf)},
@@ -1076,6 +1080,8 @@ static const struct MPOpts mp_default_opts = {
     .hls_bitrate = INT_MAX,
     .cache_pause = true,
     .cache_pause_wait = 1.0,
+    .decoder_stall_recovery_timeout = 5.0,
+    .decoder_stall_recovery_attempts = 3,
     .ab_loop = {MP_NOPTS_VALUE, MP_NOPTS_VALUE},
     .ab_loop_count = -1,
     .edition_id = -1,

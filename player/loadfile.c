@@ -1766,6 +1766,10 @@ static void play_current_file(struct MPContext *mpctx)
 
     reset_playback_state(mpctx);
 
+    mpctx->stall_baseline_pts = MP_NOPTS_VALUE;
+    mpctx->stall_baseline_time = 0;
+    mpctx->stall_recovery_count = 0;
+
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
     if (mpctx->playlist->num_entries > 3)
         goto terminate_playback;

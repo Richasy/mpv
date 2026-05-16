@@ -1165,6 +1165,103 @@ static void handle_playback_time(struct MPContext *mpctx)
     }
 }
 
+// Watchdog for the "playback restart completed but playback_pts never
+// advances" failure mode that can occur on flaky HTTP streams: after a
+// reconnect, the demuxer keeps reading packets and the playloop keeps
+// running, but the decoder pipeline (often a hwdec) silently accepts
+// packets without ever producing a second output frame. From mpv's point
+// of view nothing is wrong -- core-idle is false, paused_for_cache is
+// false, no underrun is reported -- but the user sees a frozen first
+// frame while bandwidth meters tick.
+//
+// Recovery is the same trick a human user performs to "unstick" mpv in
+// this situation: seek to the current playback position. That tears
+// down decoder state via reset_playback_state() and forces the next
+// keyframe to be re-decoded, which almost always breaks the deadlock.
+//
+// Triggering criteria are deliberately conservative:
+//   - the feature is enabled (timeout > 0, attempts > 0)
+//   - restart_complete is true (we saw at least one decoded frame)
+//   - no user pause and no paused_for_cache (mpv itself thinks it should
+//     be playing)
+//   - no pending seek (don't fight a real seek the user just issued)
+//   - not stop_play, not fully EOF
+//   - the stream is a network stream (local files don't suffer from this
+//     pattern and we never want to surprise-seek on a local file)
+//   - playback_pts has a real value but hasn't advanced in
+//     decoder_stall_recovery_timeout seconds
+//   - we haven't already used up decoder_stall_recovery_attempts seeks
+//
+// The recovery counter only resets when playback_pts actually moves
+// forward (so a successful recovery hands the user a fresh budget for
+// the next incident), not on every reset_playback_state() -- otherwise
+// our own recovery seek would reset the counter and we'd loop forever.
+static void handle_decoder_stall_recovery(struct MPContext *mpctx)
+{
+    struct MPOpts *opts = mpctx->opts;
+
+    if (opts->decoder_stall_recovery_timeout <= 0 ||
+        opts->decoder_stall_recovery_attempts <= 0)
+        return;
+
+    bool eligible = mpctx->restart_complete &&
+                    !mpctx->stop_play &&
+                    mpctx->seek.type == MPSEEK_NONE &&
+                    !mpctx->paused &&
+                    !(mpctx->video_status >= STATUS_EOF &&
+                      mpctx->audio_status >= STATUS_EOF) &&
+                    mpctx->demuxer && mpctx->demuxer->is_network;
+
+    double pts = mpctx->playback_pts;
+    if (!eligible || pts == MP_NOPTS_VALUE) {
+        mpctx->stall_baseline_time = 0;
+        mpctx->stall_baseline_pts = MP_NOPTS_VALUE;
+        return;
+    }
+
+    double now = mp_time_sec();
+    double timeout = opts->decoder_stall_recovery_timeout;
+
+    // (Re)start the observation window when:
+    //   - we don't yet have one (baseline_time <= 0), OR
+    //   - playback_pts moved forward since the snapshot (real progress).
+    bool advanced = mpctx->stall_baseline_pts == MP_NOPTS_VALUE ||
+                    pts > mpctx->stall_baseline_pts;
+    if (mpctx->stall_baseline_time <= 0 || advanced) {
+        if (advanced)
+            mpctx->stall_recovery_count = 0;
+        mpctx->stall_baseline_pts = pts;
+        mpctx->stall_baseline_time = now;
+        mp_set_timeout(mpctx, timeout);
+        return;
+    }
+
+    double stuck_for = now - mpctx->stall_baseline_time;
+    if (stuck_for < timeout) {
+        mp_set_timeout(mpctx, timeout - stuck_for);
+        return;
+    }
+
+    if (mpctx->stall_recovery_count >= opts->decoder_stall_recovery_attempts)
+        return;
+
+    MP_WARN(mpctx, "Decoder stalled at pts=%g for %.2fs (restart complete, "
+            "network stream, not paused); issuing flush seek to current "
+            "position (attempt %d/%d).\n",
+            pts, stuck_for,
+            mpctx->stall_recovery_count + 1,
+            opts->decoder_stall_recovery_attempts);
+
+    mpctx->stall_recovery_count++;
+    // Restart the window so reset_playback_state's pts=MP_NOPTS_VALUE
+    // (which will land us in the "no baseline" branch on the next tick)
+    // is followed by exactly one fresh `timeout` wait, not two.
+    mpctx->stall_baseline_time = now;
+
+    queue_seek(mpctx, MPSEEK_ABSOLUTE, pts, MPSEEK_EXACT, 0);
+    mp_set_timeout(mpctx, timeout);
+}
+
 // We always make sure audio and video buffers are filled before actually
 // starting playback. This code handles starting them at the same time.
 static void handle_playback_restart(struct MPContext *mpctx)
@@ -1447,6 +1544,8 @@ void run_playloop(struct MPContext *mpctx)
     handle_playback_restart(mpctx);
 
     handle_playback_time(mpctx);
+
+    handle_decoder_stall_recovery(mpctx);
 
     handle_dummy_ticks(mpctx);
 

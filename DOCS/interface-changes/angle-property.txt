@@ -1,0 +1,1 @@
+add `angles`, `current-angle` and `angle-list` properties for DVD/Blu-ray angle introspection

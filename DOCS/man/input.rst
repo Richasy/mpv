@@ -2464,6 +2464,46 @@ Property list
                 "default"           MPV_FORMAT_FLAG
                 "metadata"          MPV_FORMAT_NODE_MAP
 
+``angles``
+    Number of available angles for the currently playing DVD/Blu-ray title.
+    Unavailable for files that do not support multi-angle playback (most regular
+    files).
+
+``current-angle``
+    Currently selected angle (1-indexed) for the currently playing DVD/Blu-ray
+    title. Unavailable if the stream does not support angles.
+
+    This property is read-only. To change the angle, set the ``--dvd-angle`` or
+    ``--bluray-angle`` option. For Blu-ray streams, setting ``--bluray-angle``
+    at runtime performs a seamless angle change.
+
+``angle-list``
+    List of angles, current entry marked.
+
+    This has a number of sub-properties. Replace ``N`` with the 0-based angle
+    index.
+
+    ``angle-list/count``
+        Number of available angles.
+
+    ``angle-list/N/id``
+        Angle number (1-indexed), matching the value accepted by
+        ``--dvd-angle`` / ``--bluray-angle``.
+
+    ``angle-list/N/current``
+        ``yes`` if this is the currently selected angle.
+
+    When querying the property with the client API using ``MPV_FORMAT_NODE``,
+    or with Lua ``mp.get_property_native``, this will return a mpv_node with
+    the following contents:
+
+    ::
+
+        MPV_FORMAT_NODE_ARRAY
+            MPV_FORMAT_NODE_MAP (for each angle)
+                "id"        MPV_FORMAT_INT64
+                "current"   MPV_FORMAT_FLAG
+
 ``metadata``
     Metadata key/value pairs.
 

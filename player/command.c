@@ -1239,6 +1239,85 @@ static int mp_property_list_editions(void *ctx, struct m_property *prop,
                                 get_edition_entry, mpctx);
 }
 
+/* DVD/Blu-ray angles. The stream layer uses inconsistent indexing
+ * (libdvdnav: 1-indexed, libbluray: 0-indexed), so the property layer
+ * normalizes both to 1-indexed to match `--dvd-angle` / `--bluray-angle`. */
+static bool stream_is_bluray(const struct stream *s)
+{
+    if (!s || !s->info || !s->info->name)
+        return false;
+    return !strcmp(s->info->name, "bd") ||
+           !strcmp(s->info->name, "bdmv/bluray") ||
+           !strcmp(s->info->name, "iso/bluray");
+}
+
+static int get_angle_count_and_current(struct MPContext *mpctx,
+                                       int *out_count, int *out_current)
+{
+    struct demuxer *demuxer = mpctx->demuxer;
+    if (!demuxer || !demuxer->stream)
+        return -1;
+    int count = 0;
+    if (stream_control(demuxer->stream, STREAM_CTRL_GET_NUM_ANGLES,
+                       &count) != STREAM_OK || count <= 0)
+        return -1;
+    int current = 0;
+    if (stream_control(demuxer->stream, STREAM_CTRL_GET_ANGLE,
+                       &current) != STREAM_OK)
+        return -1;
+    if (stream_is_bluray(demuxer->stream))
+        current += 1;
+    if (out_count)
+        *out_count = count;
+    if (out_current)
+        *out_current = current;
+    return 0;
+}
+
+static int mp_property_angles(void *ctx, struct m_property *prop,
+                              int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    int count = 0;
+    if (get_angle_count_and_current(mpctx, &count, NULL) < 0)
+        return M_PROPERTY_UNAVAILABLE;
+    return m_property_int_ro(action, arg, count);
+}
+
+static int mp_property_current_angle(void *ctx, struct m_property *prop,
+                                     int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    int current = 0;
+    if (get_angle_count_and_current(mpctx, NULL, &current) < 0)
+        return M_PROPERTY_UNAVAILABLE;
+    return m_property_int_ro(action, arg, current);
+}
+
+static int get_angle_entry(int item, int action, void *arg, void *ctx)
+{
+    struct MPContext *mpctx = ctx;
+    int current = 0;
+    get_angle_count_and_current(mpctx, NULL, &current);
+    int id = item + 1;
+    struct m_sub_property props[] = {
+        {"id",      SUB_PROP_INT(id)},
+        {"current", SUB_PROP_BOOL(id == current)},
+        {0}
+    };
+    return m_property_read_sub(props, action, arg);
+}
+
+static int mp_property_list_angles(void *ctx, struct m_property *prop,
+                                   int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    int count = 0;
+    if (get_angle_count_and_current(mpctx, &count, NULL) < 0)
+        return M_PROPERTY_UNAVAILABLE;
+    return m_property_read_list(action, arg, count, get_angle_entry, mpctx);
+}
+
 /// Number of chapters in file
 static int mp_property_chapters(void *ctx, struct m_property *prop,
                                 int action, void *arg)
@@ -4744,8 +4823,10 @@ static const struct m_property mp_properties_base[] = {
     {"chapter", mp_property_chapter},
     {"edition", mp_property_edition},
     {"current-edition", mp_property_current_edition},
+    {"current-angle", mp_property_current_angle},
     {"chapters", mp_property_chapters},
     {"editions", mp_property_editions},
+    {"angles", mp_property_angles},
     {"metadata", mp_property_metadata},
     {"filtered-metadata", mp_property_filtered_metadata},
     {"chapter-metadata", mp_property_chapter_metadata},
@@ -4781,6 +4862,7 @@ static const struct m_property mp_properties_base[] = {
     {"track-list", mp_property_list_tracks},
     {"current-tracks", mp_property_current_tracks},
     {"edition-list", mp_property_list_editions},
+    {"angle-list", mp_property_list_angles},
 
     {"playlist", mp_property_playlist},
     {"playlist-path", mp_property_playlist_path},
@@ -8516,9 +8598,14 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
         struct demuxer *demuxer = mpctx->demuxer;
         if (mpctx->playback_initialized && demuxer && demuxer->stream &&
                 (!strcmp(demuxer->stream->info->name, "bd") ||
-                 !strcmp(demuxer->stream->info->name, "bdmv/bluray"))) {
+                 !strcmp(demuxer->stream->info->name, "bdmv/bluray") ||
+                 !strcmp(demuxer->stream->info->name, "iso/bluray"))) {
             int angle = opts->stream_bluray_opts->angle - 1;
-            stream_control(demuxer->stream, STREAM_CTRL_SET_ANGLE, &angle);
+            if (stream_control(demuxer->stream, STREAM_CTRL_SET_ANGLE,
+                               &angle) == STREAM_OK) {
+                mp_notify_property(mpctx, "current-angle");
+                mp_notify_property(mpctx, "angle-list");
+            }
         }
     }
 #endif

@@ -24,6 +24,7 @@
 #include <libavutil/hwcontext_d3d11va.h>
 
 #include "common/common.h"
+#include "common/tags.h"
 #include "osdep/timer.h"
 #include "osdep/windows_utils.h"
 #include "filters/f_autoconvert.h"
@@ -222,6 +223,57 @@ static bool enable_nvidia_true_hdr(struct mp_filter *vf)
     return true;
 }
 
+// Returns a stable string describing the current NVIDIA RTX Video HDR state.
+// Exposed to clients via the `vf-metadata/<label>/nvidia-true-hdr-status`
+// property so the UI can react when the SDR->HDR conversion is automatically
+// skipped (see upstream mpv issue #17800). Possible values:
+//   "disabled"       - the filter option is not set
+//   "active"         - SDR->HDR conversion is currently running
+//   "source-is-hdr"  - skipped because the source is already HDR
+//   "display-is-sdr" - skipped because the display target is in SDR mode
+//   "display-unknown"- skipped because the display target colorspace is
+//                      not yet known (e.g. before the first frame is
+//                      rendered, or the filter is not attached to a VO)
+//   "unsupported"    - skipped because the driver does not support the
+//                      RTX Video HDR extension on this GPU
+static const char *nvidia_true_hdr_status_str(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+
+    if (!p->opts->nvidia_true_hdr)
+        return "disabled";
+    if (p->true_hdr_unsupported)
+        return "unsupported";
+    if (p->true_hdr_active)
+        return "active";
+
+    // Source params haven't been populated yet (no frame has flowed
+    // through the filter). We don't know enough about the source yet
+    // to classify the skip reason, so report it as unknown.
+    if (p->params.color.transfer == PL_COLOR_TRC_UNKNOWN)
+        return "display-unknown";
+
+    if (pl_color_transfer_is_hdr(p->params.color.transfer))
+        return "source-is-hdr";
+
+    struct mp_stream_info *info = mp_filter_find_stream_info(vf);
+    if (!info || !info->dr_vo)
+        return "display-unknown";
+
+    struct mp_image_params target = vo_get_target_params(info->dr_vo);
+    if (target.color.transfer == PL_COLOR_TRC_UNKNOWN)
+        return "display-unknown";
+    if (!pl_color_transfer_is_hdr(target.color.transfer))
+        return "display-is-sdr";
+
+    // All activation conditions are satisfied but the active flag hasn't
+    // been flipped yet (transient state for at most one frame after a
+    // display SDR->HDR switch). The next process() call will turn the
+    // converter on; report "active" so the UI doesn't flicker through a
+    // bogus skip reason.
+    return "active";
+}
+
 // Decide whether NVIDIA RTX Video HDR should currently be active.
 // RTX Video HDR is an SDR-to-HDR inverse tone-mapper run inside the video
 // processor; tagging the output as HDR while the GPU/display can't actually
@@ -253,6 +305,20 @@ static bool should_enable_nvidia_true_hdr_now(struct mp_filter *vf)
         return false;
 
     struct mp_image_params target = vo_get_target_params(info->dr_vo);
+
+    // The target colorspace is briefly reported as UNKNOWN while the VO
+    // tears down and recreates its swap chain in response to our own
+    // out_params change (HDR10 <-> SDR). Treating UNKNOWN as "not HDR" here
+    // would flip true_hdr_active back to false, force another out_params
+    // recompute and swap-chain rebuild, then the next frame sees HDR again
+    // and flips it back on -- an active <-> display-unknown oscillation that
+    // makes the screen visibly flicker between HDR and SDR several times per
+    // second. Once we have committed to a decision and the target was known
+    // HDR at that point, stick with it across these transient UNKNOWN
+    // windows; only an explicit SDR target should turn us off.
+    if (target.color.transfer == PL_COLOR_TRC_UNKNOWN)
+        return p->true_hdr_active;
+
     if (!pl_color_transfer_is_hdr(target.color.transfer))
         return false;
 
@@ -775,9 +841,29 @@ static void uninit(struct mp_filter *vf)
         ID3D11Device_Release(p->vo_dev);
 }
 
+static bool vf_d3d11vpp_command(struct mp_filter *vf, struct mp_filter_command *cmd)
+{
+    struct priv *p = vf->priv;
+
+    if (cmd->type != MP_FILTER_COMMAND_GET_META)
+        return false;
+
+    struct mp_tags **ptags = cmd->res;
+    struct mp_tags *tags = talloc_zero(NULL, struct mp_tags);
+    mp_tags_set_str(tags, "nvidia-true-hdr-status",
+                    nvidia_true_hdr_status_str(vf));
+    mp_tags_set_str(tags, "nvidia-true-hdr-active",
+                    p->true_hdr_active ? "yes" : "no");
+    mp_tags_set_str(tags, "nvidia-true-hdr-requested",
+                    p->opts->nvidia_true_hdr ? "yes" : "no");
+    *ptags = tags;
+    return true;
+}
+
 static const struct mp_filter_info vf_d3d11vpp_filter = {
     .name = "d3d11vpp",
     .process = vf_d3d11vpp_process,
+    .command = vf_d3d11vpp_command,
     .reset = flush_frames,
     .destroy = uninit,
     .priv_size = sizeof(struct priv),

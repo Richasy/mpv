@@ -770,6 +770,42 @@ Available mpv-only filters are:
         frame so toggling the display between HDR and SDR mode during
         playback takes effect on the next frame.
 
+        Clients (e.g. libmpv front-ends) can observe the current state via
+        ``vf-metadata/<label>`` (with the standard ``mpv_observe_property``
+        API). The following keys are exposed:
+
+        ``nvidia-true-hdr-requested``
+            ``yes`` if the option is enabled in the filter chain, ``no``
+            otherwise.
+
+        ``nvidia-true-hdr-active``
+            ``yes`` while SDR-to-HDR conversion is actually running,
+            ``no`` otherwise.
+
+        ``nvidia-true-hdr-status``
+            One of the following strings:
+
+            ``disabled``
+                The option is not set.
+            ``active``
+                SDR-to-HDR conversion is currently running.
+            ``source-is-hdr``
+                Skipped because the source video is already HDR.
+            ``display-is-sdr``
+                Skipped because the display target is in SDR mode.
+            ``display-unknown``
+                Skipped because the display target colorspace is not
+                yet known (e.g. before the first frame is rendered, or
+                the filter is not attached to a VO).
+            ``unsupported``
+                Skipped because the driver does not support the
+                RTX Video HDR extension on this GPU.
+
+        For example, to label the filter and observe its status:
+
+        ``--vf=@hdr:d3d11vpp=nvidia-true-hdr=yes`` together with
+        ``mpv_observe_property(ctx, 0, "vf-metadata/hdr/nvidia-true-hdr-status", MPV_FORMAT_STRING)``.
+
 ``amf_frc``
     AMD Frame Rate Conversion filter. Requires AMD hardware and drivers
     supporting AMF FRC.

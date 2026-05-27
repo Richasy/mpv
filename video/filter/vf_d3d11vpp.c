@@ -36,6 +36,7 @@
 #include "video/mp_image.h"
 #include "video/mp_image_pool.h"
 #include "video/out/gpu/d3d11_helpers.h"
+#include "video/out/vo.h"
 
 // For video processor extensions identifiers reference see:
 // https://chromium.googlesource.com/chromium/src/+/5f354f38/ui/gl/swap_chain_presenter.cc
@@ -108,6 +109,8 @@ struct priv {
     D3D11_VIDEO_FRAME_FORMAT d3d_frame_format;
 
     bool require_filtering;
+    bool true_hdr_active;
+    bool true_hdr_unsupported;
 
     struct mp_image_params params, out_params;
     int c_w, c_h;
@@ -217,6 +220,73 @@ static bool enable_nvidia_true_hdr(struct mp_filter *vf)
 
     MP_VERBOSE(vf, "NVIDIA RTX Video HDR enabled.\n");
     return true;
+}
+
+// Decide whether NVIDIA RTX Video HDR should currently be active.
+// RTX Video HDR is an SDR-to-HDR inverse tone-mapper run inside the video
+// processor; tagging the output as HDR while the GPU/display can't actually
+// perform the conversion (because the source is already HDR or because the
+// display is in SDR mode) results in a broken picture. This mirrors what
+// mpcvr does (see DX11VideoProcessor.cpp `rtxHDR` logic).
+static bool should_enable_nvidia_true_hdr_now(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+
+    if (!p->opts->nvidia_true_hdr)
+        return false;
+
+    // The driver was probed once and reported no support for RTX Video HDR.
+    if (p->true_hdr_unsupported)
+        return false;
+
+    // Don't run an SDR->HDR converter on HDR sources.
+    if (pl_color_transfer_is_hdr(p->params.color.transfer))
+        return false;
+
+    // We need a VO with a known target colorspace to tell whether the display
+    // is currently in HDR mode. Target params get populated by the VO after
+    // the first frame is rendered; if they aren't available yet, treat the
+    // display as SDR so we don't tag the first frame as HDR on an SDR
+    // monitor. The decision is re-evaluated on every subsequent frame.
+    struct mp_stream_info *info = mp_filter_find_stream_info(vf);
+    if (!info || !info->dr_vo)
+        return false;
+
+    struct mp_image_params target = vo_get_target_params(info->dr_vo);
+    if (!pl_color_transfer_is_hdr(target.color.transfer))
+        return false;
+
+    return true;
+}
+
+// Recompute p->out_params and p->require_filtering from p->params, options
+// and the current p->true_hdr_active decision. Safe to call multiple times.
+static void recompute_out_params(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+
+    p->out_params = p->params;
+    p->out_params.w = (int)(p->opts->scale * p->params.w);
+    p->out_params.w += p->out_params.w % 2 != 0;
+    p->out_params.h = (int)(p->opts->scale * p->params.h);
+    p->out_params.h += p->out_params.h % 2 != 0;
+    p->out_params.crop.x0 = lrintf(p->opts->scale * p->out_params.crop.x0);
+    p->out_params.crop.x1 = lrintf(p->opts->scale * p->out_params.crop.x1);
+    p->out_params.crop.y0 = lrintf(p->opts->scale * p->out_params.crop.y0);
+    p->out_params.crop.y1 = lrintf(p->opts->scale * p->out_params.crop.y1);
+
+    if (p->opts->format)
+        p->out_params.hw_subfmt = p->opts->format;
+
+    if (p->true_hdr_active) {
+        // NVIDIA RTX Video HDR seems to require BT.2020+PQ RGB output.
+        p->out_params.color = pl_color_space_hdr10;
+        p->out_params.color.hdr.max_luma = 1000;
+        if (!p->opts->format)
+            p->out_params.hw_subfmt = IMGFMT_X2BGR10;
+    }
+
+    p->require_filtering = !mp_image_params_static_equal(&p->params, &p->out_params);
 }
 
 static void enable_intel_vsr_extension(struct mp_filter *vf)
@@ -399,25 +469,25 @@ static int recreate_video_proc(struct mp_filter *vf)
                                                             D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_NORMAL,
                                                          FALSE, 0);
 
-    if (p->opts->nvidia_true_hdr && enable_nvidia_true_hdr(vf)) {
-        // NVIDIA RTX Video HDR seems to require BT.2020+PQ RGB output.
-        p->out_params.color = pl_color_space_hdr10;
-        p->out_params.color.hdr.max_luma = 1000;
-        MP_WARN(vf, "Tagging image output as HDR with max-luma=1000 nits for "
-                    "NVIDIA RTX Video HDR. This is only a guess. "
-                    "Adjust the value to match NVIDIA settings with "
-                    "`--vf-add=format=max-luma=<value>`.\n");
-        const enum mp_imgfmt output_format = IMGFMT_X2BGR10;
-        if (p->opts->format) {
-            // Don't override user choice, even if it might break output.
-            if (p->out_params.hw_subfmt != output_format) {
+    if (p->true_hdr_active) {
+        if (enable_nvidia_true_hdr(vf)) {
+            MP_WARN(vf, "Tagging image output as HDR with max-luma=1000 nits for "
+                        "NVIDIA RTX Video HDR. This is only a guess. "
+                        "Adjust the value to match NVIDIA settings with "
+                        "`--vf-add=format=max-luma=<value>`.\n");
+            if (p->opts->format && p->out_params.hw_subfmt != IMGFMT_X2BGR10) {
                 MP_WARN(vf, "Requested %s format is not supported for NVIDIA RTX Video HDR. "
                             "Consider using %s instead or leave it unspecified.\n",
                         mp_imgfmt_to_name(p->opts->format),
-                        mp_imgfmt_to_name(output_format));
+                        mp_imgfmt_to_name(IMGFMT_X2BGR10));
             }
         } else {
-            p->out_params.hw_subfmt = output_format;
+            // Driver doesn't actually support RTX Video HDR. Cache this so we
+            // stop trying, and revert out_params so we don't tag the output
+            // as HDR while the driver does nothing.
+            p->true_hdr_active = false;
+            p->true_hdr_unsupported = true;
+            recompute_out_params(vf);
         }
     }
 
@@ -528,22 +598,10 @@ static struct mp_image *render(struct mp_filter *vf)
     UINT num_past = 0;
     UINT num_future = 0;
 
-    out = alloc_out(vf);
-    if (!out) {
-        MP_WARN(vf, "failed to allocate frame\n");
-        goto cleanup;
-    }
-
-    ID3D11Texture2D *d3d_out_tex = (void *)out->planes[0];
-
     in = mp_refqueue_get(p->queue, 0);
     if (!in)
         goto cleanup;
     ID3D11Texture2D *d3d_tex = (void *)in->planes[0];
-
-    mp_image_copy_attributes(out, in);
-    // TODO: sanitize out_params based the processing enabled.
-    out->params = p->out_params;
 
     D3D11_VIDEO_FRAME_FORMAT d3d_frame_format;
     if (!mp_refqueue_should_deint(p->queue)) {
@@ -563,9 +621,25 @@ static struct mp_image *render(struct mp_filter *vf)
         p->c_h = texdesc.Height;
         p->d3d_frame_format = d3d_frame_format;
         p->output_seq = 0;
+        // recreate_video_proc() may probe NVIDIA RTX Video HDR support and,
+        // on failure, mutate p->out_params back to non-HDR. Do this before
+        // allocating the output frame so we don't tag a frame as HDR (or
+        // allocate it as X2BGR10) when the driver actually has no support.
         if (recreate_video_proc(vf) < 0)
             goto cleanup;
     }
+
+    out = alloc_out(vf);
+    if (!out) {
+        MP_WARN(vf, "failed to allocate frame\n");
+        goto cleanup;
+    }
+
+    ID3D11Texture2D *d3d_out_tex = (void *)out->planes[0];
+
+    mp_image_copy_attributes(out, in);
+    // TODO: sanitize out_params based the processing enabled.
+    out->params = p->out_params;
 
     ID3D11VideoContext_VideoProcessorSetStreamFrameFormat(p->video_ctx,
                                                           p->video_proc,
@@ -644,21 +718,21 @@ static void vf_d3d11vpp_process(struct mp_filter *vf)
         destroy_video_proc(vf);
 
         p->params = in_fmt->params;
-        p->out_params = p->params;
-        p->out_params.w = (int)(p->opts->scale * p->params.w);
-        p->out_params.w += p->out_params.w % 2 != 0;
-        p->out_params.h = (int)(p->opts->scale * p->params.h);
-        p->out_params.h += p->out_params.h % 2 != 0;
-        p->out_params.crop.x0 = lrintf(p->opts->scale * p->out_params.crop.x0);
-        p->out_params.crop.x1 = lrintf(p->opts->scale * p->out_params.crop.x1);
-        p->out_params.crop.y0 = lrintf(p->opts->scale * p->out_params.crop.y0);
-        p->out_params.crop.y1 = lrintf(p->opts->scale * p->out_params.crop.y1);
-
-        if (p->opts->format)
-            p->out_params.hw_subfmt = p->opts->format;
-
-        p->require_filtering = !mp_image_params_static_equal(&p->params, &p->out_params) ||
-                               p->opts->nvidia_true_hdr;
+        p->true_hdr_active = should_enable_nvidia_true_hdr_now(vf);
+        recompute_out_params(vf);
+    } else if (p->opts->nvidia_true_hdr) {
+        // Re-evaluate every frame so we react to the display switching
+        // between HDR and SDR mode (target_params is populated by the VO
+        // after the first frame and updated on subsequent draws).
+        bool want = should_enable_nvidia_true_hdr_now(vf);
+        if (want != p->true_hdr_active) {
+            MP_VERBOSE(vf, "NVIDIA RTX Video HDR turned %s.\n", want ? "on" : "off");
+            p->true_hdr_active = want;
+            recompute_out_params(vf);
+            // Force the video processor to be recreated so the driver-side
+            // RTX Video HDR state matches our new decision.
+            destroy_video_proc(vf);
+        }
     }
 
     if (!mp_refqueue_can_output(p->queue))

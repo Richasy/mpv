@@ -760,7 +760,15 @@ Available mpv-only filters are:
         of the d3d11 frame.
 
     ``nvidia-true-hdr``
-        Enable NVIDIA RTX Video HDR processing.
+        Enable NVIDIA RTX Video HDR processing. NVIDIA RTX Video HDR is an
+        SDR-to-HDR inverse tone-mapper that runs inside the D3D11 video
+        processor. It is automatically skipped (and the output keeps the
+        source colorspace) when the source is already HDR, when the display
+        target is currently in SDR mode, or when the driver does not actually
+        support the extension, to avoid producing a broken picture (see
+        upstream mpv issue #17800). The decision is re-evaluated on every
+        frame so toggling the display between HDR and SDR mode during
+        playback takes effect on the next frame.
 
 ``amf_frc``
     AMD Frame Rate Conversion filter. Requires AMD hardware and drivers

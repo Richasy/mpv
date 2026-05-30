@@ -176,6 +176,7 @@ sources = files(
     'player/screenshot.c',
     'player/scripting.c',
     'player/sub.c',
+    'player/thumbnail.c',
     'player/video.c',
     'player/whisper.c',
     'player/whisper_translate.c',

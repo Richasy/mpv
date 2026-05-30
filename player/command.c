@@ -74,6 +74,7 @@
 #include "video/out/bitmap_packer.h"
 #include "options/path.h"
 #include "screenshot.h"
+#include "thumbnail.h"
 #include "misc/dispatch.h"
 #include "misc/language.h"
 #include "misc/node.h"
@@ -7912,6 +7913,18 @@ const struct mp_cmd_def mp_cmds[] = {
                 {"rgba64", 3}),
                 OPTDEF_INT(0)},
         },
+    },
+    { "thumbnail-raw", cmd_thumbnail_raw,
+        {
+            {"time", OPT_DOUBLE(v.d)},
+            {"max-width", OPT_INT(v.i), OPTDEF_INT(320)},
+            {"mode", OPT_CHOICE(v.i,
+                {"auto", 0},
+                {"local", 1},
+                {"cache", 2}),
+                OPTDEF_INT(0)},
+        },
+        .spawn_thread = true,
     },
     { "loadfile", cmd_loadfile,
         {

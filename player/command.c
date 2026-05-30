@@ -8449,6 +8449,18 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
         osd_changed(mpctx->osd);
     }
 
+    if (flags & UPDATE_SUB_AVOID) {
+        // sub-avoid-bottom-px changed. Its value is read during osd_render
+        // (apply_sub_avoid_bottom), but a paused / still frame won't re-run
+        // that path on its own, so the subtitle would not shift (nor settle
+        // back) until playback resumes. Force a sub/OSD redraw only, WITHOUT
+        // sub_control(SD_CTRL_UPDATE_OPTS), so libass is not reconfigured and
+        // user-applied styles are preserved. See mp_subtitle_avoid_sub_opts.
+        redraw_subs(mpctx);
+        osd_changed(mpctx->osd);
+        mp_wakeup_core(mpctx);
+    }
+
     if (flags & UPDATE_BUILTIN_SCRIPTS)
         mp_load_builtin_scripts(mpctx);
 

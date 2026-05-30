@@ -430,15 +430,24 @@ const struct m_sub_options mp_subtitle_shared_sub_opts = {
 #undef OPT_BASE_STRUCT
 #define OPT_BASE_STRUCT struct mp_subtitle_avoid_opts
 
-// Runtime-only sub geometry knobs that must NOT trigger any sub option-change
-// callback when written. See struct mp_subtitle_avoid_opts in options.h for
-// rationale. .change_flags is intentionally left empty.
+// Runtime-only sub geometry knobs. These must NOT route through the regular
+// sub option-change path (UPDATE_OSD / sub_control(SD_CTRL_UPDATE_OPTS)), which
+// sets ass_configured = false in sd_ass and would drop user-applied styles /
+// re-trigger initial-frame layout glitches on every UI overlay show/hide.
+// See struct mp_subtitle_avoid_opts in options.h for rationale.
+//
+// They DO need a lightweight redraw on change: the value is consumed during
+// osd_render (apply_sub_avoid_bottom), but a paused / still frame produces no
+// new osd_render on its own, so the subtitle would not move until playback
+// resumes. UPDATE_SUB_AVOID forces only redraw_subs + osd_changed (no libass
+// reinit), so avoidance applies (and clears) immediately even while paused.
 const struct m_sub_options mp_subtitle_avoid_sub_opts = {
     .opts = (const struct m_option[]){
         {"sub-avoid-bottom-px", OPT_INT(sub_avoid_bottom_px), M_RANGE(0, INT_MAX)},
         {0}
     },
     .size = sizeof(OPT_BASE_STRUCT),
+    .change_flags = UPDATE_SUB_AVOID,
 };
 
 #undef OPT_BASE_STRUCT

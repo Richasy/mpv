@@ -170,6 +170,14 @@ typedef struct stream {
     // is the backend's error code (e.g. an AVERROR), or a non-zero sentinel
     // when no specific code is available; any non-zero value means error.
     int error;
+    // Terminal failure flag. Set when an in-place backend reopen
+    // (s->reconnect) failed, or succeeded but left the backend cursor detached
+    // from s->pos and it could not be realigned. The backend is then unusable
+    // (e.g. stream_lavf priv == NULL, or the avio cursor no longer matches the
+    // logical position): all further reads and seeks are refused so we never
+    // NULL-deref the backend or serve bytes from the wrong offset. Recovery
+    // requires reopening the stream from scratch (a fresh stream object).
+    bool broken;
     int mode; //STREAM_READ or STREAM_WRITE
     int stream_origin; // any STREAM_ORIGIN_*
     void *priv; // used for DVD, TV, RTSP etc

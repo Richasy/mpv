@@ -603,6 +603,29 @@ stream_t *open_output_stream(const char *filename, struct mpv_global *global)
     return s;
 }
 
+// Max in-place reopen attempts for one unbuffered read when a redirect-
+// following network stream fails mid-stream (see stream_read_unbuffered).
+#define STREAM_MID_STREAM_REOPEN_ATTEMPTS 3
+
+// One read attempt at the current logical position through whichever path is
+// active (LRU cache or direct backend). Returns bytes read (0 on EOF / error /
+// cancel); does not advance s->pos or touch s->eof -- the caller does that.
+static int stream_read_backend(stream_t *s, void *buf, int len)
+{
+    if (s->broken)
+        return 0;
+    if (s->lru_cache && !stream_lru_cache_is_disabled(s->lru_cache)) {
+        // Route through the LRU cache. It handles seeking the backend on
+        // misses and clears s->error on success (matches fill_buffer
+        // contract). On 0-return, s->error tells us EOF vs hard error.
+        return stream_lru_cache_read(s->lru_cache, s, s->pos, buf, len);
+    } else if (s->fill_buffer && !mp_cancel_test(s->cancel)) {
+        // we will retry even if we already reached EOF previously.
+        return s->fill_buffer(s, buf, len);
+    }
+    return 0;
+}
+
 // Read function bypassing the local stream buffer. This will not write into
 // s->buffer, but into buf[0..len] instead.
 // Returns 0 on error or EOF, and length of bytes read on success.
@@ -613,16 +636,77 @@ static int stream_read_unbuffered(stream_t *s, void *buf, int len)
     if (len <= 0)
         return 0;
 
-    int res = 0;
-    if (s->lru_cache && !stream_lru_cache_is_disabled(s->lru_cache)) {
-        // Route through the LRU cache. It handles seeking the backend on
-        // misses and clears s->error on success (matches fill_buffer
-        // contract). On 0-return, s->error tells us EOF vs hard error.
-        res = stream_lru_cache_read(s->lru_cache, s, s->pos, buf, len);
-    } else if (s->fill_buffer && !mp_cancel_test(s->cancel)) {
-        // we will retry even if we already reached EOF previously.
-        res = s->fill_buffer(s, buf, len);
+    int res = stream_read_backend(s, buf, len);
+
+    // Mid-stream recovery for redirect-following network streams (typical
+    // case: Emby/Jellyfin issuing a 302 to a cloud-drive direct link, e.g.
+    // 123pan). A *hard* transport error (s->error != 0, as opposed to a clean
+    // EOF which leaves s->error == 0) here usually means the *redirected* URL
+    // went stale: the cloud link's short TTL expired or the origin closed the
+    // long-lived connection. ffmpeg's own `reconnect` reopens the stale
+    // redirect target and gets a 404, killing playback. Instead we reopen the
+    // ORIGINAL url via s->reconnect(), which re-runs the redirect chain and
+    // resolves a *fresh* link, realign the backend to the current logical
+    // offset, and retry. Bounded attempts with a short growing backoff so we
+    // never hammer a backend that may already be throttling us.
+    //
+    // s->reconnect is only set for HTTP-like network backends (stream_lavf),
+    // so local files and non-network streams skip this entirely.
+    for (int attempt = 0;
+         res <= 0 && s->error != 0 && s->reconnect && !s->broken
+             && !mp_cancel_test(s->cancel)
+             && attempt < STREAM_MID_STREAM_REOPEN_ATTEMPTS;
+         attempt++)
+    {
+        // No delay before the first retry (the common case is a single
+        // expired link that a fresh reopen fixes instantly); back off on
+        // later attempts. mp_cancel_wait() (unlike mp_cancel_test) is not
+        // NULL-safe and returns true if cancelled, so guard s->cancel.
+        if (attempt > 0 && s->cancel && mp_cancel_wait(s->cancel, (double)attempt))
+            break;
+
+        MP_WARN(s, "network read failed at pos %" PRId64 " (err=%d); reopening "
+                "source to refresh the redirect/link (attempt %d/%d)\n",
+                s->pos, s->error, attempt + 1,
+                STREAM_MID_STREAM_REOPEN_ATTEMPTS);
+
+        if (s->reconnect(s) != STREAM_OK) {
+            // The backend is left unusable (stream_lavf nulls priv on a failed
+            // reopen). Mark the stream broken so no further read/seek touches
+            // the dead backend.
+            MP_WARN(s, "reopen failed; marking stream broken\n");
+            s->broken = true;
+            break;
+        }
+
+        // The reopened backend's byte cursor is at 0. Cached bucket payloads
+        // remain valid (same file content at the same offsets), but the LRU
+        // cache's shadow backend position must be invalidated so it issues a
+        // fresh seek on the next miss.
+        if (s->lru_cache)
+            stream_lru_cache_invalidate_backend_pos(s->lru_cache);
+
+        bool cache_active =
+            s->lru_cache && !stream_lru_cache_is_disabled(s->lru_cache);
+        s->error = 0;
+
+        // The cache issues its own seek on the next fetch; the direct path
+        // reads from the backend's current cursor, so realign it with s->pos.
+        // If we cannot realign, the cursor is detached from the logical
+        // position: refuse further access rather than risk serving bytes from
+        // the wrong offset.
+        if (!cache_active && s->pos > 0) {
+            if (!s->seek || s->seek(s, s->pos) <= 0) {
+                MP_WARN(s, "realign to pos %" PRId64 " after reopen failed; "
+                        "marking stream broken\n", s->pos);
+                s->broken = true;
+                break;
+            }
+        }
+
+        res = stream_read_backend(s, buf, len);
     }
+
     if (res <= 0) {
         s->eof = 1;
         return 0;
@@ -810,6 +894,12 @@ void stream_drop_buffers(stream_t *s)
 // Seek function bypassing the local stream buffer.
 static bool stream_seek_unbuffered(stream_t *s, int64_t newpos)
 {
+    // A broken backend (failed in-place reopen) must not be touched: its
+    // transport may be torn down (e.g. stream_lavf priv == NULL) or detached
+    // from the logical position. Refuse the seek; the stream needs reopening
+    // from scratch.
+    if (s->broken)
+        return false;
     if (newpos != s->pos) {
         int64_t old_pos = s->pos;
         double t0 = mp_time_sec();

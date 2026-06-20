@@ -1018,12 +1018,22 @@ bool stream_seek_skip(stream_t *s, int64_t pos)
 
 int stream_control(stream_t *s, int cmd, void *arg)
 {
+    // A broken backend (failed in-place reopen) must not be touched: its
+    // transport may be torn down (e.g. stream_lavf priv == NULL). Mirrors the
+    // guard in stream_read_backend() / stream_seek_unbuffered(); without it a
+    // STREAM_CTRL_* issued after the stream was marked broken would NULL-deref
+    // the dead backend.
+    if (s->broken)
+        return STREAM_ERROR;
     return s->control ? s->control(s, cmd, arg) : STREAM_UNSUPPORTED;
 }
 
 // Return the current size of the stream, or a negative value if unknown.
 int64_t stream_get_size(stream_t *s)
 {
+    // See stream_control(): never query a broken (torn-down) backend.
+    if (s->broken)
+        return -1;
     return s->get_size ? s->get_size(s) : -1;
 }
 

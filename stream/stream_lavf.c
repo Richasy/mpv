@@ -87,6 +87,8 @@ static struct mp_tags *read_icy(stream_t *stream);
 static int fill_buffer(stream_t *s, void *buffer, int max_len)
 {
     AVIOContext *avio = s->priv;
+    if (!avio)
+        return -1;
     int r = avio_read_partial(avio, buffer, max_len);
     if (r <= 0) {
         // Distinguish a real I/O error from a clean EOF. avio->error is set
@@ -112,6 +114,8 @@ static int fill_buffer(stream_t *s, void *buffer, int max_len)
 static int write_buffer(stream_t *s, void *buffer, int len)
 {
     AVIOContext *avio = s->priv;
+    if (!avio)
+        return -1;
     avio_write(avio, buffer, len);
     avio_flush(avio);
     if (avio->error)
@@ -122,6 +126,12 @@ static int write_buffer(stream_t *s, void *buffer, int len)
 static int seek(stream_t *s, int64_t newpos)
 {
     AVIOContext *avio = s->priv;
+    // Backend torn down by a failed in-place reopen: refuse rather than
+    // dereference a NULL avio (the stream should already be marked broken).
+    if (!avio) {
+        s->error = AVERROR_EXTERNAL;
+        return 0;
+    }
     if (newpos != avio_tell(avio))
         MP_VERBOSE(s, "stream_lavf seek to %" PRId64 "\n", newpos);
     int64_t r = avio_seek(avio, newpos, SEEK_SET);
@@ -139,6 +149,8 @@ static int seek(stream_t *s, int64_t newpos)
 static int64_t get_size(stream_t *s)
 {
     AVIOContext *avio = s->priv;
+    if (!avio)
+        return -1;
     return avio_size(avio);
 }
 
@@ -185,6 +197,8 @@ static int reconnect_f(stream_t *stream)
 static int control(stream_t *s, int cmd, void *arg)
 {
     AVIOContext *avio = s->priv;
+    if (!avio)
+        return STREAM_ERROR;
     switch(cmd) {
     case STREAM_CTRL_AVSEEK: {
         struct stream_avseek *c = arg;

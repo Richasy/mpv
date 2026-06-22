@@ -88,6 +88,7 @@ struct demux_opts {
     double back_seek_size;
     char *meta_cp;
     bool force_retry_eof;
+    char **directory_filter;
     int autocreate_playlist;
     bool preserve_cache_on_track_switch;
 };

@@ -49,6 +49,8 @@
 #include "misc/thread_tools.h"
 
 #include "stream/stream.h"
+#include "stream/stream_curl.h"
+
 #include "demux.h"
 #include "stheader.h"
 #include "options/m_config.h"
@@ -214,6 +216,7 @@ static const struct format_hack format_hacks[] = {
 struct nested_stream {
     AVIOContext *id;
     int64_t last_bytes;
+    void *curl_data;
 };
 
 struct stream_info {
@@ -793,7 +796,7 @@ static void handle_new_stream(demuxer_t *demuxer, int i)
             sh->codec->dv_level = cfg->dv_level;
         }
 
-        // This also applies to vfw-muxed mkv, but we can't detect these easily.
+        // AVI uses decode-order indices as DTS and needs the compensation.
         sh->codec->avi_dts = matches_avinputformat_name(priv, "avi");
 
         break;
@@ -966,12 +969,24 @@ static int nested_io_open(struct AVFormatContext *s, AVIOContext **pb,
         }
     }
 
-    int r = priv->default_io_open(s, pb, url, flags, options);
+    // Try the libcurl-based backend first, so nested connections use the same
+    // stack. Only ENOSYS (the URL not supported) falls back to Lavf IO.
+    void *curl_data = NULL;
+    int r = AVERROR(ENOSYS);
+#if HAVE_LIBCURL
+    r = mp_curl_avio_open(demuxer, pb, &curl_data, url, flags, options,
+                          s->protocol_whitelist, s->protocol_blacklist);
+    mp_assert(r != 0 || curl_data != NULL);
+#endif
+    if (r == AVERROR(ENOSYS))
+        r = priv->default_io_open(s, pb, url, flags, options);
+
     if (r >= 0) {
         if (options)
             mp_avdict_print_unset(demuxer->log, MSGL_TRACE, *options);
         struct nested_stream nest = {
             .id = *pb,
+            .curl_data = curl_data,
         };
         MP_TARRAY_APPEND(priv, priv->nested, priv->num_nested, nest);
     }
@@ -984,12 +999,21 @@ static int nested_io_close2(struct AVFormatContext *s, AVIOContext *pb)
     mp_require(demuxer);
     lavf_priv_t *priv = demuxer->priv;
 
+    MP_UNUSED void *curl_data = NULL;
     for (int n = 0; n < priv->num_nested; n++) {
         if (priv->nested[n].id == pb) {
+            curl_data = priv->nested[n].curl_data;
             MP_TARRAY_REMOVE_AT(priv->nested, priv->num_nested, n);
             break;
         }
     }
+
+#if HAVE_LIBCURL
+    if (curl_data) {
+        mp_curl_avio_close(pb, curl_data);
+        return 0;
+    }
+#endif
 
     return priv->default_io_close2(s, pb);
 }
@@ -1012,6 +1036,7 @@ static void build_editions(demuxer_t *demuxer)
         return;
     }
 
+    int first_nonempty = -1;
     for (unsigned i = 0; i < avfc->nb_programs; i++) {
         AVProgram *prog = avfc->programs[i];
 
@@ -1021,12 +1046,13 @@ static void build_editions(demuxer_t *demuxer)
         };
         mp_tags_copy_from_av_dictionary(ed.metadata, prog->metadata);
 
-        int video_count = 0, audio_count = 0;
+        int video_count = 0, audio_count = 0, track_count = 0;
         int video_idx = -1, audio_idx = -1;
         for (unsigned j = 0; j < prog->nb_stream_indexes; j++) {
             unsigned idx = prog->stream_index[j];
             if (idx >= priv->num_streams || !priv->streams[idx]->sh)
                 continue;
+            track_count++;
             struct sh_stream *sh = priv->streams[idx]->sh;
             if (sh->type == STREAM_VIDEO) {
                 video_count++;
@@ -1062,6 +1088,9 @@ static void build_editions(demuxer_t *demuxer)
                                                   prog->id, prefix);
         if (title)
             mp_tags_set_str(ed.metadata, "title", title);
+
+        if (track_count > 0 && first_nonempty < 0)
+            first_nonempty = demuxer->num_editions;
 
         MP_TARRAY_APPEND(demuxer, demuxer->editions, demuxer->num_editions, ed);
     }
@@ -1112,7 +1141,7 @@ static void build_editions(demuxer_t *demuxer)
             selected = best;
     }
 
-    demuxer->edition = selected >= 0 ? selected : 0;
+    demuxer->edition = selected >= 0 ? selected : first_nonempty >= 0 ? first_nonempty : 0;
 }
 
 #if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(60, 19, 100)
@@ -1230,20 +1259,26 @@ static void handle_iamf_audio_element_group(demuxer_t *demuxer,
 // enhancement NALUs. Only the base is decodable on its own.
 static void handle_lcevc_group(demuxer_t *demuxer, AVStreamGroup *stg)
 {
-    lavf_priv_t *priv = demuxer->priv;
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(62, 19, 100)
+    AVStreamGroupLayeredVideo *lcevc = stg->params.layered_video;
+    unsigned el_index = lcevc->el_index;
+#else
     AVStreamGroupLCEVC *lcevc = stg->params.lcevc;
+    unsigned el_index = lcevc->lcevc_index;
+#endif
+    lavf_priv_t *priv = demuxer->priv;
 
-    if (lcevc->lcevc_index >= stg->nb_streams) {
-        MP_WARN(demuxer, "LCEVC group %u: lcevc_index %u out of range (%u streams)\n",
-                stg->index, lcevc->lcevc_index, stg->nb_streams);
+    if (el_index >= stg->nb_streams) {
+        MP_WARN(demuxer, "LCEVC group %u: el_index %u out of range (%u streams)\n",
+                stg->index, el_index, stg->nb_streams);
         return;
     }
 
     MP_VERBOSE(demuxer, "LCEVC group %u: enhancement stream index %u, "
                "final size %dx%d\n",
-               stg->index, lcevc->lcevc_index, lcevc->width, lcevc->height);
+               stg->index, el_index, lcevc->width, lcevc->height);
 
-    AVStream *lcevc_st = stg->streams[lcevc->lcevc_index];
+    AVStream *lcevc_st = stg->streams[el_index];
     if ((unsigned)lcevc_st->index < (unsigned)priv->num_streams) {
         struct sh_stream *sh = priv->streams[lcevc_st->index]->sh;
         if (sh)
@@ -1397,6 +1432,22 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
     } else {
         avfc->io_open = block_io_open;
     }
+
+#if HAVE_LIBCURL
+    // When nested HTTP requests are routed through our libcurl backend,
+    // Lavf's HLS demuxer must not try to reuse the URLContext of the previous
+    // request via ff_http_do_new_request2(). Our AVIOContext is not backed by a
+    // URLContext, so ffio_geturlcontext() returns NULL and av_assert0() trips.
+    // Note that our implementation will reuse and multiplex connections.
+    // This will be fixed upstream, but keep compatibility with older versions.
+    if (demuxer->access_references) {
+        av_dict_set(&dopts, "http_persistent", "0", 0);
+        // Actually enable http_multiple, this is basic prefetching logic in
+        // HLS demuxer. We just need to avoid autodetection (-1) which would
+        // be incorrect as our backed is handling everything.
+        av_dict_set(&dopts, "http_multiple", "1", 0);
+    }
+#endif
 
     mp_set_avdict(&dopts, lavfdopts->avopts);
 
@@ -1601,6 +1652,8 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
             }
             return false;
         }
+        if (mp_cancel_test(demux->cancel))
+            return false;
         MP_WARN(demux, "error reading packet: %s.\n", av_err2str(r));
         // Don't keep retrying on errors that are permanent for this URL
         // (HTTP 4xx, server errors, ...). Without this the demuxer will

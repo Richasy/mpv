@@ -1,6 +1,7 @@
 ExternalProject_Add(mpv
     DEPENDS
         angle-headers
+        curl
         ffmpeg
         fribidi
         lcms2
@@ -51,6 +52,7 @@ ExternalProject_Add(mpv
         -Dspirv-cross=enabled
         -Dvulkan=enabled
         -Dsubrandr=enabled
+        -Dlibcurl=enabled
         ${mpv_gl}
         -Dc_args='-Wno-error=int-conversion'
         -Drife=auto

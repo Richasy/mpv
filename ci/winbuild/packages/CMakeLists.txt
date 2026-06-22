@@ -94,7 +94,10 @@ list(LENGTH ep ep_length)
 message(STATUS "Parsing ${ep_length} packages")
 
 # Exclude packages which dont depend on mpv when update
-list(APPEND removed "opusfile" "libsixel" "curl" "libressl" "mbedtls" "nettle" "gmp")
+# NOTE: curl + mbedtls are NOT excluded — mpv now links libcurl for its
+# stream_curl backend (DEPENDS curl, meson -Dlibcurl=enabled), so they must
+# participate in the download/update/clean cycle and build before mpv.
+list(APPEND removed "opusfile" "libsixel" "libressl" "nettle" "gmp")
 list(REMOVE_ITEM repo ${removed})
 list(REMOVE_ITEM ep ${removed})
 list(TRANSFORM repo APPEND "-force-update" OUTPUT_VARIABLE update)

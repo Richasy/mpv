@@ -163,6 +163,15 @@ build() {
     rm -rf "$BUILD_DIR/packages/amf-headers-prefix/src/amf-headers-stamp" 2>/dev/null || true
     rm -rf "$BUILD_DIR/${ARCH}-w64-mingw32/include/AMF" 2>/dev/null || true
 
+    # Force curl re-clone (newly enabled mpv dep for the stream_curl backend).
+    # Wiping the whole curl-prefix avoids stale ExternalProject step definitions
+    # lingering from earlier runs (e.g. a removed PATCH_COMMAND) and tracks
+    # curl.git master cleanly. mbedtls (curl's TLS backend) is left cached; it
+    # is pinned to a fixed tag and builds deterministically.
+    log "Removing curl cache to force re-clone..."
+    rm -rf "$SRC_PACKAGES/curl" 2>/dev/null || true
+    rm -rf "$BUILD_DIR/packages/curl-prefix" 2>/dev/null || true
+
     # Force whisper re-build
     log "Removing whisper cache to force rebuild..."
     rm -rf "$SRC_PACKAGES/whisper" 2>/dev/null || true

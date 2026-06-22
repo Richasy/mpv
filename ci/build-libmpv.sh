@@ -150,6 +150,19 @@ build() {
     rm -rf "$BUILD_DIR/packages/ffmpeg-prefix/src/ffmpeg-stamp" 2>/dev/null || true
     rm -rf "$BUILD_DIR/packages/ffmpeg-prefix/src/ffmpeg-build" 2>/dev/null || true
 
+    # Force amf-headers re-clone + re-install so the freshly-cloned ffmpeg's
+    # newer AMF code builds against up-to-date AMF SDK headers. ffmpeg is
+    # re-cloned every build (above), but the AMF headers were previously left
+    # cached/stale; when upstream ffmpeg added AMFSurface1 host-memory mapping
+    # (libavutil/hwcontext_amf.c, 2026-06) the stale headers broke the build:
+    #   error: unknown type name 'AMFSurface1'; did you mean 'AMFSurface'?
+    # Removing the source dir before cmake configure makes force_rebuild_git
+    # generate a proper fresh clone; wiping the installed AMF dir forces re-copy.
+    log "Removing amf-headers cache to force re-clone..."
+    rm -rf "$SRC_PACKAGES/amf-headers" 2>/dev/null || true
+    rm -rf "$BUILD_DIR/packages/amf-headers-prefix/src/amf-headers-stamp" 2>/dev/null || true
+    rm -rf "$BUILD_DIR/${ARCH}-w64-mingw32/include/AMF" 2>/dev/null || true
+
     # Force whisper re-build
     log "Removing whisper cache to force rebuild..."
     rm -rf "$SRC_PACKAGES/whisper" 2>/dev/null || true

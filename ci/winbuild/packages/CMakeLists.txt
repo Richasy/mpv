@@ -72,10 +72,10 @@ list(APPEND ep
     libsixel
     whisper
     ffmpeg
+    curl
     mpv
     mpv-release
     mpv-packaging
-    curl
     opusfile
 )
 foreach(package IN LISTS ep)

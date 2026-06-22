@@ -130,6 +130,8 @@ jobs:
             ${{ env.BUILD_DIR }}/packages/mpv-prefix/src/mpv-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/mpv-prefix/src/mpv-build/meson-logs/*.txt
             ${{ env.BUILD_DIR }}/packages/ffmpeg-prefix/src/ffmpeg-stamp/*.log
+            ${{ env.BUILD_DIR }}/packages/curl-prefix/src/curl-stamp/*.log
+            ${{ env.BUILD_DIR }}/packages/mbedtls-prefix/src/mbedtls-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-build/CMakeFiles/CMakeOutput.log
             ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-build/CMakeFiles/CMakeError.log

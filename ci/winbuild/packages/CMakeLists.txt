@@ -94,10 +94,12 @@ list(LENGTH ep ep_length)
 message(STATUS "Parsing ${ep_length} packages")
 
 # Exclude packages which dont depend on mpv when update
-# NOTE: curl + mbedtls are NOT excluded — mpv now links libcurl for its
-# stream_curl backend (DEPENDS curl, meson -Dlibcurl=enabled), so they must
-# participate in the download/update/clean cycle and build before mpv.
-list(APPEND removed "opusfile" "libsixel" "libressl" "nettle" "gmp")
+# NOTE: curl is NOT excluded — mpv now links libcurl for its stream_curl
+# backend (DEPENDS curl, meson -Dlibcurl=enabled), so it must participate in
+# the download/update/clean cycle and build before mpv. curl links the
+# already-built openssl (same TLS backend ffmpeg/libssh use), so mbedtls
+# stays excluded/unused.
+list(APPEND removed "opusfile" "libsixel" "mbedtls" "libressl" "nettle" "gmp")
 list(REMOVE_ITEM repo ${removed})
 list(REMOVE_ITEM ep ${removed})
 list(TRANSFORM repo APPEND "-force-update" OUTPUT_VARIABLE update)

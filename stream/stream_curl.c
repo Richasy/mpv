@@ -139,6 +139,18 @@ static const struct curl_scheme *curl_scheme_lookup(bstr url)
     return NULL;
 }
 
+// libcurl rejects URLs that contain raw spaces or non-ASCII bytes with
+// CURLE_URL_MALFORMAT ("URL using bad/illegal format or missing URL"), unlike
+// lavf's http protocol which is lenient. WebDAV/SMB/etc. paths proxied over
+// http (e.g. "http://host/dav/动漫/foo - bar.mp4") routinely contain spaces and
+// unicode, so escape them the same way stream_lavf's normalize_url() does.
+// Escape everything but reserved characters, and keep '%' in the allow set so
+// already-escaped URLs are not double-escaped.
+static char *normalize_url(void *ta_parent, const char *url)
+{
+    return mp_url_escape(ta_parent, url, ":/?#[]@!$&'()*+,;=%");
+}
+
 struct curl_ctx {
     mp_thread thread;
     struct mp_dispatch_queue *dispatch;
@@ -902,7 +914,7 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     p->s = s;
     p->opts = talloc_steal(p, opts);
     p->net_opts = mp_get_config_group(p, s->global, &mp_network_conf);
-    p->url = talloc_strdup(p, s->url);
+    p->url = normalize_url(p, s->url);
     p->scheme = curl_scheme_lookup(bstr0(p->url));
     // Only supported URLs are supposed to reach here.
     mp_assert(p->scheme);

@@ -199,6 +199,7 @@ struct priv {
     bool paused;         // write callback paused due to a full buffer
     bool stream_eof;     // producer has delivered all data
     bool stream_error;   // unrecoverable error
+    CURLcode error_code; // CURLcode behind stream_error (CURLE_OK if none)
     atomic_bool aborted; // canceled by user (mp_cancel)
 };
 
@@ -700,6 +701,7 @@ static void on_done(struct priv *p, CURLcode code)
 
     mp_mutex_lock(&p->mtx);
     p->stream_error = true;
+    p->error_code = code;
     mp_cond_broadcast(&p->cond);
     mp_mutex_unlock(&p->mtx);
 }
@@ -838,6 +840,9 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
         p->count -= copy;
     }
 
+    bool had_error = p->stream_error;
+    CURLcode err_code = p->error_code;
+
     bool unpause = p->paused && !p->stream_eof && !p->stream_error &&
                    p->buffer_size - p->count >= p->buffer_size / 2;
 
@@ -845,6 +850,21 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
 
     if (unpause)
         cmd_async(p, CMD_UNPAUSE);
+
+    // Distinguish a hard transport error from a clean EOF, so the stream layer
+    // and the byte-range LRU cache don't mistake a dropped connection or an
+    // expired cloud-drive link for end-of-file (which would silently truncate
+    // playback). Only signal once the ring buffer is drained -- any buffered
+    // bytes must be delivered first -- and never flag a user cancel as an
+    // error. Mirrors stream_lavf::fill_buffer's s->error contract.
+    if (copy > 0) {
+        s->error = 0;
+    } else if (had_error &&
+               !atomic_load_explicit(&p->aborted, memory_order_relaxed)) {
+        s->error = err_code ? (int)err_code : -1;
+    } else {
+        s->error = 0;
+    }
 
     return copy;
 }
@@ -970,6 +990,31 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     s->seek = p->seekable ? curl_seek : NULL;
     s->get_size = curl_get_size;
     s->close = curl_close;
+
+    // Opt in to the byte-range LRU cache for seekable, full-file HTTP(S)
+    // streams. Without it, every demuxer "yo-yo" seek -- a poorly-interleaved
+    // mkv/mp4 reading audio and video from far-apart regions makes the demuxer
+    // hop back and forth constantly -- tears down the transfer and starts a
+    // fresh request from the ORIGINAL url. Because Emby/Jellyfin answer with a
+    // 302 to a short-lived cloud-drive link, each hop re-runs the whole
+    // redirect chain, so a single episode can hammer the origin with hundreds
+    // of requests. The cache turns those repeated hops into in-memory lookups,
+    // issuing a real backend request only when a genuinely new region is
+    // touched. The stream layer makes the final call based on seekability, a
+    // known file size and --stream-lru-cache.
+    //
+    // We intentionally do NOT set s->reconnect: curl always restarts from the
+    // original url with CURLOPT_FOLLOWLOCATION, so every cache miss already
+    // re-resolves the redirect to a fresh link -- the lavf-style in-place
+    // reopen is unnecessary here. We also skip capped sub-range opens
+    // (request_end != 0, e.g. lavf nested IO fetching HLS byte-range segments):
+    // those are short-lived, read forward and would only waste a cache buffer
+    // each. FTP pays no redirect cost, so it is left out too.
+    if (s->mode == STREAM_READ && s->seekable && p->request_end == 0 &&
+        p->scheme->proto == MP_CURL_PROTO_HTTP)
+    {
+        s->wants_lru_cache = true;
+    }
 
     return STREAM_OK;
 }

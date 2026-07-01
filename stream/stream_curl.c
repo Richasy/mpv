@@ -145,10 +145,13 @@ static const struct curl_scheme *curl_scheme_lookup(bstr url)
 // http (e.g. "http://host/dav/动漫/foo - bar.mp4") routinely contain spaces and
 // unicode, so escape them the same way stream_lavf's normalize_url() does.
 // Escape everything but reserved characters, and keep '%' in the allow set so
-// already-escaped URLs are not double-escaped.
+// already-escaped URLs are not double-escaped. '#' is deliberately NOT reserved:
+// a literal '#' in a proxied filename (e.g. "メダリスト #13.mkv") would otherwise
+// be parsed by libcurl as the start of a URL fragment and dropped from the
+// request path, so the server receives a truncated path and answers 404.
 static char *normalize_url(void *ta_parent, const char *url)
 {
-    return mp_url_escape(ta_parent, url, ":/?#[]@!$&'()*+,;=%");
+    return mp_url_escape(ta_parent, url, ":/?[]@!$&'()*+,;=%");
 }
 
 struct curl_ctx {

@@ -399,8 +399,9 @@ static char *normalize_url(void *ta_parent, const char *filename)
     for (int n = 0; http_like[n]; n++) {
         if (bstr_equals0(proto, http_like[n]))
             // Escape everything but reserved characters.
-            // Also don't double-scape, so include '%'.
-            return mp_url_escape(ta_parent, filename, ":/?#[]@!$&'()*+,;=%");
+            // Also don't double-scape, so include '%'. '#' is escaped too, so a
+            // literal '#' in a filename is not mistaken for a URL fragment.
+            return mp_url_escape(ta_parent, filename, ":/?[]@!$&'()*+,;=%");
     }
     return (char *)filename;
 }

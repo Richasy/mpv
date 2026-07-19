@@ -847,6 +847,23 @@ static void init_avctx(struct mp_filter *vd)
 
     mp_set_avopts(vd->log, avctx, lavc_param->avopts);
 
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+    if (lavc_codec->id == AV_CODEC_ID_H264 && avctx->thread_count > 1 &&
+        (avctx->thread_type & FF_THREAD_FRAME))
+    {
+        int requested_thread_type = avctx->thread_type;
+        avctx->thread_type &= ~FF_THREAD_FRAME;
+        avctx->thread_type |= FF_THREAD_SLICE;
+        MP_WARN(vd,
+                "[arm64-h264-frame-thread-disabled] using slice threading "
+                "to avoid unsafe DPB AVBufferRef handoff (threads=%d, "
+                "requested_type=0x%x, effective_type=0x%x, hwdec=%s, dr=%d)\n",
+                avctx->thread_count, requested_thread_type, avctx->thread_type,
+                ctx->use_hwdec ? ctx->hwdec.name : "no",
+                !ctx->use_hwdec && ctx->vo && lavc_param->dr);
+    }
+#endif
+
     // Do this after the above avopt handling in case it changes values
     ctx->skip_frame = avctx->skip_frame;
 

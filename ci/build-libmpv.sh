@@ -306,9 +306,8 @@ collect() {
         fi
     fi
 
-    # PDB lives next to the DLL only in the linker BINARY_DIR (not copied
-    # into mpv-dev by the upstream cmake), so search both DLL_DIR and the
-    # whole BUILD_DIR as a fallback.
+    # copy-binary preserves the PDB in mpv-dev before winbuild cleanup removes
+    # the linker BINARY_DIR. Keep a fallback search for older build trees.
     local PDB_PATH=""
     if [ -n "$DLL_DIR" ] && [ -f "$DLL_DIR/libmpv-2.pdb" ]; then
         PDB_PATH="$DLL_DIR/libmpv-2.pdb"
@@ -319,8 +318,37 @@ collect() {
         cp "$PDB_PATH" "$ARCH_OUTPUT/"
         log "libmpv-2.pdb copied from $(dirname "$PDB_PATH") ($(du -h "$PDB_PATH" | cut -f1))"
     else
-        warn "libmpv-2.pdb not found - crash dumps will not symbolicate"
+        err "libmpv-2.pdb not found - refusing to publish an unsymbolizable build"
     fi
+
+    local MPV_BUILD_COMMIT="${MPV_COMMIT:-unknown}"
+    local FFMPEG_BUILD_COMMIT="unknown"
+    local COMPILER_VERSION="unknown"
+    local PDB_GUID="unknown"
+    if [ -n "${MPV_SRC_DIR:-}" ] && git -C "$MPV_SRC_DIR" rev-parse HEAD >/dev/null 2>&1; then
+        MPV_BUILD_COMMIT=$(git -C "$MPV_SRC_DIR" rev-parse HEAD)
+    fi
+    if git -C "$SRC_PACKAGES/ffmpeg" rev-parse HEAD >/dev/null 2>&1; then
+        FFMPEG_BUILD_COMMIT=$(git -C "$SRC_PACKAGES/ffmpeg" rev-parse HEAD)
+    fi
+    if [ -x "$CLANG_ROOT/bin/clang" ]; then
+        COMPILER_VERSION=$("$CLANG_ROOT/bin/clang" --version | head -n1)
+    fi
+    if [ -x "$CLANG_ROOT/bin/llvm-readobj" ]; then
+        PDB_GUID=$("$CLANG_ROOT/bin/llvm-readobj" --coff-debug-directory \
+            "$ARCH_OUTPUT/libmpv-2.dll" |
+            sed -n 's/.*PDBGUID: {\(.*\)}/\1/p' | head -n1)
+        PDB_GUID="${PDB_GUID:-unknown}"
+    fi
+    cat > "$ARCH_OUTPUT/build-info.txt" <<EOF
+mpv_commit=$MPV_BUILD_COMMIT
+ffmpeg_commit=$FFMPEG_BUILD_COMMIT
+target_arch=$TARGET_ARCH
+build_type=$BUILD_TYPE
+compiler=$COMPILER_VERSION
+pdb_guid=$PDB_GUID
+EOF
+    log "Build metadata written to $ARCH_OUTPUT/build-info.txt"
 
     # Copy ggml/whisper shared libraries. whisper.cpp is now built as
     # BUILD_SHARED_LIBS=ON so af_whisper (static-linked into libmpv-2.dll)

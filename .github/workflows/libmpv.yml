@@ -94,6 +94,7 @@ jobs:
         run: |
           ARCH_OUT="$OUTPUT_DIR/${{ matrix.arch }}"
           AZ_DIR="native/${{ matrix.name }}${BUILD_SUFFIX}"
+          SYMBOL_DIR="symbols/${{ github.sha }}/${{ matrix.name }}${BUILD_SUFFIX}"
           DLL_PATH="$ARCH_OUT/libmpv-2.dll"
           if [ ! -f "$DLL_PATH" ]; then
             echo "ERROR: libmpv-2.dll not found at $DLL_PATH"
@@ -101,24 +102,34 @@ jobs:
           fi
           upload() {
             local file="$1"
+            local blob_dir="${2:-$AZ_DIR}"
             local name
             name=$(basename "$file")
-            echo "Uploading $name..."
+            echo "Uploading $name to $blob_dir..."
             az storage blob upload \
               --container-name rodel-player-deps \
-              --name "$AZ_DIR/$name" \
+              --name "$blob_dir/$name" \
               --file "$file" \
               --overwrite \
               --connection-string "$AZURE_STORAGE_CONNECTION_STRING"
-            echo "Uploaded: $AZ_DIR/$name"
+            echo "Uploaded: $blob_dir/$name"
           }
-          # Upload everything in ARCH_OUT — libmpv-2.dll/.pdb plus ggml/whisper
+          # Upload runtime artifacts and current symbols to the stable paths.
           # shared libraries (BUILD_SHARED_LIBS=ON + GGML_BACKEND_DL=ON). The
           # consumer app needs all of them deployed alongside libmpv-2.dll;
           # missing any breaks whisper realtime captions or libmpv loading.
           shopt -s nullglob
-          for f in "$ARCH_OUT"/*.dll "$ARCH_OUT"/*.pdb; do
+          for f in "$ARCH_OUT"/*.dll "$ARCH_OUT"/*.pdb "$ARCH_OUT"/*.txt; do
             upload "$f"
+          done
+          # Preserve exact DLL/PDB pairs by commit so future customer dumps
+          # remain symbolizable after the stable native path is overwritten.
+          for name in libmpv-2.dll libmpv-2.pdb build-info.txt; do
+            if [ ! -f "$ARCH_OUT/$name" ]; then
+              echo "ERROR: required symbol artifact missing: $name"
+              exit 1
+            fi
+            upload "$ARCH_OUT/$name" "$SYMBOL_DIR"
           done
 
       - name: Upload build logs on failure

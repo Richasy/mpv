@@ -235,6 +235,7 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
             .encode_lavc_ctx = mpctx->encode_lavc_ctx,
             .wakeup_cb = mp_wakeup_core_cb,
             .wakeup_ctx = mpctx,
+            .display_surface = mpctx->display_surface,
         };
         mpctx->video_out = init_best_video_out(mpctx->global, &ex);
         if (!mpctx->video_out) {

@@ -246,6 +246,7 @@ sources = files(
     'video/out/gpu/utils.c',
     'video/out/gpu/video.c',
     'video/out/gpu/video_shaders.c',
+    'video/out/display_surface.c',
     'video/out/libmpv_sw.c',
     'video/out/vo.c',
     'video/out/vo_gpu.c',

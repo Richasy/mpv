@@ -38,6 +38,7 @@
 #include "stream/stream.h"
 #include "common/msg.h"
 #include "common/common.h"
+#include "display_surface.h"
 #include "vo.h"
 #include "win_state.h"
 #include "w32_common.h"
@@ -2618,9 +2619,24 @@ HWND vo_w32_hwnd(struct vo *vo)
     return w32->window; // immutable, so no synchronization needed
 }
 
+static void retain_swapchain(void *swapchain)
+{
+    IUnknown_AddRef((IUnknown *)swapchain);
+}
+
 void vo_w32_swapchain(struct vo *vo, void *swapchain)
 {
-    vo->display_swapchain = swapchain;
+    if (vo_display_surface_publish(vo->extra.display_surface, swapchain,
+                                   retain_swapchain))
+    {
+        vo_event(vo, VO_EVENT_WIN_STATE);
+    }
+}
+
+void vo_w32_release_swapchain(void *swapchain)
+{
+    if (swapchain)
+        IUnknown_Release((IUnknown *)swapchain);
 }
 
 bool vo_w32_composition_size(struct vo *vo)

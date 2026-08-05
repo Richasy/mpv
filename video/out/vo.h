@@ -219,6 +219,7 @@ struct vo;
 struct osd_state;
 struct mp_image;
 struct mp_image_params;
+struct vo_display_surface_state;
 
 struct vo_extra {
     struct input_ctx *input_ctx;
@@ -226,6 +227,7 @@ struct vo_extra {
     struct encode_lavc_context *encode_lavc_ctx;
     void (*wakeup_cb)(void *ctx);
     void *wakeup_ctx;
+    struct vo_display_surface_state *display_surface;
 };
 
 struct vo_frame {
@@ -518,8 +520,6 @@ struct vo {
     // current GPU context (--vo=gpu and --vo=gpu-next only)
     const char *context_name;
 
-    // composition swapchain (--d3d11-output-mode=composition only)
-    void *display_swapchain;
 };
 
 struct mpv_global;
@@ -555,7 +555,6 @@ double vo_get_vsync_interval(struct vo *vo);
 double vo_get_estimated_vsync_interval(struct vo *vo);
 double vo_get_estimated_vsync_jitter(struct vo *vo);
 double vo_get_display_fps(struct vo *vo);
-void * vo_get_display_swapchain(struct vo *vo);
 double vo_get_delay(struct vo *vo);
 void vo_discard_timing_info(struct vo *vo);
 struct vo_frame *vo_get_current_vo_frame(struct vo *vo);

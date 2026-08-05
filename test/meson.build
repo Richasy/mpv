@@ -115,6 +115,13 @@ paths = executable('paths', 'paths.c', include_directories: incdir,
                    objects: paths_objects, link_with: test_utils)
 test('paths', paths)
 
+display_surface_objects = libmpv.extract_objects('video/out/display_surface.c')
+display_surface = executable('display-surface', 'display_surface.c',
+                             include_directories: incdir,
+                             objects: display_surface_objects,
+                             link_with: test_utils)
+test('display-surface', display_surface)
+
 if get_option('libmpv')
     file = join_paths(source_root, 'etc', 'mpv-icon-8bit-16x16.png')
 

@@ -322,6 +322,8 @@ static void init_sym_table(struct mp_script_args *args, void *lib) {
     INIT_SYM(mpv_client_api_version);
     INIT_SYM(mpv_error_string);
     INIT_SYM(mpv_free);
+    INIT_SYM(mpv_acquire_d3d11_composition_surface);
+    INIT_SYM(mpv_release_d3d11_composition_surface);
     INIT_SYM(mpv_client_name);
     INIT_SYM(mpv_client_id);
     INIT_SYM(mpv_create);

@@ -66,6 +66,7 @@
 #include "options/parse_configfile.h"
 #include "osdep/getpid.h"
 #include "video/out/vo.h"
+#include "video/out/display_surface.h"
 #include "video/csputils.h"
 #include "video/hwdec.h"
 #include "audio/aframe.h"
@@ -2810,21 +2811,13 @@ static struct mp_image_params get_video_out_params(struct MPContext *mpctx)
     return o_params;
 }
 
-static int mp_property_vo_display_swapchain(void *ctx, struct m_property *prop,
-    int action, void *arg)
+static int mp_property_vo_display_swapchain_epoch(void *ctx,
+                                                  struct m_property *prop,
+                                                  int action, void *arg)
 {
     MPContext *mpctx = ctx;
-    struct vo *vo = mpctx->video_out;
-    if (!vo)
-        return M_PROPERTY_UNAVAILABLE;
-
-    void *swapchain_ptr = vo_get_display_swapchain(vo);
-    if (swapchain_ptr == NULL)
-        return M_PROPERTY_UNAVAILABLE;
-
-    int64_t swapchain = (intptr_t)swapchain_ptr;
-
-    return m_property_int64_ro(action, arg, swapchain);
+    int64_t epoch = vo_display_surface_epoch(mpctx->display_surface);
+    return m_property_int64_ro(action, arg, epoch);
 }
 
 static int mp_property_vo_imgparams(void *ctx, struct m_property *prop,
@@ -4884,7 +4877,7 @@ static const struct m_property mp_properties_base[] = {
     {"deinterlace-active", mp_property_deinterlace},
     {"idle-active", mp_property_idle},
     {"window-id", mp_property_window_id},
-    {"display-swapchain", mp_property_vo_display_swapchain},
+    {"display-swapchain-epoch", mp_property_vo_display_swapchain_epoch},
     {"player-operation-mode", mp_property_player_operation_mode},
 
     {"chapter-list", mp_property_list_chapters},
@@ -5080,7 +5073,8 @@ static const char *const *const mp_event_property_change[] = {
       "video-format", "video-codec", "video-bitrate", "dwidth", "dheight",
       "width", "height", "container-fps", "aspect", "aspect-name", "vo-configured", "current-vo",
       "video-dec-params", "osd-dimensions", "hwdec", "hwdec-current", "hwdec-interop",
-      "window-id", "display-swapchain", "track-list", "current-tracks"),
+      "window-id", "display-swapchain-epoch",
+      "track-list", "current-tracks"),
     E(MPV_EVENT_AUDIO_RECONFIG, "audio-format", "audio-codec", "audio-bitrate",
       "samplerate", "channels", "audio", "volume", "volume-gain", "mute",
       "current-ao", "audio-codec-name", "audio-params", "track-list", "current-tracks",
@@ -5096,7 +5090,7 @@ static const char *const *const mp_event_property_change[] = {
     E(MP_EVENT_WIN_RESIZE, "current-window-scale", "osd-width", "osd-height",
       "osd-par", "osd-dimensions"),
     E(MP_EVENT_WIN_STATE, "display-names", "display-fps", "display-width",
-      "display-height"),
+      "display-height", "display-swapchain-epoch"),
     E(MP_EVENT_WIN_STATE2, "display-hidpi-scale"),
     E(MP_EVENT_FOCUS, "focused"),
     E(MP_EVENT_AMBIENT_LIGHTING_CHANGED, "ambient-light"),

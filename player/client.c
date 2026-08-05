@@ -46,6 +46,11 @@
 #include "command.h"
 #include "core.h"
 #include "client.h"
+#include "video/out/display_surface.h"
+
+#if HAVE_WIN32_DESKTOP
+#include "video/out/w32_common.h"
+#endif
 
 /*
  * Locking hierarchy:
@@ -1511,6 +1516,50 @@ char *mpv_get_property_osd_string(mpv_handle *ctx, const char *name)
     char *str = NULL;
     mpv_get_property(ctx, name, MPV_FORMAT_OSD_STRING, &str);
     return str;
+}
+
+struct acquire_d3d11_surface_request {
+    struct MPContext *mpctx;
+    mpv_d3d11_composition_surface *surface;
+};
+
+static void acquire_d3d11_surface(void *ptr)
+{
+    struct acquire_d3d11_surface_request *request = ptr;
+    struct vo_display_surface_snapshot snapshot =
+        vo_display_surface_acquire(request->mpctx->display_surface);
+    request->surface->swapchain = snapshot.surface;
+    request->surface->epoch = snapshot.epoch;
+}
+
+int mpv_acquire_d3d11_composition_surface(
+    mpv_handle *ctx, mpv_d3d11_composition_surface *surface)
+{
+    if (!ctx || !surface)
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    *surface = (mpv_d3d11_composition_surface){0};
+    if (!ctx->mpctx->initialized)
+        return MPV_ERROR_UNINITIALIZED;
+
+    struct acquire_d3d11_surface_request request = {
+        .mpctx = ctx->mpctx,
+        .surface = surface,
+    };
+    run_locked(ctx, acquire_d3d11_surface, &request);
+    return MPV_ERROR_SUCCESS;
+}
+
+void mpv_release_d3d11_composition_surface(
+    mpv_d3d11_composition_surface *surface)
+{
+    if (!surface)
+        return;
+
+#if HAVE_WIN32_DESKTOP
+    vo_w32_release_swapchain(surface->swapchain);
+#endif
+    *surface = (mpv_d3d11_composition_surface){0};
 }
 
 int mpv_get_property_async(mpv_handle *ctx, uint64_t ud, const char *name,

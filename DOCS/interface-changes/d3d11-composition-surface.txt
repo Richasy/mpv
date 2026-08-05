@@ -1,0 +1,1 @@
+replace the unsafe fork-only `display-swapchain` pointer property with the read-only `display-swapchain-epoch` notification property; acquire surfaces through `mpv_acquire_d3d11_composition_surface()`

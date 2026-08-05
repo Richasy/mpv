@@ -63,6 +63,7 @@
 #include "audio/out/ao.h"
 #include "misc/thread_tools.h"
 #include "sub/osd.h"
+#include "video/out/display_surface.h"
 #include "video/out/vo.h"
 
 #include "core.h"
@@ -280,6 +281,7 @@ struct MPContext *mp_create(void)
         .playlist = talloc_zero(mpctx, struct playlist),
         .dispatch = mp_dispatch_create(mpctx),
         .playback_abort = mp_cancel_new(mpctx),
+        .display_surface = vo_display_surface_state_create(mpctx),
         .thread_pool = mp_thread_pool_create(mpctx, 0, 1, 30),
         .stop_play = PT_NEXT_ENTRY,
         .play_dir = 1,

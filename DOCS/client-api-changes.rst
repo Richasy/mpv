@@ -32,6 +32,10 @@ API changes
 
 ::
 
+ --- mpv 0.41.0 ---
+ 2.7    - add mpv_acquire_d3d11_composition_surface(),
+          mpv_release_d3d11_composition_surface(), and
+          mpv_d3d11_composition_surface (Richasy/mpv fork addition).
  --- mpv 0.40.0 ---
  2.6    - add MPV_EVENT_TRACK_FAILED and mpv_event_track_failed (Richasy/mpv
           fork addition; broadcast when a track is automatically deselected

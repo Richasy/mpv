@@ -118,6 +118,7 @@ struct priv {
     int64_t last_sync_qpc_time;
     int64_t vsync_duration_qpc;
     int64_t last_submit_qpc;
+    HRESULT present_result;
 
     // Composition mode: cache the monitor currently hosting the host HWND so
     // we can notify the core (VO_EVENT_WIN_STATE) when it changes.
@@ -231,6 +232,9 @@ static bool d3d11_start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
 {
     struct priv *p = sw->priv;
 
+    if (FAILED(p->present_result))
+        return false;
+
     if (!out_fbo)
         return true;
 
@@ -280,13 +284,23 @@ static void d3d11_swap_buffers(struct ra_swapchain *sw)
 {
     struct priv *p = sw->priv;
 
+    if (FAILED(p->present_result))
+        return;
+
     m_config_cache_update(p->opts_cache);
 
     LARGE_INTEGER perf_count;
     QueryPerformanceCounter(&perf_count);
     p->last_submit_qpc = perf_count.QuadPart;
 
-    IDXGISwapChain_Present(p->swapchain, p->opts->sync_interval, 0);
+    HRESULT hr = IDXGISwapChain_Present(p->swapchain, p->opts->sync_interval, 0);
+    if (FAILED(hr)) {
+        p->present_result = hr;
+        MP_FATAL(sw->ctx, "Couldn't present swapchain: %s\n",
+                 mp_HRESULT_to_str(hr));
+        if (sw->ctx->opts.composition)
+            vo_w32_swapchain(sw->ctx->vo, NULL);
+    }
 }
 
 static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
@@ -671,11 +685,12 @@ static void d3d11_uninit(struct ra_ctx *ctx)
 
     if (ctx->ra)
         ra_tex_free(ctx->ra, &p->backbuffer);
-    SAFE_RELEASE(p->swapchain);
     if (!ctx->opts.composition) {
+        SAFE_RELEASE(p->swapchain);
         vo_w32_uninit(ctx->vo);
     } else {
         vo_w32_swapchain(ctx->vo, NULL);
+        SAFE_RELEASE(p->swapchain);
     }
     SAFE_RELEASE(p->device);
     mp_dxgi_factory_uninit(&p->dxgi_ctx);

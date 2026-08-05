@@ -248,7 +248,7 @@ extern "C" {
  * relational operators (<, >, <=, >=).
  */
 #define MPV_MAKE_VERSION(major, minor) (((major) << 16) | (minor) | 0UL)
-#define MPV_CLIENT_API_VERSION MPV_MAKE_VERSION(2, 6)
+#define MPV_CLIENT_API_VERSION MPV_MAKE_VERSION(2, 7)
 
 /**
  * The API user is allowed to "#define MPV_ENABLE_DEPRECATED 0" before
@@ -397,6 +397,46 @@ MPV_EXPORT const char *mpv_error_string(int error);
  * @param data A valid pointer returned by the API, or NULL.
  */
 MPV_EXPORT void mpv_free(void *data);
+
+/**
+ * One retained lease over mpv's D3D11 composition swapchain.
+ *
+ * A non-NULL swapchain carries one owned COM reference. It remains valid until
+ * mpv_release_d3d11_composition_surface() releases this lease, including while
+ * mpv replaces or destroys its own swapchain reference.
+ *
+ * The epoch increases whenever mpv publishes a different swapchain or
+ * publishes NULL after surface loss/uninitialization. A successful acquisition
+ * with swapchain == NULL therefore still reports the current loss epoch.
+ *
+ * The client may host the swapchain in a composition tree, but must not render,
+ * clear, resize, present, or change HDR/color-space metadata on it.
+ */
+typedef struct mpv_d3d11_composition_surface {
+    void *swapchain;
+    uint64_t epoch;
+} mpv_d3d11_composition_surface;
+
+/**
+ * Atomically acquire the current D3D11 composition swapchain and epoch.
+ *
+ * The caller must pass an empty lease and release every successful non-NULL
+ * swapchain exactly once. This function is thread-safe. It returns success with
+ * a NULL swapchain when no composition surface is currently published.
+ *
+ * @return error code
+ */
+MPV_EXPORT int mpv_acquire_d3d11_composition_surface(
+    mpv_handle *ctx, mpv_d3d11_composition_surface *surface);
+
+/**
+ * Release a lease returned by mpv_acquire_d3d11_composition_surface().
+ *
+ * The struct is cleared before returning, so releasing the same struct again is
+ * harmless. NULL is also allowed and does nothing.
+ */
+MPV_EXPORT void mpv_release_d3d11_composition_surface(
+    mpv_d3d11_composition_surface *surface);
 
 /**
  * Return the name of this client handle. Every client has its own unique
@@ -1970,6 +2010,10 @@ MPV_DEFINE_SYM_PTR(mpv_error_string)
 #define mpv_error_string pfn_mpv_error_string
 MPV_DEFINE_SYM_PTR(mpv_free)
 #define mpv_free pfn_mpv_free
+MPV_DEFINE_SYM_PTR(mpv_acquire_d3d11_composition_surface)
+#define mpv_acquire_d3d11_composition_surface pfn_mpv_acquire_d3d11_composition_surface
+MPV_DEFINE_SYM_PTR(mpv_release_d3d11_composition_surface)
+#define mpv_release_d3d11_composition_surface pfn_mpv_release_d3d11_composition_surface
 MPV_DEFINE_SYM_PTR(mpv_client_name)
 #define mpv_client_name pfn_mpv_client_name
 MPV_DEFINE_SYM_PTR(mpv_client_id)

@@ -131,6 +131,12 @@ local function init_buffers()
     vsjitter_buf = {0, pos = 1, len = 50, max = 0}
 end
 local cache_ahead_buf, cache_speed_buf
+local function reset_cache_buffers()
+    cache_ahead_buf = {0, pos = 1, len = 50, max = 0}
+    cache_speed_buf = {0, pos = 1, len = 50, max = 0}
+end
+reset_cache_buffers()
+mp.register_event("start-file", reset_cache_buffers)
 local perf_buffers = {}
 local process_key_binding
 
@@ -145,8 +151,16 @@ end
 
 local function graph_add_value(graph, value)
     graph.pos = (graph.pos % graph.len) + 1
+    local previous = graph[graph.pos]
     graph[graph.pos] = value
-    graph.max = max(graph.max, value)
+    if previous == graph.max and value < graph.max then
+        graph.max = 0
+        for index = 1, graph.len do
+            graph.max = max(graph.max, graph[index] or 0)
+        end
+    else
+        graph.max = max(graph.max, value)
+    end
 end
 
 local function no_ASS(t)
@@ -1516,7 +1530,8 @@ local function record_cache_stats()
         graph_add_value(cache_ahead_buf, b - a)
     end
 
-    graph_add_value(cache_speed_buf, info["raw-input-rate"] or 0)
+    graph_add_value(cache_speed_buf,
+                    math.log(1 + max(info["raw-input-rate"] or 0, 0)))
 end
 
 cache_recorder_timer = mp.add_periodic_timer(0.25, record_cache_stats)
@@ -1884,8 +1899,6 @@ process_key_binding = function(oneshot)
             mp.set_property_native("tone-mapping-visualize", true)
         end
         if not oneshot then
-            cache_ahead_buf = {0, pos = 1, len = 50, max = 0}
-            cache_speed_buf = {0, pos = 1, len = 50, max = 0}
             cache_recorder_timer:resume()
         end
         display_timer:kill()

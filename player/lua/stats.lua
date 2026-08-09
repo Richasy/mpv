@@ -151,8 +151,16 @@ end
 
 local function graph_add_value(graph, value)
     graph.pos = (graph.pos % graph.len) + 1
+    local previous = graph[graph.pos]
     graph[graph.pos] = value
-    graph.max = max(graph.max, value)
+    if previous == graph.max and value < graph.max then
+        graph.max = 0
+        for index = 1, graph.len do
+            graph.max = max(graph.max, graph[index] or 0)
+        end
+    else
+        graph.max = max(graph.max, value)
+    end
 end
 
 local function no_ASS(t)

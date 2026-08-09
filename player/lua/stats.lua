@@ -1530,7 +1530,8 @@ local function record_cache_stats()
         graph_add_value(cache_ahead_buf, b - a)
     end
 
-    graph_add_value(cache_speed_buf, info["raw-input-rate"] or 0)
+    graph_add_value(cache_speed_buf,
+                    math.log(1 + max(info["raw-input-rate"] or 0, 0)))
 end
 
 cache_recorder_timer = mp.add_periodic_timer(0.25, record_cache_stats)

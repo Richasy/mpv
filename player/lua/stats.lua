@@ -131,6 +131,12 @@ local function init_buffers()
     vsjitter_buf = {0, pos = 1, len = 50, max = 0}
 end
 local cache_ahead_buf, cache_speed_buf
+local function reset_cache_buffers()
+    cache_ahead_buf = {0, pos = 1, len = 50, max = 0}
+    cache_speed_buf = {0, pos = 1, len = 50, max = 0}
+end
+reset_cache_buffers()
+mp.register_event("start-file", reset_cache_buffers)
 local perf_buffers = {}
 local process_key_binding
 
@@ -1884,8 +1890,6 @@ process_key_binding = function(oneshot)
             mp.set_property_native("tone-mapping-visualize", true)
         end
         if not oneshot then
-            cache_ahead_buf = {0, pos = 1, len = 50, max = 0}
-            cache_speed_buf = {0, pos = 1, len = 50, max = 0}
             cache_recorder_timer:resume()
         end
         display_timer:kill()

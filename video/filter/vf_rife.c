@@ -79,6 +79,7 @@ DEFINE_GUID(MPV_IID_IDMLDevice, 0x6dbd6437, 0x96fd, 0x423f,
 #include "filters/user_filters.h"
 #include "options/m_option.h"
 #include "video/out/gpu/d3d11_adapter.h"
+#include "osdep/io.h"
 #include "osdep/timer.h"
 #include "osdep/windows_utils.h"
 #include "video/hwdec.h"

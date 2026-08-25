@@ -56,19 +56,19 @@ static void test_auto(void)
         &selector, "anything", 0, 0));
 }
 
-static void test_hardware_ordinal_skips_software_entries(void)
+static void test_raw_ordinal_never_compresses_software_holes(void)
 {
-    assert(!mp_d3d11_adapter_selector_matches_hardware(
+    assert(!mp_d3d11_adapter_selector_matches_candidate(
         NULL, "software", 1, 2, true, 0, 0));
-    assert(mp_d3d11_adapter_selector_matches_hardware(
-        NULL, "physical", 3, 4, false, 0, 0));
-    assert(!mp_d3d11_adapter_selector_matches_hardware(
-        NULL, "second physical", 5, 6, false, 1, 0));
+    assert(!mp_d3d11_adapter_selector_matches_candidate(
+        NULL, "physical", 3, 4, false, 1, 0));
+    assert(mp_d3d11_adapter_selector_matches_candidate(
+        NULL, "physical", 3, 4, false, 1, 1));
 
     struct mp_d3d11_adapter_selector selector;
     assert(mp_d3d11_adapter_selector_parse(
         "luid:0000000400000003", &selector));
-    assert(mp_d3d11_adapter_selector_matches_hardware(
+    assert(mp_d3d11_adapter_selector_matches_candidate(
         &selector, "physical", 3, 4, false, 7, 0));
 }
 
@@ -78,6 +78,6 @@ int main(void)
     test_exact_luid();
     test_invalid_luid();
     test_auto();
-    test_hardware_ordinal_skips_software_entries();
+    test_raw_ordinal_never_compresses_software_holes();
     return 0;
 }

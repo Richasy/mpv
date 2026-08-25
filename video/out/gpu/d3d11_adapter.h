@@ -32,14 +32,14 @@ bool mp_d3d11_adapter_selector_matches(
     uint32_t luid_low,
     uint32_t luid_high);
 
-bool mp_d3d11_adapter_selector_matches_hardware(
+bool mp_d3d11_adapter_selector_matches_candidate(
     const struct mp_d3d11_adapter_selector *selector,
     const char *description,
     uint32_t luid_low,
     uint32_t luid_high,
     bool software,
-    int hardware_ordinal,
-    int requested_hardware_ordinal);
+    int raw_ordinal,
+    int requested_raw_ordinal);
 
 void mp_d3d11_adapter_format_luid(
     char output[MP_D3D11_ADAPTER_LUID_STRING_SIZE],

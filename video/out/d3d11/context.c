@@ -638,7 +638,10 @@ static int d3d11_control(struct ra_ctx *ctx, int *events, int request, void *arg
             .luid_low = p->adapter.desc.AdapterLuid.LowPart,
             .luid_high = p->adapter.desc.AdapterLuid.HighPart,
             .ordinal = p->adapter.ordinal,
-            .software = p->adapter.desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE,
+            .software =
+                p->adapter.desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE ||
+                (p->adapter.desc.VendorId == 0x1414 &&
+                 p->adapter.desc.DeviceId == 0x8c),
         };
         return VO_TRUE;
     }

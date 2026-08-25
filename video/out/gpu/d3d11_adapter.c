@@ -87,21 +87,21 @@ bool mp_d3d11_adapter_selector_matches(
     }
 }
 
-bool mp_d3d11_adapter_selector_matches_hardware(
+bool mp_d3d11_adapter_selector_matches_candidate(
     const struct mp_d3d11_adapter_selector *selector,
     const char *description,
     uint32_t luid_low,
     uint32_t luid_high,
     bool software,
-    int hardware_ordinal,
-    int requested_hardware_ordinal)
+    int raw_ordinal,
+    int requested_raw_ordinal)
 {
     if (software)
         return false;
     return selector
         ? mp_d3d11_adapter_selector_matches(
               selector, description, luid_low, luid_high)
-        : hardware_ordinal == requested_hardware_ordinal;
+        : raw_ordinal == requested_raw_ordinal;
 }
 
 void mp_d3d11_adapter_format_luid(

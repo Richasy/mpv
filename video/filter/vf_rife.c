@@ -353,10 +353,11 @@ struct priv {
     // slot to the free list so it can be recycled for a future frame.
     bool                       use_zc_out;
     bool                       gpu_selected;
+    bool                       gpu_session_active;
     char                      *gpu_name;
     LUID                       gpu_luid;
     int                        gpu_dxgi_ordinal;
-    int                        gpu_dml_ordinal;
+    int                        gpu_hardware_ordinal;
     bool                       zc_luid_checked;
     bool                       zc_luid_match;
     LUID                       zc_d3d12_luid;
@@ -753,12 +754,14 @@ static bool select_gpu_adapter(struct mp_filter *vf,
             break;
         DXGI_ADAPTER_DESC1 desc = {0};
         IDXGIAdapter1_GetDesc1(cand, &desc);
-        bool software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE;
+        bool software =
+            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE ||
+            (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c);
         char *description = mp_to_utf8(NULL, desc.Description);
-        bool matched = mp_d3d11_adapter_selector_matches_hardware(
+        bool matched = mp_d3d11_adapter_selector_matches_candidate(
             use_luid ? &selector : NULL, description,
             desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart,
-            software, hw_idx, p->opts->gpu_id);
+            software, (int)i, p->opts->gpu_id);
         if (matched) {
             adapter = cand;
             p->gpu_selected = true;
@@ -766,7 +769,7 @@ static bool select_gpu_adapter(struct mp_filter *vf,
             p->gpu_name = talloc_strdup(p, description);
             p->gpu_luid = desc.AdapterLuid;
             p->gpu_dxgi_ordinal = (int)i;
-            p->gpu_dml_ordinal = hw_idx;
+            p->gpu_hardware_ordinal = hw_idx;
             MP_VERBOSE(vf, "RIFE: selected adapter dml=%d dxgi=%u\n",
                        hw_idx, i);
             talloc_free(description);
@@ -874,7 +877,8 @@ static bool d3d12_init(struct mp_filter *vf)
         goto fail;
     }
 
-    MP_INFO(vf, "RIFE zc: D3D12 device + DML device ready (gpu=%d)\n", gpu_id);
+    MP_INFO(vf, "RIFE zc: D3D12 device + DML device ready (gpu=%d)\n",
+            p->gpu_dxgi_ordinal);
     return true;
 
 fail:
@@ -966,7 +970,7 @@ static bool d3d12_alloc_tensors(struct mp_filter *vf,
         return false;
 
     st = g_ort.api->CreateMemoryInfo("DML", OrtDeviceAllocator,
-            p->opts->gpu_id, OrtMemTypeDefault, &p->zc_dml_mem_info);
+            p->gpu_dxgi_ordinal, OrtMemTypeDefault, &p->zc_dml_mem_info);
     if (!ort_check(vf, st, "CreateMemoryInfo(DML)"))
         return false;
 
@@ -3126,6 +3130,7 @@ static void release_session(struct priv *p)
     p->mem_info = NULL;
     p->input_name = p->output_name = NULL;
     p->allocator = NULL;
+    p->gpu_session_active = false;
     free(p->in_buf);  p->in_buf  = NULL;
     free(p->out_buf); p->out_buf = NULL;
     d3d12_release(p);
@@ -3184,7 +3189,7 @@ static bool init_session(struct mp_filter *vf, int orig_w, int orig_h)
         if (!p->gpu_selected && !select_gpu_adapter(vf, &selected))
             goto fail;
         SAFE_RELEASE(selected);
-        st = g_ort.append_dml(p->session_opts, p->gpu_dml_ordinal);
+        st = g_ort.append_dml(p->session_opts, p->gpu_dxgi_ordinal);
         if (!ort_check(vf, st, "AppendExecutionProvider_DML")) goto fail;
 
         // DML EP recommends disabling memory pattern + per-session arena.
@@ -3238,7 +3243,7 @@ static bool init_session(struct mp_filter *vf, int orig_w, int orig_h)
         MP_INFO(vf, "RIFE session ready (zerocopy/DML1): src=%dx%d proc=%dx%d "
                     "(padded %dx%d) scale=%.3f, gpu=%d\n",
                 orig_w, orig_h, p->proc_w, p->proc_h, p->pad_w, p->pad_h,
-                (float)p->proc_w / orig_w, p->opts->gpu_id);
+                (float)p->proc_w / orig_w, p->gpu_dxgi_ordinal);
 
         if (p->opts->pack_shader) {
             if (!pack_shader_init(vf)) {
@@ -3263,8 +3268,9 @@ static bool init_session(struct mp_filter *vf, int orig_w, int orig_h)
         MP_INFO(vf, "RIFE session ready: src=%dx%d proc=%dx%d (padded %dx%d) "
                     "scale=%.3f, DirectML gpu=%d\n",
                 orig_w, orig_h, p->proc_w, p->proc_h, p->pad_w, p->pad_h,
-                (float)p->proc_w / orig_w, p->opts->gpu_id);
+                (float)p->proc_w / orig_w, p->gpu_dxgi_ordinal);
     }
+    p->gpu_session_active = true;
     return true;
 
 fail:
@@ -4803,15 +4809,20 @@ static bool vf_rife_command(struct mp_filter *vf, struct mp_filter_command *cmd)
                         mp_tprintf(16, "%dx", p->opts->multiplier));
         mp_tags_set_str(t, "model", p->opts->model_path ? p->opts->model_path : "");
         mp_tags_set_str(t, "gpu-name", p->gpu_name ? p->gpu_name : "");
+        mp_tags_set_str(t, "gpu-selected", p->gpu_selected ? "yes" : "no");
+        mp_tags_set_str(t, "gpu-session-active",
+                        p->gpu_session_active ? "yes" : "no");
         char gpu_luid[MP_D3D11_ADAPTER_LUID_STRING_SIZE] = "";
         if (p->gpu_selected)
             mp_d3d11_adapter_format_luid(gpu_luid, p->gpu_luid.LowPart,
                                          p->gpu_luid.HighPart);
         mp_tags_set_str(t, "gpu-luid", gpu_luid);
-        mp_tags_set_str(t, "gpu-ordinal",
-                        mp_tprintf(16, "%d", p->gpu_dml_ordinal));
-        mp_tags_set_str(t, "gpu-dxgi-ordinal",
-                        mp_tprintf(16, "%d", p->gpu_dxgi_ordinal));
+        if (p->gpu_selected) {
+            mp_tags_set_str(t, "gpu-ordinal",
+                            mp_tprintf(16, "%d", p->gpu_dxgi_ordinal));
+            mp_tags_set_str(t, "gpu-hardware-ordinal",
+                            mp_tprintf(16, "%d", p->gpu_hardware_ordinal));
+        }
         char d3d11_luid[MP_D3D11_ADAPTER_LUID_STRING_SIZE] = "";
         if (p->zc_luid_checked)
             mp_d3d11_adapter_format_luid(d3d11_luid,

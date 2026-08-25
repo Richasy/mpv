@@ -122,6 +122,12 @@ display_surface = executable('display-surface', 'display_surface.c',
                              link_with: test_utils)
 test('display-surface', display_surface)
 
+d3d11_adapter = executable('d3d11-adapter',
+                           ['d3d11_adapter.c',
+                            '../video/out/gpu/d3d11_adapter.c'],
+                           include_directories: incdir)
+test('d3d11-adapter', d3d11_adapter)
+
 if get_option('libmpv')
     file = join_paths(source_root, 'etc', 'mpv-icon-8bit-16x16.png')
 

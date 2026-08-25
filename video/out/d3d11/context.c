@@ -111,6 +111,8 @@ struct priv {
     struct ra_tex *backbuffer;
     ID3D11Device *device;
     IDXGISwapChain *swapchain;
+    struct mp_d3d11_adapter_info adapter;
+    char *adapter_name;
     struct pl_color_space swapchain_csp;
 
     int64_t perf_freq;
@@ -627,6 +629,22 @@ static int d3d11_control(struct ra_ctx *ctx, int *events, int request, void *arg
     bool fullscreen_switch_needed = false;
 
     switch (request) {
+    case VOCTRL_GET_D3D11_ADAPTER: {
+        if (!p->adapter.valid)
+            return VO_NOTAVAIL;
+        struct voctrl_d3d11_adapter *adapter = arg;
+        *adapter = (struct voctrl_d3d11_adapter){
+            .name = p->adapter_name,
+            .luid_low = p->adapter.desc.AdapterLuid.LowPart,
+            .luid_high = p->adapter.desc.AdapterLuid.HighPart,
+            .ordinal = p->adapter.ordinal,
+            .software =
+                p->adapter.desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE ||
+                (p->adapter.desc.VendorId == 0x1414 &&
+                 p->adapter.desc.DeviceId == 0x8c),
+        };
+        return VO_TRUE;
+    }
     case VOCTRL_VO_OPTS_CHANGED: {
         void *changed_option;
 
@@ -736,8 +754,10 @@ static bool d3d11_init(struct ra_ctx *ctx)
         .max_frame_latency = ctx->vo->opts->swapchain_depth,
         .adapter_name = p->opts->adapter_name,
     };
-    if (!mp_d3d11_create_present_device(ctx->log, &dopts, &p->device))
+    if (!mp_d3d11_create_present_device(ctx->log, &dopts, &p->device,
+                                        &p->adapter))
         goto error;
+    p->adapter_name = mp_to_utf8(p, p->adapter.desc.Description);
 
     if (!spirv_compiler_init(ctx))
         goto error;

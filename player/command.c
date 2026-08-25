@@ -3294,6 +3294,41 @@ static int mp_property_gpu_context(void *ctx, struct m_property *p, int action, 
                                 mpctx->video_out->context_name : NULL);
 }
 
+static int mp_property_d3d11_adapter_active(void *ctx, struct m_property *p,
+                                           int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    if (!mpctx->video_out)
+        return M_PROPERTY_UNAVAILABLE;
+
+    switch (action) {
+    case M_PROPERTY_GET_TYPE:
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
+        return M_PROPERTY_OK;
+    case M_PROPERTY_GET: {
+        struct voctrl_d3d11_adapter adapter = {0};
+        if (vo_control(mpctx->video_out, VOCTRL_GET_D3D11_ADAPTER,
+                       &adapter) <= 0)
+            return M_PROPERTY_UNAVAILABLE;
+
+        struct mpv_node node;
+        node_init(&node, MPV_FORMAT_NODE_MAP, NULL);
+        node_map_add_string(&node, "name", adapter.name ?: "");
+        node_map_add_string(
+            &node, "luid",
+            mp_tprintf(22, "luid:%08x%08x",
+                       adapter.luid_high, adapter.luid_low));
+        node_map_add_int64(&node, "luid-low", adapter.luid_low);
+        node_map_add_int64(&node, "luid-high", adapter.luid_high);
+        node_map_add_int64(&node, "ordinal", adapter.ordinal);
+        node_map_add_flag(&node, "software", adapter.software);
+        *(struct mpv_node *)arg = node;
+        return M_PROPERTY_OK;
+    }
+    }
+    return M_PROPERTY_NOT_IMPLEMENTED;
+}
+
 static int mp_property_osd_dim(void *ctx, struct m_property *prop,
                                int action, void *arg)
 {
@@ -4928,6 +4963,7 @@ static const struct m_property mp_properties_base[] = {
     {"perf-info", mp_property_perf_info},
     {"current-vo", mp_property_vo},
     {"current-gpu-context", mp_property_gpu_context},
+    {"d3d11-adapter-active", mp_property_d3d11_adapter_active},
     {"container-fps", mp_property_fps},
     {"estimated-vf-fps", mp_property_vf_fps},
     {"video-aspect-override", mp_property_video_aspect_override},

@@ -369,13 +369,17 @@ IDXGIAdapter1 *mp_get_dxgi_adapter(struct mp_log *log,
                                    bstr *listing)
 {
     HRESULT hr = S_OK;
-    IDXGIFactory1 *factory;
+    IDXGIFactory1 *factory = NULL;
     IDXGIAdapter1 *picked_adapter = NULL;
+    char *request = bstrto0(NULL, requested_adapter_name);
+    struct mp_d3d11_adapter_selector selector;
+    if (!mp_d3d11_adapter_selector_parse(request, &selector))
+        goto done;
 
     PFN_CREATE_DXGI_FACTORY pCreateDXGIFactory1 = get_CreateDXGIFactory1();
     if (!pCreateDXGIFactory1) {
         mp_fatal(log, "Failed to load CreateDXGIFactory1 function.\n");
-        return NULL;
+        goto done;
     }
 
     hr = pCreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory);
@@ -409,18 +413,20 @@ IDXGIAdapter1 *mp_get_dxgi_adapter(struct mp_log *log,
         adapter_description = mp_to_utf8(NULL, desc.Description);
 
         if (listing) {
+            char luid[MP_D3D11_ADAPTER_LUID_STRING_SIZE];
+            mp_d3d11_adapter_format_luid(luid, desc.AdapterLuid.LowPart,
+                                         desc.AdapterLuid.HighPart);
             bstr_xappend_asprintf(NULL, listing,
-                                  "Adapter %u: vendor: %u, description: %s\n",
+                                  "Adapter %u: vendor: %u, luid: %s, description: %s\n",
                                   adapter_num, desc.VendorId,
+                                  luid,
                                   adapter_description);
         }
 
-        if (requested_adapter_name.len &&
-            bstr_case_startswith(bstr0(adapter_description),
-                                 requested_adapter_name))
-        {
+        if (mp_d3d11_adapter_selector_matches(
+                &selector, adapter_description, desc.AdapterLuid.LowPart,
+                desc.AdapterLuid.HighPart))
             picked_adapter = adapter;
-        }
 
         talloc_free(adapter_description);
 
@@ -431,7 +437,9 @@ IDXGIAdapter1 *mp_get_dxgi_adapter(struct mp_log *log,
         SAFE_RELEASE(adapter);
     }
 
+done:
     SAFE_RELEASE(factory);
+    talloc_free(request);
 
     return picked_adapter;
 }
@@ -447,6 +455,15 @@ int mp_dxgi_validate_adapter(struct mp_log *log,
 
     if (bstr_equals0(param, "")) {
         return 0;
+    }
+
+    char *request = bstrto0(NULL, param);
+    struct mp_d3d11_adapter_selector selector;
+    bool valid = mp_d3d11_adapter_selector_parse(request, &selector);
+    talloc_free(request);
+    if (!valid) {
+        mp_err(log, "Invalid D3D11 adapter selector '%.*s'.\n", BSTR_P(param));
+        return M_OPT_INVALID;
     }
 
     adapter_matched = mp_dxgi_list_or_verify_adapters(log,
@@ -510,7 +527,8 @@ bool mp_dxgi_list_or_verify_adapters(struct mp_log *log,
 // the same device creation logic and log the same information.
 bool mp_d3d11_create_present_device(struct mp_log *log,
                                     struct d3d11_device_opts *opts,
-                                    ID3D11Device **dev_out)
+                                    ID3D11Device **dev_out,
+                                    struct mp_d3d11_adapter_info *adapter_out)
 {
     bool debug = opts->debug;
     bool warp = opts->force_warp;
@@ -528,6 +546,13 @@ bool mp_d3d11_create_present_device(struct mp_log *log,
     adapter = mp_get_dxgi_adapter(log, bstr0(adapter_name), NULL);
 
     if (adapter_name && !adapter) {
+        struct mp_d3d11_adapter_selector selector;
+        bool parsed = mp_d3d11_adapter_selector_parse(adapter_name, &selector);
+        if (parsed && selector.kind == MP_D3D11_ADAPTER_LUID) {
+            mp_fatal(log, "Exact D3D11 adapter '%s' is no longer available.\n",
+                     adapter_name);
+            goto done;
+        }
         mp_warn(log, "Adapter matching '%s' was not found in the system! "
                      "Will fall back to the default adapter.\n",
                  adapter_name);
@@ -637,6 +662,40 @@ bool mp_d3d11_create_present_device(struct mp_log *log,
                "Using a software adapter\n");
     }
 
+    int ordinal = -1;
+    IDXGIFactory1 *factory = NULL;
+    PFN_CREATE_DXGI_FACTORY pCreateDXGIFactory1 = get_CreateDXGIFactory1();
+    if (pCreateDXGIFactory1 &&
+        SUCCEEDED(pCreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory)))
+    {
+        for (unsigned int n = 0; ; n++) {
+            IDXGIAdapter1 *candidate = NULL;
+            if (IDXGIFactory1_EnumAdapters1(factory, n, &candidate) ==
+                DXGI_ERROR_NOT_FOUND)
+                break;
+            if (!candidate)
+                continue;
+            DXGI_ADAPTER_DESC1 candidate_desc = {0};
+            if (SUCCEEDED(IDXGIAdapter1_GetDesc1(candidate, &candidate_desc)) &&
+                candidate_desc.AdapterLuid.LowPart == desc.AdapterLuid.LowPart &&
+                candidate_desc.AdapterLuid.HighPart == desc.AdapterLuid.HighPart)
+            {
+                ordinal = (int)n;
+                SAFE_RELEASE(candidate);
+                break;
+            }
+            SAFE_RELEASE(candidate);
+        }
+    }
+    SAFE_RELEASE(factory);
+
+    if (adapter_out) {
+        *adapter_out = (struct mp_d3d11_adapter_info){
+            .valid = true,
+            .desc = desc,
+            .ordinal = ordinal,
+        };
+    }
     *dev_out = dev;
     dev = NULL;
     success = true;

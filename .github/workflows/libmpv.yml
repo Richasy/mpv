@@ -70,6 +70,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test D3D11 adapter selector
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -I. \
+            test/d3d11_adapter.c video/out/gpu/d3d11_adapter.c \
+            -o /tmp/d3d11-adapter-test
+          /tmp/d3d11-adapter-test
+
       - name: Ensure PATH includes local bin
         run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 

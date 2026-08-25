@@ -78,6 +78,7 @@ DEFINE_GUID(MPV_IID_IDMLDevice, 0x6dbd6437, 0x96fd, 0x423f,
 #include "common/tags.h"
 #include "filters/user_filters.h"
 #include "options/m_option.h"
+#include "video/out/gpu/d3d11_adapter.h"
 #include "osdep/timer.h"
 #include "osdep/windows_utils.h"
 #include "video/hwdec.h"
@@ -238,6 +239,7 @@ struct rife_opts {
     char *model_path;
     int   multiplier;
     int   gpu_id;
+    char *gpu_luid;
     float scale;
     float scene_threshold;
     float static_threshold;
@@ -350,6 +352,13 @@ struct priv {
     // exactly one slot through a custom AVBufferRef; the destructor returns the
     // slot to the free list so it can be recycled for a future frame.
     bool                       use_zc_out;
+    bool                       gpu_selected;
+    char                      *gpu_name;
+    LUID                       gpu_luid;
+    int                        gpu_dxgi_ordinal;
+    int                        gpu_dml_ordinal;
+    bool                       zc_luid_checked;
+    bool                       zc_luid_match;
     LUID                       zc_d3d12_luid;
     LUID                       zc_d3d11_luid;
     ID3D12Fence               *zc_xfence_d3d12;   // SHARED fence
@@ -707,6 +716,82 @@ static void d3d12_release(struct priv *p)
     p->use_zc = false;
 }
 
+static bool select_gpu_adapter(struct mp_filter *vf,
+                               IDXGIAdapter1 **adapter_out)
+{
+    struct priv *p = vf->priv;
+    if (!g_ort.create_dxgi_factory2) {
+        MP_ERR(vf, "RIFE: DXGI factory is unavailable\n");
+        return false;
+    }
+
+    IDXGIFactory4 *factory = NULL;
+    IDXGIAdapter1 *adapter = NULL;
+    HRESULT hr = g_ort.create_dxgi_factory2(
+        0, &IID_IDXGIFactory4, (void **)&factory);
+    if (FAILED(hr)) {
+        MP_ERR(vf, "RIFE: CreateDXGIFactory2 hr=0x%08lx\n",
+               (unsigned long)hr);
+        return false;
+    }
+
+    struct mp_d3d11_adapter_selector selector;
+    bool use_luid = p->opts->gpu_luid && p->opts->gpu_luid[0];
+    if (use_luid &&
+        (!mp_d3d11_adapter_selector_parse(p->opts->gpu_luid, &selector) ||
+         selector.kind != MP_D3D11_ADAPTER_LUID))
+    {
+        MP_ERR(vf, "RIFE: invalid gpu-luid selector\n");
+        SAFE_RELEASE(factory);
+        return false;
+    }
+
+    int hw_idx = 0;
+    for (UINT i = 0; ; i++) {
+        IDXGIAdapter1 *cand = NULL;
+        if (FAILED(IDXGIFactory4_EnumAdapters1(factory, i, &cand)))
+            break;
+        DXGI_ADAPTER_DESC1 desc = {0};
+        IDXGIAdapter1_GetDesc1(cand, &desc);
+        bool software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE;
+        char *description = mp_to_utf8(NULL, desc.Description);
+        bool matched = mp_d3d11_adapter_selector_matches_hardware(
+            use_luid ? &selector : NULL, description,
+            desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart,
+            software, hw_idx, p->opts->gpu_id);
+        if (matched) {
+            adapter = cand;
+            p->gpu_selected = true;
+            talloc_free(p->gpu_name);
+            p->gpu_name = talloc_strdup(p, description);
+            p->gpu_luid = desc.AdapterLuid;
+            p->gpu_dxgi_ordinal = (int)i;
+            p->gpu_dml_ordinal = hw_idx;
+            MP_VERBOSE(vf, "RIFE: selected adapter dml=%d dxgi=%u\n",
+                       hw_idx, i);
+            talloc_free(description);
+            break;
+        }
+        talloc_free(description);
+        SAFE_RELEASE(cand);
+        if (!software)
+            hw_idx++;
+    }
+
+    SAFE_RELEASE(factory);
+    if (!adapter) {
+        if (use_luid)
+            MP_ERR(vf, "RIFE: exact gpu-luid adapter is unavailable\n");
+        else
+            MP_ERR(vf, "RIFE: gpu=%d not found among hardware adapters\n",
+                   p->opts->gpu_id);
+        return false;
+    }
+
+    *adapter_out = adapter;
+    return true;
+}
+
 static bool d3d12_init(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
@@ -723,51 +808,15 @@ static bool d3d12_init(struct mp_filter *vf)
         return false;
     }
 
-    HRESULT hr;
-    IDXGIFactory4 *factory = NULL;
     IDXGIAdapter1 *adapter = NULL;
-
-    hr = g_ort.create_dxgi_factory2(0, &IID_IDXGIFactory4, (void **)&factory);
-    if (FAILED(hr)) {
-        MP_ERR(vf, "RIFE zc: CreateDXGIFactory2 hr=0x%08lx\n", (unsigned long)hr);
+    if (!select_gpu_adapter(vf, &adapter))
         return false;
-    }
 
-    int gpu_id = p->opts->gpu_id;
-    int hw_idx = 0;
-    for (UINT i = 0; ; i++) {
-        IDXGIAdapter1 *cand = NULL;
-        if (FAILED(IDXGIFactory4_EnumAdapters1(factory, i, &cand)))
-            break;
-        DXGI_ADAPTER_DESC1 desc = {0};
-        IDXGIAdapter1_GetDesc1(cand, &desc);
-        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
-            SAFE_RELEASE(cand);
-            continue;
-        }
-        if (hw_idx == gpu_id) {
-            adapter = cand;
-            MP_VERBOSE(vf, "RIFE zc: selected adapter %d: %ls "
-                           "(vendor=0x%04x device=0x%04x)\n",
-                       hw_idx, desc.Description,
-                       desc.VendorId, desc.DeviceId);
-            break;
-        }
-        SAFE_RELEASE(cand);
-        hw_idx++;
-    }
-    if (!adapter) {
-        MP_ERR(vf, "RIFE zc: gpu_id=%d not found among hw adapters\n", gpu_id);
-        SAFE_RELEASE(factory);
-        return false;
-    }
-
-    hr = g_ort.d3d12_create_device((IUnknown *)adapter,
+    HRESULT hr = g_ort.d3d12_create_device((IUnknown *)adapter,
                                    D3D_FEATURE_LEVEL_11_0,
                                    &IID_ID3D12Device,
                                    (void **)&p->zc_d3d12);
     SAFE_RELEASE(adapter);
-    SAFE_RELEASE(factory);
     if (FAILED(hr)) {
         MP_ERR(vf, "RIFE zc: D3D12CreateDevice hr=0x%08lx\n", (unsigned long)hr);
         goto fail;
@@ -2705,6 +2754,8 @@ static bool zc_check_luid(struct mp_filter *vf)
     p->zc_d3d11_luid = desc.AdapterLuid;
     bool match = (l12.LowPart == desc.AdapterLuid.LowPart &&
                   l12.HighPart == desc.AdapterLuid.HighPart);
+    p->zc_luid_checked = true;
+    p->zc_luid_match = match;
     MP_INFO(vf, "RIFE zc-out: LUID d3d12=%08lx:%08lx d3d11=%08lx:%08lx %s\n",
             (unsigned long)l12.HighPart, (unsigned long)l12.LowPart,
             (unsigned long)desc.AdapterLuid.HighPart,
@@ -3129,7 +3180,11 @@ static bool init_session(struct mp_filter *vf, int orig_w, int orig_h)
                        " by onnxruntime.dll; this build lacks DirectML.\n");
             goto fail;
         }
-        st = g_ort.append_dml(p->session_opts, p->opts->gpu_id);
+        IDXGIAdapter1 *selected = NULL;
+        if (!p->gpu_selected && !select_gpu_adapter(vf, &selected))
+            goto fail;
+        SAFE_RELEASE(selected);
+        st = g_ort.append_dml(p->session_opts, p->gpu_dml_ordinal);
         if (!ort_check(vf, st, "AppendExecutionProvider_DML")) goto fail;
 
         // DML EP recommends disabling memory pattern + per-session arena.
@@ -4747,6 +4802,25 @@ static bool vf_rife_command(struct mp_filter *vf, struct mp_filter_command *cmd)
         mp_tags_set_str(t, "multiplier",
                         mp_tprintf(16, "%dx", p->opts->multiplier));
         mp_tags_set_str(t, "model", p->opts->model_path ? p->opts->model_path : "");
+        mp_tags_set_str(t, "gpu-name", p->gpu_name ? p->gpu_name : "");
+        char gpu_luid[MP_D3D11_ADAPTER_LUID_STRING_SIZE] = "";
+        if (p->gpu_selected)
+            mp_d3d11_adapter_format_luid(gpu_luid, p->gpu_luid.LowPart,
+                                         p->gpu_luid.HighPart);
+        mp_tags_set_str(t, "gpu-luid", gpu_luid);
+        mp_tags_set_str(t, "gpu-ordinal",
+                        mp_tprintf(16, "%d", p->gpu_dml_ordinal));
+        mp_tags_set_str(t, "gpu-dxgi-ordinal",
+                        mp_tprintf(16, "%d", p->gpu_dxgi_ordinal));
+        char d3d11_luid[MP_D3D11_ADAPTER_LUID_STRING_SIZE] = "";
+        if (p->zc_luid_checked)
+            mp_d3d11_adapter_format_luid(d3d11_luid,
+                                         p->zc_d3d11_luid.LowPart,
+                                         p->zc_d3d11_luid.HighPart);
+        mp_tags_set_str(t, "d3d11-luid", d3d11_luid);
+        mp_tags_set_str(t, "d3d11-match",
+                        !p->zc_luid_checked ? "unknown" :
+                        p->zc_luid_match ? "yes" : "no");
         mp_tags_set_str(t, "scale",
                         mp_tprintf(32, "%.3f", p->opts->scale > 0 ? p->opts->scale : 1.0));
         mp_tags_set_str(t, "src",
@@ -4851,6 +4925,7 @@ static const m_option_t rife_opts_fields[] = {
     {"model-path",       OPT_STRING(model_path)},
     {"multiplier",       OPT_INT(multiplier),   M_RANGE(2, 8)},
     {"gpu",              OPT_INT(gpu_id),       M_RANGE(0, 15)},
+    {"gpu-luid",         OPT_STRING(gpu_luid)},
     {"scale",            OPT_FLOAT(scale),      M_RANGE(0.25, 1.0)},
     {"scene-threshold",  OPT_FLOAT(scene_threshold),  M_RANGE(0.0, 1.0)},
     {"static-threshold", OPT_FLOAT(static_threshold), M_RANGE(0.0, 1.0)},
@@ -4877,6 +4952,7 @@ const struct mp_user_filter_entry vf_rife = {
             .model_path = NULL,
             .multiplier = 2,
             .gpu_id = 0,
+            .gpu_luid = NULL,
             .scale = 1.0f,
             .scene_threshold = 0.35f,
             .static_threshold = 0.01f,

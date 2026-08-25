@@ -4007,6 +4007,13 @@ Property list
     Current GPU context of video output driver (name as used with ``--gpu-context``).
     Valid for ``--vo=gpu`` and ``--vo=gpu-next``.
 
+``d3d11-adapter-active``
+    A read-only node map describing the adapter that backs the configured D3D11
+    video output. It contains ``name`` (string), canonical ``luid`` (string),
+    ``luid-low`` and ``luid-high`` (integers), raw DXGI ``ordinal`` (integer),
+    and ``software`` (flag). The property is unavailable when the active video
+    output does not use D3D11.
+
 ``current-ao``
     Current audio output driver (name as used with ``--ao``).
 

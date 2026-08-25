@@ -227,7 +227,8 @@ static bool d3d11_device_create(struct ra_ctx *ctx)
         .min_feature_level = D3D_FEATURE_LEVEL_9_3,
         .max_frame_latency = ctx->vo->opts->swapchain_depth,
     };
-    if (!mp_d3d11_create_present_device(vo->log, &device_opts, &p->d3d11_device))
+    if (!mp_d3d11_create_present_device(vo->log, &device_opts,
+                                        &p->d3d11_device, NULL))
         return false;
     ID3D11Device_GetImmediateContext(p->d3d11_device, &p->d3d11_context);
 

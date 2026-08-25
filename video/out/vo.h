@@ -119,6 +119,7 @@ enum mp_voctrl {
     VOCTRL_GET_HIDPI_SCALE,             // double*
     VOCTRL_GET_DISPLAY_RES,             // int[2]
     VOCTRL_GET_WINDOW_ID,               // int64_t*
+    VOCTRL_GET_D3D11_ADAPTER,           // struct voctrl_d3d11_adapter*
 
     /* private to vo_gpu and vo_gpu_next */
     VOCTRL_EXTERNAL_RESIZE,
@@ -154,6 +155,14 @@ struct voctrl_playback_state {
     bool playing;
     bool paused;
     uint8_t position;
+};
+
+struct voctrl_d3d11_adapter {
+    const char *name;
+    uint32_t luid_low;
+    uint32_t luid_high;
+    int ordinal;
+    bool software;
 };
 
 // VOCTRL_PERFORMANCE_DATA

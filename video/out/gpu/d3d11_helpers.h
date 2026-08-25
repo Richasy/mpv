@@ -26,6 +26,7 @@
 #include <dxgidebug.h>
 
 #include "video/mp_image.h"
+#include "d3d11_adapter.h"
 
 #if !HAVE_DXGI_DEBUG_D3D11
 DEFINE_GUID(DXGI_DEBUG_D3D11, 0x4b99317b, 0xac39, 0x4aa6, 0xbb, 0xb, 0xba, 0xa0, 0x47, 0x84, 0x79, 0x8f);
@@ -62,6 +63,12 @@ struct d3d11_device_opts {
     char *adapter_name;
 };
 
+struct mp_d3d11_adapter_info {
+    bool valid;
+    DXGI_ADAPTER_DESC1 desc;
+    int ordinal;
+};
+
 struct mp_dxgi_factory_ctx {
     IDXGIFactory1 *factory;
     IDXGIOutput6 *last_matched_output;
@@ -91,7 +98,8 @@ bool mp_dxgi_list_or_verify_adapters(struct mp_log *log,
 
 bool mp_d3d11_create_present_device(struct mp_log *log,
                                     struct d3d11_device_opts *opts,
-                                    ID3D11Device **dev_out);
+                                    ID3D11Device **dev_out,
+                                    struct mp_d3d11_adapter_info *adapter_out);
 
 struct d3d11_swapchain_opts {
     HWND window;

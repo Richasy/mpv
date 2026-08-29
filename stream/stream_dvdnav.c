@@ -839,9 +839,11 @@ static int iso_dvdnav_stream_open(stream_t *stream)
     talloc_free(opts);
 
     priv->opts = mp_get_config_group(stream, stream->global, &dvd_conf);
-    priv->device = talloc_strdup(priv, stream->url);
+    priv->device = mp_file_get_path(priv, bstr0(stream->url));
+    if (!priv->device)
+        priv->device = talloc_strdup(priv, stream->url);
 
-    MP_INFO(stream, "ISO detected over HTTP. Trying DVD...\n");
+    MP_INFO(stream, "ISO detected. Trying DVD...\n");
 
     if (!new_dvdnav_stream(stream, priv->device)) {
         MP_VERBOSE(stream, "Not a valid DVD ISO.\n");
@@ -907,6 +909,6 @@ static int iso_dvdnav_stream_open(stream_t *stream)
 const stream_info_t stream_info_iso_dvdnav = {
     .name = "iso/dvdnav",
     .open = iso_dvdnav_stream_open,
-    .protocols = (const char*const[]){ "http", "https", NULL },
+    .protocols = (const char*const[]){ "file", "", "http", "https", NULL },
     .stream_origin = STREAM_ORIGIN_UNSAFE,
 };

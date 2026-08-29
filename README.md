@@ -15,6 +15,14 @@ mpv bd://0 --bluray-device=https://example.com/movie.iso
 
 The HTTP server must support `Range` requests for seeking to work (most servers do: nginx, Apache, S3, cloud storage).
 
+Local Blu-ray and DVD ISO files can be opened directly. mpv probes Blu-ray
+first, then DVD, and falls back to regular file handling if neither recognizes
+the image:
+
+```bash
+mpv /path/to/movie.iso
+```
+
 The fork is maintained as a `libmpv` build target — it produces `libmpv-2.dll` for Windows x64 and arm64.
 
 * [Compilation](#compilation)

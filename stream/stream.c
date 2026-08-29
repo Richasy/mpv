@@ -85,6 +85,10 @@ static const stream_info_t *const stream_list[] = {
 #if HAVE_LIBBLURAY
     &stream_info_bdmv_dir,
     &stream_info_bluray,
+    &stream_info_iso_bluray,
+#endif
+#if HAVE_DVDNAV
+    &stream_info_iso_dvdnav,
 #endif
 #if HAVE_LIBARCHIVE
     &stream_info_libarchive,
@@ -100,12 +104,6 @@ static const stream_info_t *const stream_list[] = {
     &stream_info_slice,
     &stream_info_fd,
     &stream_info_cb,
-#if HAVE_LIBBLURAY
-    &stream_info_iso_bluray,
-#endif
-#if HAVE_DVDNAV
-    &stream_info_iso_dvdnav,
-#endif
 #if HAVE_LIBCURL
     &stream_info_curl,
 #endif

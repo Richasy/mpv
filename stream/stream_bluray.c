@@ -738,15 +738,17 @@ static int iso_bluray_stream_open(stream_t *s)
     b->cfg_title = opts->edition_id >= 0 ? opts->edition_id : BLURAY_DEFAULT_TITLE;
     talloc_free(opts);
 
-    b->cfg_device = talloc_strdup(b, s->url);
+    b->cfg_device = mp_file_get_path(b, bstr0(s->url));
+    if (!b->cfg_device)
+        b->cfg_device = talloc_strdup(b, s->url);
 
-    MP_INFO(s, "ISO detected over HTTP. Trying Blu-ray...\n");
+    MP_INFO(s, "ISO detected. Trying Blu-ray...\n");
     return bluray_stream_open_internal(s);
 }
 
 const stream_info_t stream_info_iso_bluray = {
     .name = "iso/bluray",
     .open = iso_bluray_stream_open,
-    .protocols = (const char*const[]){ "http", "https", NULL },
+    .protocols = (const char*const[]){ "file", "", "http", "https", NULL },
     .stream_origin = STREAM_ORIGIN_UNSAFE,
 };

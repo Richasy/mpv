@@ -2123,7 +2123,10 @@ static MP_THREAD_VOID gui_thread(void *ptr)
     if (w32->parent) {
         RECT r;
         GetClientRect(w32->parent, &r);
-        CreateWindowExW(WS_EX_NOPARENTNOTIFY, (LPWSTR)MAKEINTATOM(cls), MPV_WINDOW_CLASS_NAME,
+        // The embedding host owns input. Make the child output-only from birth
+        // so it cannot capture a button press away from a host overlay.
+        CreateWindowExW(WS_EX_NOPARENTNOTIFY | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+                        (LPWSTR)MAKEINTATOM(cls), MPV_WINDOW_CLASS_NAME,
                         WS_CHILD | WS_VISIBLE, 0, 0, r.right, r.bottom,
                         w32->parent, 0, HINST_THISCOMPONENT, w32);
 

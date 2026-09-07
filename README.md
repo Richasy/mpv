@@ -79,6 +79,8 @@ Use the workflow's `ffmpeg_ref` input (or `FFMPEG_COMMIT` for the build script)
 to build an exact companion FFmpeg revision without changing the default branch.
 It defaults to `master`. For a coordinated upgrade, select the committed FFmpeg
 SHA and use `upload_target=github` until the artifact set is ready to publish.
+GitHub-only runs omit ARM64. The `build_arm64` input is honored only when
+`upload_target` is `azure` or `both`; ordinary artifact builds use x64.
 
 ## Upstream integration: 2026-09-07
 

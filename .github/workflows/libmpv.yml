@@ -8,7 +8,7 @@ on:
         type: boolean
         default: true
       build_arm64:
-        description: 'Build ARM64'
+        description: 'Build ARM64 (Azure uploads only)'
         type: boolean
         default: false
       upload_target:
@@ -48,7 +48,12 @@ jobs:
             entries+=('{"arch":"x86_64","name":"x64"}')
           fi
           if [ "${{ inputs.build_arm64 }}" = "true" ]; then
-            entries+=('{"arch":"aarch64","name":"arm64"}')
+            if [ "${{ inputs.upload_target }}" = "azure" ] ||
+               [ "${{ inputs.upload_target }}" = "both" ]; then
+              entries+=('{"arch":"aarch64","name":"arm64"}')
+            else
+              echo "::notice::Skipping ARM64: it is built only for Azure uploads."
+            fi
           fi
           matrix="{\"include\":[$(IFS=,; echo "${entries[*]}")]}"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"

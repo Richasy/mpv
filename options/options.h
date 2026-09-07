@@ -112,7 +112,6 @@ struct mp_subtitle_opts {
     bool sub_scale_with_window;
     bool ass_scale_with_window;
     struct osd_style_opts *sub_style;
-    float sub_scale;
     bool sub_scale_signs;
     float sub_gauss;
     bool sub_gray;
@@ -155,8 +154,9 @@ enum sub_stack_order {
 
 // Options for both primary and secondary subs.
 struct mp_subtitle_shared_opts {
-    float sub_delay[2];
+    double sub_delay[2];
     float sub_pos[2];
+    float sub_scale[2];
     bool sub_visibility[2];
     int ass_style_override[2];
     int sub_stack_layout;       // enum sub_stack_layout
@@ -193,6 +193,11 @@ struct mp_osd_render_opts {
 struct mp_bluray_opts {
     char *bluray_device;
     int angle;
+};
+
+struct dvda_opts {
+    char *device;
+    int page;
 };
 
 typedef struct MPOpts {
@@ -296,6 +301,7 @@ typedef struct MPOpts {
     int hls_bitrate;
     int edition_id;
     bool flatten_editions;
+    bool disc_menu;
     bool show_dependent_tracks;
     bool initial_audio_sync;
     double sync_max_video_change;
@@ -304,7 +310,7 @@ typedef struct MPOpts {
     int hr_seek;
     float hr_seek_demuxer_offset;
     bool hr_seek_framedrop;
-    float audio_delay;
+    double audio_delay;
     float default_max_pts_correction;
     int autosync;
     int frame_dropping;
@@ -324,6 +330,7 @@ typedef struct MPOpts {
     char **input_commands;
     bool consolecontrols;
     int playlist_pos;
+    int playlist_inherit_options;
     struct m_rel_time play_start;
     struct m_rel_time play_end;
     struct m_rel_time play_length;
@@ -468,6 +475,7 @@ typedef struct MPOpts {
     struct wingl_opts *wingl_opts;
     struct cuda_opts *cuda_opts;
     struct dvd_opts *dvd_opts;
+    struct dvda_opts *dvda_opts;
     struct vaapi_opts *vaapi_opts;
     struct sws_opts *sws_opts;
     struct zimg_opts *zimg_opts;

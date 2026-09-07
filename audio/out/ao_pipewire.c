@@ -195,7 +195,7 @@ static void on_process(void *userdata)
     int64_t end_time = mp_time_ns();
     end_time += MP_TIME_S_TO_NS(nframes) / ao->samplerate;
     end_time += MP_TIME_S_TO_NS(time.delay) * time.rate.num / time.rate.denom;
-    end_time += MP_TIME_S_TO_NS(time.queued) / ao->samplerate;
+    end_time += MP_TIME_S_TO_NS(time.queued / ao->sstride) / ao->samplerate;
     end_time += MP_TIME_S_TO_NS(time.buffered) / ao->samplerate;
     end_time -= pw_stream_get_nsec(p->stream) - time.now;
 
@@ -668,7 +668,7 @@ static int init(struct ao *ao)
 
     pw_thread_loop_unlock(p->loop);
 
-    if (p->init_state == INIT_STATE_ERROR)
+    if (p->init_state != INIT_STATE_SUCCESS)
         goto error;
 
     return 0;

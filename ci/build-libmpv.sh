@@ -16,6 +16,7 @@ set -e
 # Optional environment variables:
 #   MPV_REPO      - mpv git repository URL (default: https://github.com/Richasy/mpv.git)
 #   MPV_COMMIT    - mpv git commit/branch/tag (default: master)
+#   FFMPEG_COMMIT - Richasy/FFmpeg git commit/branch/tag (default: master)
 #   MPV_SRC_DIR   - path to mpv source (for copying headers)
 #   BUILD_TYPE    - 'release' (default) or 'debug'. Debug switches mpv meson
 #                   options to -Doptimization=0 -Db_lto=false -Db_ndebug=false
@@ -323,6 +324,7 @@ collect() {
 
     local MPV_BUILD_COMMIT="${MPV_COMMIT:-unknown}"
     local FFMPEG_BUILD_COMMIT="unknown"
+    local LIBPLACEBO_BUILD_COMMIT="unknown"
     local COMPILER_VERSION="unknown"
     local PDB_GUID="unknown"
     if [ -n "${MPV_SRC_DIR:-}" ] && git -C "$MPV_SRC_DIR" rev-parse HEAD >/dev/null 2>&1; then
@@ -330,6 +332,9 @@ collect() {
     fi
     if git -C "$SRC_PACKAGES/ffmpeg" rev-parse HEAD >/dev/null 2>&1; then
         FFMPEG_BUILD_COMMIT=$(git -C "$SRC_PACKAGES/ffmpeg" rev-parse HEAD)
+    fi
+    if git -C "$SRC_PACKAGES/libplacebo" rev-parse HEAD >/dev/null 2>&1; then
+        LIBPLACEBO_BUILD_COMMIT=$(git -C "$SRC_PACKAGES/libplacebo" rev-parse HEAD)
     fi
     if [ -x "$CLANG_ROOT/bin/clang" ]; then
         COMPILER_VERSION=$("$CLANG_ROOT/bin/clang" --version | head -n1)
@@ -343,6 +348,7 @@ collect() {
     cat > "$ARCH_OUTPUT/build-info.txt" <<EOF
 mpv_commit=$MPV_BUILD_COMMIT
 ffmpeg_commit=$FFMPEG_BUILD_COMMIT
+libplacebo_commit=$LIBPLACEBO_BUILD_COMMIT
 target_arch=$TARGET_ARCH
 build_type=$BUILD_TYPE
 compiler=$COMPILER_VERSION

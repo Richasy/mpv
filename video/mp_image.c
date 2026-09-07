@@ -237,6 +237,7 @@ static void mp_image_destructor(void *ptr)
     for (int n = 0; n < mpi->num_ff_side_data; n++)
         av_buffer_unref(&mpi->ff_side_data[n].buf);
     talloc_free(mpi->ff_side_data);
+    mp_image_unrefp(&mpi->enhancement_layer);
 }
 
 int mp_chroma_div_up(int size, int shift)
@@ -374,6 +375,9 @@ struct mp_image *mp_image_new_ref(struct mp_image *img)
     for (int n = 0; n < new->num_ff_side_data; n++)
         ref_buffer(&new->ff_side_data[n].buf);
 
+    new->enhancement_layer = img->enhancement_layer
+        ? mp_image_new_ref(img->enhancement_layer) : NULL;
+
     return new;
 }
 
@@ -407,6 +411,7 @@ struct mp_image *mp_image_new_dummy_ref(struct mp_image *img)
     new->film_grain = NULL;
     new->num_ff_side_data = 0;
     new->ff_side_data = NULL;
+    new->enhancement_layer = NULL;
     return new;
 }
 
@@ -556,6 +561,8 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
     dst->params.primaries_orig = src->params.primaries_orig;
     dst->params.transfer_orig = src->params.transfer_orig;
     dst->params.sys_orig = src->params.sys_orig;
+    dst->params.no_dovi = src->params.no_dovi;
+    dst->params.no_enhancement_layer = src->params.no_enhancement_layer;
 
     // ensure colorspace consistency
     enum pl_color_system dst_forced_csp = mp_image_params_get_forced_csp(&dst->params);
@@ -587,6 +594,8 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
         dst->ff_side_data[n].buf = av_buffer_ref(src->ff_side_data[n].buf);
         MP_HANDLE_OOM(dst->ff_side_data[n].buf);
     }
+
+    mp_image_setrefp(&dst->enhancement_layer, src->enhancement_layer);
 }
 
 // Crop the given image to (x0, y0)-(x1, y1) (bottom/right border exclusive)
@@ -892,12 +901,14 @@ void mp_image_params_update_dynamic(struct mp_image_params *dst,
 {
     dst->repr.dovi = src->repr.dovi;
     // Don't overwrite peak-detected HDR metadata if available.
-    float max_pq_y = dst->color.hdr.max_pq_y;
-    float avg_pq_y = dst->color.hdr.avg_pq_y;
-    dst->color.hdr = src->color.hdr;
+    struct pl_hdr_metadata *hdr = &dst->color.hdr;
+    const struct pl_hdr_metadata prev = *hdr;
+    *hdr = src->color.hdr;
     if (has_peak_detect_values) {
-        dst->color.hdr.max_pq_y = max_pq_y;
-        dst->color.hdr.avg_pq_y = avg_pq_y;
+        hdr->max_pq_y  = prev.max_pq_y;
+        hdr->avg_pq_y  = prev.avg_pq_y;
+        hdr->scene_avg = prev.scene_avg;
+        memcpy(hdr->scene_max, prev.scene_max, sizeof(hdr->scene_max));
     }
 }
 
@@ -1125,6 +1136,8 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
         dst->params.stereo3d = p->stereo3d;
         // Might be incorrect if colorspace changes.
         dst->params.light = p->light;
+        dst->params.no_dovi = p->no_dovi;
+        dst->params.no_enhancement_layer = p->no_enhancement_layer;
 #if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(60, 11, 100)
         dst->params.repr.alpha = p->repr.alpha;
 #endif
@@ -1174,12 +1187,13 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
     if (sd) {
 #ifdef PL_HAVE_LAV_DOLBY_VISION
         const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
-#if PL_API_VER >= 364
-        if (pl_avdovi_metadata_supported(metadata)) {
-#else
+#if PL_API_VER < 364
         const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
-        if (header->disable_residual_flag) {
+        if (header->disable_residual_flag)
+#elif PL_API_VER < 370
+        if (pl_avdovi_metadata_supported(metadata))
 #endif
+        {
             dst->dovi = dovi = av_buffer_alloc(sizeof(struct pl_dovi_metadata));
             MP_HANDLE_OOM(dovi);
             pl_map_avdovi_metadata(&dst->params.color, &dst->params.repr,

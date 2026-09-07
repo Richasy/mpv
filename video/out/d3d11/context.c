@@ -230,6 +230,22 @@ static struct pl_color_space d3d11_target_color_space(struct ra_swapchain *sw)
     return (struct pl_color_space){0};
 }
 
+static float d3d11_target_ref_luma(struct ra_swapchain *sw)
+{
+    struct priv *p = sw->priv;
+    HWND hwnd;
+    if (sw->ctx->opts.composition) {
+        m_config_cache_update(p->vo_opts_cache);
+        hwnd = (HWND)(intptr_t)p->vo_opts->d3d11_composition_hwnd;
+    } else {
+        hwnd = vo_w32_hwnd(sw->ctx->vo);
+    }
+    if (!hwnd)
+        return 0;
+
+    return mp_dxgi_sdr_white_level_from_hwnd(&p->dxgi_ctx, hwnd);
+}
+
 static bool d3d11_start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
 {
     struct priv *p = sw->priv;
@@ -722,6 +738,7 @@ static void d3d11_uninit(struct ra_ctx *ctx)
 static const struct ra_swapchain_fns d3d11_swapchain = {
     .color_depth  = d3d11_color_depth,
     .target_csp   = d3d11_target_color_space,
+    .target_ref_luma = d3d11_target_ref_luma,
     .start_frame  = d3d11_start_frame,
     .submit_frame = d3d11_submit_frame,
     .swap_buffers = d3d11_swap_buffers,

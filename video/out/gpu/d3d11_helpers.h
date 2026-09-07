@@ -72,6 +72,8 @@ struct mp_d3d11_adapter_info {
 struct mp_dxgi_factory_ctx {
     IDXGIFactory1 *factory;
     IDXGIOutput6 *last_matched_output;
+    HMONITOR white_level_monitor;
+    float sdr_white_level;
 };
 
 void mp_dxgi_factory_uninit(struct mp_dxgi_factory_ctx *ctx);
@@ -87,6 +89,11 @@ bool mp_dxgi_output_desc_from_swapchain(struct mp_dxgi_factory_ctx *ctx,
                                         DXGI_OUTPUT_DESC1 *desc);
 bool mp_dxgi_output_desc_from_device(ID3D11Device *device,
                                      DXGI_OUTPUT_DESC1 *desc);
+
+// Returns the system SDR white level for the monitor the window is on, in nits,
+// or 0 if unknown.
+float mp_dxgi_sdr_white_level_from_hwnd(struct mp_dxgi_factory_ctx *ctx,
+                                        HWND hwnd);
 
 struct pl_color_space mp_dxgi_desc_to_color_space(const DXGI_OUTPUT_DESC1 *desc);
 

@@ -60,11 +60,13 @@ sources = files(
     'audio/chmap.c',
     'audio/chmap_avchannel.c',
     'audio/chmap_sel.c',
+    'audio/decode/ad_dsd.c',
     'audio/decode/ad_lavc.c',
     'audio/decode/ad_spdif.c',
     'audio/filter/af_drop.c',
     'audio/filter/af_format.c',
     'audio/filter/af_lavcac3enc.c',
+    'audio/filter/af_lavfi_tempo.c',
     'audio/filter/af_scaletempo.c',
     'audio/filter/af_scaletempo2.c',
     'audio/filter/af_scaletempo2_internals.c',
@@ -106,6 +108,7 @@ sources = files(
     'demux/demux_playlist.c',
     'demux/demux_raw.c',
     'demux/demux_timeline.c',
+    'demux/dovi_split.c',
     'demux/ebml.c',
     'demux/packet.c',
     'demux/packet_pool.c',
@@ -117,6 +120,7 @@ sources = files(
     'filters/f_auto_filters.c',
     'filters/f_decoder_wrapper.c',
     'filters/f_demux_in.c',
+    'filters/f_enhancement_pair.c',
     'filters/f_hwtransfer.c',
     'filters/f_lavfi.c',
     'filters/f_output_chain.c',
@@ -167,6 +171,7 @@ sources = files(
     'player/client.c',
     'player/command.c',
     'player/configfiles.c',
+    'player/discnav.c',
     'player/external_files.c',
     'player/loadfile.c',
     'player/main.c',
@@ -201,6 +206,8 @@ sources = files(
     'stream/stream_mpv.c',
     'stream/stream_null.c',
     'stream/stream_slice.c',
+    'stream/stream_bstr.c',
+    'stream/stream_env.c',
 
     ## Subtitles
     'sub/ass_mp.c',
@@ -631,11 +638,12 @@ if darwin
     subdir(join_paths('TOOLS', 'osxbundle'))
 endif
 
-libcurl = dependency('libcurl', version: '>= 7.87.0', required: get_option('libcurl'))
+libcurl = dependency('libcurl', version: '>= 7.88.0', required: get_option('libcurl'))
 features += {'libcurl': libcurl.found()}
 if features['libcurl']
     dependencies += [libcurl]
-    sources += files('stream/stream_curl.c')
+    sources += files('demux/avio_crypto.c',
+                     'stream/stream_curl.c')
 endif
 
 cdda_opt = get_option('cdda').require(
@@ -661,11 +669,22 @@ if features['dvbin']
                      'stream/stream_dvb.c')
 endif
 
+dvda_opt = get_option('dvda').require(
+    get_option('gpl'),
+    error_message: 'the build is not GPL!',
+)
+dvdread = dependency('dvdread', version: '>= 7.1.1', required: dvda_opt)
+features += {'dvda': dvdread.found()}
+if features['dvda']
+    dependencies += dvdread
+    sources += files('stream/stream_dvda.c')
+endif
+
 dvdnav_opt = get_option('dvdnav').require(
     get_option('gpl'),
     error_message: 'the build is not GPL!',
 )
-dvdnav = dependency('dvdnav', version: '>= 4.2.0', required: dvdnav_opt)
+dvdnav = dependency('dvdnav', version: '>= 6.1.0', required: dvdnav_opt)
 features += {'dvdnav': dvdnav.found()}
 if features['dvdnav']
     dependencies += dvdnav
@@ -707,7 +726,7 @@ if features['libavdevice']
     dependencies += libavdevice
 endif
 
-libbluray = dependency('libbluray', version: '>= 0.5.0', required: get_option('libbluray'))
+libbluray = dependency('libbluray', version: '>= 1.0.2', required: get_option('libbluray'))
 features += {'libbluray': libbluray.found()}
 if features['libbluray']
     dependencies += libbluray
@@ -790,7 +809,10 @@ if features['uchardet']
     dependencies += uchardet
 endif
 
-vapoursynth = dependency('vapoursynth', version: '>= 56', required: get_option('vapoursynth'))
+vapoursynth = dependency('vapoursynth-script', version: '>= 56', required: false)
+if not vapoursynth.found()
+    vapoursynth = dependency('vapoursynth', version: '>= 56', required: get_option('vapoursynth'))
+endif
 features += {'vapoursynth': vapoursynth.found()}
 if features['vapoursynth']
     dependencies += vapoursynth.partial_dependency(compile_args: true, includes: true)
@@ -1742,7 +1764,7 @@ if rst2man.found()
           docutils_wrapper, rst2man,
           '--record-dependencies', '@DEPFILE@',
           '--strip-elements-with-class=contents',
-          '@INPUT@', '@OUTPUT@'],
+          '--output=@OUTPUT@', '@INPUT@'],
         depfile: 'mpv.1.dep',
         install: true,
         install_tag: 'man',

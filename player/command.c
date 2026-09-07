@@ -147,6 +147,10 @@ struct overlay {
     struct mp_image *source;
     int x, y;
     int dw, dh;
+    enum pl_color_primaries primaries;
+    enum pl_color_transfer transfer;
+    float max_luma;
+    bool video_colorspace;
 };
 
 struct hook_handler {
@@ -538,7 +542,7 @@ static int mp_property_filename(void *ctx, struct m_property *prop,
         if (strcmp(ka->key, "no-ext") == 0) {
             action = ka->action;
             arg = ka->arg;
-            f = mp_strip_ext(filename, f);
+            f = bstrto0(filename, mp_strip_ext(bstr0(f)));
         }
     }
     int r = m_property_strdup_ro(action, arg, f);
@@ -1132,6 +1136,19 @@ static int mp_property_current_edition(void *ctx, struct m_property *prop,
     return m_property_int_ro(action, arg, demuxer->edition);
 }
 
+static int mp_property_disc_menu_active(void *ctx, struct m_property *prop,
+                                        int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    struct stream *s = disc_nav_get_stream(mpctx);
+    if (!s)
+        return M_PROPERTY_UNAVAILABLE;
+    struct stream_nav_state st = {0};
+    if (stream_control(s, STREAM_CTRL_GET_NAV_STATE, &st) < 1)
+        return M_PROPERTY_UNAVAILABLE;
+    return m_property_bool_ro(action, arg, st.menu_active);
+}
+
 static int mp_property_edition(void *ctx, struct m_property *prop,
                                int action, void *arg)
 {
@@ -1166,6 +1183,26 @@ static int mp_property_edition(void *ctx, struct m_property *prop,
             *(char **) arg = talloc_asprintf(NULL, "%d", ed + 1);
         }
         return M_PROPERTY_OK;
+    }
+    case M_PROPERTY_SET: {
+        // For disc demuxers, jump the title directly, we sometimes need to
+        // react even if the actual edition "value" doesn't change.
+        if (disc_nav_get_stream(mpctx)) {
+            int new_ed = *(int *)arg;
+            if (new_ed < 0 || new_ed >= demuxer->num_editions)
+                return M_PROPERTY_ERROR;
+            unsigned new_title = new_ed;
+            if (stream_control(demuxer->stream, STREAM_CTRL_SET_CURRENT_TITLE,
+                               &new_title) < 1)
+                return M_PROPERTY_ERROR;
+            mpctx->opts->edition_id = new_ed;
+            m_config_notify_change_opt_ptr(mpctx->mconfig,
+                                           &mpctx->opts->edition_id);
+            mp_notify_property(mpctx, "edition");
+            mp_wakeup_core(mpctx);
+            return M_PROPERTY_OK;
+        }
+        return mp_property_generic_option(mpctx, prop, action, arg);
     }
     default:
         return mp_property_generic_option(mpctx, prop, action, arg);
@@ -1241,9 +1278,7 @@ static int mp_property_list_editions(void *ctx, struct m_property *prop,
                                 get_edition_entry, mpctx);
 }
 
-/* DVD/Blu-ray angles. The stream layer uses inconsistent indexing
- * (libdvdnav: 1-indexed, libbluray: 0-indexed), so the property layer
- * normalizes both to 1-indexed to match `--dvd-angle` / `--bluray-angle`. */
+/* DVD/Blu-ray stream controls and angle properties are both 1-indexed. */
 static bool stream_is_bluray(const struct stream *s)
 {
     if (!s || !s->info || !s->info->name)
@@ -1267,8 +1302,6 @@ static int get_angle_count_and_current(struct MPContext *mpctx,
     if (stream_control(demuxer->stream, STREAM_CTRL_GET_ANGLE,
                        &current) != STREAM_OK)
         return -1;
-    if (stream_is_bluray(demuxer->stream))
-        current += 1;
     if (out_count)
         *out_count = count;
     if (out_current)
@@ -2326,7 +2359,8 @@ static int get_track_entry(int item, int action, void *arg, void *ctx)
         {"main-selection", SUB_PROP_INT(order), .unavailable = order < 0},
         {"external-filename", SUB_PROP_STR(track->external_filename),
                         .unavailable = !track->external_filename},
-        {"ff-index",    SUB_PROP_INT(track->ff_index)},
+        {"ff-index",    SUB_PROP_INT(track->ff_index),
+                        .unavailable = track->ff_index == -1},
         {"hls-bitrate", SUB_PROP_INT(track->hls_bitrate),
                         .unavailable = !track->hls_bitrate},
         {"program-id",  SUB_PROP_INT(sh && sh->num_program_ids ? sh->program_ids[0] : -1),
@@ -4881,6 +4915,7 @@ static const struct m_property mp_properties_base[] = {
     {"edition", mp_property_edition},
     {"current-edition", mp_property_current_edition},
     {"current-angle", mp_property_current_angle},
+    {"disc-menu-active", mp_property_disc_menu_active},
     {"chapters", mp_property_chapters},
     {"editions", mp_property_editions},
     {"angles", mp_property_angles},
@@ -5344,6 +5379,7 @@ static const struct property_osd_display {
       "${?secondary-sub-visibility==yes:visible${?secondary-sid==no: (but no secondary subtitles selected)}}"},
     {"sub-forced-events-only", "Forced sub only"},
     {"sub-scale", "Sub Scale"},
+    {"secondary-sub-scale", "Secondary sub scale"},
     {"sub-ass-use-video-data", "Subtitle using video properties"},
     {"sub-ass-video-aspect-override", "Subtitle aspect override"},
     {"sub-ass-override", "ASS subtitle style override"},
@@ -5552,6 +5588,12 @@ static void recreate_overlays(struct MPContext *mpctx)
                 .h = s->h, .dh = o->dh,
                 .x = o->x,
                 .y = o->y,
+                .bgra = {
+                    .primaries = o->primaries,
+                    .transfer = o->transfer,
+                    .max_luma = o->max_luma,
+                    .video_color_space = o->video_colorspace,
+                },
             };
             MP_TARRAY_APPEND(cmd, new->parts, new->num_parts, b);
         }
@@ -5613,7 +5655,7 @@ done:
         new->num_parts = 0;
     }
 
-    osd_set_external2(mpctx->osd, new);
+    osd_set_bitmaps(mpctx->osd, OSDTYPE_EXTERNAL2, new);
     mp_wakeup_core(mpctx);
     cmd->overlay_osd_current = overlay_next;
 }
@@ -5669,6 +5711,13 @@ static void cmd_overlay_add(void *pcmd)
     char *fmt = cmd->args[5].v.s;
     int w = cmd->args[6].v.i, h = cmd->args[7].v.i, stride = cmd->args[8].v.i;
     int dw = cmd->args[9].v.i, dh = cmd->args[10].v.i;
+    bool video_colorspace = cmd->args[11].v.b;
+    float max_luma = cmd->args[12].v.f;
+    int primaries = cmd->args[13].v.i, transfer = cmd->args[14].v.i;
+
+    // video_colorspace overrides explicit tags
+    if (video_colorspace)
+        primaries = transfer = 0;
 
     if (dw <= 0)
         dw = w;
@@ -5682,7 +5731,7 @@ static void cmd_overlay_add(void *pcmd)
         MP_ERR(mpctx, "overlay-add: invalid id %d\n", id);
         goto error;
     }
-    if (w <= 0 || h <= 0 || stride < w * 4 || (stride % 4) || offset < 0) {
+    if (w <= 0 || h <= 0 || stride / 4 < w || (stride % 4) || offset < 0) {
         MP_ERR(mpctx, "overlay-add: inconsistent parameters\n");
         goto error;
     }
@@ -5692,6 +5741,10 @@ static void cmd_overlay_add(void *pcmd)
         .y = y,
         .dw = dw,
         .dh = dh,
+        .primaries = primaries,
+        .transfer = transfer,
+        .max_luma = max_luma,
+        .video_colorspace = video_colorspace,
     };
     if (!overlay.source)
         goto error;
@@ -5751,7 +5804,7 @@ static void overlay_uninit(struct MPContext *mpctx)
         return;
     for (int id = 0; id < cmd->num_overlays; id++)
         replace_overlay(mpctx, id, &(struct overlay){0});
-    osd_set_external2(mpctx->osd, NULL);
+    osd_set_bitmaps(mpctx->osd, OSDTYPE_EXTERNAL2, NULL);
     for (int n = 0; n < 2; n++)
         mp_image_unrefp(&cmd->overlay_osd[n].packed);
 }
@@ -7663,6 +7716,50 @@ static void cmd_context_menu(void *p)
         vo_control(vo, VOCTRL_SHOW_MENU, NULL);
 }
 
+static void cmd_discnav(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    struct MPContext *mpctx = cmd->mpctx;
+    int action = cmd->args[0].v.i;
+
+    struct stream *s = disc_nav_get_stream(mpctx);
+    if (!s) {
+        cmd->success = false;
+        return;
+    }
+
+    struct stream_nav_cmd nc = { .action = action };
+
+    struct stream_nav_state pre = {0};
+    stream_control(s, STREAM_CTRL_GET_NAV_STATE, &pre);
+
+    if (action == STREAM_NAV_MOUSE_MOVE || action == STREAM_NAV_MOUSE_CLICK) {
+        double nx = cmd->args[1].v.d;
+        double ny = cmd->args[2].v.d;
+        if (nx >= 0 && ny >= 0) {
+            if (pre.src_w <= 0 || pre.src_h <= 0 || nx > 1 || ny > 1) {
+                cmd->success = false;
+                return;
+            }
+            nc.x = (int)(nx * pre.src_w);
+            nc.y = (int)(ny * pre.src_h);
+        } else if (!disc_nav_mouse_pos_to_src(mpctx, pre.src_w, pre.src_h,
+                                              &nc.x, &nc.y))
+        {
+            cmd->success = false;
+            return;
+        }
+    }
+
+    if (stream_control(s, STREAM_CTRL_NAV_CMD, &nc) < 1) {
+        cmd->success = false;
+    } else if (mpctx->demuxer && stream_nav_action_activates(action)) {
+        demux_drive_nav(mpctx->demuxer);
+    }
+
+    mp_wakeup_core(mpctx);
+}
+
 static void cmd_flush_status_line(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
@@ -8151,7 +8248,15 @@ const struct mp_cmd_def mp_cmds[] = {
                                         {"h", OPT_INT(v.i)},
                                         {"stride", OPT_INT(v.i)},
                                         {"dw", OPT_INT(v.i), OPTDEF_INT(0)},
-                                        {"dh", OPT_INT(v.i), OPTDEF_INT(0)}, }},
+                                        {"dh", OPT_INT(v.i), OPTDEF_INT(0)},
+                                        {"video_colorspace", OPT_BOOL(v.b),
+                                            OPTDEF_INT(0)},
+                                        {"max_luma", OPT_FLOAT(v.f),
+                                            M_RANGE(0, 10000), OPTDEF_FLOAT(0)},
+                                        {"primaries", OPT_CHOICE_C(v.i, pl_csp_prim_names),
+                                            OPTDEF_INT(PL_COLOR_PRIM_UNKNOWN)},
+                                        {"transfer", OPT_CHOICE_C(v.i, pl_csp_trc_names),
+                                            OPTDEF_INT(PL_COLOR_TRC_UNKNOWN)}, }},
     { "overlay-remove", cmd_overlay_remove, { {"id", OPT_INT(v.i)} } },
 
     { "osd-overlay", cmd_osd_overlay,
@@ -8230,6 +8335,23 @@ const struct mp_cmd_def mp_cmds[] = {
     },
 
     { "context-menu", cmd_context_menu },
+
+    { "discnav", cmd_discnav,
+        { {"action", OPT_CHOICE(v.i,
+            {"up",          STREAM_NAV_UP},
+            {"down",        STREAM_NAV_DOWN},
+            {"left",        STREAM_NAV_LEFT},
+            {"right",       STREAM_NAV_RIGHT},
+            {"select",      STREAM_NAV_SELECT},
+            {"menu",        STREAM_NAV_MENU_ROOT},
+            {"title-menu",  STREAM_NAV_MENU_TITLE},
+            {"popup",       STREAM_NAV_MENU_POPUP},
+            {"prev",        STREAM_NAV_PREV_MENU},
+            {"mouse-move",  STREAM_NAV_MOUSE_MOVE},
+            {"mouse-click", STREAM_NAV_MOUSE_CLICK})},
+          {"x", OPT_DOUBLE(v.d), OPTDEF_DOUBLE(-1)},
+          {"y", OPT_DOUBLE(v.d), OPTDEF_DOUBLE(-1)} },
+    },
 
     { "flush-status-line", cmd_flush_status_line, { {"clear", OPT_BOOL(v.b)} } },
 
@@ -8509,9 +8631,6 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
                 int ret = sub_control(sub, SD_CTRL_UPDATE_OPTS, &flags);
                 if (ret == CONTROL_OK && flags & (UPDATE_SUB_FILT | UPDATE_SUB_HARD)) {
                     sub_redecode_cached_packets(sub);
-                    sub_reset(sub);
-                    if (track->selected)
-                        reselect_demux_stream(mpctx, track, true);
                 }
             }
         }
@@ -8664,9 +8783,17 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
                                 mp_switch_track_n(mpctx, i, t, sel, 0);
                         }
                     }
+                    if (demuxer->ts_resets_possible) {
+                        reset_playback_state(mpctx);
+                        demux_flush(demuxer);
+                    }
                     mp_notify_property(mpctx, "current-edition");
                     print_track_list(mpctx,
                         mp_tprintf(42, "Selected edition %d:", demuxer->edition));
+                } else if (disc_nav_get_stream(mpctx)) {
+                    unsigned new_title = opts->edition_id;
+                    stream_control(demuxer->stream,
+                                   STREAM_CTRL_SET_CURRENT_TITLE, &new_title);
                 } else {
                     if (!mpctx->stop_play)
                         mpctx->stop_play = PT_CURRENT_ENTRY;
@@ -8679,16 +8806,26 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
 #if HAVE_LIBBLURAY
     if (opt_ptr == &opts->stream_bluray_opts->angle) {
         struct demuxer *demuxer = mpctx->demuxer;
-        if (mpctx->playback_initialized && demuxer && demuxer->stream &&
-                (!strcmp(demuxer->stream->info->name, "bd") ||
-                 !strcmp(demuxer->stream->info->name, "bdmv/bluray") ||
-                 !strcmp(demuxer->stream->info->name, "iso/bluray"))) {
-            int angle = opts->stream_bluray_opts->angle - 1;
+        if (mpctx->playback_initialized && demuxer &&
+            stream_is_bluray(demuxer->stream)) {
+            int angle = opts->stream_bluray_opts->angle;
             if (stream_control(demuxer->stream, STREAM_CTRL_SET_ANGLE,
                                &angle) == STREAM_OK) {
                 mp_notify_property(mpctx, "current-angle");
                 mp_notify_property(mpctx, "angle-list");
             }
+        }
+    }
+#endif
+
+#if HAVE_DVDA
+    if (opt_ptr == &opts->dvda_opts->page) {
+        struct demuxer *demuxer = mpctx->demuxer;
+        if (mpctx->playback_initialized && demuxer && demuxer->stream &&
+                (!strcmp(demuxer->stream->info->name, "dvda") ||
+                 !strcmp(demuxer->stream->info->name, "ifo_dvda"))) {
+            int page = opts->dvda_opts->page;
+            stream_control(demuxer->stream, STREAM_CTRL_SET_STILL_PAGE, &page);
         }
     }
 #endif

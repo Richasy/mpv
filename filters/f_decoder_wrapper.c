@@ -233,6 +233,7 @@ struct priv {
     bool pts_reset;
     int attempt_framedrops; // try dropping this many frames
     int dropped_frames; // total frames _probably_ dropped
+    int extra_hw_frames; // extra surfaces retained outside the decoder
 
     // Audio frame tap (whisper realtime captions). Read/written under
     // cache_lock so the decoder thread can fetch the snapshot quickly without
@@ -270,7 +271,7 @@ static int decoder_list_help(struct mp_log *log, const m_option_t *opt,
         return M_OPT_EXIT;
     }
     if (strcmp(opt->name, "audio-spdif") == 0) {
-        mp_info(log, "Choices: ac3,dts-hd,dts (and possibly more)\n");
+        mp_info(log, "Choices: ac3,dts-hd,dts,dsd (and possibly more)\n");
         return M_OPT_EXIT;
     }
     return 1;
@@ -462,6 +463,14 @@ static bool reinit_decoder(struct priv *p)
                 list = spdif;
             } else {
                 talloc_free(spdif);
+                struct mp_decoder_list *dsd =
+                    select_dsd_codec(p->codec->codec, p->opts->audio_spdif);
+                if (dsd->num_entries) {
+                    driver = &ad_dsd;
+                    list = dsd;
+                } else {
+                    talloc_free(dsd);
+                }
             }
         }
     }
@@ -504,6 +513,16 @@ static bool reinit_decoder(struct priv *p)
                p->codec->codec ? p->codec->codec : "<?>");
     }
 
+    if (p->decoder && p->decoder->control) {
+        mp_mutex_lock(&p->cache_lock);
+        int extra_hw_frames = p->extra_hw_frames;
+        mp_mutex_unlock(&p->cache_lock);
+        if (extra_hw_frames > 0) {
+            p->decoder->control(p->decoder->f, VDCTRL_SET_EXTRA_HW_FRAMES,
+                                &extra_hw_frames);
+        }
+    }
+
     update_cached_values(p);
 
     talloc_free(list);
@@ -530,6 +549,19 @@ bool mp_decoder_wrapper_reinit(struct mp_decoder_wrapper *d)
     bool res = reinit_decoder(p);
     thread_unlock(p);
     return res;
+}
+
+void mp_decoder_wrapper_set_extra_hw_frames(struct mp_decoder_wrapper *d, int n)
+{
+    struct priv *p = d->f->priv;
+    if (p->is_group) {
+        for (int i = 0; i < p->num_children; i++)
+            mp_decoder_wrapper_set_extra_hw_frames(p->children[i], n);
+        return;
+    }
+    mp_mutex_lock(&p->cache_lock);
+    p->extra_hw_frames = n;
+    mp_mutex_unlock(&p->cache_lock);
 }
 
 void mp_decoder_wrapper_set_frame_drops(struct mp_decoder_wrapper *d, int num)
@@ -1510,13 +1542,14 @@ struct mp_decoder_wrapper *mp_decoder_wrapper_create(struct mp_filter *parent,
 
     decf_reset(p->decf);
 
+    struct mp_pin *out_pin;
     if (p->queue) {
         struct mp_filter *f_in =
             mp_async_queue_create_filter(public_f, MP_PIN_OUT, p->queue);
         struct mp_filter *f_out =
             mp_async_queue_create_filter(p->decf, MP_PIN_IN, p->queue);
-        mp_pin_connect(public_f->ppins[0], f_in->pins[0]);
         mp_pin_connect(f_out->pins[0], p->decf->pins[0]);
+        out_pin = f_in->pins[0];
 
         p->dec_thread_valid = true;
         if (mp_thread_create(&p->dec_thread, dec_thread, p)) {
@@ -1524,8 +1557,10 @@ struct mp_decoder_wrapper *mp_decoder_wrapper_create(struct mp_filter *parent,
             goto error;
         }
     } else {
-        mp_pin_connect(public_f->ppins[0], p->decf->pins[0]);
+        out_pin = p->decf->pins[0];
     }
+
+    mp_pin_connect(public_f->ppins[0], out_pin);
 
     public_f_reset(public_f);
 

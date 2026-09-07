@@ -26,6 +26,10 @@ on:
           - release
           - debug
         default: release
+      ffmpeg_ref:
+        description: 'Richasy/FFmpeg commit, branch, or tag'
+        type: string
+        default: master
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -65,6 +69,7 @@ jobs:
       TARGET_ARCH: ${{ matrix.arch }}
       MPV_REPO: https://github.com/Richasy/mpv.git
       MPV_COMMIT: ${{ github.sha }}
+      FFMPEG_COMMIT: ${{ inputs.ffmpeg_ref || 'master' }}
       BUILD_TYPE: ${{ inputs.build_type }}
       BUILD_SUFFIX: ${{ inputs.build_type == 'debug' && '-debug' || '' }}
     steps:

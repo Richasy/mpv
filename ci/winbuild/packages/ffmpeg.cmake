@@ -1,3 +1,8 @@
+set(ffmpeg_git_tag master)
+if(DEFINED ENV{FFMPEG_COMMIT} AND NOT "$ENV{FFMPEG_COMMIT}" STREQUAL "")
+    set(ffmpeg_git_tag "$ENV{FFMPEG_COMMIT}")
+endif()
+
 ExternalProject_Add(ffmpeg
     DEPENDS
         amf-headers
@@ -34,7 +39,7 @@ ExternalProject_Add(ffmpeg
         openal-soft
         whisper
     GIT_REPOSITORY https://github.com/Richasy/FFmpeg.git
-    GIT_TAG master
+    GIT_TAG "${ffmpeg_git_tag}"
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--sparse --filter=tree:0"
     GIT_CLONE_POST_COMMAND "sparse-checkout set --no-cone /* !tests/ref/fate"

@@ -285,8 +285,23 @@ Playback Control
 ``--pause``
     Start the player in paused state.
 
-``--shuffle``
+``--shuffle=<yes|no>``
     Play files in random order.
+    This works by shuffling the playlist at the following points:
+
+      1. At player startup before playback starts. The files specified on the
+         command line are shuffled. Note that the directories and
+         playlist files in these arguments are not expanded at this time, so
+         their contents are not shuffled until the situation 2 mentioned below
+         happens. To expand these lists at startup, use ``--playlist``.
+
+      2. When loading a directory or playlist file, either with ``loadlist``
+         command or by playing a playlist file in the current playlist. The
+         items in the loaded playlist are shuffled before they are added to
+         the current playlist. Other existing items are not shuffled.
+
+      3. When ``--loop-playlist`` is enabled, the player performs a shuffle
+         after looping.
 
 ``--playlist-start=<auto|index>``
     Set which file on the internal playlist to start playback with. The index
@@ -312,6 +327,13 @@ Playback Control
     different demuxers and will not work with this option. They still can be
     played directly, without using this option.
 
+    This option differs from specifying playlist files directly as arguments.
+    The playlists specified by ``--playlist`` are expanded at startup, while
+    playlist files specified directly as arguments are expanded only when the
+    list is being played. Note that this expansion is not recursive, except in
+    the case of ``--playlist=<directory>``, where expansion follows the
+    ``--directory-mode`` option.
+
     By default, mpv doesn't play URLs from playlists which are considered
     unsafe. If you trust the playlist file, you can disable any security checks
     with ``--load-unsafe-playlists``. Because playlists can load other playlist
@@ -334,6 +356,12 @@ Playback Control
         In particular, playlists can contain entries using protocols other than
         local files, such as special protocols like ``avdevice://`` (which are
         inherently unsafe).
+
+``--playlist-inherit-options=<yes|no|current>``
+    Whether the per-file options of a playlist file are inherited by its items
+    when the playlist file is resolved and expanded (default: no). The value
+    ``current`` means that for playlists created by ``--autocreate-playlist``,
+    only the file from which the playlist is created inherits the options.
 
 ``--chapter-merge-threshold=<number>``
     Threshold for merging almost consecutive ordered chapter parts in
@@ -1541,20 +1569,27 @@ Video
     Runtime changes to this are ignored (the current option value is used
     whenever the renderer is created).
 
-``--hwdec-extra-frames=<N>``
-    Number of GPU frames hardware decoding should preallocate (default: see
-    ``--list-options`` output). If this is too low, frame allocation may fail
-    during decoding, and video frames might get dropped and/or corrupted.
-    Setting it too high simply wastes GPU memory and has no advantages.
+``--hwdec-extra-frames=<auto|N>``
+    Number of extra GPU frames hardware decoding should preallocate, on top of
+    what the codec itself requires (default: ``auto``).
 
     This value is used only for hardware decoding APIs which require
     preallocating surfaces (known examples include ``d3d11va`` and ``vaapi``).
     For other APIs, frames are allocated as needed. The details depend on the
     libavcodec implementations of the hardware decoders.
 
-    The required number of surfaces depends on dynamic runtime situations. The
-    default is a fixed value that is thought to be sufficient for most uses. But
-    in certain situations, it may not be enough.
+    In ``auto`` mode, the number is derived from how many frames the player
+    and the VO may reference at the same time. For example, enabling
+    ``--interpolation`` increases it in proportion to the ``--tscale`` filter
+    radius, and VO deinterlacing adds the temporal reference frames it needs.
+    The value is determined when the decoder is initialized; runtime option
+    changes that increase frame requirements do not resize the pool, so set a
+    fixed value if you intend to switch such options during playback.
+
+    Setting a fixed value overrides the automatic sizing in both directions.
+    If it is too low, frame allocation may fail during decoding, and video
+    frames might get dropped and/or corrupted. Setting it too high simply
+    wastes GPU memory and has no advantages.
 
 ``--hwdec-image-format=<name>``
     Set the internal pixel format used by hardware decoding via ``--hwdec``
@@ -1793,6 +1828,10 @@ Video
     Keep in mind that using this filter **will** conflict with any manually
     inserted deinterlacing filters, and that this will make video look worse if
     it's not actually interlaced.
+
+    Enabling video output deinterlacing at runtime may require setting
+    ``--hwdec-extra-frames``, as the hardware decoder's surface pool is sized
+    at decoder initialization.
 
 ``--deinterlace-field-parity=<tff|bff|auto>``
     Specify the field parity/order when deinterlacing (default: auto).
@@ -2093,11 +2132,16 @@ Audio
     List of codecs for which compressed audio passthrough should be used. This
     works for both classic S/PDIF and HDMI.
 
-    Possible codecs are ``ac3``, ``dts``, ``dts-hd``, ``eac3``, ``truehd``.
-    Multiple codecs can be specified by separating them with ``,``. ``dts``
-    refers to low bitrate DTS core, while ``dts-hd`` refers to DTS MA (receiver
-    and OS support varies). If both ``dts`` and ``dts-hd`` are specified, it
-    behaves equivalent to specifying ``dts-hd`` only.
+    Possible codecs are ``ac3``, ``dts``, ``dts-hd``, ``eac3``, ``truehd``,
+    ``dsd``. Multiple codecs can be specified by separating them with ``,``.
+    ``dts`` refers to low bitrate DTS core, while ``dts-hd`` refers to DTS MA
+    (receiver and OS support varies). If both ``dts`` and ``dts-hd`` are
+    specified, it behaves equivalent to specifying ``dts-hd`` only.
+
+    ``dsd`` enables bit-perfect passthrough of DSD audio, requires an audio
+    output with exclusive device access (currently ``wasapi``) and a DAC that
+    accepts DoP at the resulting PCM rate (176.4 kHz for DSD64, 352.8 kHz for
+    DSD128, and so on).
 
     In earlier mpv versions you could use ``--ad`` to force the spdif wrapper.
     This does not work anymore.
@@ -2518,6 +2562,10 @@ Subtitles
         This affects ASS subtitles as well, and may lead to incorrect subtitle
         rendering. Use with care, or use ``--sub-font-size`` instead.
 
+``--secondary-sub-scale=<0-100>``
+    Factor for the secondary subtitle font size. This is similar to
+    ``--sub-scale`` but for secondary subtitles (default: 1).
+
 ``--sub-scale-signs=<yes|no>``
     When set to yes, also apply ``--sub-scale`` to typesetting (or "signs").
     When this is set to no, ``--sub-scale`` is only applied to dialogue. The
@@ -2892,10 +2940,12 @@ Subtitles
     This also affects image subtitle brightness in HDR tone mapping with
     ``--blend-subtitles=<yes|video>``.
 
-``--sub-hdr-peak=<sdr|10-10000>``
+``--sub-hdr-peak=<auto|sdr|10-10000>``
     Controls the text subtitle and OSD diffuse white level in cd/m² (nits)
-    for HDR output (default: sdr). ``sdr`` is 203 cd/m² for standard SDR white.
-    (``--vo=gpu-next`` only)
+    for HDR output (default: auto). In ``auto`` mode, subtitles and OSD follow
+    the reference white (see ``--hdr-reference-white``), matching the diffuse
+    white level used for SDR content. ``sdr`` forces 203 cd/m² for standard SDR
+    white. (``--vo=gpu-next`` only)
 
     This also affects text subtitle brightness in HDR tone mapping with
     ``--blend-subtitles=<yes|video>``.
@@ -3949,6 +3999,12 @@ Window
 Disc Devices
 ------------
 
+``--disc-menu=<yes|no>``
+    When set, opening ``dvd://`` or ``bd://`` boots into the disc's interactive
+    menu instead of automatically playing the longest title (default: ``no``).
+    The menu can also be reached at any time via the synthetic "Disc Menu"
+    entry in the editions/titles list, or with ``discnav menu`` command.
+
 ``--cdda-device=<path>``
     Specify the CD device for CDDA playback. The default device path depends on
     the OS. See the `OPTICAL DRIVES`_ section.
@@ -3962,6 +4018,21 @@ Disc Devices
     .. admonition:: Example
 
         ``mpv dvd:// --dvd-device=/path/to/dvd/``
+
+``--dvda-device=<path>``
+    Specify the DVD-Audio device or .iso filename for ``dvda://`` playback.
+    You can also specify a directory that contains files previously copied
+    directly from a DVD-Audio disc. The default device path depends on
+    the OS. See the `OPTICAL DRIVES`_ section.
+
+    .. admonition:: Example
+
+        ``mpv dvda:// --dvda-device=/path/to/dvda/``
+
+``--dvda-page=<-1|0-...>``
+    Force the still picture page shown during DVD-Audio playback, instead of
+    the page scheduled for the current playback position (default: -1, use
+    the scheduled page).
 
 ``--bluray-device=<path>``
     Specify the Blu-ray disc location. Must be a directory with Blu-ray
@@ -4662,14 +4733,16 @@ Input
     .. admonition:: Example
 
         ``--input-ipc-client=fd://123``
+        ``--input-ipc-client=handle://123``
 
     .. note::
 
         To use this option on Windows, the fd must refer to a wrapped
         (created by ``_open_osfhandle``) named pipe server handle with a client
-        already connected. The named pipe must be created duplex with overlapped
-        IO and inheritable handles. The program communicates with mpv through
-        the client handle.
+        already connected. Alternatively, the Windows HANDLE can be passed by
+        prefixing it with handle:// if mpv inherited it from the parent. The
+        named pipe must be created duplex with overlapped IO and inheritable
+        handles. The program communicates with mpv through the client handle.
 
     .. warning::
 
@@ -5864,14 +5937,12 @@ TLS/connection diagnostics), set ``--msg-level=curl=trace``.
 ``--curl-enabled=<yes|no>``
     Enable the libcurl-based network backend (default: ``yes``).
 
-    Defaults to ``no`` with libavformat < 62.15.101, which has a nested IO
+    Defaults to ``no`` on known older FFmpeg versions, which have a nested IO
     cleanup bug that can cause crashes or memory leaks. The issue happens only
-    on transfer failures or aborts, can be enabled if you don't mind possible
-    stability issues.
+    on transfer failures or aborts.
 
 ``--curl-http-version=<auto|1.0|1.1|2|2tls|2-prior-knowledge|3|3only>``
     Select the maximum HTTP protocol version libcurl is allowed to negotiate.
-    If libcurl was built without HTTP/3 support, it will fallback to ``auto``.
     (default: ``auto``, i.e. let libcurl pick)
 
 ``--curl-max-redirects=<0-100>``
@@ -6063,6 +6134,10 @@ them.
     being the smoothest/blurriest and ``oversample`` being the sharpest/least
     smooth.
 
+    Switching to a filter with a larger radius at runtime may require setting
+    ``--hwdec-extra-frames``, as the hardware decoder's surface pool is sized
+    at decoder initialization.
+
 ``--scale-param1=<value>``, ``--scale-param2=<value>``, ``--cscale-param1=<value>``, ``--cscale-param2=<value>``, ``--dscale-param1=<value>``, ``--dscale-param2=<value>``, ``--tscale-param1=<value>``, ``--tscale-param2=<value>``
     Set filter parameters. By default, these are set to the special string
     ``default``, which maps to a scaler-specific default value. Ignored if the
@@ -6214,6 +6289,9 @@ them.
     This essentially attempts to interpolate the missing frames by convoluting
     the video along the temporal axis. The filter used can be controlled using
     the ``--tscale`` setting.
+
+    Enabling this at runtime may require setting ``--hwdec-extra-frames``, as
+    the hardware decoder's surface pool is sized at decoder initialization.
 
 ``--interpolation-threshold=<0..1,-1>``
     Threshold below which frame ratio interpolation gets disabled (default:
@@ -7650,11 +7728,16 @@ them.
     encoding into the target colorspace, so after the application of
     ``--target-trc``. (Only for ``--vo=gpu-next``)
 
-``--hdr-reference-white=<auto|10-1000000>``
+``--hdr-reference-white=<auto|10-10000>``
     Specifies the assumed peak brightness of the mastering display for SDR
     content, in cd/m² (nits). This is used as HDR diffuse white level for SDR
     content. Essentially this is the SDR brightness in HDR container.
-    Default is 203 cd/m². (Only for ``--vo=gpu-next``)
+    (Only for ``--vo=gpu-next``)
+
+    In ``auto`` mode (default), the reference white luminance is queried from
+    the system. This is currently only supported on Windows. If the system does
+    not provide a value, 203 cd/m² is assumed. (``auto`` mode works only
+    with libplacebo >= 371)
 
     .. note::
 

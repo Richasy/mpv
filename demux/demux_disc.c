@@ -1157,11 +1157,13 @@ static int d_open(demuxer_t *demuxer, enum demux_check check)
 
     p->is_cdda = strcmp(sname, "cdda") == 0;
     p->is_dvd = strcmp(sname, "dvdnav") == 0 ||
-                strcmp(sname, "ifo_dvdnav") == 0;
+                strcmp(sname, "ifo_dvdnav") == 0 ||
+                strcmp(sname, "iso/dvdnav") == 0;
     p->is_dvda = strcmp(sname, "dvda") == 0 ||
                  strcmp(sname, "ifo_dvda") == 0;
     p->is_bd = strcmp(sname, "bd") == 0 ||
-               strcmp(sname, "bdmv/bluray") == 0;
+               strcmp(sname, "bdmv/bluray") == 0 ||
+               strcmp(sname, "iso/bluray") == 0;
     p->skip_audio_until = MP_NOPTS_VALUE;
 
     if (p->is_cdda)

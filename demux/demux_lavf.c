@@ -1674,11 +1674,13 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
     if (priv->stream) {
         const char *sname = priv->stream->info->name;
         priv->is_dvd = strcmp(sname, "dvdnav") == 0 ||
-                       strcmp(sname, "ifo_dvdnav") == 0;
+                       strcmp(sname, "ifo_dvdnav") == 0 ||
+                       strcmp(sname, "iso/dvdnav") == 0;
         priv->is_dvd_bd = priv->is_dvd ||
                           strcmp(sname, "bd") == 0 ||
                           strcmp(sname, "bdnav") == 0 ||
-                          strcmp(sname, "bdmv/bluray") == 0;
+                          strcmp(sname, "bdmv/bluray") == 0 ||
+                          strcmp(sname, "iso/bluray") == 0;
     }
 
     return 0;

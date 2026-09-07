@@ -336,7 +336,7 @@ static bool upload_overlay_tex(struct vo *vo, struct osd_entry *entry,
 }
 
 // Duplicate overlay parts for each eye in stereo 3D modes
-static void dup_stereo_parts(struct priv *p, struct osd_entry *entry, int start,
+static void dup_stereo_parts(void *ta_ctx, struct osd_entry *entry, int start,
                              struct mp_osd_res res, const int div[2])
 {
     int num_eye_parts = entry->num_parts - start;
@@ -352,7 +352,7 @@ static void dup_stereo_parts(struct priv *p, struct osd_entry *entry, int start,
                 duped.dst.x1 += off_x;
                 duped.dst.y0 += off_y;
                 duped.dst.y1 += off_y;
-                MP_TARRAY_APPEND(p, entry->parts, entry->num_parts, duped);
+                MP_TARRAY_APPEND(ta_ctx, entry->parts, entry->num_parts, duped);
             }
         }
     }
@@ -436,13 +436,13 @@ static struct pl_color_space libass_overlay_color(struct priv *p,
     return color;
 }
 
-static void add_run_overlay(struct priv *p, struct osd_state *state,
+static void add_run_overlay(void *ta_ctx, struct osd_state *state,
                             const struct osd_entry *entry,
                             const struct sub_bitmaps *item,
                             const struct pl_color_space *color, int start,
                             enum pl_overlay_coords coords)
 {
-    MP_TARRAY_GROW(p, state->overlays, state->num_overlays);
+    MP_TARRAY_GROW(ta_ctx, state->overlays, state->num_overlays);
     struct pl_overlay *ol = &state->overlays[state->num_overlays++];
     *ol = (struct pl_overlay) {
         .tex = entry->tex,
@@ -464,7 +464,7 @@ static void add_run_overlay(struct priv *p, struct osd_state *state,
     }
 }
 
-static void update_overlays(struct vo *vo, struct mp_osd_res res,
+static void update_overlays(struct vo *vo, void *ta_ctx, struct mp_osd_res res,
                             int flags, enum pl_overlay_coords coords,
                             struct osd_state *state, struct pl_frame *frame,
                             struct mp_image *src, int stereo_mode, float ref_luma)
@@ -487,7 +487,7 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
         if (!upload_overlay_tex(vo, entry, item))
             break;
 
-        MP_TARRAY_GROW(p, entry->parts, item->num_parts * div[0] * div[1]);
+        MP_TARRAY_GROW(ta_ctx, entry->parts, item->num_parts * div[0] * div[1]);
         entry->num_parts = 0;
         struct pl_color_space color = {0};
         int start = -1;
@@ -500,8 +500,8 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                                     : libass_overlay_color(p, item, src, ref_luma);
             // Emit pl_overlay per each distinct colorspace run
             if (start >= 0 && !pl_color_space_equal(&color, &part_color)) {
-                dup_stereo_parts(p, entry, start, res, div);
-                add_run_overlay(p, state, entry, item, &color, start, coords);
+                dup_stereo_parts(ta_ctx, entry, start, res, div);
+                add_run_overlay(ta_ctx, state, entry, item, &color, start, coords);
                 start = -1;
             }
             if (start < 0) {
@@ -519,11 +519,11 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                 part.color[2] = ((c >> 8) & 0xFF) / 255.0f;
                 part.color[3] = (255 - (c & 0xFF)) / 255.0f;
             }
-            MP_TARRAY_APPEND(p, entry->parts, entry->num_parts, part);
+            MP_TARRAY_APPEND(ta_ctx, entry->parts, entry->num_parts, part);
         }
         if (start >= 0) {
-            dup_stereo_parts(p, entry, start, res, div);
-            add_run_overlay(p, state, entry, item, &color, start, coords);
+            dup_stereo_parts(ta_ctx, entry, start, res, div);
+            add_run_overlay(ta_ctx, state, entry, item, &color, start, coords);
         }
     }
 
@@ -1617,7 +1617,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     }
 
     stats_time_start(p->stats, "osd-update");
-    update_overlays(vo, p->osd_res,
+    update_overlays(vo, p, p->osd_res,
                     (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
                     PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current,
                     frame->current ? frame->current->params.stereo3d : 0, get_ref_luma(p));
@@ -1694,7 +1694,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
                     enum pl_overlay_coords rel = opts->blend_subs == BLEND_SUBS_VIDEO
                         ? PL_OVERLAY_COORDS_SRC_CROP : PL_OVERLAY_COORDS_DST_CROP;
                     stats_time_start(p->stats, "osd-blend-update");
-                    update_overlays(vo, res, OSD_DRAW_SUB_ONLY,
+                    update_overlays(vo, fp, res, OSD_DRAW_SUB_ONLY,
                                     rel, &fp->subs, image, mpi,
                                     mpi->params.stereo3d, get_ref_luma(p));
                     stats_time_end(p->stats, "osd-blend-update");
@@ -2061,12 +2061,12 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
         };
         enum pl_overlay_coords rel = opts->blend_subs == BLEND_SUBS_VIDEO
             ? PL_OVERLAY_COORDS_SRC_CROP : PL_OVERLAY_COORDS_DST_CROP;
-        update_overlays(vo, res, osd_flags,
+        update_overlays(vo, fp, res, osd_flags,
                         rel, &fp->subs, &image, mpi,
                         mpi->params.stereo3d, 0);
     } else {
         // Disable overlays when blend_subs is disabled
-        update_overlays(vo, osd, osd_flags, PL_OVERLAY_COORDS_DST_FRAME,
+        update_overlays(vo, p, osd, osd_flags, PL_OVERLAY_COORDS_DST_FRAME,
                         &p->osd_state, &target, mpi,
                         mpi->params.stereo3d, 0);
         image.num_overlays = 0;

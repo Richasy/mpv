@@ -107,14 +107,13 @@ static inline struct sh_stream *sh_stream_dependent_sibling(struct sh_stream *bl
 {
     if (!bl || !bl->group || bl->dependent_track)
         return NULL;
-    if (bl->group->num_members != 2)
+    if (bl->group->num_members != 2 || bl->group->lavfi_graph)
         return NULL;
-    for (int i = 0; i < bl->group->num_members; i++) {
-        struct sh_stream *m = bl->group->members[i];
-        if (m && m != bl && m->dependent_track && m->type == bl->type)
-            return m->absent ? NULL : m;
-    }
-    return NULL;
+    struct sh_stream *a = bl->group->members[0];
+    struct sh_stream *b = bl->group->members[1];
+    struct sh_stream *el = a == bl ? b : b == bl ? a : NULL;
+    return el && el->dependent_track && el->type == bl->type && !el->absent
+           ? el : NULL;
 }
 
 struct mp_codec_params {

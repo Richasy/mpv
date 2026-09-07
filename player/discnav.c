@@ -120,7 +120,8 @@ struct stream *disc_nav_get_stream(struct MPContext *mpctx)
         return NULL;
     const char *n = s->info->name;
     if (strcmp(n, "dvdnav") == 0 || strcmp(n, "ifo_dvdnav") == 0 ||
-        strcmp(n, "bd") == 0 || strcmp(n, "bdmv/bluray") == 0)
+        strcmp(n, "iso/dvdnav") == 0 || strcmp(n, "bd") == 0 ||
+        strcmp(n, "bdmv/bluray") == 0 || strcmp(n, "iso/bluray") == 0)
     {
         return s;
     }
@@ -471,7 +472,8 @@ void disc_nav_update(struct MPContext *mpctx)
     // navigation. So, we always drive the VM at least at 20Hz.
     if (have && mpctx->demuxer) {
         bool bd_idle = (strcmp(s->info->name, "bd") == 0 ||
-                        strcmp(s->info->name, "bdmv/bluray") == 0) &&
+                        strcmp(s->info->name, "bdmv/bluray") == 0 ||
+                        strcmp(s->info->name, "iso/bluray") == 0) &&
                        (still || (mpctx->video_status == STATUS_EOF &&
                                   mpctx->audio_status == STATUS_EOF));
         if (bd_idle || (nav.menu_active && mpctx->paused)) {
@@ -509,7 +511,9 @@ void disc_nav_update(struct MPContext *mpctx)
     sync_current_edition(mpctx, s, &nav);
     sync_disc_track_selection(mpctx, s, &nav);
 
-    bool is_bd = strcmp(s->info->name, "bd") == 0 || strcmp(s->info->name, "bdmv/bluray") == 0;
+    bool is_bd = strcmp(s->info->name, "bd") == 0 ||
+                 strcmp(s->info->name, "bdmv/bluray") == 0 ||
+                 strcmp(s->info->name, "iso/bluray") == 0;
     bool visible = nav.menu_active &&
                    (is_bd || (mp_rect_w(nav.hl.rect) > 0 && mp_rect_h(nav.hl.rect) > 0));
 

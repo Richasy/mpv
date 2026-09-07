@@ -104,6 +104,10 @@ existing track IDs, GPU-adapter identity, RIFE, Whisper, thumbnail, subtitle
 layout, and statistics interfaces. The consumer already represents optional
 `ff-index` values as nullable, as required by upstream.
 
+The integration also keeps remote ISO backends in the new navigation lifecycle,
+excludes tiled-image filter graphs from enhancement-layer pairing, and gives
+blended-subtitle overlay arrays and parts frame-local ownership.
+
 Do not remove the consumer's external-player IPC, `sub-add`, playlist, or
 `--start` sequencing workarounds on account of the subtitle-option change.
 Source merges also do not update an installed player: publish the matching

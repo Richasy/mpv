@@ -101,6 +101,8 @@ GPU pipeline and ownership
 * Retired output pools can outlive filter destruction. GPU waits and module
   pins protect asynchronous retirement. Resources with unproven completion
   are retained on exceptional failure.
+  D3D11 is unloaded synchronously only after its COM objects are released;
+  the callback's sole deferred DLL-unload registration is reserved for libmpv.
 
 ``zero-copy=yes`` means **no CPU pixel upload/readback inside this hardware
 filter**. It does not mean zero GPU copies. All model creation, allocation and
@@ -177,6 +179,10 @@ GPU work and matching applied/requested settings. Runtime failures remain
 visible and video passes through instead of failing the host.
 All option values are emitted even before processing starts, including defaults:
 the nineteen non-path controls plus ``model-path``.
+Worker completion increments ``evaluated-frames`` only. A queued result retains
+its settings, GPU result and seek epoch; delivered counters, applied generation
+and new active proof are committed only after the output pin accepts the frame.
+Reset-discarded, rejected and failed results cannot acknowledge a fresh setting.
 
 Build integration
 -----------------
@@ -224,6 +230,17 @@ diagnostics. Link it with ``shaders.c``.
 binding. Its optional ``--create18`` argument tests direct core dispatch;
 it never calls ``GetFeatureRequirements``.
 
+``test_gpu_failures.c`` injects failure of GPU-context allocation and checks that
+repeated calls preserve an already-failed context's actionable diagnostic. It
+includes ``gpu.c`` itself; link the other backend sources, not a second copy of
+``gpu.c``. It does not initialize a GPU or vendor runtime.
+
+``test_delivery.c`` tests the filter's actual staging and delivery-accounting
+functions with pending, rejected, stale-epoch, stale-setting, failed and accepted
+results. Build with the configured mpv headers, optimization, function/data
+sections and dead-section elimination, linking ``params.c``. Its
+``DLSSNR_DELIVERY_TEST`` guard omits registration only for this standalone test.
+
 ``test_gpu.c`` links the five backend sources (not ``vf_dlssnr.c`` or ``bridge.c``)
 and loads the separately built helper beside the executable. It takes
 one absolute private model path. It performs real NR evaluation, checks changed,
@@ -238,6 +255,11 @@ Its optional ``--nv12-1080p`` argument instead runs only a cold-context
 1920x1080 BT.709 limited NV12 acceptance case with a padded two-slice decoder-like
 texture and the default NR controls. This is a synthetic format-matching fixture,
 not a claim that the user's original clip was decoded by this diagnostic.
+
+For DLL-host retirement proof, compile ``test_gpu.c`` with ``DLSSNR_TEST_DLL``
+and the backend sources into ``dlssnr-test-host.dll``. ``test_dll_host.c`` loads
+that DLL, runs the real GPU ownership regressions with non-null module pins,
+then verifies final module unloading. Keep ``mpv-nvngx.dll`` beside the test.
 
 Compile with Clang C17 and Windows SDK headers. Keep test executables, logs and
 caches under an ignored project build directory. Never package the supplied

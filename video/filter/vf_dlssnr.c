@@ -167,7 +167,8 @@ static void publish_ready_metadata(struct priv *p, const struct ready_frame *rea
     if (!p->settings->options.enabled)
         p->info.status = DLSSNR_DISABLED;
     else if (ready->settings->serial != p->settings->serial ||
-             (ready->info.status == DLSSNR_ACTIVE && !previously_active))
+             (ready->info.status == DLSSNR_ACTIVE &&
+              (!ready->processed || !previously_active)))
         p->info.status = DLSSNR_INITIALIZING;
 }
 

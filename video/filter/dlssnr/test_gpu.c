@@ -687,6 +687,15 @@ int wmain(int argc, wchar_t **argv)
 #ifdef DLSSNR_TEST_DLL
 __declspec(dllexport) int __cdecl dlssnr_gpu_test(const wchar_t *model)
 {
+    static const unsigned char marker = 0;
+    HMODULE module = NULL;
+    bool in_dll = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                     (const wchar_t *)&marker, &module) &&
+                  module != GetModuleHandleW(NULL);
+    printf("GPU-backend-under-test-resides-in-DLL=%s\n", in_dll ? "yes" : "NO");
+    if (!in_dll)
+        return 1;
     wchar_t name[] = L"dlssnr-dll-test";
     wchar_t *arguments[] = {name, (wchar_t *)model};
     return wmain(2, arguments);

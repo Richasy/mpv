@@ -101,6 +101,9 @@ const struct mp_user_filter_entry *vf_list[] = {
 #if HAVE_D3D_HWACCEL
     &vf_d3d11vpp,
 #endif
+#if HAVE_DLSSNR
+    &vf_dlssnr,
+#endif
 #if HAVE_AMF
     &vf_amf_frc,
 #endif

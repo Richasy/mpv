@@ -812,6 +812,135 @@ Available mpv-only filters are:
         ``--vf=@hdr:d3d11vpp=nvidia-true-hdr=yes`` together with
         ``mpv_observe_property(ctx, 0, "vf-metadata/hdr/nvidia-true-hdr-status", MPV_FORMAT_STRING)``.
 
+``dlssnr``
+    Experimental NVIDIA DLSS neural rendering (often called DLSS 5 in
+    community integrations). This is a same-resolution appearance enhancement,
+    not RTX Video Super Resolution, frame generation, or a substitute for
+    ``d3d11vpp``. It can change lighting, materials, and fine detail.
+
+    Requires a Windows x64 Clang or MSVC build with ``dlssnr`` enabled, an
+    NVIDIA D3D11 decoding device, and a compatible external
+    ``nvngx_dlssnr.dll`` runtime.
+    Deploy the original ``mpv-nvngx.dll`` bridge beside the mpv module. The bridge
+    is included in x64 artifacts and uses its actual module filename for the
+    runtime's caller convention; it does not modify provenance APIs or the
+    model. No NVIDIA model is included in mpv's build artifacts. The interface
+    is experimental and runtime/driver compatibility is not guaranteed.
+
+    The hardware path keeps pixels on the GPU between D3D11 decoding, D3D12
+    inference, and rendering. GPU-local copies transfer the decoder surface
+    into shared staging and the completed result into an owned output surface.
+    GPU-resident does not mean that no GPU copies occur. A worker thread waits
+    for GPU completion; this is not a claim that all CPU waits are eliminated.
+    Inference uses the same physical adapter as the decoding/rendering device.
+    HDR and unsupported formats are bypassed rather than interpreted as SDR.
+
+    Use a label to control and observe the filter::
+
+        mpv --vo=gpu-next --gpu-api=d3d11 --hwdec=d3d11va \
+            --vf=@dlss5:dlssnr=input-resolution=50 video.mp4
+
+    ``enabled=<yes|no>``
+        Enable processing within the filter (default: yes). The filter itself
+        is opt-in and has no effect when absent from ``vf``.
+
+    ``model-path=<path>``
+        Path to the external neural-rendering runtime. The default location is
+        ``ngx\nvngx_dlssnr.dll`` beside the mpv module, not the current working
+        directory. Model files from community distributions may be modified;
+        a version string or an embedded certificate does not prove authenticity.
+
+    ``preset=<0-3>``
+        Model creation preset (default: 0). Changing this can rebuild inference
+        state. The meaning and availability of presets depend on the runtime.
+
+    ``style=<0-2>``
+        Appearance style: default, natural, or cinematic (default: 0).
+
+    ``intensity=<0-1>``
+        Overall enhancement intensity (default: 1).
+
+    ``local-tone=<0-1>``
+        Local tone strength (default: 1).
+
+    ``local-structure=<0-1>``
+        Local structure strength (default: 1).
+
+    ``skin-structure=<-1-2>``
+        Skin structure strength. ``-1`` selects the model's automatic setting
+        (default: -1).
+
+    ``auto-mask=<yes|no>``
+        Enable the runtime's automatic masking (default: yes).
+
+    ``ui-correction=<yes|no>``
+        Enable the runtime's text/UI correction (default: yes). mpv subtitles
+        and OSD are rendered after this filter and are not inference inputs.
+
+    ``scaling=<yes|no>``
+        Enable internal-resolution processing and residual reconstruction
+        (default: yes). This does not change the output frame dimensions.
+
+    ``input-resolution=<25-100>``
+        Inference dimensions as a percentage of source dimensions (default:
+        100). This value is ignored when ``scaling=no``. Lower resolutions
+        reduce inference work; they are not a guarantee of real-time playback.
+
+    ``residual-multiplier=<1-2>``
+        Multiply the processed-minus-input residual before reconstructing the
+        full-resolution source (default: 1).
+
+    ``residual-saturation=<0-2>``
+        Relative saturation contribution of the residual (default: 1).
+
+    ``residual-lightness=<0-2>``
+        Relative lightness contribution of the residual (default: 1).
+
+    ``shadow-structure=<0-2>``
+        Relative shadow-structure contribution of the residual (default: 1).
+
+    ``reflection-glow=<0-2>``
+        Relative reflection/glow contribution of the residual (default: 1).
+
+    ``motion-quality=<0-5>``
+        Reserved optical-flow guidance quality. This implementation supports
+        only ``0`` (zero-motion guidance, the default). Nonzero values fail
+        explicitly instead of pretending optical flow is active.
+
+    ``nvof-follow-scaling=<yes|no>``
+        Reserved control for reduced-resolution optical flow. Only ``no`` is
+        currently supported; ``yes`` fails explicitly.
+
+    ``max-height=<height>``
+        Bypass sources above this height. ``0`` disables the limit (default).
+
+    Filter commands use option names directly, for example
+    ``vf-command dlss5 intensity 0.5``. Invalid values fail without partially
+    applying a new configuration. Structural changes can require rebuilding
+    resources; ordinary appearance changes do not reload the model.
+
+    ``vf-metadata/<label>`` distinguishes a request from actual processing:
+
+    - ``requested``: whether processing was requested.
+    - ``status`` and ``active``: actual runtime state. ``active=yes`` requires
+      a successful evaluated frame, not merely an accepted command.
+    - ``processed-frames``, ``passthrough-frames``, ``failed-frames``: counters
+      distinguishing inference from bypass and failure.
+    - ``proc``, ``input-resolution``, ``preset``, ``style``, ``intensity``:
+      processing configuration.
+    - ``zero-copy``, ``gpu-luid``, ``gpu-name``: pixel-transfer path and adapter.
+    - ``last-infer-ms`` and ``timing-kind``: latency and its measurement domain.
+      A CPU wall-clock measurement must not be interpreted as GPU timestamp time.
+    - ``motion-status`` and ``last-error``: guidance mode and failure detail.
+    - ``caller-compatibility`` and ``model-signature``: the caller integration
+      path and whether the known reference artifact has a signature hash
+      mismatch. Neither is an indication of official NVIDIA support.
+
+    With the label ``dlss5``, the default statistics page shows a dedicated
+    DLSS5 section, including bypass/failure states. A checked menu item, a loaded
+    DLL, or nonzero GPU utilization alone is not evidence that neural rendering
+    has changed the video.
+
 ``amf_frc``
     AMD Frame Rate Conversion filter. Requires AMD hardware and drivers
     supporting AMF FRC.

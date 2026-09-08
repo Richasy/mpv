@@ -307,6 +307,17 @@ collect() {
         fi
     fi
 
+    if [ "$ARCH" = "x86_64" ]; then
+        if [ ! -f "$DLL_DIR/mpv-nvngx.dll" ]; then
+            err "mpv-nvngx.dll not found beside libmpv-2.dll"
+        fi
+        cp "$DLL_DIR/mpv-nvngx.dll" "$ARCH_OUTPUT/"
+        if [ -f "$DLL_DIR/mpv-nvngx.pdb" ]; then
+            cp "$DLL_DIR/mpv-nvngx.pdb" "$ARCH_OUTPUT/"
+        fi
+        log "Original mpv NGX bridge copied (no NVIDIA model is bundled)"
+    fi
+
     # copy-binary preserves the PDB in mpv-dev before winbuild cleanup removes
     # the linker BINARY_DIR. Keep a fallback search for older build trees.
     local PDB_PATH=""

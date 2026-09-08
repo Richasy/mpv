@@ -642,12 +642,12 @@ local function append_display_sync(s)
 end
 
 
-local function append_filters(s, prop, prefix, skip_label)
+local function append_filters(s, prop, prefix, skip_labels)
     local length = 0
     local filters = {}
 
     for _,f in ipairs(mp.get_property_native(prop, {})) do
-        if not (skip_label and f.label == skip_label) then
+        if not (skip_labels and skip_labels[f.label]) then
         local n = f.name
         if f.enabled ~= nil and not f.enabled then
             n = n .. " (disabled)"
@@ -1075,12 +1075,42 @@ local function add_video(s)
     append_img_params(s, r, ro)
     append_hdr(s, ro)
     append_property(s, "video-bitrate", {prefix="Bitrate:"})
-    -- Probe RIFE metadata once so we can both (a) suppress the rife filter
-    -- entry from the generic Filters: line (its dedicated section already
-    -- shows everything) and (b) render the dedicated section below.
     local rife = mp.get_property_native("vf-metadata/rife", nil)
     local rife_on = rife and (rife.enabled == "yes" or rife.enabled == true)
-    append_filters(s, "vf", "Filters:", rife_on and "rife" or nil)
+    local dlss5 = mp.get_property_native("vf-metadata/dlss5", nil)
+    append_filters(s, "vf", "Filters:", {
+        rife = rife_on,
+        dlss5 = type(dlss5) == "table",
+    })
+
+    if type(dlss5) == "table" then
+        local sep2 = o.prefix_sep .. o.prefix_sep
+        local indent2 = o.indent .. o.indent
+        local active = dlss5.active == "yes" or dlss5.active == true
+        append(s, active and "active" or (dlss5.status or "unknown"),
+               {prefix="DLSS5 (experimental):"})
+        append(s, dlss5.proc or "-", {prefix="Proc:", nl="", indent=sep2})
+        append(s, dlss5["processed-frames"] or "0",
+               {prefix="Processed:", nl="", indent=sep2})
+        append(s, dlss5.preset or "-", {prefix="Preset:", indent=indent2})
+        append(s, dlss5.style or "-", {prefix="Style:", nl="", indent=sep2})
+        append(s, dlss5.intensity or "-", {prefix="Intensity:", nl="", indent=sep2})
+        append(s, (dlss5["input-resolution"] or "-") .. "%",
+               {prefix="Resolution:", nl="", indent=sep2})
+        append(s, dlss5["zero-copy"] or "-", {prefix="GPU-resident:", indent=indent2})
+        append(s, (dlss5["last-infer-ms"] or "-") .. " ms",
+               {prefix="Infer:", nl="", indent=sep2})
+        append(s, dlss5["timing-kind"] or "unknown",
+               {prefix="Timing:", nl="", indent=sep2})
+        append(s, dlss5["motion-status"] or "-", {prefix="Motion:", indent=indent2})
+        append(s, dlss5["passthrough-frames"] or "0",
+               {prefix="Bypassed:", nl="", indent=sep2})
+        append(s, dlss5["failed-frames"] or "0",
+               {prefix="Failed:", nl="", indent=sep2})
+        if dlss5["last-error"] and dlss5["last-error"] ~= "" then
+            append(s, dlss5["last-error"], {prefix="Error:", indent=indent2})
+        end
+    end
 
     -- RIFE filter stats: only shown when a labeled "rife" filter is present,
     -- exposes vf-metadata, AND is currently enabled. Recommended label is

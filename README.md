@@ -30,6 +30,23 @@ mpv /path/to/movie.iso
 
 The fork is maintained as a `libmpv` build target — it produces `libmpv-2.dll` for Windows x64 and arm64.
 
+### Experimental DLSS neural rendering
+
+The Windows x64 `dlssnr` filter integrates experimental DLSSNR directly into
+the D3D11/D3D12 hardware-frame path, rather than routing frames through
+VapourSynth or CPU pixel buffers. It is a same-resolution appearance effect,
+not RTX VSR or frame interpolation. Deploy the original `mpv-nvngx.dll` bridge
+beside `libmpv-2.dll`; both are included in x64 build artifacts. The external
+NVIDIA model is not included, and compatibility depends on the supplied runtime
+and driver. The bridge uses its genuine module identity without modifying
+provenance APIs or the model.
+
+Use `@dlss5:dlssnr` to expose its state on the mpv statistics page and through
+`vf-metadata/dlss5`. Requested settings, successful processing, bypasses, and
+failures are reported separately. The filter is opt-in; existing playback and
+composition-surface ownership remain unchanged. See `DOCS/man/vf.rst` for
+parameters, runtime placement, and limitations.
+
 * [Compilation](#compilation)
 * [Upstream](#upstream)
 

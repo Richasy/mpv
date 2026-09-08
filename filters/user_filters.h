@@ -36,6 +36,7 @@ extern const struct mp_user_filter_entry vf_format;
 extern const struct mp_user_filter_entry vf_vdpaupp;
 extern const struct mp_user_filter_entry vf_vavpp;
 extern const struct mp_user_filter_entry vf_d3d11vpp;
+extern const struct mp_user_filter_entry vf_dlssnr;
 extern const struct mp_user_filter_entry vf_amf_frc;
 extern const struct mp_user_filter_entry vf_rife;
 extern const struct mp_user_filter_entry vf_fingerprint;

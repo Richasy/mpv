@@ -835,6 +835,11 @@ Available mpv-only filters are:
     Inference uses the same physical adapter as the decoding/rendering device.
     HDR and unsupported formats are bypassed rather than interpreted as SDR.
 
+    Output storage grows lazily from six surfaces to a bounded capacity covering
+    the VO's retained frames and in-flight work. Exhaustion waits for references
+    and GPU fences without replacing the input frame or reporting a runtime
+    failure. Seek, disable, and shutdown cancel this wait.
+
     Use a label to control and observe the filter::
 
         mpv --vo=gpu-next --gpu-api=d3d11 --hwdec=d3d11va \
@@ -932,6 +937,8 @@ Available mpv-only filters are:
     - ``last-infer-ms`` and ``timing-kind``: latency and its measurement domain.
       A CPU wall-clock measurement must not be interpreted as GPU timestamp time.
     - ``motion-status`` and ``last-error``: guidance mode and failure detail.
+    - ``output-slots``, ``output-slot-capacity``, ``backpressure-waits`` and
+      ``last-slot-wait-ms``: output storage and resource-pressure telemetry.
     - ``caller-compatibility`` and ``model-signature``: the caller integration
       path and whether the known reference artifact has a signature hash
       mismatch. Neither is an indication of official NVIDIA support.

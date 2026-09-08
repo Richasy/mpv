@@ -17,6 +17,15 @@
 
 #define DLSSNR_ERROR_SIZE 512
 #define DLSSNR_GPU_NAME_SIZE 256
+/* Mirrors the decoder's six-surface baseline and VO retention + three in flight. */
+#define DLSSNR_INITIAL_OUTPUT_SLOTS 6
+#define DLSSNR_MAX_OUTPUT_SLOTS 23
+
+enum dlssnr_gpu_result {
+    DLSSNR_GPU_ERROR,
+    DLSSNR_GPU_READY,
+    DLSSNR_GPU_CANCELLED,
+};
 
 enum dlssnr_status {
     DLSSNR_DISABLED,
@@ -41,6 +50,9 @@ struct dlssnr_gpu_info {
     bool caller_compatibility;
     bool model_signature_mismatch;
     uint64_t runtime_loads, feature_builds;
+    uint64_t backpressure_waits;
+    double slot_wait_ms;
+    unsigned output_slots, output_capacity;
 };
 
 struct dlssnr_gpu_input {
@@ -49,6 +61,8 @@ struct dlssnr_gpu_input {
     struct dlssnr_shader_config color;
     void *lifetime;
     void (*release_lifetime)(void *);
+    HANDLE cancel_event;
+    unsigned output_capacity;
 };
 
 struct dlssnr_gpu_output {
@@ -57,12 +71,11 @@ struct dlssnr_gpu_output {
     void (*release)(void *);
 };
 
-/* process takes ownership of input.lifetime, including on failure. */
-bool dlssnr_gpu_process(struct dlssnr_gpu **gpu,
-                       const struct dlssnr_gpu_input *input,
-                       const struct dlssnr_options *options, bool reset_history,
-                       struct dlssnr_gpu_output *output,
-                       struct dlssnr_gpu_info *info);
+/* Takes input.lifetime on every result; slot starvation waits until release or cancellation. */
+enum dlssnr_gpu_result dlssnr_gpu_process(
+    struct dlssnr_gpu **gpu, const struct dlssnr_gpu_input *input,
+    const struct dlssnr_options *options, bool reset_history,
+    struct dlssnr_gpu_output *output, struct dlssnr_gpu_info *info);
 void dlssnr_gpu_destroy(struct dlssnr_gpu **gpu);
 
 bool dlssnr_resolve_model_path(const char *configured, wchar_t *path,

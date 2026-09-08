@@ -27,7 +27,7 @@ struct ID3D10Effect;
 #include "gpu.h"
 #include "runtime.h"
 
-#define OUTPUT_SLOTS 4
+#define OUTPUT_SLOTS DLSSNR_MAX_OUTPUT_SLOTS
 #define SHADER_COUNT 5
 #define UAV_BASE 16
 #define DESCRIPTOR_COUNT 32
@@ -76,6 +76,10 @@ struct output_pool {
     // This consumer-only fence is independent of the inference handoff fence.
     ID3D11Fence *fence;
     uint64_t next_value;
+    uint64_t wait_value;
+    unsigned allocated, capacity;
+    D3D11_TEXTURE2D_DESC texture_desc;
+    HANDLE released_event, completed_event;
     HMODULE module_pin, d3d11_module;
     struct output_slot slots[OUTPUT_SLOTS];
 };
@@ -116,6 +120,7 @@ struct dlssnr_gpu {
     struct dlssnr_gpu_info info;
     D3D11_TEXTURE2D_DESC input_desc;
     int width, height, proc_width, proc_height, preset;
+    unsigned output_capacity;
     wchar_t *model_path;
     void *input_lifetime;
     void (*release_input)(void *);
@@ -197,6 +202,8 @@ static void CALLBACK pool_cleanup(PTP_CALLBACK_INSTANCE instance, void *opaque)
     DROP(pool->context);
     DROP(pool->multithread);
     DROP(pool->device);
+    CloseHandle(pool->released_event);
+    CloseHandle(pool->completed_event);
     free(pool);
     if (d3d11)
         FreeLibrary(d3d11);
@@ -229,7 +236,22 @@ static void release_output(void *opaque)
         atomic_store_explicit(&pool->failed, true, memory_order_release);
     slot->retired_at = value;
     atomic_store_explicit(&slot->leased, false, memory_order_release);
+    SetEvent(pool->released_event);
     pool_unref(pool);
+}
+
+static bool pool_grow(struct output_pool *pool, struct dlssnr_gpu_info *info)
+{
+    if (pool->allocated >= pool->capacity)
+        return false;
+    struct output_slot *slot = &pool->slots[pool->allocated];
+    HRESULT hr = ID3D11Device5_CreateTexture2D(pool->device, &pool->texture_desc,
+                                             NULL, &slot->texture);
+    if (!hr_ok(info, "D3D11 output-slot allocation", hr))
+        return false;
+    pool->allocated++;
+    info->output_slots = pool->allocated;
+    return true;
 }
 
 static struct output_pool *pool_create(struct dlssnr_gpu *g)
@@ -244,12 +266,16 @@ static struct output_pool *pool_create(struct dlssnr_gpu *g)
     pool->device = g->device11_5;
     pool->context = g->context11;
     pool->multithread = g->multithread;
+    pool->capacity = g->output_capacity;
+    pool->released_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    pool->completed_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     ID3D11Device5_AddRef(pool->device);
     ID3D11DeviceContext4_AddRef(pool->context);
     ID3D10Multithread_AddRef(pool->multithread);
-    HRESULT hr = ID3D11Device5_CreateFence(pool->device, 0, D3D11_FENCE_FLAG_NONE,
-        &IID_ID3D11Fence, (void **)&pool->fence);
-    D3D11_TEXTURE2D_DESC desc = {
+    HRESULT hr = pool->released_event && pool->completed_event ?
+        ID3D11Device5_CreateFence(pool->device, 0, D3D11_FENCE_FLAG_NONE,
+            &IID_ID3D11Fence, (void **)&pool->fence) : E_OUTOFMEMORY;
+    pool->texture_desc = (D3D11_TEXTURE2D_DESC){
         .Width = (g->width + 1) & ~1, .Height = (g->height + 1) & ~1,
         .MipLevels = 1, .ArraySize = 1,
         .Format = DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -257,11 +283,15 @@ static struct output_pool *pool_create(struct dlssnr_gpu *g)
         .Usage = D3D11_USAGE_DEFAULT,
         .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
     };
-    for (unsigned n = 0; SUCCEEDED(hr) && n < OUTPUT_SLOTS; n++) {
+    for (unsigned n = 0; n < OUTPUT_SLOTS; n++) {
         pool->slots[n].pool = pool;
         atomic_init(&pool->slots[n].leased, false);
-        hr = ID3D11Device5_CreateTexture2D(pool->device, &desc, NULL,
-                                         &pool->slots[n].texture);
+    }
+    unsigned initial = pool->capacity < DLSSNR_INITIAL_OUTPUT_SLOTS ?
+                       pool->capacity : DLSSNR_INITIAL_OUTPUT_SLOTS;
+    while (SUCCEEDED(hr) && pool->allocated < initial) {
+        if (!pool_grow(pool, &g->info))
+            hr = E_OUTOFMEMORY;
     }
     if (FAILED(hr)) {
         hr_ok(&g->info, "D3D11 output pool allocation", hr);
@@ -271,6 +301,10 @@ static struct output_pool *pool_create(struct dlssnr_gpu *g)
         DROP(pool->device);
         DROP(pool->context);
         DROP(pool->multithread);
+        if (pool->released_event)
+            CloseHandle(pool->released_event);
+        if (pool->completed_event)
+            CloseHandle(pool->completed_event);
         if (pool->module_pin)
             FreeLibrary(pool->module_pin);
         if (pool->d3d11_module)
@@ -278,26 +312,88 @@ static struct output_pool *pool_create(struct dlssnr_gpu *g)
         free(pool);
         return NULL;
     }
+    g->info.output_capacity = pool->capacity;
     return pool;
 }
 
-static struct output_slot *pool_acquire(struct output_pool *pool)
+static bool cancelled(HANDLE event)
 {
-    if (atomic_load_explicit(&pool->failed, memory_order_acquire))
-        return NULL;
-    uint64_t completed = ID3D11Fence_GetCompletedValue(pool->fence);
-    if (completed == UINT64_MAX)
-        return NULL;
-    for (unsigned n = 0; n < OUTPUT_SLOTS; n++) {
-        struct output_slot *slot = &pool->slots[n];
-        if (!atomic_load_explicit(&slot->leased, memory_order_acquire) &&
-            completed >= slot->retired_at) {
-            atomic_store_explicit(&slot->leased, true, memory_order_release);
-            atomic_fetch_add_explicit(&pool->references, 1, memory_order_relaxed);
-            return slot;
+    return event && WaitForSingleObject(event, 0) == WAIT_OBJECT_0;
+}
+
+static enum dlssnr_gpu_result pool_acquire(struct dlssnr_gpu *g, HANDLE cancel_event,
+                                          struct output_slot **result)
+{
+    struct output_pool *pool = g->pool;
+    LARGE_INTEGER start = {0}, frequency;
+    QueryPerformanceFrequency(&frequency);
+    g->info.slot_wait_ms = 0;
+    for (;;) {
+        if (cancelled(cancel_event))
+            return DLSSNR_GPU_CANCELLED;
+        uint64_t completed = ID3D11Fence_GetCompletedValue(pool->fence);
+        if (atomic_load_explicit(&pool->failed, memory_order_acquire) ||
+            completed == UINT64_MAX ||
+            FAILED(ID3D11Device5_GetDeviceRemovedReason(pool->device))) {
+            g->info.status = DLSSNR_RUNTIME_FAILED;
+            snprintf(g->info.error, sizeof(g->info.error),
+                     "D3D11 output consumer fence or device failed");
+            return DLSSNR_GPU_ERROR;
         }
+        uint64_t earliest = UINT64_MAX;
+        for (unsigned n = 0; n < pool->allocated; n++) {
+            struct output_slot *slot = &pool->slots[n];
+            if (atomic_load_explicit(&slot->leased, memory_order_acquire))
+                continue;
+            if (completed >= slot->retired_at) {
+                atomic_store_explicit(&slot->leased, true, memory_order_release);
+                atomic_fetch_add_explicit(&pool->references, 1, memory_order_relaxed);
+                *result = slot;
+                if (start.QuadPart) {
+                    LARGE_INTEGER end;
+                    QueryPerformanceCounter(&end);
+                    g->info.slot_wait_ms = (end.QuadPart - start.QuadPart) *
+                                           1000.0 / frequency.QuadPart;
+                }
+                return DLSSNR_GPU_READY;
+            }
+            if (slot->retired_at < earliest)
+                earliest = slot->retired_at;
+        }
+        if (earliest == UINT64_MAX && pool->allocated < pool->capacity) {
+            if (!pool_grow(pool, &g->info))
+                return DLSSNR_GPU_ERROR;
+            continue;
+        }
+        if (!start.QuadPart) {
+            QueryPerformanceCounter(&start);
+            g->info.backpressure_waits++;
+        }
+        if (earliest != UINT64_MAX && pool->wait_value != earliest) {
+            HRESULT hr = ID3D11Fence_SetEventOnCompletion(pool->fence, earliest,
+                                                          pool->completed_event);
+            if (!hr_ok(&g->info, "D3D11 consumer completion notification", hr))
+                return DLSSNR_GPU_ERROR;
+            pool->wait_value = earliest;
+        }
+        HANDLE events[3];
+        DWORD count = 0;
+        if (cancel_event)
+            events[count++] = cancel_event;
+        events[count++] = pool->released_event;
+        DWORD gpu_event_index = count;
+        events[count++] = pool->completed_event;
+        DWORD wait = WaitForMultipleObjects(count, events, FALSE, 100);
+        if (wait == WAIT_FAILED) {
+            g->info.status = DLSSNR_RUNTIME_FAILED;
+            snprintf(g->info.error, sizeof(g->info.error),
+                     "Output-slot backpressure wait failed (Windows error %lu)",
+                     GetLastError());
+            return DLSSNR_GPU_ERROR;
+        }
+        if (wait == WAIT_OBJECT_0 + gpu_event_index)
+            pool->wait_value = 0;
     }
-    return NULL;
 }
 
 static bool wait_fence(struct dlssnr_gpu *g, uint64_t value, DWORD timeout)
@@ -796,7 +892,8 @@ static bool configure(struct dlssnr_gpu *g, const struct dlssnr_gpu_input *input
         free(g->model_path);
         g->model_path = copy;
     }
-    bool full_size = !g->pool || g->width != width || g->height != height ||
+    bool full_size = !g->pool || g->pool->capacity != g->output_capacity ||
+        g->width != width || g->height != height ||
         g->input_desc.Width != desc.Width || g->input_desc.Height != desc.Height ||
         g->input_desc.Format != desc.Format;
     bool resized = full_size || !g->initialized ||
@@ -892,13 +989,17 @@ void dlssnr_gpu_destroy(struct dlssnr_gpu **gpu)
     }
 }
 
-bool dlssnr_gpu_process(struct dlssnr_gpu **gpu,
-                       const struct dlssnr_gpu_input *input,
-                       const struct dlssnr_options *options, bool reset_history,
-                       struct dlssnr_gpu_output *output,
-                       struct dlssnr_gpu_info *info)
+enum dlssnr_gpu_result dlssnr_gpu_process(
+    struct dlssnr_gpu **gpu, const struct dlssnr_gpu_input *input,
+    const struct dlssnr_options *options, bool reset_history,
+    struct dlssnr_gpu_output *output, struct dlssnr_gpu_info *info)
 {
     *output = (struct dlssnr_gpu_output){0};
+    if (cancelled(input->cancel_event)) {
+        if (input->lifetime && input->release_lifetime)
+            input->release_lifetime(input->lifetime);
+        return DLSSNR_GPU_CANCELLED;
+    }
     ID3D11Device *device = NULL;
     ID3D11Texture2D_GetDevice(input->texture, &device);
     if (*gpu && ((*gpu)->device11 != device || ((*gpu)->failed && reset_history)))
@@ -929,25 +1030,30 @@ bool dlssnr_gpu_process(struct dlssnr_gpu **gpu,
             info->status = DLSSNR_RUNTIME_FAILED;
             snprintf(info->error, sizeof(info->error), "Out of memory creating GPU context");
         }
-        return false;
+        return DLSSNR_GPU_ERROR;
     }
     g->info.status = DLSSNR_INITIALIZING;
     g->info.error[0] = 0;
     g->input_lifetime = input->lifetime;
     g->release_input = input->release_lifetime;
     struct output_slot *slot = NULL;
+    g->output_capacity = input->output_capacity ? input->output_capacity : OUTPUT_SLOTS;
+    if (g->output_capacity > OUTPUT_SLOTS) {
+        g->info.status = DLSSNR_RUNTIME_FAILED;
+        snprintf(g->info.error, sizeof(g->info.error), "Invalid native output-slot capacity");
+        goto fail;
+    }
     uint64_t previous_feature = g->feature_serial;
     if (!configure(g, input, options))
         goto fail;
-    slot = pool_acquire(g->pool);
-    if (!slot) {
-        g->info.status = DLSSNR_RUNTIME_FAILED;
-        snprintf(g->info.error, sizeof(g->info.error),
-                 "All bounded output slots are retained downstream or in GPU use");
+    enum dlssnr_gpu_result acquired = pool_acquire(g, input->cancel_event, &slot);
+    if (acquired == DLSSNR_GPU_CANCELLED) {
         release_input(g);
         *info = g->info;
-        return false;
+        return DLSSNR_GPU_CANCELLED;
     }
+    if (acquired == DLSSNR_GPU_ERROR)
+        goto fail;
     LARGE_INTEGER start, finish, frequency;
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&start);
@@ -1038,7 +1144,7 @@ bool dlssnr_gpu_process(struct dlssnr_gpu **gpu,
     };
     release_input(g);
     *info = g->info;
-    return true;
+    return DLSSNR_GPU_READY;
 fail:
     g->failed = true;
     if (g->info.status == DLSSNR_ACTIVE || g->info.status == DLSSNR_INITIALIZING)
@@ -1052,5 +1158,5 @@ fail:
     if (!g->pending)
         release_input(g);
     *info = g->info;
-    return false;
+    return DLSSNR_GPU_ERROR;
 }

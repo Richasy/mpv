@@ -43,10 +43,20 @@ int main(void)
     struct dlssnr_gpu_info info = {0};
     struct dlssnr_gpu *gpu = NULL;
     fail_allocations = true;
-    assert(!dlssnr_gpu_process(&gpu, &input, &dlssnr_defaults, false, &output, &info));
+    assert(dlssnr_gpu_process(&gpu, &input, &dlssnr_defaults, false, &output, &info) ==
+           DLSSNR_GPU_ERROR);
     assert(!gpu && !output.lease && released == 1);
     assert(info.status == DLSSNR_RUNTIME_FAILED);
     assert(strstr(info.error, "Out of memory"));
+
+    HANDLE cancel = CreateEventW(NULL, TRUE, TRUE, NULL);
+    assert(cancel);
+    input.cancel_event = cancel;
+    assert(dlssnr_gpu_process(&gpu, &input, &dlssnr_defaults, false, &output, &info) ==
+           DLSSNR_GPU_CANCELLED);
+    assert(!gpu && !output.lease && released == 2);
+    CloseHandle(cancel);
+    input.cancel_event = NULL;
 
     struct dlssnr_gpu failed = {
         .failed = true,
@@ -55,13 +65,14 @@ int main(void)
     snprintf(failed.info.error, sizeof(failed.info.error), "original actionable GPU failure");
     gpu = &failed;
     for (unsigned n = 0; n < 2; n++) {
-        assert(!dlssnr_gpu_process(&gpu, &input, &dlssnr_defaults, false, &output, &info));
+        assert(dlssnr_gpu_process(&gpu, &input, &dlssnr_defaults, false, &output, &info) ==
+               DLSSNR_GPU_ERROR);
         assert(gpu == &failed && !output.lease);
         assert(info.status == DLSSNR_RUNTIME_FAILED);
         assert(!strcmp(info.error, "original actionable GPU failure"));
         assert(!strcmp(failed.info.error, "original actionable GPU failure"));
     }
-    assert(released == 3);
-    puts("GPU context OOM and repeated-failure diagnostic preservation passed");
+    assert(released == 4);
+    puts("GPU context OOM, early cancellation and failure diagnostic preservation passed");
     return 0;
 }

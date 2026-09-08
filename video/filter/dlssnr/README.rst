@@ -91,7 +91,7 @@ GPU pipeline and ownership
   does not substitute an upscaled low-resolution model frame. This preserves
   source detail and P010 precision even though model input/output are eight-bit.
 * Copies the shared F16 result to an ordinary D3D11 F16 texture for gpu-next.
-  Four bounded output slots are tied to image buffer references. Recycling
+  Bounded output slots are tied to image buffer references. Recycling
   requires both release of downstream references and completion of a D3D11
   consumer fence placed after their queued reads. This fence is separate from
   the inference handoff fence. Consumer values are assigned under immediate-
@@ -103,6 +103,30 @@ GPU pipeline and ownership
   are retained on exceptional failure.
   D3D11 is unloaded synchronously only after its COM objects are released;
   the callback's sole deferred DLL-unload registration is reserved for libmpv.
+
+Resource backpressure
+---------------------
+
+Four slots are insufficient for the real player: ``vo_gpu_next.c`` requests at
+least two future frames and declares retained past/future frames separately.
+``vo.h`` bounds requested frames at ten and retained frames at twenty.
+``vd_lavc.c`` already sizes fixed decoder pools with a six-surface baseline and
+three additional in-flight surfaces above VO retention.
+
+The NR pool follows that contract: six initial output textures, lazy growth
+when additional references are retained, and a hard maximum of twenty-three
+textures (twenty retained plus three in flight). A compile-time assertion
+checks this bound against ``VO_MAX_REQ_FRAMES``. Released textures whose GPU
+reads are still pending are waited on instead of causing growth.
+
+At the bound, the worker retains the same input frame and waits on consumer
+reference-release/fence-completion events. This is normal backpressure, not a
+runtime failure or an unrequested passthrough. Seek/reset, disable and destruction
+signal a cancellation event before waiting for the worker; queued GPU work still
+uses the existing completion/retirement rules. The filter requests at most one
+worker job for outstanding output demand. ``backpressure-waits``,
+``output-slots``, ``output-slot-capacity`` and ``last-slot-wait-ms`` expose the
+resulting resource behavior. Slot-wait time is not included in inference timing.
 
 ``zero-copy=yes`` means **no CPU pixel upload/readback inside this hardware
 filter**. It does not mean zero GPU copies. All model creation, allocation and
@@ -150,6 +174,11 @@ For example, the libmpv command arguments are::
     ["vf-command", "dlss5", "preset", "1"]
     ["seek", "<saved time-pos, invariant round-trip precision>", "absolute+exact"]
 
+If the frontend serializes commands behind a gate, the exact seek must be
+issued inside the apply transaction **before** waiting for native confirmation.
+Queuing a later seek behind that confirmation wait cannot refresh a paused/EOS
+decoder and will time out. Alternatively, start playback before applying.
+
 A redraw request alone only repaints the previously filtered texture. Do not
 take the "after" A/B capture just because the mutation command succeeded.
 Wait for seek completion/new-frame presentation and, for NR-on, an increased
@@ -157,6 +186,9 @@ Wait for seek completion/new-frame presentation and, for NR-on, an increased
 ``active=yes``. For NR-off, wait for a newly presented passthrough frame instead
 of waiting for an applied NR generation. Keep both captures at the same source
 position; do not use frame-step to simulate a same-frame comparison.
+If NR-off removes the filter, its metadata no longer exists: verify removal
+and a newly presented decoded frame rather than waiting for ``dlss5``
+passthrough metadata.
 
 Residual controls
 -----------------
@@ -231,14 +263,16 @@ binding. Its optional ``--create18`` argument tests direct core dispatch;
 it never calls ``GetFeatureRequirements``.
 
 ``test_gpu_failures.c`` injects failure of GPU-context allocation and checks that
-repeated calls preserve an already-failed context's actionable diagnostic. It
+repeated calls preserve an already-failed context's actionable diagnostic, plus
+early cancellation/ownership release. It
 includes ``gpu.c`` itself; link the other backend sources, not a second copy of
 ``gpu.c``. It does not initialize a GPU or vendor runtime.
 
 ``test_delivery.c`` tests the filter's actual staging and delivery-accounting
 functions with pending, rejected, stale-epoch, stale-setting, failed and accepted
 results. Build with the configured mpv headers, optimization, function/data
-sections and dead-section elimination, linking ``params.c``. Its
+sections, ``-Wno-unused-function`` for this standalone translation unit, and
+dead-section elimination, linking ``params.c``. Its
 ``DLSSNR_DELIVERY_TEST`` guard omits registration only for this standalone test.
 
 ``test_gpu.c`` links the five backend sources (not ``vf_dlssnr.c`` or ``bridge.c``)
@@ -248,8 +282,11 @@ finite F16 output, verifies live changes do not reload the model, checks
 NV12/P010 decoder-array slice handling at quarter resolution, and verifies
 bounded output ownership across later frames and engine destruction.
 It also releases slots out of order behind a deliberately blocked GPU consumer
-queue, verifies that zero CPU references cannot permit reuse, and verifies reuse
-only after the consumer fence completes.
+queue, verifies cancellable starvation and same-frame resumption without error,
+and verifies reuse only after the consumer fence completes. Sustained tests
+retain five and twenty-two downstream frames while producing additional frames,
+covering both ordinary and maximum declared retention instead of treating a
+failed fifth allocation as sufficient proof.
 CPU upload/readback is confined to this diagnostic, not production code.
 Its optional ``--nv12-1080p`` argument instead runs only a cold-context
 1920x1080 BT.709 limited NV12 acceptance case with a padded two-slice decoder-like

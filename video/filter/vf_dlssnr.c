@@ -25,10 +25,14 @@
 #include "options/m_option.h"
 #include "osdep/threads.h"
 #include "video/mp_image.h"
+#include "video/out/vo.h"
 #include "video/out/gpu/d3d11_adapter.h"
 
 #include "dlssnr/gpu.h"
 #include "dlssnr/params.h"
+
+_Static_assert(DLSSNR_MAX_OUTPUT_SLOTS >= 2 * VO_MAX_REQ_FRAMES + 3,
+               "Output pool must cover VO retention and in-flight frames");
 
 #define OPT_BASE_STRUCT struct dlssnr_options
 static const struct m_option options[] = {
@@ -83,6 +87,7 @@ struct priv {
     mp_mutex lock;
     mp_cond changed;
     bool stopping, busy;
+    HANDLE cancel_event;
     struct settings *settings;
     struct job *job;
     struct ready_frame ready;
@@ -372,6 +377,7 @@ static MP_THREAD_VOID worker_main(void *opaque)
         struct mp_image *source = job->image;
         struct mp_image *processed = NULL;
         bool evaluated = false;
+        enum dlssnr_gpu_result gpu_result = DLSSNR_GPU_ERROR;
         struct dlssnr_gpu_input input = {0};
         double duration = isfinite(source->pkt_duration) && source->pkt_duration > 0 ?
                           source->pkt_duration : 1.0 / 24;
@@ -396,9 +402,12 @@ static MP_THREAD_VOID worker_main(void *opaque)
             input.subresource = (unsigned)(uintptr_t)source->planes[1];
             input.lifetime = mp_image_new_ref(source);
             input.release_lifetime = release_image;
+            input.cancel_event = p->cancel_event;
+            input.output_capacity = DLSSNR_MAX_OUTPUT_SLOTS;
             struct dlssnr_gpu_output native = {0};
-            evaluated = dlssnr_gpu_process(&gpu, &input, &job->settings->options,
-                                           reset, &native, &info);
+            gpu_result = dlssnr_gpu_process(&gpu, &input, &job->settings->options,
+                                            reset, &native, &info);
+            evaluated = gpu_result == DLSSNR_GPU_READY;
             if (evaluated) {
                 processed = wrap_output(source, output_frames, &native);
                 if (!processed) {
@@ -410,11 +419,27 @@ static MP_THREAD_VOID worker_main(void *opaque)
         char error_to_log[DLSSNR_ERROR_SIZE] = "";
         bool integrity_warning = false;
         mp_mutex_lock(&p->lock);
+        if (gpu_result == DLSSNR_GPU_CANCELLED && !p->stopping &&
+            job->epoch == p->epoch && p->settings->options.enabled) {
+            struct settings *old = job->settings;
+            job->settings = p->settings;
+            atomic_fetch_add_explicit(&p->settings->references, 1, memory_order_relaxed);
+            job->history = p->history;
+            p->job = job;
+            ResetEvent(p->cancel_event);
+            mp_mutex_unlock(&p->lock);
+            unref_settings(old);
+            continue;
+        }
         p->busy = false;
         if (evaluated)
             p->evaluated++;
         bool discard = p->stopping || job->epoch != p->epoch;
         if (!discard) {
+            if (gpu_result == DLSSNR_GPU_CANCELLED) {
+                info.status = DLSSNR_DISABLED;
+                info.error[0] = 0;
+            }
             struct settings *completed_settings = job->settings;
             job->settings = NULL;
             p->ready = (struct ready_frame){
@@ -530,6 +555,7 @@ static void process(struct mp_filter *f)
     atomic_fetch_add_explicit(&p->settings->references, 1, memory_order_relaxed);
     job->epoch = p->epoch;
     job->history = p->history;
+    ResetEvent(p->cancel_event);
     p->job = job;
     p->busy = true;
     mp_cond_signal(&p->changed);
@@ -542,6 +568,7 @@ static void reset(struct mp_filter *f)
     mp_mutex_lock(&p->lock);
     p->epoch++;
     p->history++;
+    SetEvent(p->cancel_event);
     struct job *queued = p->job;
     if (queued) {
         p->job = NULL;
@@ -611,6 +638,8 @@ static bool set_option(struct mp_filter *f, const char *name, const char *value)
         p->history++;
     p->settings = next;
     p->info.status = candidate.enabled ? DLSSNR_INITIALIZING : DLSSNR_DISABLED;
+    if (!candidate.enabled)
+        SetEvent(p->cancel_event);
     mp_mutex_unlock(&p->lock);
     unref_settings(old);
     if (path_changed)
@@ -654,6 +683,9 @@ static bool command(struct mp_filter *f, struct mp_filter_command *cmd)
     NUMBER("applied-generation", p->applied_serial);
     NUMBER("runtime-loads", p->info.runtime_loads);
     NUMBER("feature-builds", p->info.feature_builds);
+    NUMBER("backpressure-waits", p->info.backpressure_waits);
+    NUMBER("output-slots", p->info.output_slots);
+    NUMBER("output-slot-capacity", p->info.output_capacity);
 #undef NUMBER
     mp_tags_set_str(tags, "proc", mp_tprintf(64, "%dx%d", p->info.proc_width, p->info.proc_height));
     mp_tags_set_str(tags, "zero-copy", active ? "yes" : "no");
@@ -664,6 +696,7 @@ static bool command(struct mp_filter *f, struct mp_filter_command *cmd)
     mp_tags_set_str(tags, "gpu-luid", luid);
     mp_tags_set_str(tags, "gpu-name", p->info.gpu_name);
     mp_tags_set_str(tags, "last-infer-ms", mp_tprintf(64, "%.3f", p->info.wall_ms));
+    mp_tags_set_str(tags, "last-slot-wait-ms", mp_tprintf(64, "%.3f", p->info.slot_wait_ms));
     mp_tags_set_str(tags, "timing-kind", p->evaluated ?
                     "wall-submit-to-gpu-complete" : "not-measured");
     mp_tags_set_str(tags, "execution-thread", "worker");
@@ -690,6 +723,8 @@ static void destroy(struct mp_filter *f)
     struct priv *p = f->priv;
     mp_mutex_lock(&p->lock);
     p->stopping = true;
+    if (p->cancel_event)
+        SetEvent(p->cancel_event);
     mp_cond_signal(&p->changed);
     mp_mutex_unlock(&p->lock);
     if (p->worker_started)
@@ -697,6 +732,8 @@ static void destroy(struct mp_filter *f)
     free_job(p->job);
     free_ready(&p->ready);
     unref_settings(p->settings);
+    if (p->cancel_event)
+        CloseHandle(p->cancel_event);
     mp_cond_destroy(&p->changed);
     mp_mutex_destroy(&p->lock);
 }
@@ -734,6 +771,12 @@ static struct mp_filter *create(struct mp_filter *parent, void *configuration)
     p->info.status = settings->options.enabled ? DLSSNR_INITIALIZING : DLSSNR_DISABLED;
     mp_mutex_init(&p->lock);
     mp_cond_init(&p->changed);
+    p->cancel_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!p->cancel_event) {
+        MP_ERR(f, "Cannot create native NR cancellation event\n");
+        talloc_free(f);
+        return NULL;
+    }
     mp_filter_add_pin(f, MP_PIN_IN, "in");
     mp_filter_add_pin(f, MP_PIN_OUT, "out");
     if (mp_thread_create(&p->worker, worker_main, p)) {

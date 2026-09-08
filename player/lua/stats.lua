@@ -1107,6 +1107,13 @@ local function add_video(s)
                {prefix="Bypassed:", nl="", indent=sep2})
         append(s, dlss5["failed-frames"] or "0",
                {prefix="Failed:", nl="", indent=sep2})
+        append(s, (dlss5["output-slots"] or "-") .. " / " ..
+                  (dlss5["output-slot-capacity"] or "-"),
+               {prefix="Output slots:", indent=indent2})
+        append(s, dlss5["backpressure-waits"] or "0",
+               {prefix="Waits:", nl="", indent=sep2})
+        append(s, (dlss5["last-slot-wait-ms"] or "-") .. " ms",
+               {prefix="Slot wait:", nl="", indent=sep2})
         if dlss5["last-error"] and dlss5["last-error"] ~= "" then
             append(s, dlss5["last-error"], {prefix="Error:", indent=indent2})
         end

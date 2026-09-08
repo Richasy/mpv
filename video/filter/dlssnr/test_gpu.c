@@ -138,7 +138,8 @@ static bool test_yuv(ID3D11Device *device, ID3D11DeviceContext *context,
     dlssnr_yuv_matrix(bits, false, 0.2126, 0.0722, input.color.matrix);
     struct dlssnr_gpu_info info = {0};
     struct dlssnr_gpu_output output = {0};
-    bool ok = dlssnr_gpu_process(gpu, &input, &options, true, &output, &info);
+    bool ok = dlssnr_gpu_process(gpu, &input, &options, true, &output, &info) ==
+              DLSSNR_GPU_READY;
     ID3D11Texture2D_Release(source);
     if (!ok) {
         fprintf(stderr, "YUV%d evaluation failed: %s\n", bits, info.error);
@@ -186,6 +187,59 @@ static bool test_yuv(ID3D11Device *device, ID3D11DeviceContext *context,
     return ok;
 }
 
+struct queued_inference {
+    struct dlssnr_gpu **gpu;
+    struct dlssnr_gpu_input input;
+    struct dlssnr_options options;
+    struct dlssnr_gpu_output output;
+    struct dlssnr_gpu_info info;
+    enum dlssnr_gpu_result result;
+    HANDLE thread, started, finished, cancel;
+};
+
+static DWORD WINAPI run_queued_inference(void *opaque)
+{
+    struct queued_inference *work = opaque;
+    SetEvent(work->started);
+    work->result = dlssnr_gpu_process(work->gpu, &work->input, &work->options,
+                                      false, &work->output, &work->info);
+    SetEvent(work->finished);
+    return 0;
+}
+
+static bool start_inference(struct queued_inference *work, struct dlssnr_gpu **gpu,
+                            const struct dlssnr_gpu_input *input,
+                            const struct dlssnr_options *options)
+{
+    *work = (struct queued_inference){.gpu = gpu, .input = *input, .options = *options};
+    work->started = CreateEventW(NULL, TRUE, FALSE, NULL);
+    work->finished = CreateEventW(NULL, TRUE, FALSE, NULL);
+    work->cancel = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!work->started || !work->finished || !work->cancel)
+        return false;
+    work->input.cancel_event = work->cancel;
+    work->thread = CreateThread(NULL, 0, run_queued_inference, work, 0, NULL);
+    return work->thread && WaitForSingleObject(work->started, 5000) == WAIT_OBJECT_0;
+}
+
+static void finish_inference(struct queued_inference *work)
+{
+    if (work->thread) {
+        if (WaitForSingleObject(work->thread, 5000) != WAIT_OBJECT_0) {
+            SetEvent(work->cancel);
+            WaitForSingleObject(work->thread, INFINITE);
+        }
+        CloseHandle(work->thread);
+    }
+    if (work->started)
+        CloseHandle(work->started);
+    if (work->finished)
+        CloseHandle(work->finished);
+    if (work->cancel)
+        CloseHandle(work->cancel);
+    work->thread = work->started = work->finished = work->cancel = NULL;
+}
+
 struct release_gate {
     ID3D12Fence *fence;
     HANDLE requested;
@@ -217,6 +271,7 @@ static bool test_release_order(ID3D11Device *device, ID3D11DeviceContext *contex
     ID3D11Texture2D *copies[2] = {0};
     HANDLE shared = NULL, thread = NULL;
     struct release_gate gate = {0};
+    struct queued_inference waiting = {0};
     bool valid = false;
     if (!library)
         goto done;
@@ -268,16 +323,15 @@ static bool test_release_order(ID3D11Device *device, ID3D11DeviceContext *contex
         held[slot].lease = NULL;
     }
     ID3D11DeviceContext4_Flush(context4);
-    struct dlssnr_gpu_info info = {0};
-    struct dlssnr_gpu_output extra = {0};
-    bool acquired = dlssnr_gpu_process(gpu, input, options, false, &extra, &info);
+    if (!start_inference(&waiting, gpu, input, options))
+        goto done;
+    bool blocked = WaitForSingleObject(waiting.finished, 30) == WAIT_TIMEOUT;
     SetEvent(gate.requested);
     WaitForSingleObject(thread, INFINITE);
-    if (acquired)
-        extra.release(extra.lease);
-    printf("released-refs-with-blocked-GPU-consumers-refuse-reuse=%s\n",
-           acquired ? "NO" : "yes");
-    if (acquired)
+    finish_inference(&waiting);
+    printf("released-refs-with-blocked-GPU-consumers-wait=%s\n", blocked ? "yes" : "NO");
+    if (!blocked || waiting.result != DLSSNR_GPU_READY ||
+        !waiting.info.backpressure_waits || waiting.info.error[0])
         goto done;
     for (unsigned n = 0; n < 2; n++) {
         double mean = 0, delta = 0;
@@ -289,14 +343,8 @@ static bool test_release_order(ID3D11Device *device, ID3D11DeviceContext *contex
         if (!unchanged)
             goto done;
     }
-    for (unsigned attempt = 0; attempt < 100; attempt++) {
-        if (dlssnr_gpu_process(gpu, input, options, false, &extra, &info)) {
-            valid = extra.texture == held[3].texture || extra.texture == held[1].texture;
-            extra.release(extra.lease);
-            break;
-        }
-        Sleep(1);
-    }
+    valid = waiting.output.texture == held[3].texture ||
+            waiting.output.texture == held[1].texture;
     printf("reuse-after-consumer-GPU-completion=%s\n", valid ? "yes" : "NO");
 #undef GATE_HR
 done:
@@ -305,6 +353,11 @@ done:
         WaitForSingleObject(thread, INFINITE);
         CloseHandle(thread);
     }
+    if (waiting.thread)
+        SetEvent(waiting.cancel);
+    finish_inference(&waiting);
+    if (waiting.output.lease)
+        waiting.output.release(waiting.output.lease);
     if (gate.requested)
         CloseHandle(gate.requested);
     if (shared)
@@ -343,6 +396,7 @@ static bool test_ownership(ID3D11Device *device, ID3D11DeviceContext *context,
     options.ui_correction = false;
     struct dlssnr_gpu_input input = {
         .texture = source,
+        .output_capacity = 4,
         .color = {.width = WIDTH, .height = HEIGHT,
                   .luma = {0.2126f, 0.7152f, 0.0722f}},
     };
@@ -355,7 +409,8 @@ static bool test_ownership(ID3D11Device *device, ID3D11DeviceContext *context,
             pixels[pixel * 4 + 1] = (uint8_t)(60 + n * 35);
         ID3D11DeviceContext_UpdateSubresource(context, (ID3D11Resource *)source,
                                                0, NULL, pixels, WIDTH * 4, 0);
-        if (!dlssnr_gpu_process(gpu, &input, &options, n == 0, &held[n], &info)) {
+        if (dlssnr_gpu_process(gpu, &input, &options, n == 0, &held[n], &info) !=
+            DLSSNR_GPU_READY) {
             fprintf(stderr, "ownership frame %u: %s\n", n, info.error);
             valid = false;
             break;
@@ -366,13 +421,39 @@ static bool test_ownership(ID3D11Device *device, ID3D11DeviceContext *context,
             break;
     }
     if (valid) {
-        struct dlssnr_gpu_output extra = {0};
-        bool acquired = dlssnr_gpu_process(gpu, &input, &options, false, &extra, &info);
-        if (acquired) {
-            extra.release(extra.lease);
-            valid = false;
+        struct queued_inference waiting;
+        valid = start_inference(&waiting, gpu, &input, &options);
+        bool blocked = valid && WaitForSingleObject(waiting.finished, 30) == WAIT_TIMEOUT;
+        if (waiting.cancel)
+            SetEvent(waiting.cancel);
+        finish_inference(&waiting);
+        valid = valid && blocked && waiting.result == DLSSNR_GPU_CANCELLED &&
+                !waiting.output.lease && waiting.info.status != DLSSNR_RUNTIME_FAILED &&
+                waiting.info.backpressure_waits > 0;
+        if (waiting.output.lease)
+            waiting.output.release(waiting.output.lease);
+        printf("starved-pool-cancels-without-runtime-failure=%s\n", valid ? "yes" : "NO");
+    }
+    if (valid) {
+        struct queued_inference waiting;
+        valid = start_inference(&waiting, gpu, &input, &options);
+        bool blocked = valid && WaitForSingleObject(waiting.finished, 30) == WAIT_TIMEOUT;
+        held[3].release(held[3].lease);
+        held[3].lease = NULL;
+        finish_inference(&waiting);
+        valid = valid && blocked && waiting.result == DLSSNR_GPU_READY &&
+                waiting.info.status == DLSSNR_ACTIVE && !waiting.info.error[0] &&
+                waiting.info.backpressure_waits > 0 && waiting.info.slot_wait_ms > 0;
+        if (valid) {
+            held[3] = waiting.output;
+            double delta = 0;
+            valid = inspect_output(device, context, held[3].texture, pixels,
+                                     &means[3], &delta);
+        } else if (waiting.output.lease) {
+            waiting.output.release(waiting.output.lease);
         }
-        printf("bounded-pool-refuses-fifth-live-output=%s\n", acquired ? "NO" : "yes");
+        printf("starved-pool-release-resumes-same-frame-without-failure=%s\n",
+               valid ? "yes" : "NO");
     }
     if (valid)
         valid = test_release_order(device, context, gpu, &input, &options,
@@ -381,7 +462,8 @@ static bool test_ownership(ID3D11Device *device, ID3D11DeviceContext *context,
         input.color.width = WIDTH - 16;
         input.color.height = HEIGHT - 16;
         struct dlssnr_gpu_output resized = {0};
-        valid = dlssnr_gpu_process(gpu, &input, &options, true, &resized, &info);
+        valid = dlssnr_gpu_process(gpu, &input, &options, true, &resized, &info) ==
+                DLSSNR_GPU_READY;
         if (valid) {
             D3D11_TEXTURE2D_DESC desc;
             ID3D11Texture2D_GetDesc(resized.texture, &desc);
@@ -463,7 +545,7 @@ static bool test_nv12_1080p(ID3D11Device *device, ID3D11DeviceContext *context,
         LARGE_INTEGER start, end;
         QueryPerformanceCounter(&start);
         bool evaluated = dlssnr_gpu_process(&gpu, &input, &options, n == 0,
-                                            &output, &info);
+                                            &output, &info) == DLSSNR_GPU_READY;
         QueryPerformanceCounter(&end);
         double context_ms = (end.QuadPart - start.QuadPart) * 1000.0 /
                             frequency.QuadPart;
@@ -522,6 +604,56 @@ static bool test_nv12_1080p(ID3D11Device *device, ID3D11DeviceContext *context,
     free(pixels);
     Sleep(100);
     return valid;
+}
+
+static bool test_sustained_retention(struct dlssnr_gpu **gpu, ID3D11Texture2D *source,
+                                     const char *model)
+{
+    struct dlssnr_options options = dlssnr_defaults;
+    options.model_path = (char *)model;
+    options.input_resolution = 50;
+    options.auto_mask = false;
+    options.ui_correction = false;
+    struct dlssnr_gpu_input input = {
+        .texture = source,
+        .color = {.width = WIDTH, .height = HEIGHT,
+                  .luma = {0.2126f, 0.7152f, 0.0722f}},
+    };
+    const unsigned retention[] = {5, DLSSNR_MAX_OUTPUT_SLOTS - 1};
+    for (unsigned phase = 0; phase < 2; phase++) {
+        struct dlssnr_gpu_output held[DLSSNR_MAX_OUTPUT_SLOTS] = {0};
+        unsigned count = 0, produced = 0;
+        struct dlssnr_gpu_info info = {0};
+        bool valid = true;
+        for (unsigned frame = 0; frame < retention[phase] + 40; frame++) {
+            struct dlssnr_gpu_output next = {0};
+            enum dlssnr_gpu_result result = dlssnr_gpu_process(
+                gpu, &input, &options, frame == 0, &next, &info);
+            if (result != DLSSNR_GPU_READY || info.status != DLSSNR_ACTIVE ||
+                info.error[0] || info.output_slots > DLSSNR_MAX_OUTPUT_SLOTS) {
+                fprintf(stderr, "sustained frame %u failed: %s\n", frame, info.error);
+                if (next.lease)
+                    next.release(next.lease);
+                valid = false;
+                break;
+            }
+            produced++;
+            held[count++] = next;
+            if (count > retention[phase]) {
+                held[0].release(held[0].lease);
+                memmove(held, held + 1, (--count) * sizeof(held[0]));
+            }
+        }
+        for (unsigned n = 0; n < count; n++)
+            held[n].release(held[n].lease);
+        printf("sustained-vo-retention=%u produced=%u slots=%u capacity=%u "
+               "backpressure-waits=%llu no-runtime-failure=%s\n",
+               retention[phase], produced, info.output_slots, info.output_capacity,
+               (unsigned long long)info.backpressure_waits, valid ? "yes" : "NO");
+        if (!valid)
+            return false;
+    }
+    return true;
 }
 
 int wmain(int argc, wchar_t **argv)
@@ -636,7 +768,7 @@ int wmain(int argc, wchar_t **argv)
         }
         struct dlssnr_gpu_output output = {0};
         bool ok = dlssnr_gpu_process(&gpu, &input, &options, frame == 0,
-                                     &output, &info);
+                                     &output, &info) == DLSSNR_GPU_READY;
         printf("frame=%u success=%s status=%d proc=%dx%d wall_ms=%.3f "
                "caller_compatibility=%s gpu=%s error=%s\n",
                frame, ok ? "yes" : "no", info.status, info.proc_width,
@@ -672,6 +804,8 @@ int wmain(int argc, wchar_t **argv)
         result = 6;
     if (!result && !test_ownership(device, context, &gpu, source, pixels, model))
         result = 7;
+    if (!result && !test_sustained_retention(&gpu, source, model))
+        result = 10;
     dlssnr_gpu_destroy(&gpu);
     ID3D11Texture2D_Release(source);
     ID3D11DeviceContext_Release(context);

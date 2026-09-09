@@ -1658,9 +1658,9 @@ Filter Commands
           ``a`` key is hit.
 
 ``vf-command <label> <command> <argument> [<target>]``
-    Send a command to the filter. Note that currently, this only works with
-    the ``lavfi`` filter. Refer to the libavfilter documentation for the list
-    of supported commands for each filter.
+    Send a command to a filter that supports commands, such as ``lavfi`` or
+    ``dlssnr``. Refer to the filter's documentation for its supported commands;
+    for ``lavfi``, refer to the libavfilter documentation.
 
     ``<label>`` is a mpv filter label, use ``all`` to send it to all filters
     at once.

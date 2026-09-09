@@ -87,6 +87,13 @@ jobs:
             -o /tmp/d3d11-adapter-test
           /tmp/d3d11-adapter-test
 
+      - name: Test DLSSNR parameters and color matrices
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror \
+            video/filter/dlssnr/test_params.c video/filter/dlssnr/params.c \
+            -lm -o /tmp/dlssnr-params-test
+          /tmp/dlssnr-params-test
+
       - name: Ensure PATH includes local bin
         run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 

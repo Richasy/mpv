@@ -356,7 +356,7 @@ if posix
     flags += ['-D_GNU_SOURCE']
 endif
 
-link_flags += cc.get_supported_link_arguments(['-Wl,--nxcompat,--no-seh,--dynamicbase',
+link_flags += cc.get_supported_link_arguments(['-Wl,--nxcompat,--dynamicbase',
                                                '-Wl,-z,noexecstack'])
 
 features += {'build-date': get_option('build-date')}
@@ -1449,6 +1449,38 @@ amf = cc.has_header('AMF/core/Factory.h', required:
 features += {'amf': amf}
 if features['amf']
     sources += files('video/filter/vf_amf.c')
+endif
+
+dlssnr_opt = get_option('dlssnr').require(
+    features['d3d11'] and features['d3d-hwaccel'] and
+    host_machine.cpu_family() == 'x86_64',
+    error_message: 'dlssnr requires Windows x64 and D3D11 hardware decoding!',
+).require(
+    cc.get_id() in ['clang', 'clang-cl', 'msvc'],
+    error_message: 'dlssnr requires Clang or MSVC for Windows structured exception handling!',
+)
+features += {'dlssnr': dlssnr_opt.allowed()}
+if features['dlssnr']
+    add_project_arguments(cc.get_supported_arguments('-fms-extensions'),
+                          language: 'c')
+    if cc.get_id() == 'msvc'
+        add_project_arguments('/experimental:c11atomics', language: 'c')
+    endif
+    sources += files('video/filter/vf_dlssnr.c',
+                     'video/filter/dlssnr/params.c',
+                     'video/filter/dlssnr/shaders.c',
+                     'video/filter/dlssnr/gpu.c',
+                     'video/filter/dlssnr/runtime.c',
+                     'video/filter/dlssnr/model_identity.c')
+    shared_module('mpv-nvngx', 'video/filter/dlssnr/bridge.c',
+                  name_prefix: '',
+                  install: true,
+                  install_dir: get_option('bindir'))
+endif
+# Guarded DLSSNR runtime calls need Windows exception dispatch.
+if win32 and not features['dlssnr']
+    add_project_link_arguments(cc.get_supported_link_arguments('-Wl,--no-seh'),
+                               language: ['c', 'cpp', 'objc'])
 endif
 
 # RIFE frame interpolation (via ONNX Runtime + DirectML).

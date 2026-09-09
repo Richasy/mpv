@@ -1,3 +1,13 @@
+set(mpv_dlssnr -Ddlssnr=disabled)
+set(mpv_copy_dlssnr)
+if(TARGET_CPU STREQUAL "x86_64")
+    set(mpv_dlssnr -Ddlssnr=enabled)
+    set(mpv_copy_dlssnr
+        COMMAND ${CMAKE_COMMAND} -E copy <BINARY_DIR>/mpv-nvngx.dll ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/mpv-nvngx.dll
+        COMMAND ${CMAKE_COMMAND} -DINPUT_FILE=<BINARY_DIR>/mpv-nvngx.pdb -DOUTPUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/mpv-nvngx.pdb -P <SOURCE_DIR>/ci/winbuild/packages/mpv-copy-symbols.cmake
+    )
+endif()
+
 ExternalProject_Add(mpv
     DEPENDS
         angle-headers
@@ -53,6 +63,7 @@ ExternalProject_Add(mpv
         -Dvulkan=enabled
         -Dsubrandr=enabled
         -Dlibcurl=enabled
+        ${mpv_dlssnr}
         ${mpv_gl}
         -Dc_args='-Wno-error=int-conversion'
         -Drife=auto
@@ -76,6 +87,7 @@ ExternalProject_Add_Step(mpv copy-binary
     COMMAND ${CMAKE_COMMAND} -E copy ${MINGW_INSTALL_PREFIX}/etc/fonts/fonts.conf   ${CMAKE_CURRENT_BINARY_DIR}/mpv-package/mpv/fonts.conf
     ${mpv_copy_debug}
     COMMAND ${CMAKE_COMMAND} -E copy <BINARY_DIR>/libmpv-2.dll          ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/libmpv-2.dll
+    ${mpv_copy_dlssnr}
     ${mpv_copy_lib_debug}
     COMMAND ${CMAKE_COMMAND} -E copy <BINARY_DIR>/libmpv.dll.a          ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/libmpv.dll.a
     COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/include/mpv/client.h       ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv/client.h

@@ -5876,6 +5876,20 @@ Network
     protocol is used which does not support timeouts, this option is silently
     ignored.
 
+    The FFmpeg HTTP stream backend emits ``network_io`` diagnostics through
+    the owning stream's logger. Verbose logging records open and byte-seek
+    operations, the first read after each, requested numeric network options,
+    native results, and elapsed time. These records contain no URLs, headers,
+    or response bodies and do not depend on FFmpeg's process-global log
+    callback. A successful seek or reopen is not proof that a subsequent read
+    returned data.
+
+    While FFmpeg polls its interrupt callback, an operation still pending
+    after 15 seconds emits a warning, with at most three warnings per operation
+    and at least 30 seconds between them. This reports an outstanding operation,
+    not its HTTP status or the reason for a server delay. It does not interrupt
+    the operation, alter retry behavior, or impose a total startup deadline.
+
     .. warning::
 
         This breaks the RTSP protocol, because of inconsistent FFmpeg API

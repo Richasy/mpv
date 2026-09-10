@@ -176,6 +176,16 @@ if get_option('libmpv')
         exe = executable('libmpv-lifetime', sources: 'libmpv_lifetime.c',
                          include_directories: incdir_public)
         test('libmpv-lifetime', exe, depends: mpvlib, suite: 'libmpv')
+
+        network_diagnostics = executable('libmpv-test-network-diagnostics',
+                                         'libmpv_test_network_diagnostics.c',
+                                         include_directories: incdir,
+                                         link_with: test_utils,
+                                         dependencies: libmpv_dep)
+        test('libmpv-network-diagnostics', python,
+             args: [files('libmpv_network_diagnostics.py'), network_diagnostics],
+             depends: network_diagnostics, suite: 'libmpv-network',
+             timeout: 65)
     endif
 endif
 

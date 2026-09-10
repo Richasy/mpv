@@ -29,6 +29,7 @@
 #include "network.h"
 #include "options/m_config.h"
 #include "options/m_option.h"
+#include "osdep/timer.h"
 
 #include "cookies.h"
 
@@ -55,12 +56,108 @@ static const char *const http_like[] =
 static int open_f(stream_t *stream);
 static struct mp_tags *read_icy(stream_t *stream);
 
+struct lavf_priv {
+    AVIOContext *avio;
+    struct stream *stream;
+    bool network_diagnostics;
+    bool report_next_read;
+    const char *operation;
+    uint64_t operation_id;
+    int64_t operation_offset;
+    int operation_size;
+    int64_t operation_started;
+    int64_t next_slow_report;
+    int slow_reports;
+    bool report_operation;
+};
+
+static void begin_io(struct lavf_priv *p, const char *operation,
+                     int64_t offset, int size, bool report)
+{
+    if (!p->network_diagnostics)
+        return;
+
+    p->operation = operation;
+    p->operation_id++;
+    p->operation_offset = offset;
+    p->operation_size = size;
+    p->operation_started = mp_time_ns();
+    p->next_slow_report = p->operation_started + MP_TIME_S_TO_NS(15);
+    p->slow_reports = 0;
+    p->report_operation = report;
+    if (report) {
+        MP_VERBOSE(p->stream, "network_io begin id=%"PRIu64" operation=%s "
+                   "offset=%"PRId64" requested=%d\n",
+                   p->operation_id, operation, offset, size);
+    }
+}
+
+static void end_io(struct lavf_priv *p, int64_t result, bool failure)
+{
+    if (!p->network_diagnostics)
+        return;
+
+    int64_t elapsed = mp_time_ns() - p->operation_started;
+    bool cancelled = mp_cancel_test(p->stream->cancel);
+    int avio_error = p->avio ? p->avio->error : 0;
+    bool eof = p->avio && p->avio->eof_reached;
+    int error = result < 0 ? (int)result : avio_error;
+    bool slow = elapsed >= MP_TIME_S_TO_NS(15);
+    if (p->report_operation || failure || slow || cancelled) {
+        int level = (failure || slow) && !cancelled ? MSGL_WARN : MSGL_V;
+        mp_msg(p->stream->log, level,
+               "network_io end id=%"PRIu64" operation=%s offset=%"PRId64
+               " requested=%d result=%"PRId64" avio_error=%d error_text=%s "
+               "eof=%d cancelled=%d elapsed_ms=%.3f\n",
+               p->operation_id, p->operation, p->operation_offset,
+               p->operation_size, result, avio_error,
+               error < 0 ? av_err2str(error) : "none",
+               eof, cancelled, MP_TIME_NS_TO_MS(elapsed));
+    }
+    p->operation = NULL;
+}
+
+static void report_slow_io(struct lavf_priv *p)
+{
+    if (!p || !p->network_diagnostics || !p->operation || p->slow_reports >= 3)
+        return;
+
+    int64_t now = mp_time_ns();
+    if (now < p->next_slow_report)
+        return;
+
+    p->slow_reports++;
+    p->next_slow_report = now + MP_TIME_S_TO_NS(30);
+    MP_WARN(p->stream, "network_io pending id=%"PRIu64" operation=%s "
+            "offset=%"PRId64" requested=%d elapsed_ms=%.3f report=%d/3\n",
+            p->operation_id, p->operation, p->operation_offset,
+            p->operation_size, MP_TIME_NS_TO_MS(now - p->operation_started),
+            p->slow_reports);
+}
+
+static const char *numeric_option(AVDictionary *dict, const char *name)
+{
+    const AVDictionaryEntry *entry = av_dict_get(dict, name, NULL, 0);
+    if (!entry)
+        return "unset";
+    size_t length = strlen(entry->value);
+    if (!length || length > 20 ||
+        strspn(entry->value, "-0123456789") != length)
+        return "non-numeric";
+    return entry->value;
+}
+
 static int fill_buffer(stream_t *s, void *buffer, int max_len)
 {
-    AVIOContext *avio = s->priv;
+    struct lavf_priv *p = s->priv;
+    AVIOContext *avio = p ? p->avio : NULL;
     if (!avio)
         return -1;
+    begin_io(p, "read", avio_tell(avio), max_len, p->report_next_read);
     int r = avio_read_partial(avio, buffer, max_len);
+    end_io(p, r, (r < 0 && r != AVERROR_EOF) ||
+                (avio->error && avio->error != AVERROR_EOF));
+    p->report_next_read = false;
     if (r <= 0) {
         // Distinguish a real I/O error from a clean EOF. avio->error is set
         // by libavformat when the underlying transport (HTTP, file, ...) hit
@@ -84,11 +181,14 @@ static int fill_buffer(stream_t *s, void *buffer, int max_len)
 
 static int write_buffer(stream_t *s, void *buffer, int len)
 {
-    AVIOContext *avio = s->priv;
+    struct lavf_priv *p = s->priv;
+    AVIOContext *avio = p ? p->avio : NULL;
     if (!avio)
         return -1;
+    begin_io(p, "write", avio_tell(avio), len, false);
     avio_write(avio, buffer, len);
     avio_flush(avio);
+    end_io(p, avio->error ? avio->error : len, avio->error != 0);
     if (avio->error)
         return -1;
     return len;
@@ -96,16 +196,21 @@ static int write_buffer(stream_t *s, void *buffer, int len)
 
 static int seek(stream_t *s, int64_t newpos)
 {
-    AVIOContext *avio = s->priv;
+    struct lavf_priv *p = s->priv;
+    AVIOContext *avio = p ? p->avio : NULL;
     // Backend torn down by a failed in-place reopen: refuse rather than
     // dereference a NULL avio (the stream should already be marked broken).
     if (!avio) {
         s->error = AVERROR_EXTERNAL;
         return 0;
     }
-    if (newpos != avio_tell(avio))
+    bool moved = newpos != avio_tell(avio);
+    if (moved)
         MP_VERBOSE(s, "stream_lavf seek to %" PRId64 "\n", newpos);
+    begin_io(p, "seek", newpos, 0, moved);
     int64_t r = avio_seek(avio, newpos, SEEK_SET);
+    end_io(p, r, r < 0);
+    p->report_next_read |= moved;
     if (r < 0) {
         // Record the error so a subsequent fill_buffer that returns short
         // because of the failed seek still surfaces it as an error rather
@@ -119,22 +224,31 @@ static int seek(stream_t *s, int64_t newpos)
 
 static int64_t get_size(stream_t *s)
 {
-    AVIOContext *avio = s->priv;
+    struct lavf_priv *p = s->priv;
+    AVIOContext *avio = p ? p->avio : NULL;
     if (!avio)
         return -1;
-    return avio_size(avio);
+    begin_io(p, "size", -1, 0, false);
+    int64_t result = avio_size(avio);
+    end_io(p, result, false);
+    return result;
 }
 
 static void close_f(stream_t *stream)
 {
-    AVIOContext *avio = stream->priv;
+    struct lavf_priv *p = stream->priv;
+    AVIOContext *avio = p ? p->avio : NULL;
     /* NOTE: As of 2011 write streams must be manually flushed before close.
      * Currently write_buffer() always flushes them after writing.
      * avio_close() could return an error, but we have no way to return that
      * with the current stream API.
      */
-    if (avio)
-        avio_close(avio);
+    if (avio) {
+        begin_io(p, "close", -1, 0, false);
+        p->avio = NULL;
+        int result = avio_close(avio);
+        end_io(p, result, result < 0);
+    }
 }
 
 // Tear down and reopen the AVIOContext in place. Used by the LRU cache to
@@ -151,11 +265,7 @@ static void close_f(stream_t *stream)
 // disables itself so the demuxer surfaces the error rather than spinning.
 static int reconnect_f(stream_t *stream)
 {
-    AVIOContext *avio = stream->priv;
-    if (avio) {
-        avio_close(avio);
-        stream->priv = NULL;
-    }
+    close_f(stream);
     int res = open_f(stream);
     if (res != STREAM_OK) {
         MP_WARN(stream, "stream_lavf reconnect failed (res=%d)\n", res);
@@ -167,13 +277,17 @@ static int reconnect_f(stream_t *stream)
 
 static int control(stream_t *s, int cmd, void *arg)
 {
-    AVIOContext *avio = s->priv;
+    struct lavf_priv *p = s->priv;
+    AVIOContext *avio = p ? p->avio : NULL;
     if (!avio)
         return STREAM_ERROR;
     switch(cmd) {
     case STREAM_CTRL_AVSEEK: {
         struct stream_avseek *c = arg;
+        begin_io(p, "time-seek", -1, 0, true);
         int64_t r = avio_seek_time(avio, c->stream_index, c->timestamp, c->flags);
+        end_io(p, r, r < 0);
+        p->report_next_read = true;
         if (r >= 0) {
             s->error = 0;
             stream_drop_buffers(s);
@@ -219,7 +333,10 @@ static int control(stream_t *s, int cmd, void *arg)
 static int interrupt_cb(void *ctx)
 {
     struct stream *stream = ctx;
-    return mp_cancel_test(stream->cancel);
+    bool cancelled = mp_cancel_test(stream->cancel);
+    if (!cancelled)
+        report_slow_io(stream->priv);
+    return cancelled;
 }
 
 static const char * const prefix[] = { "lavf://", "ffmpeg://" };
@@ -405,6 +522,7 @@ static char *normalize_url(void *ta_parent, const char *filename)
 
 static int open_f(stream_t *stream)
 {
+    struct lavf_priv *p = stream->priv;
     AVIOContext *avio = NULL;
     int res = STREAM_ERROR;
     AVDictionary *dict = NULL;
@@ -464,6 +582,27 @@ static int open_f(stream_t *stream)
 
     mp_setup_av_network_options(&dict, NULL, stream->global, stream->log);
 
+    if (!p) {
+        p = talloc_zero(stream, struct lavf_priv);
+        p->stream = stream;
+        stream->priv = p;
+    }
+    bstr protocol = mp_split_proto(bstr0(filename), NULL);
+    for (int n = 0; http_like[n]; n++)
+        p->network_diagnostics |= bstr_equals0(protocol, http_like[n]);
+    if (p->network_diagnostics) {
+        MP_VERBOSE(stream, "network_io requested_options timeout_us=%s "
+                   "rw_timeout_us=%s seekable=%s multiple_requests=%s reconnect=%s "
+                   "reconnect_on_network_error=%s reconnect_delay_max=%s\n",
+                   numeric_option(dict, "timeout"),
+                   numeric_option(dict, "rw_timeout"),
+                   numeric_option(dict, "seekable"),
+                   numeric_option(dict, "multiple_requests"),
+                   numeric_option(dict, "reconnect"),
+                   numeric_option(dict, "reconnect_on_network_error"),
+                   numeric_option(dict, "reconnect_delay_max"));
+    }
+
     AVIOInterruptCB cb = {
         .callback = interrupt_cb,
         .opaque = stream,
@@ -478,7 +617,10 @@ static int open_f(stream_t *stream)
         av_dict_set(&dict, "timeout", "0", 0);
     }
 
+    begin_io(p, "open", 0, 0, true);
     int err = avio_open2(&avio, filename, flags, &cb, &dict);
+    p->avio = avio;
+    end_io(p, err, err < 0);
     if (err < 0) {
         if (err == AVERROR_PROTOCOL_NOT_FOUND)
             MP_ERR(stream, "Protocol not found. Make sure"
@@ -496,7 +638,7 @@ static int open_f(stream_t *stream)
         }
     }
 
-    stream->priv = avio;
+    p->report_next_read = true;
     stream->seekable = avio->seekable & AVIO_SEEKABLE_NORMAL;
     stream->seek = stream->seekable ? seek : NULL;
     stream->fill_buffer = fill_buffer;
@@ -533,6 +675,10 @@ static int open_f(stream_t *stream)
     res = STREAM_OK;
 
 out:
+    if (res != STREAM_OK) {
+        stream->priv = NULL;
+        talloc_free(p);
+    }
     av_dict_free(&dict);
     talloc_free(temp);
     return res;
@@ -540,9 +686,10 @@ out:
 
 static struct mp_tags *read_icy(stream_t *s)
 {
-    AVIOContext *avio = s->priv;
+    struct lavf_priv *p = s->priv;
+    AVIOContext *avio = p ? p->avio : NULL;
 
-    if (!avio->av_class)
+    if (!avio || !avio->av_class)
         return NULL;
 
     uint8_t *icy_header = NULL;

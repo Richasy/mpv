@@ -14,7 +14,7 @@
 struct dlssnr_runtime;
 
 struct dlssnr_runtime *dlssnr_runtime_open(
-    ID3D12Device *device, const wchar_t *model_path,
+    ID3D12Device *device, const wchar_t *model_path, const wchar_t *cache_path,
     struct dlssnr_gpu_info *info);
 bool dlssnr_runtime_create(struct dlssnr_runtime *runtime,
                           ID3D12GraphicsCommandList *commands,

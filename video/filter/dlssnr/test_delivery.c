@@ -10,8 +10,29 @@
 
 int main(void)
 {
+    assert(!strcmp(options[0].name, "enabled"));
+    assert(!strcmp(options[1].name, "model-path"));
+    assert(!strcmp(options[2].name, "preset"));
+    assert(!strcmp(options[19].name, "max-height"));
+    assert(!strcmp(options[20].name, "cache-path"));
+
+    char model[] = "ngx\\model.dll";
+    char cache[] = "C:\\app data\\cache";
+    struct dlssnr_options copied = dlssnr_defaults;
+    copied.model_path = model;
+    copied.cache_path = cache;
+    struct settings *owned = new_settings(&copied, 1);
+    assert(owned);
+    model[0] = 'X';
+    cache[0] = 'X';
+    assert(!strcmp(owned->options.model_path, "ngx\\model.dll"));
+    assert(!strcmp(owned->options.cache_path, "C:\\app data\\cache"));
+    unref_settings(owned);
+
     struct settings current = {.serial = 3, .options = dlssnr_defaults};
     struct settings old = {.serial = 2, .options = dlssnr_defaults};
+    current.options.model_path = "ngx\\model.dll";
+    current.options.cache_path = "C:\\app data\\cache";
     struct priv p = {
         .settings = &current, .epoch = 7,
         .info = {.status = DLSSNR_INITIALIZING},
@@ -48,6 +69,7 @@ int main(void)
     record_delivery(&p, &ready, true);
     assert(p.processed == 2 && p.applied_serial == current.serial);
     assert(p.info.status == DLSSNR_ACTIVE);
+    assert(!p.applied.model_path && !p.applied.cache_path);
 
     current.serial++;
     ready.processed = false;

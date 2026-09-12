@@ -17,6 +17,7 @@
 
 #define DLSSNR_ERROR_SIZE 512
 #define DLSSNR_GPU_NAME_SIZE 256
+#define DLSSNR_CACHE_LOCK_FILENAME L"mpv-dlssnr-cache.lock"
 /* Mirrors the decoder's six-surface baseline and VO retention + three in flight. */
 #define DLSSNR_INITIAL_OUTPUT_SLOTS 6
 #define DLSSNR_MAX_OUTPUT_SLOTS 23
@@ -80,5 +81,10 @@ void dlssnr_gpu_destroy(struct dlssnr_gpu **gpu);
 
 bool dlssnr_resolve_model_path(const char *configured, wchar_t *path,
                               size_t count, char error[DLSSNR_ERROR_SIZE]);
+bool dlssnr_resolve_cache_path(const char *configured, wchar_t *path,
+                              size_t count, char error[DLSSNR_ERROR_SIZE]);
+/* Hold the shared-read handle until every native user of the cache has stopped. */
+HANDLE dlssnr_acquire_cache_directory(const wchar_t *path,
+                                     char error[DLSSNR_ERROR_SIZE]);
 
 #endif

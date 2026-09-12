@@ -11,6 +11,7 @@
 
 struct dlssnr_options {
     char *model_path;
+    char *cache_path;
     bool enabled;
     int preset;
     int style;

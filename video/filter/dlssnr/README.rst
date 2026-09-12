@@ -18,10 +18,28 @@ The user supplies ``nvngx_dlssnr.dll`` privately. The default location is
 directory. An explicit relative ``model-path``, including
 ``ngx\nvngx_dlssnr.dll``, is also resolved against that module directory, never
 the working directory. Absolute drive/UNC overrides remain supported;
-ambiguous drive-relative and single-rooted paths are rejected. The module-adjacent
-``dlssnr-cache`` directory must be writable. No model is downloaded by this
-implementation. NGX itself can perform its normal driver-cache maintenance
-and telemetry.
+ambiguous drive-relative and single-rooted paths are rejected.
+
+NGX storage is separate from the model and installation directory.
+``cache-path`` accepts an absolute writable directory; empty or omitted uses
+``mpv\cache\dlssnr`` under the Windows LocalAppData known folder, even with
+``--no-config``. Embedded applications should explicitly select storage owned by
+their active application/package identity. Creation and write-probe failures
+include a Windows error code and never fall back to the working directory or
+installation. Existing cache contents are retained, and changing ``cache-path``
+reloads the runtime. NGX's application data path requires filesystem write
+access; GPU scratch buffers are not a memory-only substitute for this directory.
+No model is downloaded by this implementation. NGX itself can perform its
+normal driver-cache maintenance and telemetry.
+
+The runtime holds ``mpv-dlssnr-cache.lock`` in this directory with read access
+and ``FILE_SHARE_READ`` until actual NGX shutdown succeeds. Frontends may hold
+additional shared-read leases. Cleanup must obtain an exclusive read/write
+handle to this same file and preserve it while deleting cache contents.
+Do not treat filter removal or an asynchronous GPU retirement request as proof
+that the cache is unused. Fault-retained native runtimes also retain the lease
+until process exit. A frontend can use separate per-session directories and
+reclaim only inactive sessions without interfering with another player.
 
 The installed NGX core provides parameter factories. Original C declarations
 describe the public parameter interface's Microsoft x64 vtable. Neither C++
@@ -210,7 +228,7 @@ timing and errors. ``active=yes`` requires successful real evaluation, completed
 GPU work and matching applied/requested settings. Runtime failures remain
 visible and video passes through instead of failing the host.
 All option values are emitted even before processing starts, including defaults:
-the nineteen non-path controls plus ``model-path``.
+the nineteen non-path controls plus ``model-path`` and ``cache-path``.
 Worker completion increments ``evaluated-frames`` only. A queued result retains
 its settings, GPU result and seek epoch; delivered counters, applied generation
 and new active proof are committed only after the output pin accepts the frame.
@@ -223,6 +241,7 @@ Production sources:
 
 * ``video\filter\vf_dlssnr.c``
 * ``video\filter\dlssnr\params.c``
+* ``video\filter\dlssnr\cache.c``
 * ``video\filter\dlssnr\shaders.c``
 * ``video\filter\dlssnr\gpu.c``
 * ``video\filter\dlssnr\runtime.c``
@@ -248,7 +267,22 @@ dimensions and NV12/P010 color matrices. Link it with ``params.c``.
 
 ``test_paths.c`` verifies omitted, explicit-relative and absolute model paths,
 including that module-relative resolution is independent of the working
-directory. Link it with ``runtime.c``, ``model_identity.c`` and ``params.c``.
+directory. Link it with ``runtime.c``, ``cache.c``, ``model_identity.c`` and
+``params.c``, plus the ordinary Windows ``shell32``, ``ole32`` and ``uuid``
+libraries used by the cache helper.
+
+``test_cache.c`` checks the per-user default, absolute Unicode overrides,
+working-directory independence, nested creation, retained contents, write-probe
+cleanup, shared/exclusive leases and explicit creation/write failures.
+It includes ``cache.c`` to inject
+denied writes without changing filesystem permissions. Link it with ``params.c``
+and the same three Windows libraries. It does not initialize a GPU or NGX and
+creates only an owned temporary fixture tree.
+
+``test_runtime_cache.c`` includes ``runtime.c`` and proves that fault-retained
+native state keeps its cache lease until successful teardown, without loading
+a GPU or vendor runtime. Link it with ``cache.c``, ``model_identity.c`` and
+``params.c`` plus the same Windows libraries.
 
 ``test_bridge.c`` checks ABI version negotiation, argument forwarding, and the
 genuine caller-module identity at all five optimized call boundaries, including
@@ -275,7 +309,7 @@ sections, ``-Wno-unused-function`` for this standalone translation unit, and
 dead-section elimination, linking ``params.c``. Its
 ``DLSSNR_DELIVERY_TEST`` guard omits registration only for this standalone test.
 
-``test_gpu.c`` links the five backend sources (not ``vf_dlssnr.c`` or ``bridge.c``)
+``test_gpu.c`` links the six backend sources (not ``vf_dlssnr.c`` or ``bridge.c``)
 and loads the separately built helper beside the executable. It takes
 one absolute private model path. It performs real NR evaluation, checks changed,
 finite F16 output, verifies live changes do not reload the model, checks

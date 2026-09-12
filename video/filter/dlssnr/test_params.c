@@ -7,6 +7,7 @@
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "params.h"
 
@@ -52,6 +53,20 @@ int main(void)
     assert(!dlssnr_options_valid(&o, error, sizeof(error)));
     o = dlssnr_defaults;
     assert(dlssnr_model_path_type(o.model_path) == DLSSNR_MODEL_DEFAULT);
+    o.cache_path = "C:\\app data\\cache";
+    assert(dlssnr_options_valid(&o, error, sizeof(error)));
+    o.cache_path = "\\\\server\\share\\cache";
+    assert(dlssnr_options_valid(&o, error, sizeof(error)));
+    const char *invalid_cache[] = {
+        "cache", "C:cache", "\\cache", "/cache", "C:\\bad\npath",
+    };
+    for (size_t n = 0; n < sizeof(invalid_cache) / sizeof(invalid_cache[0]); n++) {
+        o.cache_path = (char *)invalid_cache[n];
+        assert(!dlssnr_options_valid(&o, error, sizeof(error)));
+        assert(strstr(error, "cache-path"));
+    }
+    o.cache_path = "";
+    assert(dlssnr_options_valid(&o, error, sizeof(error)));
     o.motion_quality = 1;
     assert(!dlssnr_options_valid(&o, error, sizeof(error)));
     o.motion_quality = 0;
@@ -66,6 +81,14 @@ int main(void)
     assert(dlssnr_model_options_equal(&o, &other));
     o.preset = 1;
     assert(!dlssnr_model_options_equal(&o, &other));
+    o = dlssnr_defaults;
+    o.cache_path = "";
+    assert(dlssnr_options_equal(&o, &other));
+    o.cache_path = "C:\\app data\\cache";
+    assert(!dlssnr_model_options_equal(&o, &other));
+    assert(!dlssnr_options_equal(&o, &other));
+    other.cache_path = o.cache_path;
+    assert(dlssnr_options_equal(&o, &other));
 
     for (int bits = 8; bits <= 10; bits += 2) {
         float matrix[3][4];

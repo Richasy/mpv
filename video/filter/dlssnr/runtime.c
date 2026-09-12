@@ -30,7 +30,7 @@
 struct dlssnr_runtime {
     HMODULE core, model, bridge_module, module_pin, caller_module;
     const struct mpv_ngx_bridge_api *bridge;
-    HANDLE model_file;
+    HANDLE model_file, cache_lease;
     ID3D12Device *device;
     struct ngx_parameters *parameters;
     struct ngx_handle *feature;
@@ -302,7 +302,8 @@ static bool load_bridge(struct dlssnr_runtime *r, struct dlssnr_gpu_info *info)
 }
 
 struct dlssnr_runtime *dlssnr_runtime_open(
-    ID3D12Device *device, const wchar_t *path, struct dlssnr_gpu_info *info)
+    ID3D12Device *device, const wchar_t *path, const wchar_t *cache_path,
+    struct dlssnr_gpu_info *info)
 {
     info->caller_compatibility = false;
     info->model_signature_mismatch = false;
@@ -327,6 +328,12 @@ struct dlssnr_runtime *dlssnr_runtime_open(
     }
     r->device = device;
     ID3D12Device_AddRef(device);
+    HANDLE cache_lease = dlssnr_acquire_cache_directory(cache_path, info->error);
+    if (cache_lease == INVALID_HANDLE_VALUE) {
+        info->status = DLSSNR_RUNTIME_FAILED;
+        goto fail;
+    }
+    r->cache_lease = cache_lease;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            (const wchar_t *)&module_anchor, &r->caller_module)) {
@@ -389,26 +396,6 @@ struct dlssnr_runtime *dlssnr_runtime_open(
         goto fail;
     }
     *slash = 0;
-    wchar_t data_directory[32768];
-    DWORD data_length = GetModuleFileNameW(r->caller_module, data_directory, 32768);
-    wchar_t *data_slash = data_length && data_length < 32768 ?
-                          wcsrchr(data_directory, L'\\') : NULL;
-    static const wchar_t cache_suffix[] = L"\\dlssnr-cache";
-    if (!data_slash || (size_t)(data_slash - data_directory) +
-        sizeof(cache_suffix) / sizeof(cache_suffix[0]) > 32768) {
-        free(directory);
-        info->status = DLSSNR_RUNTIME_FAILED;
-        snprintf(info->error, sizeof(info->error), "Cannot resolve the NR cache directory");
-        goto fail;
-    }
-    wmemcpy(data_slash, cache_suffix, sizeof(cache_suffix) / sizeof(cache_suffix[0]));
-    if (!CreateDirectoryW(data_directory, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
-        free(directory);
-        info->status = DLSSNR_RUNTIME_FAILED;
-        snprintf(info->error, sizeof(info->error),
-                 "The libmpv-adjacent dlssnr-cache directory is not writable");
-        goto fail;
-    }
     const wchar_t *search[] = {directory};
     struct ngx_common_info common = {
         .search = {.paths = search, .count = 1},
@@ -418,12 +405,12 @@ struct dlssnr_runtime *dlssnr_runtime_open(
     bool initialized = false;
     __try {
         ngx_result result = core_init("b4f841f0-9c9b-4754-8b3a-1c79d4adb09a",
-            0, "mpv-native-dlssnr-1", data_directory, device, NGX_API_VERSION, &common);
+            0, "mpv-native-dlssnr-1", cache_path, device, NGX_API_VERSION, &common);
         if (sdk_result(info, "NGX core Init_ProjectID", result)) {
             r->core_initialized = true;
             result = allocate(&r->parameters);
             if (sdk_result(info, "NGX AllocateParameters", result) && r->parameters) {
-                result = r->bridge->init(model_init, 0, data_directory,
+                result = r->bridge->init(model_init, 0, cache_path,
                                           device, NGX_API_VERSION, NULL);
                 if (sdk_result(info, "NR model Init_Ext", result)) {
                     r->model_initialized = true;
@@ -607,6 +594,8 @@ bool dlssnr_runtime_close(struct dlssnr_runtime **runtime,
     if (r->bridge_module)
         FreeLibrary(r->bridge_module);
     ID3D12Device_Release(r->device);
+    if (r->cache_lease)
+        CloseHandle(r->cache_lease);
     HMODULE pin = r->module_pin;
     free(r);
     *runtime = NULL;

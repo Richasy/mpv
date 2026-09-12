@@ -89,6 +89,12 @@ bool dlssnr_options_valid(const struct dlssnr_options *o,
                               "drive-relative/rooted paths and control characters are invalid");
         return false;
     }
+    enum dlssnr_model_path_type cache_type = dlssnr_model_path_type(o->cache_path);
+    if (cache_type != DLSSNR_MODEL_DEFAULT && cache_type != DLSSNR_MODEL_ABSOLUTE) {
+        snprintf(error, size, "cache-path must be an absolute directory or empty "
+                              "for the per-user cache; relative paths are invalid");
+        return false;
+    }
     if (size)
         error[0] = 0;
     return true;
@@ -99,7 +105,9 @@ bool dlssnr_model_options_equal(const struct dlssnr_options *a,
 {
     const char *ap = a->model_path ? a->model_path : "";
     const char *bp = b->model_path ? b->model_path : "";
-    return a->preset == b->preset && !strcmp(ap, bp);
+    const char *ac = a->cache_path ? a->cache_path : "";
+    const char *bc = b->cache_path ? b->cache_path : "";
+    return a->preset == b->preset && !strcmp(ap, bp) && !strcmp(ac, bc);
 }
 
 bool dlssnr_options_equal(const struct dlssnr_options *a,

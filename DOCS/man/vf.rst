@@ -859,6 +859,20 @@ Available mpv-only filters are:
         Model creation preset (default: 0). Changing this can rebuild inference
         state. The meaning and availability of presets depend on the runtime.
 
+    ``cache-path=<path>``
+        Absolute directory for NGX temporary files and caches. Empty or omitted
+        selects ``mpv\cache\dlssnr`` under the Windows LocalAppData known folder,
+        independently of the working directory, model location and ``--no-config``.
+        The directory is created as needed and must be writable; an invalid
+        override fails instead of falling back to another location.
+        Embedded applications should supply their own per-identity cache path.
+        Changing the path reloads the runtime. This is not a memory-only cache:
+        NGX requires a writable filesystem directory.
+        The runtime holds a shared-read lease on ``mpv-dlssnr-cache.lock`` until
+        native shutdown completes. Cache maintenance must exclusively open
+        that file before deleting contents; filter removal alone does not
+        prove that asynchronously retiring native resources have stopped.
+
     ``style=<0-2>``
         Appearance style: default, natural, or cinematic (default: 0).
 

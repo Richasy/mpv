@@ -1468,6 +1468,7 @@ if features['dlssnr']
     endif
     sources += files('video/filter/vf_dlssnr.c',
                      'video/filter/dlssnr/params.c',
+                     'video/filter/dlssnr/cache.c',
                      'video/filter/dlssnr/shaders.c',
                      'video/filter/dlssnr/gpu.c',
                      'video/filter/dlssnr/runtime.c',

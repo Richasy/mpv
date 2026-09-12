@@ -56,6 +56,7 @@ static const struct m_option options[] = {
     {"motion-quality", OPT_INT(motion_quality), M_RANGE(0, 5)},
     {"nvof-follow-scaling", OPT_BOOL(nvof_follow_scaling)},
     {"max-height", OPT_INT(max_height), M_RANGE(0, INT_MAX)},
+    {"cache-path", OPT_STRING(cache_path)},
     {0}
 };
 
@@ -63,7 +64,7 @@ struct settings {
     _Atomic unsigned references;
     uint64_t serial;
     struct dlssnr_options options;
-    char model_path[];
+    char paths[];
 };
 
 struct job {
@@ -103,15 +104,19 @@ struct priv {
 static struct settings *new_settings(const struct dlssnr_options *o, uint64_t serial)
 {
     const char *path = o->model_path ? o->model_path : "";
+    const char *cache = o->cache_path ? o->cache_path : "";
     size_t length = strlen(path);
-    struct settings *s = malloc(sizeof(*s) + length + 1);
+    size_t cache_length = strlen(cache);
+    struct settings *s = malloc(sizeof(*s) + length + cache_length + 2);
     if (!s)
         return NULL;
     atomic_init(&s->references, 1);
     s->serial = serial;
     s->options = *o;
-    memcpy(s->model_path, path, length + 1);
-    s->options.model_path = s->model_path;
+    memcpy(s->paths, path, length + 1);
+    memcpy(s->paths + length + 1, cache, cache_length + 1);
+    s->options.model_path = s->paths;
+    s->options.cache_path = s->paths + length + 1;
     return s;
 }
 
@@ -148,6 +153,7 @@ static void record_delivery(struct priv *p, const struct ready_frame *ready,
         p->processed++;
         p->applied = ready->settings->options;
         p->applied.model_path = NULL;
+        p->applied.cache_path = NULL;
         p->applied_serial = ready->settings->serial;
     } else {
         p->passthrough++;
@@ -594,14 +600,16 @@ static bool set_option(struct mp_filter *f, const char *name, const char *value)
             break;
         }
     }
-    bool empty_path = option && !strcmp(option->name, "model-path");
+    bool empty_path = option && (!strcmp(option->name, "model-path") ||
+                                 !strcmp(option->name, "cache-path"));
     if (!option || (!*value && !empty_path))
         return false;
     mp_mutex_lock(&p->lock);
     struct dlssnr_options candidate = p->settings->options;
-    bool path_changed = !strcmp(option->name, "model-path");
-    if (path_changed)
-        candidate.model_path = NULL;
+    char **parsed_path = empty_path ?
+        (char **)((char *)&candidate + option->offset) : NULL;
+    if (parsed_path)
+        *parsed_path = NULL;
     int result = m_option_parse(f->log, option, bstr0(option->name), bstr0(value),
                                 (char *)&candidate + option->offset);
     char error[DLSSNR_ERROR_SIZE] = "";
@@ -612,21 +620,21 @@ static bool set_option(struct mp_filter *f, const char *name, const char *value)
         mp_mutex_unlock(&p->lock);
         if (error[0])
             MP_ERR(f, "%s\n", error);
-        if (path_changed)
-            talloc_free(candidate.model_path);
+        if (parsed_path)
+            talloc_free(*parsed_path);
         return false;
     }
     if (dlssnr_options_equal(&candidate, &p->settings->options)) {
         mp_mutex_unlock(&p->lock);
-        if (path_changed)
-            talloc_free(candidate.model_path);
+        if (parsed_path)
+            talloc_free(*parsed_path);
         return true;
     }
     struct settings *next = new_settings(&candidate, p->settings->serial + 1);
     if (!next) {
         mp_mutex_unlock(&p->lock);
-        if (path_changed)
-            talloc_free(candidate.model_path);
+        if (parsed_path)
+            talloc_free(*parsed_path);
         return false;
     }
     struct settings *old = p->settings;
@@ -642,8 +650,8 @@ static bool set_option(struct mp_filter *f, const char *name, const char *value)
         SetEvent(p->cancel_event);
     mp_mutex_unlock(&p->lock);
     unref_settings(old);
-    if (path_changed)
-        talloc_free(candidate.model_path);
+    if (parsed_path)
+        talloc_free(*parsed_path);
     return true;
 }
 

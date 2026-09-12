@@ -122,6 +122,7 @@ struct dlssnr_gpu {
     int width, height, proc_width, proc_height, preset;
     unsigned output_capacity;
     wchar_t *model_path;
+    char *cache_path;
     void *input_lifetime;
     void (*release_input)(void *);
 };
@@ -876,21 +877,40 @@ static bool configure(struct dlssnr_gpu *g, const struct dlssnr_gpu_input *input
     wchar_t path[32768];
     if (!dlssnr_resolve_model_path(options->model_path, path, 32768, g->info.error))
         return false;
-    bool model_changed = !g->model_path || wcscmp(g->model_path, path);
-    if (model_changed) {
-        if (!dlssnr_runtime_close(&g->runtime, &g->info))
+    const char *configured_cache = options->cache_path ? options->cache_path : "";
+    bool runtime_changed = !g->model_path || wcscmp(g->model_path, path) ||
+        !g->cache_path || strcmp(g->cache_path, configured_cache);
+    if (runtime_changed) {
+        wchar_t cache_path[32768];
+        if (!dlssnr_resolve_cache_path(configured_cache, cache_path, 32768,
+                                       g->info.error)) {
+            g->info.status = DLSSNR_RUNTIME_FAILED;
             return false;
-        g->runtime = dlssnr_runtime_open(g->device12, path, &g->info);
-        if (!g->runtime)
-            return false;
-        g->info.runtime_loads++;
+        }
         size_t count = wcslen(path) + 1;
         wchar_t *copy = malloc(count * sizeof(wchar_t));
-        if (!copy)
+        char *cache_copy = malloc(strlen(configured_cache) + 1);
+        if (!copy || !cache_copy) {
+            free(copy);
+            free(cache_copy);
+            g->info.status = DLSSNR_RUNTIME_FAILED;
+            snprintf(g->info.error, sizeof(g->info.error),
+                     "Out of memory retaining DLSSNR runtime paths");
             return false;
+        }
         wmemcpy(copy, path, count);
+        strcpy(cache_copy, configured_cache);
+        if (!dlssnr_runtime_close(&g->runtime, &g->info) ||
+            !(g->runtime = dlssnr_runtime_open(g->device12, path, cache_path, &g->info))) {
+            free(copy);
+            free(cache_copy);
+            return false;
+        }
+        g->info.runtime_loads++;
         free(g->model_path);
+        free(g->cache_path);
         g->model_path = copy;
+        g->cache_path = cache_copy;
     }
     bool full_size = !g->pool || g->pool->capacity != g->output_capacity ||
         g->width != width || g->height != height ||
@@ -898,7 +918,7 @@ static bool configure(struct dlssnr_gpu *g, const struct dlssnr_gpu_input *input
         g->input_desc.Format != desc.Format;
     bool resized = full_size || !g->initialized ||
         g->proc_width != proc_width || g->proc_height != proc_height;
-    bool rebuild = resized || model_changed || g->preset != options->preset;
+    bool rebuild = resized || runtime_changed || g->preset != options->preset;
     if (rebuild && !dlssnr_runtime_release_feature(g->runtime, &g->info))
         return false;
     g->width = width;
@@ -954,6 +974,7 @@ static bool free_gpu(struct dlssnr_gpu *g)
     if (g->d3d12_module)
         FreeLibrary(g->d3d12_module);
     free(g->model_path);
+    free(g->cache_path);
     return true;
 }
 

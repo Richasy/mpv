@@ -50,6 +50,8 @@ WINBUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/winbuild"
 
 MPV_REPO="${MPV_REPO:-https://github.com/Richasy/mpv.git}"
 MPV_COMMIT="${MPV_COMMIT:-master}"
+export FFMPEG_COMMIT="${FFMPEG_COMMIT:-df21143bf252528f45d7ae56cc1d317ff00d4449}"
+# Keep the default synchronized with the Player native dependency pin.
 BUILD_TYPE="${BUILD_TYPE:-release}"
 case "$BUILD_TYPE" in
     release|debug) ;;

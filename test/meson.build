@@ -96,6 +96,7 @@ test('json', json)
 translation_objects = libmpv.extract_objects(
     'player/translation.c',
     'player/whisper_translate.c',
+    'player/sub_translate_policy.c',
     'player/sub_translate_utils.c',
 )
 translation_test = executable(

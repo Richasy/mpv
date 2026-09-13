@@ -182,6 +182,7 @@ sources = files(
     'player/scripting.c',
     'player/sub.c',
     'player/sub_translate.c',
+    'player/sub_translate_policy.c',
     'player/sub_translate_utils.c',
     'player/thumbnail.c',
     'player/translation.c',

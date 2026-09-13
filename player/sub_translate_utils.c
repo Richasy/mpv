@@ -15,57 +15,14 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <string.h>
-
 #include "mpv_talloc.h"
-
-#include "common/common.h"
-#include "misc/bstr.h"
 
 #include "sub_translate.h"
 
-bool sub_translate_is_generated_profile(const char *profile)
-{
-    return profile &&
-        (strcmp(profile, "whisper") == 0 ||
-         strcmp(profile, "translated") == 0);
-}
-
-enum sub_translate_source_class sub_translate_classify_source(
-    const char *profile, bool text_supported)
-{
-    if (sub_translate_is_generated_profile(profile))
-        return SUB_TRANSLATE_SOURCE_GENERATED;
-    return text_supported ? SUB_TRANSLATE_SOURCE_TEXT
-                          : SUB_TRANSLATE_SOURCE_BITMAP;
-}
-
 char *sub_translate_escape_ass(void *talloc_parent, const char *text)
 {
-    bstr escaped = {0};
-    for (const unsigned char *cursor =
-             (const unsigned char *)(text ? text : "");
-         *cursor; cursor++)
-    {
-        if (*cursor == '\r') {
-            if (cursor[1] == '\n')
-                continue;
-            bstr_xappend(talloc_parent, &escaped, bstr0("\\N"));
-        } else if (*cursor == '\n') {
-            bstr_xappend(talloc_parent, &escaped, bstr0("\\N"));
-        } else if (*cursor == '{') {
-            bstr_xappend(talloc_parent, &escaped, bstr0("\\{"));
-        } else if (*cursor == '\\') {
-            bstr_xappend(talloc_parent, &escaped, bstr0("\\"));
-            mp_append_utf8_bstr(talloc_parent, &escaped, 0x2060);
-        } else {
-            bstr_xappend(talloc_parent, &escaped,
-                         (bstr){(char *)cursor, 1});
-        }
-    }
-    char *result = escaped.start
-        ? bstrto0(talloc_parent, escaped)
-        : talloc_strdup(talloc_parent, "");
-    talloc_free(escaped.start);
+    size_t length = sub_translate_escape_ass_buffer(NULL, 0, text);
+    char *result = talloc_array(talloc_parent, char, length + 1);
+    sub_translate_escape_ass_buffer(result, length + 1, text);
     return result;
 }

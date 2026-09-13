@@ -19,6 +19,7 @@
 #define MP_SUB_TRANSLATE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 struct MPContext;
 struct track;
@@ -48,6 +49,8 @@ void sub_translate_destroy(struct MPContext *mpctx);
 bool sub_translate_is_generated_profile(const char *profile);
 enum sub_translate_source_class sub_translate_classify_source(
     const char *profile, bool text_supported);
+size_t sub_translate_escape_ass_buffer(char *buffer, size_t size,
+                                       const char *text);
 char *sub_translate_escape_ass(void *talloc_parent, const char *text);
 
 #endif

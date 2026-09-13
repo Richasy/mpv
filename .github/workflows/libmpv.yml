@@ -29,7 +29,7 @@ on:
       ffmpeg_ref:
         description: 'Richasy/FFmpeg commit, branch, or tag'
         type: string
-        default: master
+        default: df21143bf252528f45d7ae56cc1d317ff00d4449
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -74,7 +74,7 @@ jobs:
       TARGET_ARCH: ${{ matrix.arch }}
       MPV_REPO: https://github.com/Richasy/mpv.git
       MPV_COMMIT: ${{ github.sha }}
-      FFMPEG_COMMIT: ${{ inputs.ffmpeg_ref || 'master' }}
+      FFMPEG_COMMIT: ${{ inputs.ffmpeg_ref || 'df21143bf252528f45d7ae56cc1d317ff00d4449' }}
       BUILD_TYPE: ${{ inputs.build_type }}
       BUILD_SUFFIX: ${{ inputs.build_type == 'debug' && '-debug' || '' }}
     steps:
@@ -93,6 +93,15 @@ jobs:
             video/filter/dlssnr/test_params.c video/filter/dlssnr/params.c \
             -lm -o /tmp/dlssnr-params-test
           /tmp/dlssnr-params-test
+
+      - name: Test subtitle translation policy
+        if: matrix.arch == 'x86_64'
+        run: |
+          mkdir -p build/preflight
+          cc -std=c11 -Wall -Wextra -Werror -I. \
+            test/sub_translate_policy.c player/sub_translate_policy.c \
+            -o build/preflight/sub-translate-policy-test
+          build/preflight/sub-translate-policy-test
 
       - name: Ensure PATH includes local bin
         run: echo "$HOME/.local/bin" >> $GITHUB_PATH

@@ -508,6 +508,10 @@ typedef struct MPContext {
     struct mp_als *als_state; // lazily initialized on first use
 
     struct whisper_lookahead *whisper_lookahead;
+    mp_mutex translation_lock;
+    bool translation_init_attempted;
+    struct mp_translation *translation;
+    struct sub_translate_state *sub_translate;
     // Circuit breaker: remembers the whisper-lookahead opts string for which
     // init most recently failed, so the playloop does not infinitely restart
     // the lookahead pipeline. Cleared (and a fresh attempt allowed) when the
@@ -739,6 +743,7 @@ int64_t mp_load_user_script(struct MPContext *mpctx, const char *fname);
 void redraw_subs(struct MPContext *mpctx);
 void reset_subtitle_state(struct MPContext *mpctx);
 void reset_whisper_subtitle_track(struct MPContext *mpctx);
+void reset_translated_subtitle_track(struct MPContext *mpctx);
 void reinit_sub(struct MPContext *mpctx, struct track *track);
 void reinit_sub_all(struct MPContext *mpctx);
 void uninit_sub(struct MPContext *mpctx, struct track *track);

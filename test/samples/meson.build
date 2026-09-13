@@ -94,6 +94,64 @@ foreach name, cmd: samples
          depends: target, env: env, suite: 'libmpv')
 endforeach
 
+sub_translation_video = custom_target(
+    'sub-translation-video.mkv',
+    output: 'sub-translation-video.mkv',
+    command: [
+        ffmpeg, '-v', 'error', '-y', '-f', 'lavfi', '-i',
+        'testsrc=duration=20:size=320x180', '-c:v', 'mpeg2video', '@OUTPUT@',
+    ],
+)
+
+sub_translation_embedded = custom_target(
+    'sub-translation-embedded.mkv',
+    output: 'sub-translation-embedded.mkv',
+    depends: sub_translation_video,
+    command: [
+        ffmpeg, '-v', 'error', '-y', '-i', sub_translation_video,
+        '-f', 'srt', '-i', sub, '-c', 'copy',
+        '-map', '0:0', '-map', '1:0',
+        '-disposition:s:0', 'default', '@OUTPUT@',
+    ],
+)
+
+sub_translation_dual = custom_target(
+    'sub-translation-dual.mkv',
+    output: 'sub-translation-dual.mkv',
+    depends: sub_translation_video,
+    command: [
+        ffmpeg, '-v', 'error', '-y', '-i', sub_translation_video,
+        '-f', 'srt', '-i', sub, '-f', 'srt', '-i', sub, '-c', 'copy',
+        '-map', '0:0', '-map', '1:0', '-map', '2:0',
+        '-disposition:s:0', 'default', '-disposition:s:1', '0', '@OUTPUT@',
+    ],
+)
+
+sub_translation_test = executable(
+    'libmpv-test-sub-translation',
+    '../libmpv_test_sub_translation.c',
+    include_directories: incdir,
+    dependencies: libmpv_dep,
+)
+test(
+    'libmpv-sub-translation',
+    python,
+    args: [
+        files('../libmpv_sub_translation.py'),
+        sub_translation_test,
+        sub_translation_embedded.full_path(),
+        sub_translation_video.full_path(),
+        sub,
+        join_paths(source_root, 'test', 'samples', 'img_sub.idx'),
+        sub_translation_dual.full_path(),
+        join_paths(source_root, 'test', 'samples', 'sub_translate.ass'),
+    ],
+    depends: [sub_translation_test, sub_translation_embedded,
+              sub_translation_dual, sub_translation_video],
+    suite: 'libmpv',
+    timeout: 90,
+)
+
 
 sdh_default = join_paths(source_root, 'test', 'samples', 'sdh_default.srt')
 sdh_mixed = join_paths(source_root, 'test', 'samples', 'sdh_mixed.srt')

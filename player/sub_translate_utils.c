@@ -15,21 +15,14 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef MP_JSON_H
-#define MP_JSON_H
+#include "mpv_talloc.h"
 
-#include <stdbool.h>
+#include "sub_translate.h"
 
-#define MAX_JSON_DEPTH 50
-
-struct bstr;
-struct mpv_node;
-
-int json_parse(void *ta_parent, struct mpv_node *dst, char **src, int max_depth);
-bool json_validate_strict(const char *src, int max_depth);
-int json_append(struct bstr *b, const struct mpv_node *src, int indent);
-void json_skip_whitespace(char **src);
-int json_write(char **s, struct mpv_node *src);
-int json_write_pretty(char **s, struct mpv_node *src);
-
-#endif
+char *sub_translate_escape_ass(void *talloc_parent, const char *text)
+{
+    size_t length = sub_translate_escape_ass_buffer(NULL, 0, text);
+    char *result = talloc_array(talloc_parent, char, length + 1);
+    sub_translate_escape_ass_buffer(result, length + 1, text);
+    return result;
+}

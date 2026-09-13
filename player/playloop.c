@@ -26,6 +26,7 @@
 #include "core.h"
 #include "mpv_talloc.h"
 #include "screenshot.h"
+#include "sub_translate.h"
 
 #include "audio/out/ao.h"
 #include "common/common.h"
@@ -417,6 +418,7 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
     }
 
     whisper_lookahead_seek(mpctx, seek_pts);
+    sub_translate_seek(mpctx);
 
     if (!(seek.flags & MPSEEK_FLAG_NOFLUSH))
         clear_audio_output_buffers(mpctx);
@@ -1440,6 +1442,7 @@ void run_playloop(struct MPContext *mpctx)
     }
 
     update_demuxer_properties(mpctx);
+    sub_translate_update(mpctx);
 
     update_sparse_video(mpctx);
 

@@ -90,14 +90,23 @@ The script will patch `mpv.cmake` to point to this fork, build the LLVM toolchai
 
 ### CI
 
-The GitHub Actions workflow (`.github/workflows/libmpv.yml`) is configured for manual dispatch only (`workflow_dispatch`). It runs on a self-hosted Linux runner and outputs artifacts to a local directory.
+The GitHub Actions workflow (`.github/workflows/libmpv.yml`) is configured for
+manual dispatch only (`workflow_dispatch`). Normal builds run on the
+self-hosted Linux runner and output artifacts to a local directory; the
+artifact-only Azure retry runs on a bounded GitHub-hosted publication job and
+does not invoke the native build.
 
 Use the workflow's `ffmpeg_ref` input (or `FFMPEG_COMMIT` for the build script)
 to build an exact companion FFmpeg revision without changing the default branch.
-It defaults to `master`. For a coordinated upgrade, select the committed FFmpeg
-SHA and use `upload_target=github` until the artifact set is ready to publish.
-GitHub-only runs omit ARM64. The `build_arm64` input is honored only when
-`upload_target` is `azure` or `both`; ordinary artifact builds use x64.
+It defaults to the Player-pinned
+`df21143bf252528f45d7ae56cc1d317ff00d4449` commit. For a coordinated upgrade,
+select the committed FFmpeg SHA and use `upload_target=github` until the
+artifact set is ready to publish. GitHub-only runs omit ARM64. The
+`build_arm64` input is honored only when `upload_target` is `azure` or `both`;
+ordinary artifact builds use x64.
+
+To retry only Azure publication from the exact bytes of a prior GitHub Actions
+artifact, see [Artifact-only Azure retry](DOCS/artifact-only-azure-retry.md).
 
 ## Upstream integration: 2026-09-07
 

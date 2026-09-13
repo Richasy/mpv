@@ -16,7 +16,8 @@ set -e
 # Optional environment variables:
 #   MPV_REPO      - mpv git repository URL (default: https://github.com/Richasy/mpv.git)
 #   MPV_COMMIT    - mpv git commit/branch/tag (default: master)
-#   FFMPEG_COMMIT - Richasy/FFmpeg git commit/branch/tag (default: master)
+#   FFMPEG_COMMIT - Richasy/FFmpeg git commit/branch/tag
+#                   (default: df21143bf252528f45d7ae56cc1d317ff00d4449)
 #   MPV_SRC_DIR   - path to mpv source (for copying headers)
 #   BUILD_TYPE    - 'release' (default) or 'debug'. Debug switches mpv meson
 #                   options to -Doptimization=0 -Db_lto=false -Db_ndebug=false

@@ -550,9 +550,20 @@ static void test_config_and_source_policy(void)
     assert_int_equal(
         mp_translation_configure_legacy_whisper(
             translation, WT_PROVIDER_GOOGLE,
-            "en", "zh", NULL, NULL),
+            "en", "zh", NULL,
+            "{\"enabled\":true,\"horizon_sec\":33,"
+            "\"seek_debounce_ms\":25,\"min_text_chars\":2}"),
         0);
     assert_true(mp_translation_has_backend(translation));
+    struct mp_translation_limits limits;
+    mp_translation_get_limits(translation, &limits);
+    assert_int_equal(limits.horizon_sec, 33);
+    assert_int_equal(limits.seek_debounce_ms, 25);
+    char *status = mp_translation_get_legacy_status(translation, NULL);
+    mp_require(status);
+    mp_require(strstr(status, "\"horizon_sec\":33"));
+    mp_require(strstr(status, "\"session_req_used\":0"));
+    talloc_free(status);
     mp_translation_stop_legacy_whisper(translation);
     assert_false(mp_translation_has_backend(translation));
     mp_translation_destroy(&translation);

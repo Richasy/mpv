@@ -46,9 +46,10 @@ class TranslationHandler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
-    if len(sys.argv) != 7:
+    if len(sys.argv) != 8:
         raise SystemExit(
-            "expected executable, embedded, video, external, bitmap, and dual"
+            "expected executable, embedded, video, external, bitmap, dual, "
+            "and ASS fixtures"
         )
     server = TranslationServer()
     worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -77,10 +78,15 @@ def main():
             )
         with server.lock:
             requests = list(server.requests)
-        if sorted(requests) != ["bar", "foo"]:
+        allowed = {"foo", "bar", "Hello\nworld", "I", "Repeat"}
+        if not allowed.issubset(requests) or any(
+            text not in allowed for text in requests
+        ):
             raise RuntimeError(
                 f"unexpected translated request set: {requests!r}"
             )
+        if any("{\\i" in text for text in requests):
+            raise RuntimeError("ASS override tags reached the translator")
         if any("http://" in text or "fixture-secret" in text
                for text in requests):
             raise RuntimeError("private configuration leaked into translation text")

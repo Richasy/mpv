@@ -144,6 +144,7 @@ test(
         sub,
         join_paths(source_root, 'test', 'samples', 'img_sub.idx'),
         sub_translation_dual.full_path(),
+        join_paths(source_root, 'test', 'samples', 'sub_translate.ass'),
     ],
     depends: [sub_translation_test, sub_translation_embedded,
               sub_translation_dual, sub_translation_video],

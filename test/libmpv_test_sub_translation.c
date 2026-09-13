@@ -295,6 +295,49 @@ static void test_bitmap(const char *video, const char *bitmap)
     mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
 }
 
+static int count_occurrences(const char *text, const char *needle)
+{
+    int count = 0;
+    size_t length = strlen(needle);
+    while ((text = strstr(text, needle))) {
+        count++;
+        text += length;
+    }
+    return count;
+}
+
+static void test_ass_dialogue(const char *video, const char *subtitle)
+{
+    load_file(video);
+    command(((const char *[]){"sub-add", subtitle, "select", NULL}));
+    int enabled = 1;
+    mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    int paused = 0;
+    mpv_set_property(ctx, "pause", MPV_FORMAT_FLAG, &paused);
+    wait_for_translated_count(4);
+    advance_to(1.2);
+
+    char *text = get_string("secondary-sub-text");
+    if (!strstr(text, "translated:Hello\nworld") ||
+        !strstr(text, "translated:I") ||
+        count_occurrences(text, "translated:Repeat") != 2 ||
+        strstr(text, "{\\i"))
+    {
+        fail("ASS dialogue translation lost formatting isolation, short "
+             "text, repetition, or overlap: %s\n", text);
+    }
+    mpv_free(text);
+    double start;
+    double end;
+    get_property("secondary-sub-start", MPV_FORMAT_DOUBLE, &start);
+    get_property("secondary-sub-end", MPV_FORMAT_DOUBLE, &end);
+    if (start != 0.0 || end != 3.0)
+        fail("Overlapping ASS cue times changed.\n");
+
+    enabled = 0;
+    mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+}
+
 static void find_two_subtitles(int64_t *first, int64_t *second)
 {
     struct mpv_node tracks = {0};
@@ -348,7 +391,7 @@ static void test_secondary_conflict(const char *path)
 
 int main(int argc, char **argv)
 {
-    if (argc != 7)
+    if (argc != 8)
         return 1;
     ctx = mpv_create();
     if (!ctx)
@@ -366,6 +409,7 @@ int main(int argc, char **argv)
     test_external(argv[3], argv[4]);
     test_bitmap(argv[3], argv[5]);
     test_secondary_conflict(argv[6]);
+    test_ass_dialogue(argv[3], argv[7]);
     command_string("quit");
     while (wrap_wait_event()->event_id != MPV_EVENT_SHUTDOWN) {}
     return 0;

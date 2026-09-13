@@ -79,6 +79,8 @@ struct dec_sub {
 
     double last_vo_pts;
     struct sd *sd;
+    sub_text_cue_fn text_cue_callback;
+    void *text_cue_callback_ctx;
 
     struct demux_packet *new_segment;
     struct demux_packet **cached_pkts;
@@ -173,6 +175,8 @@ static struct sd *init_decoder(struct dec_sub *sub)
             .attachments = sub->attachments,
             .codec = sub->codec,
             .lang = sub->lang,
+            .text_cue_callback = sub->text_cue_callback,
+            .text_cue_callback_ctx = sub->text_cue_callback_ctx,
             .preload_ok = true,
         };
 
@@ -632,6 +636,36 @@ struct sub_lines *sub_get_lines(struct dec_sub *sub)
         qsort(res->entries, res->num_entries, sizeof(res->entries[0]),
               sub_line_cmp);
     }
+
     mp_mutex_unlock(&sub->lock);
     return res;
+}
+
+bool sub_set_text_cue_callback(struct dec_sub *sub,
+                               sub_text_cue_fn callback, void *callback_ctx)
+{
+    if (!sub)
+        return false;
+    mp_mutex_lock(&sub->lock);
+    bool supported = sub->sd && sub->sd->driver->emit_text_cues;
+    sub->text_cue_callback = supported ? callback : NULL;
+    sub->text_cue_callback_ctx = supported ? callback_ctx : NULL;
+    if (sub->sd) {
+        sub->sd->text_cue_callback = sub->text_cue_callback;
+        sub->sd->text_cue_callback_ctx = sub->text_cue_callback_ctx;
+    }
+    mp_mutex_unlock(&sub->lock);
+    return supported;
+}
+
+bool sub_emit_text_cues(struct dec_sub *sub, double start, double end)
+{
+    if (!sub)
+        return false;
+    mp_mutex_lock(&sub->lock);
+    bool supported = sub->sd && sub->sd->driver->emit_text_cues;
+    if (supported && sub->text_cue_callback)
+        sub->sd->driver->emit_text_cues(sub->sd, start, end);
+    mp_mutex_unlock(&sub->lock);
+    return supported;
 }

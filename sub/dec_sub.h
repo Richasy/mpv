@@ -52,6 +52,16 @@ struct sub_lines {
     int num_entries;
 };
 
+struct sub_text_cue {
+    uint64_t id;
+    double start;
+    double duration;
+    const char *text; // valid only for the duration of the callback
+};
+
+typedef void (*sub_text_cue_fn)(void *ctx,
+                                const struct sub_text_cue *cue);
+
 struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
                            struct attachment_list *attachments, int order);
 void sub_destroy(struct dec_sub *sub);
@@ -68,6 +78,11 @@ char *sub_ass_get_extradata(struct dec_sub *sub);
 struct sd_times sub_get_times(struct dec_sub *sub, double pts);
 // Return subtitle lines in memory. Call talloc_free() on the return value.
 struct sub_lines *sub_get_lines(struct dec_sub *sub);
+bool sub_set_text_cue_callback(struct dec_sub *sub,
+                               sub_text_cue_fn callback, void *callback_ctx);
+// Re-emit decoded text cues overlapping [start, end]. This is a decoder tap,
+// not an OSD text snapshot, and can include overlapping or future cues.
+bool sub_emit_text_cues(struct dec_sub *sub, double start, double end);
 
 void sub_reset(struct dec_sub *sub);
 void sub_select(struct dec_sub *sub, bool selected);

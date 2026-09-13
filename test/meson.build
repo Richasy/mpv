@@ -109,6 +109,16 @@ translation_test = executable(
 )
 test('translation', translation_test)
 
+translation_provider = executable(
+    'translation-provider',
+    'translation_provider.c',
+    include_directories: incdir,
+    objects: libmpv.extract_objects('player/whisper_translate.c'),
+    dependencies: [cc.find_library('winhttp')],
+    link_with: test_utils,
+)
+test('translation-provider', translation_provider)
+
 subtitle_timing = executable(
     'subtitle-timing',
     'subtitle_timing.c',

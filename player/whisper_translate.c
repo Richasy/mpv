@@ -22,9 +22,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
-#include <ctype.h>
-#include <time.h>
 #include <stdatomic.h>
+#include <limits.h>
 
 #include <windows.h>
 #include <winhttp.h>
@@ -38,6 +37,7 @@
 #include "misc/node.h"
 #include "osdep/threads.h"
 #include "whisper_translate.h"
+#include "whisper_translate_test.h"
 
 // --- struct definition ---
 
@@ -45,8 +45,19 @@
 #define WT_MAX_TIMEOUT_MS         5000
 #define WT_DEFAULT_MAX_TOKENS     128
 #define WT_BACKOFF_FAIL_THRESHOLD 5
-#define WT_BACKOFF_MS             30000
-#define WT_RATE_LIMIT_BACKOFF_MS  15000
+#define WT_BACKOFF_BASE_MS        5000
+#define WT_BACKOFF_MAX_MS         60000
+#define WT_CHALLENGE_BACKOFF_MS   30000
+#define WT_RATE_LIMIT_BACKOFF_MS  60000
+#define WT_PROBE_WAIT_MS          1000
+#define WT_MAX_INPUT_CODEPOINTS   5000
+#define WT_MAX_RESPONSE_BYTES     (1024 * 1024)
+
+enum wt_cooldown_kind {
+    WT_COOLDOWN_NONE,
+    WT_COOLDOWN_GENERIC,
+    WT_COOLDOWN_RATE_LIMIT,
+};
 
 struct whisper_translator {
     struct mp_log *log;
@@ -68,6 +79,12 @@ struct whisper_translator {
     int   oa_timeout_ms;        // hard-clamped <= WT_MAX_TIMEOUT_MS at init
     int   oa_max_tokens;
 
+    wt_http_transport_fn transport;
+    void *transport_ctx;
+    wt_clock_fn monotonic_ms;
+    wt_clock_fn unix_ms;
+    void *clock_ctx;
+
     // Refcount: pipeline workers acquire while a translation is in flight,
     // so destroy can't race with HTTP. >=1 means alive.
     atomic_int refcount;
@@ -76,21 +93,42 @@ struct whisper_translator {
     // while holding this lock (release before, re-acquire after).
     mp_mutex state_lock;
 
-    // Azure-only mutable state (refreshed lazily under state_lock).
-    char *azure_token;
-    int64_t azure_token_expires;
-    bool azure_token_refresh_in_flight;
-
     // Common: failure / backoff state
     int fail_count;
     int64_t backoff_until_ms;   // GetTickCount64 epoch
+    enum wt_cooldown_kind cooldown_kind;
+    uint64_t cooldown_generation;
+    bool cooldown_probe_in_flight;
 };
 
 // --- Helpers ---
 
-static int64_t wt_now_ms(void)
+static int64_t real_monotonic_ms(void *ctx)
 {
+    (void)ctx;
     return (int64_t)GetTickCount64();
+}
+
+static int64_t real_unix_ms(void *ctx)
+{
+    (void)ctx;
+    FILETIME file_time;
+    GetSystemTimeAsFileTime(&file_time);
+    ULARGE_INTEGER ticks = {
+        .LowPart = file_time.dwLowDateTime,
+        .HighPart = file_time.dwHighDateTime,
+    };
+    return (int64_t)(ticks.QuadPart / 10000ULL) - 11644473600000LL;
+}
+
+static int64_t translator_monotonic_ms(struct whisper_translator *tr)
+{
+    return tr->monotonic_ms(tr->clock_ctx);
+}
+
+static int64_t translator_unix_ms(struct whisper_translator *tr)
+{
+    return tr->unix_ms(tr->clock_ctx);
 }
 
 static void set_err(struct wt_call_result *out, const char *fmt, ...)
@@ -108,20 +146,144 @@ static WCHAR *utf8_to_wide(void *talloc_ctx, const char *utf8)
 {
     if (!utf8 || !utf8[0])
         return NULL;
-    int len = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    int len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                  utf8, -1, NULL, 0);
     if (len <= 0)
         return NULL;
     WCHAR *wide = talloc_array(talloc_ctx, WCHAR, len);
-    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide, len);
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                             utf8, -1, wide, len))
+    {
+        talloc_free(wide);
+        return NULL;
+    }
     return wide;
 }
 
-// URL-encode a UTF-8 string (talloc allocated)
-static char *url_encode(void *talloc_ctx, const char *src)
+static bool ascii_equal_ci(const char *a, const char *b)
+{
+    if (!a || !b)
+        return a == b;
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a++;
+        unsigned char cb = (unsigned char)*b++;
+        if (ca >= 'A' && ca <= 'Z')
+            ca += 'a' - 'A';
+        if (cb >= 'A' && cb <= 'Z')
+            cb += 'a' - 'A';
+        if (ca != cb)
+            return false;
+    }
+    return !*a && !*b;
+}
+
+static bool valid_language_code(const char *lang)
+{
+    if (!lang)
+        return false;
+    size_t len = strlen(lang);
+    if (len < 2 || len > 35)
+        return false;
+
+    int subtag_len = 0;
+    bool first = true;
+    for (size_t n = 0; n <= len; n++) {
+        unsigned char c = (unsigned char)lang[n];
+        if (c == '-' || c == '\0') {
+            if (subtag_len < (first ? 2 : 1) || subtag_len > 8)
+                return false;
+            first = false;
+            subtag_len = 0;
+            continue;
+        }
+        if (first) {
+            if (!((c >= 'A' && c <= 'Z') ||
+                  (c >= 'a' && c <= 'z')))
+            {
+                return false;
+            }
+        } else if (!((c >= 'A' && c <= 'Z') ||
+                     (c >= 'a' && c <= 'z') ||
+                     (c >= '0' && c <= '9')))
+        {
+            return false;
+        }
+        subtag_len++;
+    }
+    return true;
+}
+
+enum wt_text_validation {
+    WT_TEXT_VALID,
+    WT_TEXT_INVALID_UTF8,
+    WT_TEXT_TOO_LONG,
+};
+
+static enum wt_text_validation validate_text(const char *text,
+                                             size_t max_codepoints)
+{
+    const unsigned char *p = (const unsigned char *)text;
+    size_t count = 0;
+    while (*p) {
+        size_t length;
+        if (*p <= 0x7f) {
+            length = 1;
+        } else if (*p >= 0xc2 && *p <= 0xdf &&
+                   p[1] >= 0x80 && p[1] <= 0xbf)
+        {
+            length = 2;
+        } else if (*p == 0xe0 &&
+                   p[1] >= 0xa0 && p[1] <= 0xbf &&
+                   p[2] >= 0x80 && p[2] <= 0xbf)
+        {
+            length = 3;
+        } else if (((*p >= 0xe1 && *p <= 0xec) ||
+                    (*p >= 0xee && *p <= 0xef)) &&
+                   p[1] >= 0x80 && p[1] <= 0xbf &&
+                   p[2] >= 0x80 && p[2] <= 0xbf)
+        {
+            length = 3;
+        } else if (*p == 0xed &&
+                   p[1] >= 0x80 && p[1] <= 0x9f &&
+                   p[2] >= 0x80 && p[2] <= 0xbf)
+        {
+            length = 3;
+        } else if (*p == 0xf0 &&
+                   p[1] >= 0x90 && p[1] <= 0xbf &&
+                   p[2] >= 0x80 && p[2] <= 0xbf &&
+                   p[3] >= 0x80 && p[3] <= 0xbf)
+        {
+            length = 4;
+        } else if (*p >= 0xf1 && *p <= 0xf3 &&
+                   p[1] >= 0x80 && p[1] <= 0xbf &&
+                   p[2] >= 0x80 && p[2] <= 0xbf &&
+                   p[3] >= 0x80 && p[3] <= 0xbf)
+        {
+            length = 4;
+        } else if (*p == 0xf4 &&
+                   p[1] >= 0x80 && p[1] <= 0x8f &&
+                   p[2] >= 0x80 && p[2] <= 0xbf &&
+                   p[3] >= 0x80 && p[3] <= 0xbf)
+        {
+            length = 4;
+        } else {
+            return WT_TEXT_INVALID_UTF8;
+        }
+        p += length;
+        if (++count > max_codepoints)
+            return WT_TEXT_TOO_LONG;
+    }
+    return WT_TEXT_VALID;
+}
+
+// application/x-www-form-urlencoded encoding of a UTF-8 string.
+static char *form_encode(void *talloc_ctx, const char *src)
 {
     if (!src)
         return NULL;
     size_t src_len = strlen(src);
+    if (src_len > (SIZE_MAX - 1) / 3)
+        return NULL;
     char *buf = talloc_array(talloc_ctx, char, src_len * 3 + 1);
     char *dst = buf;
     for (size_t i = 0; i < src_len; i++) {
@@ -141,35 +303,30 @@ static char *url_encode(void *talloc_ctx, const char *src)
     return buf;
 }
 
-// Decode common HTML entities in-place
-static void html_entity_decode(char *s)
+static int saturated_int64_to_int(int64_t value)
 {
-    if (!s)
-        return;
-    struct { const char *entity; char replacement; } entities[] = {
-        {"&amp;",  '&'},
-        {"&lt;",   '<'},
-        {"&gt;",   '>'},
-        {"&quot;", '"'},
-        {"&#39;",  '\''},
-    };
-    char *read = s;
-    char *write = s;
-    while (*read) {
-        bool found = false;
-        for (int i = 0; i < 5; i++) {
-            size_t elen = strlen(entities[i].entity);
-            if (strncmp(read, entities[i].entity, elen) == 0) {
-                *write++ = entities[i].replacement;
-                read += elen;
-                found = true;
-                break;
-            }
-        }
-        if (!found)
-            *write++ = *read++;
+    if (value <= 0)
+        return 0;
+    return value > INT_MAX ? INT_MAX : (int)value;
+}
+
+static int64_t saturated_add_ms(int64_t now, int64_t delay)
+{
+    if (delay <= 0)
+        return now;
+    if (now > INT64_MAX - delay)
+        return INT64_MAX;
+    return now + delay;
+}
+
+static const char *provider_name(enum wt_provider provider)
+{
+    switch (provider) {
+    case WT_PROVIDER_GOOGLE: return "google";
+    case WT_PROVIDER_AZURE: return "azure";
+    case WT_PROVIDER_OPENAI: return "openai";
+    default: return "translation";
     }
-    *write = '\0';
 }
 
 // --- URL parser ---
@@ -254,427 +411,722 @@ static bool parse_endpoint_url(void *parent, const char *url,
     return true;
 }
 
-// --- WinHTTP request helpers ---
+// --- HTTP request helpers ---
 
-// Send an HTTP request and read the full response body as UTF-8.
-// Returns talloc-allocated string, or NULL on failure.
-//
-// Pass session=NULL to fall back to tr's default session. `secure` only
-// matters when path is for https vs http; pass false for plain http.
-//
-// Outputs:
-//   *out_status         HTTP status (0 if no response was received).
-//   *out_rate_limited   true if status==429 (or status>=500 with Retry-After).
-//   *out_retry_after_ms Retry-After header in milliseconds (0 if absent or
-//                       malformed). Honors both seconds and HTTP-date forms,
-//                       but only the seconds form is parsed precisely; date
-//                       form yields 0 (caller falls back to default backoff).
-static char *winhttp_request(void *talloc_ctx, struct mp_log *log,
-                             HINTERNET session,
-                             const WCHAR *host, int port, bool secure,
-                             const WCHAR *verb,
-                             const WCHAR *path,
-                             const WCHAR *headers,
-                             const char *body, size_t body_len,
-                             int *out_status,
-                             bool *out_rate_limited,
-                             int *out_retry_after_ms)
+static char *wide_to_utf8(void *talloc_ctx, const WCHAR *wide)
 {
-    if (out_status)
-        *out_status = 0;
-    if (out_rate_limited)
-        *out_rate_limited = false;
-    if (out_retry_after_ms)
-        *out_retry_after_ms = 0;
-
-    HINTERNET conn = WinHttpConnect(session, host, port, 0);
-    if (!conn) {
-        mp_warn(log, "translate: WinHttpConnect failed (%lu)\n", GetLastError());
+    if (!wide)
+        return NULL;
+    int len = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                  wide, -1, NULL, 0, NULL, NULL);
+    if (len <= 0)
+        return NULL;
+    char *utf8 = talloc_array(talloc_ctx, char, len);
+    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                             wide, -1, utf8, len, NULL, NULL))
+    {
+        talloc_free(utf8);
         return NULL;
     }
+    return utf8;
+}
 
-    DWORD flags = secure ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET req = WinHttpOpenRequest(conn, verb, path, NULL,
-                                        WINHTTP_NO_REFERER,
-                                        WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                        flags);
-    if (!req) {
-        mp_warn(log, "translate: WinHttpOpenRequest failed (%lu)\n", GetLastError());
-        WinHttpCloseHandle(conn);
-        return NULL;
+static void winhttp_transport(void *ctx, void *talloc_ctx,
+                              const struct wt_http_request *request,
+                              struct wt_http_response *response)
+{
+    struct whisper_translator *tr = ctx;
+    *response = (struct wt_http_response){
+        .failure = WT_HTTP_FAILURE_SETUP,
+    };
+
+    void *tmp = talloc_new(NULL);
+    WCHAR *host = utf8_to_wide(tmp, request->host);
+    WCHAR *method = utf8_to_wide(tmp, request->method);
+    WCHAR *path = utf8_to_wide(tmp, request->path);
+    WCHAR *headers = request->headers && request->headers[0]
+        ? utf8_to_wide(tmp, request->headers) : NULL;
+    HINTERNET session = request->proxy_mode == WT_HTTP_PROXY_NONE
+        ? tr->session_noproxy : tr->session;
+    if (!session || !host || !method || !path ||
+        (request->headers && request->headers[0] && !headers) ||
+        request->body_len > UINT32_MAX)
+    {
+        talloc_free(tmp);
+        return;
     }
 
-    if (headers && headers[0]) {
-        WinHttpAddRequestHeaders(req, headers, (DWORD)-1,
-                                  WINHTTP_ADDREQ_FLAG_ADD);
+    HINTERNET connection = WinHttpConnect(session, host, request->port, 0);
+    if (!connection) {
+        mp_warn(tr->log, "translate: WinHttpConnect failed (%lu)\n",
+                GetLastError());
+        talloc_free(tmp);
+        return;
     }
 
-    BOOL ok;
-    if (body && body_len > 0) {
-        ok = WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                 (LPVOID)body, (DWORD)body_len,
-                                 (DWORD)body_len, 0);
-    } else {
-        ok = WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    DWORD flags = request->secure ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET handle = WinHttpOpenRequest(
+        connection, method, path, NULL, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!handle) {
+        mp_warn(tr->log, "translate: WinHttpOpenRequest failed (%lu)\n",
+                GetLastError());
+        WinHttpCloseHandle(connection);
+        talloc_free(tmp);
+        return;
     }
 
+    DWORD disabled_features = WINHTTP_DISABLE_REDIRECTS;
+    if (!WinHttpSetOption(handle, WINHTTP_OPTION_DISABLE_FEATURE,
+                          &disabled_features, sizeof(disabled_features)))
+    {
+        mp_warn(tr->log, "translate: redirect policy setup failed (%lu)\n",
+                GetLastError());
+        WinHttpCloseHandle(handle);
+        WinHttpCloseHandle(connection);
+        talloc_free(tmp);
+        return;
+    }
+
+    if (headers &&
+        !WinHttpAddRequestHeaders(handle, headers, (DWORD)-1,
+                                  WINHTTP_ADDREQ_FLAG_ADD))
+    {
+        mp_warn(tr->log, "translate: request header setup failed (%lu)\n",
+                GetLastError());
+        WinHttpCloseHandle(handle);
+        WinHttpCloseHandle(connection);
+        talloc_free(tmp);
+        return;
+    }
+
+    response->http_issued = true;
+    BOOL ok = WinHttpSendRequest(
+        handle, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        request->body_len ? (LPVOID)request->body : WINHTTP_NO_REQUEST_DATA,
+        (DWORD)request->body_len, (DWORD)request->body_len, 0);
     if (!ok) {
-        mp_warn(log, "translate: WinHttpSendRequest failed (%lu)\n", GetLastError());
-        WinHttpCloseHandle(req);
-        WinHttpCloseHandle(conn);
-        return NULL;
+        response->failure = WT_HTTP_FAILURE_SEND;
+        mp_warn(tr->log, "translate: WinHttpSendRequest failed (%lu)\n",
+                GetLastError());
+        WinHttpCloseHandle(handle);
+        WinHttpCloseHandle(connection);
+        talloc_free(tmp);
+        return;
     }
 
-    ok = WinHttpReceiveResponse(req, NULL);
-    if (!ok) {
-        mp_warn(log, "translate: WinHttpReceiveResponse failed (%lu)\n", GetLastError());
-        WinHttpCloseHandle(req);
-        WinHttpCloseHandle(conn);
-        return NULL;
+    if (!WinHttpReceiveResponse(handle, NULL)) {
+        response->failure = WT_HTTP_FAILURE_RECEIVE;
+        mp_warn(tr->log, "translate: WinHttpReceiveResponse failed (%lu)\n",
+                GetLastError());
+        WinHttpCloseHandle(handle);
+        WinHttpCloseHandle(connection);
+        talloc_free(tmp);
+        return;
     }
 
     DWORD status_code = 0;
     DWORD status_size = sizeof(status_code);
-    WinHttpQueryHeaders(req,
-                         WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                         WINHTTP_HEADER_NAME_BY_INDEX,
-                         &status_code, &status_size, WINHTTP_NO_HEADER_INDEX);
-    if (out_status)
-        *out_status = (int)status_code;
+    if (!WinHttpQueryHeaders(
+            handle, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &status_size,
+            WINHTTP_NO_HEADER_INDEX))
+    {
+        response->failure = WT_HTTP_FAILURE_STATUS;
+        mp_warn(tr->log, "translate: HTTP status query failed (%lu)\n",
+                GetLastError());
+        WinHttpCloseHandle(handle);
+        WinHttpCloseHandle(connection);
+        talloc_free(tmp);
+        return;
+    }
+    response->http_status = (int)status_code;
 
-    // Parse Retry-After (seconds form). Date form is left as 0; callers fall
-    // back to a sensible default in that case.
-    if (out_retry_after_ms) {
-        WCHAR ra_buf[64];
-        DWORD ra_size = sizeof(ra_buf);
-        if (WinHttpQueryHeaders(req, WINHTTP_QUERY_RETRY_AFTER,
-                                 WINHTTP_HEADER_NAME_BY_INDEX,
-                                 ra_buf, &ra_size, WINHTTP_NO_HEADER_INDEX))
+    DWORD retry_size = 0;
+    if (!WinHttpQueryHeaders(handle, WINHTTP_QUERY_RETRY_AFTER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, NULL, &retry_size,
+                             WINHTTP_NO_HEADER_INDEX) &&
+        GetLastError() == ERROR_INSUFFICIENT_BUFFER &&
+        retry_size <= 1024)
+    {
+        WCHAR *retry_wide = talloc_zero_size(tmp, retry_size);
+        if (WinHttpQueryHeaders(handle, WINHTTP_QUERY_RETRY_AFTER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, retry_wide,
+                                &retry_size, WINHTTP_NO_HEADER_INDEX))
         {
-            // Only parse pure-number seconds form.
-            int seconds = 0;
-            bool digits_only = ra_buf[0] != L'\0';
-            for (DWORD i = 0; i < ra_size / sizeof(WCHAR) && ra_buf[i]; i++) {
-                if (ra_buf[i] < L'0' || ra_buf[i] > L'9') {
-                    digits_only = false;
-                    break;
-                }
-                seconds = seconds * 10 + (ra_buf[i] - L'0');
-                if (seconds > 600) { seconds = 600; break; } // cap 10 minutes
+            response->retry_after = wide_to_utf8(talloc_ctx, retry_wide);
+        }
+    }
+
+    response->failure = WT_HTTP_FAILURE_NONE;
+    if (status_code != 200)
+        goto done;
+
+    DWORD content_length = 0;
+    DWORD length_size = sizeof(content_length);
+    bool has_content_length = WinHttpQueryHeaders(
+        handle, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &content_length, &length_size,
+        WINHTTP_NO_HEADER_INDEX);
+    if (has_content_length && content_length > WT_MAX_RESPONSE_BYTES)
+    {
+        response->failure = WT_HTTP_FAILURE_TOO_LARGE;
+        goto done;
+    }
+
+    unsigned char *body = talloc_array(talloc_ctx, unsigned char, 1);
+    size_t total = 0;
+    body[0] = '\0';
+    while (true) {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(handle, &available)) {
+            response->failure = WT_HTTP_FAILURE_READ;
+            talloc_free(body);
+            goto done;
+        }
+        if (!available)
+            break;
+        if (available > WT_MAX_RESPONSE_BYTES - total) {
+            response->failure = WT_HTTP_FAILURE_TOO_LARGE;
+            talloc_free(body);
+            goto done;
+        }
+        body = talloc_realloc(talloc_ctx, body, unsigned char,
+                              total + available + 1);
+        DWORD read = 0;
+        if (!WinHttpReadData(handle, body + total, available, &read) ||
+            !read || read > available)
+        {
+            response->failure = WT_HTTP_FAILURE_READ;
+            talloc_free(body);
+            goto done;
+        }
+        total += read;
+        body[total] = '\0';
+    }
+    if (has_content_length && total != content_length) {
+        response->failure = WT_HTTP_FAILURE_READ;
+        talloc_free(body);
+        goto done;
+    }
+    response->body = body;
+    response->body_len = total;
+
+done:
+    WinHttpCloseHandle(handle);
+    WinHttpCloseHandle(connection);
+    talloc_free(tmp);
+}
+
+static int64_t parse_retry_after_ms(struct whisper_translator *tr,
+                                    const char *value)
+{
+    if (!value)
+        return 0;
+    while (*value == ' ' || *value == '\t')
+        value++;
+    size_t len = strlen(value);
+    while (len && (value[len - 1] == ' ' || value[len - 1] == '\t'))
+        len--;
+    if (!len)
+        return 0;
+
+    bool digits = true;
+    int64_t seconds = 0;
+    for (size_t n = 0; n < len; n++) {
+        unsigned char c = (unsigned char)value[n];
+        if (c < '0' || c > '9') {
+            digits = false;
+            break;
+        }
+        int digit = c - '0';
+        if (seconds > (INT64_MAX - digit) / 10) {
+            seconds = INT64_MAX;
+        } else if (seconds != INT64_MAX) {
+            seconds = seconds * 10 + digit;
+        }
+    }
+    if (digits) {
+        if (seconds > INT64_MAX / 1000)
+            return INT64_MAX;
+        return seconds * 1000;
+    }
+
+    if (len >= 128)
+        return 0;
+    WCHAR wide[128];
+    for (size_t n = 0; n < len; n++) {
+        unsigned char c = (unsigned char)value[n];
+        if (c > 0x7f)
+            return 0;
+        wide[n] = c;
+    }
+    wide[len] = L'\0';
+
+    SYSTEMTIME system_time = {0};
+    FILETIME file_time;
+    if (!WinHttpTimeToSystemTime(wide, &system_time) ||
+        !SystemTimeToFileTime(&system_time, &file_time))
+    {
+        return 0;
+    }
+    ULARGE_INTEGER ticks = {
+        .LowPart = file_time.dwLowDateTime,
+        .HighPart = file_time.dwHighDateTime,
+    };
+    int64_t target_ms =
+        (int64_t)(ticks.QuadPart / 10000ULL) - 11644473600000LL;
+    int64_t now_ms = translator_unix_ms(tr);
+    return target_ms > now_ms ? target_ms - now_ms : 0;
+}
+
+static bool json_unicode_escapes_valid(const char *json)
+{
+    bool in_string = false;
+    for (size_t n = 0; json[n]; n++) {
+        if (!in_string) {
+            if (json[n] == '"')
+                in_string = true;
+            continue;
+        }
+        if (json[n] == '"') {
+            in_string = false;
+            continue;
+        }
+        if (json[n] != '\\')
+            continue;
+        char escape = json[++n];
+        if (escape != 'u')
+            continue;
+        unsigned value = 0;
+        for (int digit = 0; digit < 4; digit++) {
+            char c = json[n + 1 + digit];
+            value <<= 4;
+            value |= c >= '0' && c <= '9' ? c - '0'
+                   : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                                          : c - 'A' + 10;
+        }
+        n += 4;
+        if (value == 0 || (value >= 0xdc00 && value <= 0xdfff))
+            return false;
+        if (value >= 0xd800 && value <= 0xdbff) {
+            if (json[n + 1] != '\\' || json[n + 2] != 'u')
+                return false;
+            unsigned low = 0;
+            for (int digit = 0; digit < 4; digit++) {
+                char c = json[n + 3 + digit];
+                low <<= 4;
+                low |= c >= '0' && c <= '9' ? c - '0'
+                     : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                                            : c - 'A' + 10;
             }
-            if (digits_only && seconds > 0)
-                *out_retry_after_ms = seconds * 1000;
+            if (low < 0xdc00 || low > 0xdfff)
+                return false;
+            n += 6;
         }
     }
-    if (out_rate_limited && status_code == 429)
-        *out_rate_limited = true;
+    return !in_string;
+}
 
-    char *result = talloc_strdup(talloc_ctx, "");
-    DWORD bytes_available = 0;
-    while (WinHttpQueryDataAvailable(req, &bytes_available) && bytes_available > 0) {
-        char *chunk = talloc_array(NULL, char, bytes_available + 1);
-        DWORD bytes_read = 0;
-        if (WinHttpReadData(req, chunk, bytes_available, &bytes_read)) {
-            chunk[bytes_read] = '\0';
-            result = talloc_asprintf_append(result, "%s", chunk);
-        }
-        talloc_free(chunk);
+static bool parse_json_document(void *talloc_ctx, const char *response,
+                                struct mpv_node *root)
+{
+    if (!response ||
+        validate_text(response, SIZE_MAX) != WT_TEXT_VALID ||
+        !json_validate_strict(response, MAX_JSON_DEPTH) ||
+        !json_unicode_escapes_valid(response))
+    {
+        return false;
+    }
+    char *cursor = talloc_strdup(talloc_ctx, response);
+    if (json_parse(talloc_ctx, root, &cursor, MAX_JSON_DEPTH) < 0)
+        return false;
+    json_skip_whitespace(&cursor);
+    return !cursor[0];
+}
+
+struct wt_http_observation {
+    int64_t retry_after_ms;
+};
+
+static bool perform_http(struct whisper_translator *tr, void *talloc_ctx,
+                         const struct wt_http_request *request,
+                         struct wt_call_result *out,
+                         struct wt_http_observation *observation,
+                         char **response_body)
+{
+    struct wt_http_response response = {0};
+    tr->transport(tr->transport_ctx, talloc_ctx, request, &response);
+    if (observation)
+        observation->retry_after_ms =
+            parse_retry_after_ms(tr, response.retry_after);
+    if (out) {
+        out->http_issued = response.http_issued;
+        out->http_status =
+            response.http_status >= 100 && response.http_status <= 599
+                ? response.http_status : 0;
+        out->rate_limited = response.http_status == 429;
+        out->retry_after_ms = saturated_int64_to_int(
+            observation ? observation->retry_after_ms : 0);
     }
 
-    WinHttpCloseHandle(req);
-    WinHttpCloseHandle(conn);
-
-    if (status_code >= 400) {
-        mp_warn(log, "translate: HTTP %lu error\n", status_code);
-        talloc_free(result);
-        return NULL;
+    const char *name = provider_name(tr->provider);
+    switch (response.failure) {
+    case WT_HTTP_FAILURE_NONE:
+        break;
+    case WT_HTTP_FAILURE_SETUP:
+        set_err(out, "%s: request setup failed", name);
+        return false;
+    case WT_HTTP_FAILURE_SEND:
+        set_err(out, "%s: request send failed", name);
+        return false;
+    case WT_HTTP_FAILURE_RECEIVE:
+        set_err(out, "%s: response receive failed", name);
+        return false;
+    case WT_HTTP_FAILURE_STATUS:
+        set_err(out, "%s: invalid HTTP status", name);
+        return false;
+    case WT_HTTP_FAILURE_READ:
+        set_err(out, "%s: response read failed", name);
+        return false;
+    case WT_HTTP_FAILURE_TOO_LARGE:
+        set_err(out, "%s: response too large", name);
+        return false;
     }
 
-    return result;
+    if (response.http_status < 100 || response.http_status > 599) {
+        if (out)
+            out->http_status = 0;
+        set_err(out, "%s: invalid HTTP status", name);
+        return false;
+    }
+    if (response.http_status != 200) {
+        set_err(out, "%s: HTTP %d", name, response.http_status);
+        return false;
+    }
+    if (response.body_len > WT_MAX_RESPONSE_BYTES) {
+        set_err(out, "%s: response too large", name);
+        return false;
+    }
+    if ((response.body_len && !response.body) ||
+        (response.body &&
+         memchr(response.body, '\0', response.body_len)))
+    {
+        set_err(out, "%s: invalid response body", name);
+        return false;
+    }
+
+    char *body = talloc_array(talloc_ctx, char, response.body_len + 1);
+    if (response.body_len)
+        memcpy(body, response.body, response.body_len);
+    body[response.body_len] = '\0';
+    if (validate_text(body, SIZE_MAX) != WT_TEXT_VALID) {
+        talloc_free(body);
+        set_err(out, "%s: invalid response encoding", name);
+        return false;
+    }
+    *response_body = body;
+    return true;
 }
 
 // --- Google Translate ---
 
-static const char *google_normalize_lang(const char *lang)
+static const char *google_normalize_lang(const char *lang, bool source)
 {
-    if (!lang)
-        return "auto";
-    if (strcmp(lang, "zh") == 0)
+    if (!lang || !lang[0] || ascii_equal_ci(lang, "auto"))
+        return source ? "auto" : NULL;
+    if (!valid_language_code(lang))
+        return NULL;
+    if (ascii_equal_ci(lang, "zh") ||
+        ascii_equal_ci(lang, "zh-CN") ||
+        ascii_equal_ci(lang, "zh-Hans"))
+    {
         return "zh-CN";
+    }
+    if (ascii_equal_ci(lang, "zh-TW") ||
+        ascii_equal_ci(lang, "zh-Hant"))
+    {
+        return "zh-TW";
+    }
+    if (ascii_equal_ci(lang, "ko"))
+        return "ko";
     return lang;
+}
+
+static char *google_extract_translation(void *talloc_ctx,
+                                        const char *response)
+{
+    void *tmp = talloc_new(NULL);
+    struct mpv_node root = {0};
+    if (!parse_json_document(tmp, response, &root) ||
+        root.format != MPV_FORMAT_NODE_MAP)
+    {
+        talloc_free(tmp);
+        return NULL;
+    }
+    struct mpv_node *sentences = node_map_get(&root, "sentences");
+    if (!sentences || sentences->format != MPV_FORMAT_NODE_ARRAY ||
+        !sentences->u.list)
+    {
+        talloc_free(tmp);
+        return NULL;
+    }
+
+    char *translated = talloc_strdup(talloc_ctx, "");
+    bool found_nonempty = false;
+    for (int n = 0; n < sentences->u.list->num; n++) {
+        struct mpv_node *sentence = &sentences->u.list->values[n];
+        if (sentence->format != MPV_FORMAT_NODE_MAP) {
+            talloc_free(translated);
+            talloc_free(tmp);
+            return NULL;
+        }
+        struct mpv_node *trans = node_map_get(sentence, "trans");
+        struct mpv_node *translit = node_map_get(sentence, "translit");
+        if (translit && translit->format != MPV_FORMAT_STRING) {
+            talloc_free(translated);
+            talloc_free(tmp);
+            return NULL;
+        }
+        if (trans) {
+            if (trans->format != MPV_FORMAT_STRING || !trans->u.string) {
+                talloc_free(translated);
+                talloc_free(tmp);
+                return NULL;
+            }
+            translated = talloc_asprintf_append(
+                translated, "%s", trans->u.string);
+            found_nonempty |= trans->u.string[0] != '\0';
+        } else if (!translit) {
+            talloc_free(translated);
+            talloc_free(tmp);
+            return NULL;
+        }
+    }
+    talloc_free(tmp);
+    if (!found_nonempty) {
+        talloc_free(translated);
+        return NULL;
+    }
+    return translated;
 }
 
 static char *translate_google(struct whisper_translator *tr,
                               void *talloc_ctx, const char *text,
-                              struct wt_call_result *out)
+                              struct wt_call_result *out,
+                              struct wt_http_observation *observation)
 {
-    const char *sl = google_normalize_lang(tr->source_lang);
-    const char *tl = google_normalize_lang(tr->target_lang);
-    char *encoded = url_encode(NULL, text);
-    if (!encoded) {
-        set_err(out, "google: url_encode failed");
+    const char *sl = google_normalize_lang(tr->source_lang, true);
+    const char *tl = google_normalize_lang(tr->target_lang, false);
+    if (!sl || !tl) {
+        set_err(out, "google: invalid language");
+        return NULL;
+    }
+    enum wt_text_validation text_valid =
+        validate_text(text, WT_MAX_INPUT_CODEPOINTS);
+    if (text_valid != WT_TEXT_VALID) {
+        set_err(out, text_valid == WT_TEXT_TOO_LONG
+                ? "google: input too long"
+                : "google: invalid UTF-8");
         return NULL;
     }
 
-    char *path_utf8 = talloc_asprintf(NULL, "/m?tl=%s&sl=%s&q=%s", tl, sl, encoded);
-    talloc_free(encoded);
-
-    WCHAR *path_wide = utf8_to_wide(NULL, path_utf8);
-    talloc_free(path_utf8);
-    if (!path_wide) {
-        set_err(out, "google: utf8_to_wide failed");
+    void *tmp = talloc_new(NULL);
+    char *encoded_sl = form_encode(tmp, sl);
+    char *encoded_tl = form_encode(tmp, tl);
+    char *encoded_text = form_encode(tmp, text);
+    if (!encoded_sl || !encoded_tl || !encoded_text) {
+        set_err(out, "google: request build failed");
+        talloc_free(tmp);
         return NULL;
     }
-
-    WCHAR *ua = L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                L"AppleWebKit/537.36\r\n";
-
-    int status = 0;
-    bool rate_limited = false;
-    int retry_after_ms = 0;
-    char *html = winhttp_request(NULL, tr->log, tr->session,
-                                  L"translate.google.com",
-                                  INTERNET_DEFAULT_HTTPS_PORT, true,
-                                  L"GET", path_wide, ua, NULL, 0,
-                                  &status, &rate_limited, &retry_after_ms);
-    talloc_free(path_wide);
-
-    if (out) {
-        out->http_status = status;
-        out->rate_limited = rate_limited;
-        out->retry_after_ms = retry_after_ms;
-        out->http_issued = true;
-    }
-
-    if (!html) {
-        set_err(out, "google: HTTP %d", status);
+    char *body = talloc_asprintf(
+        tmp, "sl=%s&tl=%s&q=%s", encoded_sl, encoded_tl, encoded_text);
+    struct wt_http_request request = {
+        .host = "translate.google.com",
+        .port = INTERNET_DEFAULT_HTTPS_PORT,
+        .secure = true,
+        .method = "POST",
+        .path = "/translate_a/single?client=at&dt=t&dt=rm&dj=1",
+        .headers =
+            "Content-Type: application/x-www-form-urlencoded;charset=utf-8\r\n",
+        .body = body,
+        .body_len = strlen(body),
+        .proxy_mode = WT_HTTP_PROXY_DEFAULT,
+    };
+    char *response = NULL;
+    if (!perform_http(tr, tmp, &request, out, observation, &response)) {
+        talloc_free(tmp);
         return NULL;
     }
-
-    const char *marker = "class=\"result-container\">";
-    char *start = strstr(html, marker);
-    if (!start) {
+    char *result = google_extract_translation(talloc_ctx, response);
+    if (!result) {
+        set_err(out, "google: parse failed");
         mp_warn(tr->log, "translate: google response parse failed\n");
-        set_err(out, "google: parse failed");
-        talloc_free(html);
-        return NULL;
     }
-    start += strlen(marker);
-    char *end = strchr(start, '<');
-    if (!end) {
-        set_err(out, "google: parse failed");
-        talloc_free(html);
-        return NULL;
-    }
-
-    size_t len = end - start;
-    char *result = talloc_strndup(talloc_ctx, start, len);
-    talloc_free(html);
-
-    html_entity_decode(result);
+    talloc_free(tmp);
     return result;
 }
 
-// --- Azure Translate ---
+// --- Bing/Edge Translate (provider value remains "azure") ---
 
-static const char *azure_normalize_lang(const char *lang, bool *is_auto)
+static const char *azure_normalize_lang(const char *lang, bool source)
 {
-    *is_auto = false;
-    if (!lang || strcmp(lang, "auto") == 0) {
-        *is_auto = true;
-        return "";
-    }
-    if (strcmp(lang, "zh") == 0)
+    if (!lang || !lang[0] || ascii_equal_ci(lang, "auto"))
+        return source ? "" : NULL;
+    if (!valid_language_code(lang))
+        return NULL;
+    if (ascii_equal_ci(lang, "zh") ||
+        ascii_equal_ci(lang, "zh-CN") ||
+        ascii_equal_ci(lang, "zh-Hans"))
+    {
         return "zh-Hans";
-    if (strcmp(lang, "zh-TW") == 0)
+    }
+    if (ascii_equal_ci(lang, "zh-TW") ||
+        ascii_equal_ci(lang, "zh-Hant"))
+    {
         return "zh-Hant";
+    }
+    if (ascii_equal_ci(lang, "ko"))
+        return "ko";
     return lang;
 }
 
-// Refresh azure token under the per-call state_lock discipline:
-//   - lock state, check freshness; if fresh return cached token (strdup'd).
-//   - if stale, mark refresh_in_flight=true, unlock, do HTTP, relock,
-//     install new token, clear refresh_in_flight.
-//   - returns a talloc-strdup'd token (parented to talloc_ctx), or NULL on
-//     failure (with `out` populated).
-static char *azure_refresh_token(struct whisper_translator *tr,
-                                 void *talloc_ctx,
-                                 struct wt_call_result *out)
+static char *azure_extract_translation(void *talloc_ctx,
+                                       const char *response,
+                                       const char *target_lang)
 {
-    time_t now = time(NULL);
-
-    mp_mutex_lock(&tr->state_lock);
-    if (tr->azure_token && now < tr->azure_token_expires) {
-        char *cached = talloc_strdup(talloc_ctx, tr->azure_token);
-        mp_mutex_unlock(&tr->state_lock);
-        return cached;
+    void *tmp = talloc_new(NULL);
+    struct mpv_node root = {0};
+    if (!parse_json_document(tmp, response, &root) ||
+        root.format != MPV_FORMAT_NODE_ARRAY || !root.u.list ||
+        root.u.list->num != 1)
+    {
+        talloc_free(tmp);
+        return NULL;
     }
-    tr->azure_token_refresh_in_flight = true;
-    mp_mutex_unlock(&tr->state_lock);
+    struct mpv_node *item = &root.u.list->values[0];
+    if (item->format != MPV_FORMAT_NODE_MAP) {
+        talloc_free(tmp);
+        return NULL;
+    }
+    struct mpv_node *translations = node_map_get(item, "translations");
+    if (!translations || translations->format != MPV_FORMAT_NODE_ARRAY ||
+        !translations->u.list)
+    {
+        talloc_free(tmp);
+        return NULL;
+    }
 
-    int status = 0;
-    bool rate_limited = false;
-    int retry_after_ms = 0;
-    char *token = winhttp_request(NULL, tr->log, tr->session,
-                                   L"edge.microsoft.com",
-                                   INTERNET_DEFAULT_HTTPS_PORT, true,
-                                   L"GET", L"/translate/auth",
-                                   L"User-Agent: Mozilla/5.0\r\n",
-                                   NULL, 0,
-                                   &status, &rate_limited, &retry_after_ms);
-
-    mp_mutex_lock(&tr->state_lock);
-    tr->azure_token_refresh_in_flight = false;
-
-    if (!token || !token[0]) {
-        mp_mutex_unlock(&tr->state_lock);
-        if (out) {
-            out->http_status = status;
-            out->rate_limited = rate_limited;
-            out->retry_after_ms = retry_after_ms;
-            out->http_issued = true;
+    const char *match = NULL;
+    for (int n = 0; n < translations->u.list->num; n++) {
+        struct mpv_node *translation = &translations->u.list->values[n];
+        if (translation->format != MPV_FORMAT_NODE_MAP) {
+            talloc_free(tmp);
+            return NULL;
         }
-        set_err(out, "azure: token fetch HTTP %d", status);
-        mp_warn(tr->log, "translate: azure token fetch failed\n");
-        talloc_free(token);
-        return NULL;
-    }
-
-    talloc_free(tr->azure_token);
-    tr->azure_token = talloc_strdup(tr, token);
-    tr->azure_token_expires = (int64_t)(now + 8 * 60);
-    char *result = talloc_strdup(talloc_ctx, tr->azure_token);
-    mp_mutex_unlock(&tr->state_lock);
-    talloc_free(token);
-    return result;
-}
-
-// Extract the value of the first "text":"..." in a JSON string (azure).
-static char *azure_json_extract_text(void *talloc_ctx, const char *json)
-{
-    const char *key = "\"text\":\"";
-    char *pos = strstr(json, key);
-    if (!pos)
-        return NULL;
-    pos += strlen(key);
-    char *result = talloc_strdup(talloc_ctx, "");
-    while (*pos && *pos != '"') {
-        if (*pos == '\\' && *(pos + 1)) {
-            pos++;
-            switch (*pos) {
-            case '"':  result = talloc_asprintf_append(result, "\""); break;
-            case '\\': result = talloc_asprintf_append(result, "\\"); break;
-            case 'n':  result = talloc_asprintf_append(result, "\n"); break;
-            case 't':  result = talloc_asprintf_append(result, "\t"); break;
-            case '/':  result = talloc_asprintf_append(result, "/"); break;
-            default:
-                result = talloc_asprintf_append(result, "\\%c", *pos);
-                break;
+        struct mpv_node *text = node_map_get(translation, "text");
+        struct mpv_node *to = node_map_get(translation, "to");
+        if (!text || text->format != MPV_FORMAT_STRING || !text->u.string ||
+            !to || to->format != MPV_FORMAT_STRING || !to->u.string)
+        {
+            talloc_free(tmp);
+            return NULL;
+        }
+        const char *normalized_to = azure_normalize_lang(to->u.string, false);
+        if (!normalized_to) {
+            talloc_free(tmp);
+            return NULL;
+        }
+        if (ascii_equal_ci(normalized_to, target_lang)) {
+            if (match) {
+                talloc_free(tmp);
+                return NULL;
             }
-            pos++;
-        } else {
-            char c[2] = {*pos, '\0'};
-            result = talloc_asprintf_append(result, "%s", c);
-            pos++;
+            match = text->u.string;
         }
     }
+    char *result = match && match[0]
+        ? talloc_strdup(talloc_ctx, match) : NULL;
+    talloc_free(tmp);
     return result;
 }
 
 static char *translate_azure(struct whisper_translator *tr,
                              void *talloc_ctx, const char *text,
-                             struct wt_call_result *out)
+                             struct wt_call_result *out,
+                             struct wt_http_observation *observation)
 {
+    const char *sl = azure_normalize_lang(tr->source_lang, true);
+    const char *tl = azure_normalize_lang(tr->target_lang, false);
+    if (!sl || !tl) {
+        set_err(out, "azure: invalid language");
+        return NULL;
+    }
+    enum wt_text_validation text_valid =
+        validate_text(text, WT_MAX_INPUT_CODEPOINTS);
+    if (text_valid != WT_TEXT_VALID) {
+        set_err(out, text_valid == WT_TEXT_TOO_LONG
+                ? "azure: input too long"
+                : "azure: invalid UTF-8");
+        return NULL;
+    }
+
     void *tmp = talloc_new(NULL);
-    char *token = azure_refresh_token(tr, tmp, out);
-    if (!token) {
+    char *encoded_sl = form_encode(tmp, sl);
+    char *encoded_tl = form_encode(tmp, tl);
+    if (!encoded_sl || !encoded_tl) {
+        set_err(out, "azure: request build failed");
         talloc_free(tmp);
         return NULL;
     }
 
-    bool is_auto = false;
-    const char *tl = azure_normalize_lang(tr->target_lang, &is_auto);
-    bool src_auto = false;
-    const char *sl = azure_normalize_lang(tr->source_lang, &src_auto);
-
-    char *path_utf8;
-    if (src_auto) {
-        path_utf8 = talloc_asprintf(tmp,
-            "/translate?api-version=3.0&to=%s", tl);
-    } else {
-        path_utf8 = talloc_asprintf(tmp,
-            "/translate?api-version=3.0&to=%s&from=%s", tl, sl);
+    struct mpv_node body_root;
+    node_init(&body_root, MPV_FORMAT_NODE_ARRAY, NULL);
+    talloc_steal(tmp, body_root.u.list);
+    struct mpv_node *body_text =
+        node_array_add(&body_root, MPV_FORMAT_NONE);
+    body_text->format = MPV_FORMAT_STRING;
+    body_text->u.string = talloc_strdup(body_root.u.list, text);
+    char *serialized = NULL;
+    if (json_write(&serialized, &body_root) < 0 || !serialized) {
+        set_err(out, "azure: request build failed");
+        talloc_free(serialized);
+        talloc_free(tmp);
+        return NULL;
     }
+    char *body = talloc_strdup(tmp, serialized);
+    talloc_free(serialized);
 
-    WCHAR *path_wide = utf8_to_wide(tmp, path_utf8);
-    if (!path_wide) {
-        set_err(out, "azure: path encode failed");
+    char *path = talloc_asprintf(
+        tmp, "/translate/translatetext?from=%s&to=%s&isEnterpriseClient=false",
+        encoded_sl, encoded_tl);
+    struct wt_http_request request = {
+        .host = "edge.microsoft.com",
+        .port = INTERNET_DEFAULT_HTTPS_PORT,
+        .secure = true,
+        .method = "POST",
+        .path = path,
+        .headers = "Content-Type: application/json; charset=utf-8\r\n",
+        .body = body,
+        .body_len = strlen(body),
+        .proxy_mode = WT_HTTP_PROXY_DEFAULT,
+    };
+    char *response = NULL;
+    if (!perform_http(tr, tmp, &request, out, observation, &response)) {
         talloc_free(tmp);
         return NULL;
     }
 
-    char *headers_utf8 = talloc_asprintf(tmp,
-        "Authorization: Bearer %s\r\n"
-        "Content-Type: application/json\r\n",
-        token);
-    WCHAR *headers_wide = utf8_to_wide(tmp, headers_utf8);
-
-    char *escaped = talloc_strdup(tmp, "");
-    for (const char *p = text; *p; p++) {
-        switch (*p) {
-        case '"':  escaped = talloc_asprintf_append(escaped, "\\\""); break;
-        case '\\': escaped = talloc_asprintf_append(escaped, "\\\\"); break;
-        case '\n': escaped = talloc_asprintf_append(escaped, "\\n"); break;
-        case '\r': escaped = talloc_asprintf_append(escaped, "\\r"); break;
-        case '\t': escaped = talloc_asprintf_append(escaped, "\\t"); break;
-        default:
-            escaped = talloc_asprintf_append(escaped, "%c", *p);
-            break;
-        }
-    }
-    char *body = talloc_asprintf(tmp, "[{\"Text\":\"%s\"}]", escaped);
-    size_t body_len = strlen(body);
-
-    int status = 0;
-    bool rate_limited = false;
-    int retry_after_ms = 0;
-    char *response = winhttp_request(NULL, tr->log, tr->session,
-                                      L"api-edge.cognitive.microsofttranslator.com",
-                                      INTERNET_DEFAULT_HTTPS_PORT, true,
-                                      L"POST", path_wide, headers_wide,
-                                      body, body_len,
-                                      &status, &rate_limited, &retry_after_ms);
-
-    if (out) {
-        out->http_status = status;
-        out->rate_limited = rate_limited;
-        out->retry_after_ms = retry_after_ms;
-        out->http_issued = true;
-    }
-
-    if (!response) {
-        set_err(out, "azure: HTTP %d", status);
-        // Token might be expired; clear cache and let the next call refresh.
-        mp_mutex_lock(&tr->state_lock);
-        talloc_free(tr->azure_token);
-        tr->azure_token = NULL;
-        tr->azure_token_expires = 0;
-        mp_mutex_unlock(&tr->state_lock);
-        talloc_free(tmp);
-        return NULL;
-    }
-
-    char *result = azure_json_extract_text(talloc_ctx, response);
-    talloc_free(response);
-    talloc_free(tmp);
-
+    char *result = azure_extract_translation(talloc_ctx, response, tl);
     if (!result) {
         set_err(out, "azure: parse failed");
         mp_warn(tr->log, "translate: azure response parse failed\n");
     }
+    talloc_free(tmp);
     return result;
 }
+
 
 // --- OpenAI Translate ---
 
@@ -931,14 +1383,9 @@ static char *oa_build_request_body(void *talloc_ctx,
 static char *oa_extract_content(void *talloc_ctx, struct mp_log *log,
                                 const char *response)
 {
-    if (!response)
-        return NULL;
     void *tmp = talloc_new(NULL);
-    char *mutable_copy = talloc_strdup(tmp, response);
-    char *src = mutable_copy;
     struct mpv_node root = {0};
-    int r = json_parse(tmp, &root, &src, MAX_JSON_DEPTH);
-    if (r < 0) {
+    if (!parse_json_document(tmp, response, &root)) {
         mp_warn(log, "translate: openai response is not JSON\n");
         talloc_free(tmp);
         return NULL;
@@ -969,82 +1416,59 @@ static char *oa_extract_content(void *talloc_ctx, struct mp_log *log,
 
 static char *translate_openai(struct whisper_translator *tr,
                               void *talloc_ctx, const char *text,
-                              struct wt_call_result *out)
+                              struct wt_call_result *out,
+                              struct wt_http_observation *observation)
 {
-    // Backoff check (under state_lock to coordinate with other workers).
-    int64_t now = wt_now_ms();
-    mp_mutex_lock(&tr->state_lock);
-    if (tr->backoff_until_ms && now < tr->backoff_until_ms) {
-        int remain = (int)(tr->backoff_until_ms - now);
-        mp_mutex_unlock(&tr->state_lock);
-        set_err(out, "openai: in backoff (%dms left)", remain);
+    if (validate_text(text, SIZE_MAX) != WT_TEXT_VALID) {
+        set_err(out, "openai: invalid UTF-8");
         return NULL;
     }
-    if (tr->backoff_until_ms && now >= tr->backoff_until_ms) {
-        tr->backoff_until_ms = 0;
-        tr->fail_count = 0;
-        mp_info(tr->log, "translate: openai backoff window ended, retrying\n");
-    }
-    mp_mutex_unlock(&tr->state_lock);
 
-    char *body = oa_build_request_body(NULL, tr, text);
+    void *tmp = talloc_new(NULL);
+    char *body = oa_build_request_body(tmp, tr, text);
     if (!body) {
         set_err(out, "openai: build body failed");
+        talloc_free(tmp);
         return NULL;
     }
-    size_t body_len = strlen(body);
 
-    char *headers_utf8;
+    char *headers;
     if (tr->oa_api_key && tr->oa_api_key[0]) {
-        headers_utf8 = talloc_asprintf(NULL,
+        headers = talloc_asprintf(
+            tmp,
             "Content-Type: application/json\r\n"
             "Accept: application/json\r\n"
             "Authorization: Bearer %s\r\n",
             tr->oa_api_key);
     } else {
-        headers_utf8 = talloc_strdup(NULL,
+        headers = talloc_strdup(
+            tmp,
             "Content-Type: application/json\r\n"
             "Accept: application/json\r\n");
     }
-    WCHAR *headers_wide = utf8_to_wide(NULL, headers_utf8);
-    talloc_free(headers_utf8);
 
-    WCHAR *host_wide = utf8_to_wide(NULL, tr->oa_host);
-    WCHAR *path_wide = utf8_to_wide(NULL, tr->oa_path);
-
-    int status = 0;
-    bool rate_limited = false;
-    int retry_after_ms = 0;
-    char *response = winhttp_request(NULL, tr->log, tr->session_noproxy,
-                                      host_wide, tr->oa_port, tr->oa_is_secure,
-                                      L"POST", path_wide, headers_wide,
-                                      body, body_len,
-                                      &status, &rate_limited, &retry_after_ms);
-
-    talloc_free(host_wide);
-    talloc_free(path_wide);
-    talloc_free(headers_wide);
-    talloc_free(body);
-
-    if (out) {
-        out->http_status = status;
-        out->rate_limited = rate_limited;
-        out->retry_after_ms = retry_after_ms;
-        out->http_issued = true;
-    }
-
-    if (!response) {
-        set_err(out, "openai: HTTP %d", status);
+    struct wt_http_request request = {
+        .host = tr->oa_host,
+        .port = tr->oa_port,
+        .secure = tr->oa_is_secure,
+        .method = "POST",
+        .path = tr->oa_path,
+        .headers = headers,
+        .body = body,
+        .body_len = strlen(body),
+        .proxy_mode = WT_HTTP_PROXY_NONE,
+    };
+    char *response = NULL;
+    if (!perform_http(tr, tmp, &request, out, observation, &response)) {
+        talloc_free(tmp);
         return NULL;
     }
 
     char *content = oa_extract_content(talloc_ctx, tr->log, response);
-    talloc_free(response);
-
     if (!content || !content[0]) {
         set_err(out, "openai: empty content");
-        if (content)
-            talloc_free(content);
+        talloc_free(content);
+        talloc_free(tmp);
         return NULL;
     }
 
@@ -1052,13 +1476,74 @@ static char *translate_openai(struct whisper_translator *tr,
     if (!content[0]) {
         set_err(out, "openai: empty after clean");
         talloc_free(content);
+        talloc_free(tmp);
         return NULL;
     }
 
+    talloc_free(tmp);
     return content;
 }
 
+
 // --- Public API ---
+
+static struct whisper_translator *translator_alloc(
+    void *talloc_parent, struct mp_log *log, enum wt_provider provider,
+    const char *source_lang, const char *target_lang)
+{
+    if (!target_lang || !target_lang[0])
+        return NULL;
+    struct whisper_translator *tr = talloc_zero(talloc_parent,
+                                                struct whisper_translator);
+    tr->log = log;
+    tr->provider = provider;
+    tr->source_lang = talloc_strdup(
+        tr, source_lang && source_lang[0] ? source_lang : "auto");
+    tr->target_lang = talloc_strdup(tr, target_lang);
+    tr->transport = winhttp_transport;
+    tr->transport_ctx = tr;
+    tr->monotonic_ms = real_monotonic_ms;
+    tr->unix_ms = real_unix_ms;
+    tr->clock_ctx = NULL;
+    mp_mutex_init(&tr->state_lock);
+    atomic_init(&tr->refcount, 1);
+    return tr;
+}
+
+static bool configure_openai(struct whisper_translator *tr,
+                             const struct wt_openai_config *cfg)
+{
+    if (!cfg || !cfg->endpoint || !cfg->endpoint[0] ||
+        !cfg->model || !cfg->model[0] ||
+        !cfg->target_lang || !cfg->target_lang[0])
+    {
+        return false;
+    }
+    if (!parse_endpoint_url(tr, cfg->endpoint,
+                            &tr->oa_scheme, &tr->oa_host,
+                            &tr->oa_port, &tr->oa_path,
+                            &tr->oa_is_secure))
+    {
+        return false;
+    }
+
+    tr->oa_model = talloc_strdup(tr, cfg->model);
+    tr->oa_api_key = talloc_strdup(tr, cfg->api_key ? cfg->api_key : "");
+    tr->oa_system_prompt = talloc_strdup(
+        tr, cfg->system_prompt ? cfg->system_prompt : "");
+    int timeout = cfg->timeout_ms > 0
+        ? cfg->timeout_ms : WT_DEFAULT_TIMEOUT_MS;
+    tr->oa_timeout_ms =
+        timeout < WT_MAX_TIMEOUT_MS ? timeout : WT_MAX_TIMEOUT_MS;
+    if (cfg->max_tokens == 0) {
+        tr->oa_max_tokens = 0;
+    } else if (cfg->max_tokens < 0) {
+        tr->oa_max_tokens = WT_DEFAULT_MAX_TOKENS;
+    } else {
+        tr->oa_max_tokens = cfg->max_tokens;
+    }
+    return true;
+}
 
 struct whisper_translator *whisper_translator_create(
     void *talloc_parent, struct mp_log *log,
@@ -1067,14 +1552,10 @@ struct whisper_translator *whisper_translator_create(
 {
     if (provider != WT_PROVIDER_GOOGLE && provider != WT_PROVIDER_AZURE)
         return NULL;
-    struct whisper_translator *tr = talloc_zero(talloc_parent,
-                                                struct whisper_translator);
-    tr->log = log;
-    tr->provider = provider;
-    tr->source_lang = talloc_strdup(tr, source_lang ? source_lang : "auto");
-    tr->target_lang = talloc_strdup(tr, target_lang);
-    mp_mutex_init(&tr->state_lock);
-    atomic_init(&tr->refcount, 1);
+    struct whisper_translator *tr = translator_alloc(
+        talloc_parent, log, provider, source_lang, target_lang);
+    if (!tr)
+        return NULL;
 
     WCHAR *ua = utf8_to_wide(NULL, "mpv-whisper/1.0");
     tr->session = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -1104,49 +1585,20 @@ struct whisper_translator *whisper_translator_create_openai(
     void *talloc_parent, struct mp_log *log,
     const struct wt_openai_config *cfg)
 {
-    if (!cfg || !cfg->endpoint || !cfg->endpoint[0] ||
-        !cfg->model || !cfg->model[0] ||
-        !cfg->target_lang || !cfg->target_lang[0])
-    {
+    if (!cfg) {
         mp_err(log, "translate: openai config missing endpoint/model/target_lang\n");
         return NULL;
     }
-
-    struct whisper_translator *tr = talloc_zero(talloc_parent,
-                                                struct whisper_translator);
-    tr->log = log;
-    tr->provider = WT_PROVIDER_OPENAI;
-    tr->source_lang = talloc_strdup(tr, cfg->source_lang && cfg->source_lang[0]
-                                    ? cfg->source_lang : "auto");
-    tr->target_lang = talloc_strdup(tr, cfg->target_lang);
-    mp_mutex_init(&tr->state_lock);
-    atomic_init(&tr->refcount, 1);
-
-    if (!parse_endpoint_url(tr, cfg->endpoint,
-                             &tr->oa_scheme, &tr->oa_host,
-                             &tr->oa_port, &tr->oa_path,
-                             &tr->oa_is_secure))
-    {
-        mp_err(log, "translate: openai endpoint URL invalid: %s\n", cfg->endpoint);
-        mp_mutex_destroy(&tr->state_lock);
-        talloc_free(tr);
+    struct whisper_translator *tr = translator_alloc(
+        talloc_parent, log, WT_PROVIDER_OPENAI,
+        cfg->source_lang, cfg->target_lang);
+    if (!tr || !configure_openai(tr, cfg)) {
+        mp_err(log, "translate: openai config missing or invalid\n");
+        if (tr) {
+            mp_mutex_destroy(&tr->state_lock);
+            talloc_free(tr);
+        }
         return NULL;
-    }
-
-    tr->oa_model         = talloc_strdup(tr, cfg->model);
-    tr->oa_api_key       = talloc_strdup(tr, cfg->api_key ? cfg->api_key : "");
-    tr->oa_system_prompt = talloc_strdup(tr,
-        cfg->system_prompt ? cfg->system_prompt : "");
-    // cfg->context_size is ignored (history removed); see header comment.
-    int t = cfg->timeout_ms > 0 ? cfg->timeout_ms : WT_DEFAULT_TIMEOUT_MS;
-    if (t > WT_MAX_TIMEOUT_MS) t = WT_MAX_TIMEOUT_MS;
-    tr->oa_timeout_ms    = t;
-    if (cfg->max_tokens == 0) {
-        tr->oa_max_tokens = 0;
-    } else if (cfg->max_tokens < 0) {
-        tr->oa_max_tokens = WT_DEFAULT_MAX_TOKENS;
-    } else {
-        tr->oa_max_tokens = cfg->max_tokens;
     }
 
     // Default-proxy session is unused for openai but kept NULL-safe.
@@ -1175,6 +1627,56 @@ struct whisper_translator *whisper_translator_create_openai(
             tr->oa_timeout_ms,
             tr->oa_scheme, tr->oa_host, tr->oa_port, tr->oa_path);
     return tr;
+}
+
+struct whisper_translator *whisper_translator_create_for_test(
+    void *talloc_parent, enum wt_provider provider,
+    const char *source_lang, const char *target_lang,
+    const struct wt_openai_config *openai,
+    const struct wt_test_hooks *hooks)
+{
+    if (!hooks || !hooks->transport || !hooks->monotonic_ms ||
+        !hooks->unix_ms)
+    {
+        return NULL;
+    }
+
+    struct whisper_translator *tr;
+    if (provider == WT_PROVIDER_OPENAI) {
+        if (!openai)
+            return NULL;
+        tr = translator_alloc(
+            talloc_parent, NULL, provider,
+            openai->source_lang, openai->target_lang);
+        if (!tr || !configure_openai(tr, openai)) {
+            if (tr) {
+                mp_mutex_destroy(&tr->state_lock);
+                talloc_free(tr);
+            }
+            return NULL;
+        }
+    } else if (provider == WT_PROVIDER_GOOGLE ||
+               provider == WT_PROVIDER_AZURE)
+    {
+        tr = translator_alloc(
+            talloc_parent, NULL, provider, source_lang, target_lang);
+        if (!tr)
+            return NULL;
+    } else {
+        return NULL;
+    }
+
+    tr->transport = hooks->transport;
+    tr->transport_ctx = hooks->transport_ctx;
+    tr->monotonic_ms = hooks->monotonic_ms;
+    tr->unix_ms = hooks->unix_ms;
+    tr->clock_ctx = hooks->clock_ctx;
+    return tr;
+}
+
+size_t whisper_translate_test_max_response_bytes(void)
+{
+    return WT_MAX_RESPONSE_BYTES;
 }
 
 struct whisper_translator *whisper_translator_acquire(
@@ -1214,63 +1716,208 @@ void whisper_translator_destroy(struct whisper_translator **tr)
     whisper_translator_release(tr);
 }
 
-void whisper_translate_call(struct whisper_translator *tr,
-                            void *talloc_ctx, const char *text,
-                            struct wt_call_result *out)
+struct wt_admission {
+    uint64_t cooldown_generation;
+    bool probe;
+};
+
+static bool admit_request(struct whisper_translator *tr,
+                          struct wt_call_result *out,
+                          struct wt_admission *admission)
 {
-    if (out)
-        memset(out, 0, sizeof(*out));
-    if (!tr || !text || !text[0]) {
-        set_err(out, "invalid args");
+    int64_t now = translator_monotonic_ms(tr);
+    mp_mutex_lock(&tr->state_lock);
+    admission->cooldown_generation = tr->cooldown_generation;
+
+    int64_t remaining = tr->backoff_until_ms > now
+        ? tr->backoff_until_ms - now : 0;
+    if (remaining > 0 || tr->cooldown_probe_in_flight) {
+        enum wt_cooldown_kind kind = tr->cooldown_kind;
+        if (!remaining)
+            remaining = WT_PROBE_WAIT_MS;
+        mp_mutex_unlock(&tr->state_lock);
+        if (out) {
+            out->http_status = 0;
+            out->http_issued = false;
+            out->rate_limited = kind == WT_COOLDOWN_RATE_LIMIT;
+            out->retry_after_ms = saturated_int64_to_int(remaining);
+        }
+        set_err(out, kind == WT_COOLDOWN_RATE_LIMIT
+                ? "%s: rate limited" : "%s: cooling down",
+                provider_name(tr->provider));
+        return false;
+    }
+
+    if (tr->backoff_until_ms) {
+        tr->cooldown_probe_in_flight = true;
+        admission->probe = true;
+    }
+    mp_mutex_unlock(&tr->state_lock);
+    return true;
+}
+
+static int64_t failure_backoff_ms(int fail_count)
+{
+    if (fail_count < WT_BACKOFF_FAIL_THRESHOLD)
+        return 0;
+    int shift = fail_count - WT_BACKOFF_FAIL_THRESHOLD;
+    if (shift > 10)
+        shift = 10;
+    int64_t delay = (int64_t)WT_BACKOFF_BASE_MS << shift;
+    return delay < WT_BACKOFF_MAX_MS ? delay : WT_BACKOFF_MAX_MS;
+}
+
+static void extend_cooldown_locked(struct whisper_translator *tr,
+                                   int64_t now, int64_t delay,
+                                   enum wt_cooldown_kind kind,
+                                   bool clear_probe)
+{
+    bool was_active = tr->backoff_until_ms > now;
+    int64_t candidate = saturated_add_ms(now, delay);
+    if (candidate > tr->backoff_until_ms)
+        tr->backoff_until_ms = candidate;
+    if (kind == WT_COOLDOWN_RATE_LIMIT ||
+        tr->cooldown_kind == WT_COOLDOWN_NONE ||
+        !was_active)
+    {
+        tr->cooldown_kind = kind;
+    }
+    tr->cooldown_generation++;
+    if (clear_probe)
+        tr->cooldown_probe_in_flight = false;
+}
+
+static bool immediate_generic_cooldown(int http_status)
+{
+    return (http_status >= 300 && http_status <= 399) ||
+           http_status == 401 || http_status == 403 ||
+           http_status == 404 || http_status == 407;
+}
+
+static void record_outcome(struct whisper_translator *tr,
+                           const struct wt_admission *admission,
+                           const struct wt_call_result *call,
+                           const struct wt_http_observation *observation,
+                           bool success)
+{
+    enum {
+        WT_LOG_NONE,
+        WT_LOG_RATE_LIMIT,
+        WT_LOG_RETRY_AFTER,
+        WT_LOG_FAILURE_COOLDOWN,
+    } log_event = WT_LOG_NONE;
+    int64_t now = translator_monotonic_ms(tr);
+    mp_mutex_lock(&tr->state_lock);
+
+    if (success) {
+        if (admission->cooldown_generation == tr->cooldown_generation) {
+            tr->fail_count = 0;
+            tr->backoff_until_ms = 0;
+            tr->cooldown_kind = WT_COOLDOWN_NONE;
+            tr->cooldown_probe_in_flight = false;
+        } else if (admission->probe) {
+            tr->cooldown_probe_in_flight = false;
+        }
+        mp_mutex_unlock(&tr->state_lock);
         return;
     }
 
-    char *result = NULL;
-    switch (tr->provider) {
-    case WT_PROVIDER_GOOGLE:
-        result = translate_google(tr, talloc_ctx, text, out);
-        break;
-    case WT_PROVIDER_AZURE:
-        result = translate_azure(tr, talloc_ctx, text, out);
-        break;
-    case WT_PROVIDER_OPENAI:
-        result = translate_openai(tr, talloc_ctx, text, out);
-        break;
-    default:
-        set_err(out, "unknown provider");
-        break;
+    if (!call->http_issued) {
+        if (admission->probe &&
+            admission->cooldown_generation == tr->cooldown_generation)
+        {
+            tr->cooldown_probe_in_flight = false;
+        }
+        mp_mutex_unlock(&tr->state_lock);
+        return;
     }
 
-    mp_mutex_lock(&tr->state_lock);
-    if (result) {
-        tr->fail_count = 0;
-        tr->backoff_until_ms = 0;
-    } else {
+    if (tr->fail_count < INT_MAX)
         tr->fail_count++;
-        // Backoff applies only to the OpenAI provider (where each failure is
-        // an outbound API call that may be rate-limited or expensive).
-        if (tr->provider == WT_PROVIDER_OPENAI) {
-            int64_t now_ms = wt_now_ms();
-            if (out && out->rate_limited && !tr->backoff_until_ms) {
-                int wait = out->retry_after_ms > 0
-                            ? out->retry_after_ms
-                            : WT_RATE_LIMIT_BACKOFF_MS;
-                tr->backoff_until_ms = now_ms + wait;
-                mp_warn(tr->log, "translate: openai paused %dms (HTTP 429"
-                                 " retry-after)\n", wait);
-            } else if (tr->fail_count >= WT_BACKOFF_FAIL_THRESHOLD &&
-                       !tr->backoff_until_ms)
-            {
-                tr->backoff_until_ms = now_ms + WT_BACKOFF_MS;
-                mp_warn(tr->log, "translate: openai paused for %dms after %d "
-                                 "failures\n", WT_BACKOFF_MS, tr->fail_count);
-            }
+
+    if (call->http_status == 429) {
+        int64_t delay = observation->retry_after_ms > 0
+            ? observation->retry_after_ms : WT_RATE_LIMIT_BACKOFF_MS;
+        extend_cooldown_locked(
+            tr, now, delay, WT_COOLDOWN_RATE_LIMIT, admission->probe);
+        log_event = WT_LOG_RATE_LIMIT;
+    } else if (observation->retry_after_ms > 0) {
+        extend_cooldown_locked(
+            tr, now, observation->retry_after_ms, WT_COOLDOWN_GENERIC,
+            admission->probe);
+        log_event = WT_LOG_RETRY_AFTER;
+    } else {
+        int64_t delay = immediate_generic_cooldown(call->http_status)
+            ? WT_CHALLENGE_BACKOFF_MS
+            : failure_backoff_ms(tr->fail_count);
+        if (admission->probe && delay <= 0)
+            delay = WT_BACKOFF_BASE_MS;
+        if (delay > 0) {
+            extend_cooldown_locked(
+                tr, now, delay, WT_COOLDOWN_GENERIC, admission->probe);
+            log_event = WT_LOG_FAILURE_COOLDOWN;
+        } else if (admission->probe) {
+            tr->cooldown_probe_in_flight = false;
         }
     }
     mp_mutex_unlock(&tr->state_lock);
 
-    if (out)
-        out->translated = result;
+    switch (log_event) {
+    case WT_LOG_RATE_LIMIT:
+        mp_warn(tr->log, "translate: %s paused after HTTP 429\n",
+                provider_name(tr->provider));
+        break;
+    case WT_LOG_RETRY_AFTER:
+        mp_warn(tr->log, "translate: %s honored Retry-After\n",
+                provider_name(tr->provider));
+        break;
+    case WT_LOG_FAILURE_COOLDOWN:
+        mp_warn(tr->log, "translate: %s entered failure cooldown\n",
+                provider_name(tr->provider));
+        break;
+    case WT_LOG_NONE:
+        break;
+    }
+}
+
+void whisper_translate_call(struct whisper_translator *tr,
+                            void *talloc_ctx, const char *text,
+                            struct wt_call_result *out)
+{
+    struct wt_call_result local_out = {0};
+    struct wt_call_result *call = out ? out : &local_out;
+    memset(call, 0, sizeof(*call));
+    if (!tr || !text || !text[0]) {
+        set_err(call, "invalid args");
+        return;
+    }
+
+    struct wt_admission admission = {0};
+    if (!admit_request(tr, call, &admission))
+        return;
+
+    struct wt_http_observation observation = {0};
+    char *result = NULL;
+    switch (tr->provider) {
+    case WT_PROVIDER_GOOGLE:
+        result = translate_google(
+            tr, talloc_ctx, text, call, &observation);
+        break;
+    case WT_PROVIDER_AZURE:
+        result = translate_azure(
+            tr, talloc_ctx, text, call, &observation);
+        break;
+    case WT_PROVIDER_OPENAI:
+        result = translate_openai(
+            tr, talloc_ctx, text, call, &observation);
+        break;
+    default:
+        set_err(call, "unknown provider");
+        break;
+    }
+
+    record_outcome(tr, &admission, call, &observation, result != NULL);
+    call->translated = result;
 }
 
 char *whisper_translate(struct whisper_translator *tr,
@@ -1301,10 +1948,14 @@ void whisper_translator_get_status(struct whisper_translator *tr,
     out->enabled = true;
     mp_mutex_lock(&tr->state_lock);
     out->fail_count = tr->fail_count;
-    int64_t now = wt_now_ms();
+    int64_t now = translator_monotonic_ms(tr);
     if (tr->backoff_until_ms && now < tr->backoff_until_ms) {
         out->paused = true;
-        out->retry_after_ms = (int)(tr->backoff_until_ms - now);
+        out->retry_after_ms =
+            saturated_int64_to_int(tr->backoff_until_ms - now);
+    } else if (tr->cooldown_probe_in_flight) {
+        out->paused = true;
+        out->retry_after_ms = WT_PROBE_WAIT_MS;
     }
     mp_mutex_unlock(&tr->state_lock);
     // last_error is no longer tracked at the translator level (it is

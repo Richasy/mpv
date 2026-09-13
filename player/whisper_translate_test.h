@@ -1,0 +1,86 @@
+/*
+ * This file is part of mpv.
+ *
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * mpv is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#ifndef MP_WHISPER_TRANSLATE_TEST_H
+#define MP_WHISPER_TRANSLATE_TEST_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "whisper_translate.h"
+
+// Internal offline test seam. Provider hosts and paths are still constructed
+// by whisper_translate.c; tests can only observe requests and supply responses.
+enum wt_http_proxy_mode {
+    WT_HTTP_PROXY_DEFAULT,
+    WT_HTTP_PROXY_NONE,
+};
+
+enum wt_http_failure {
+    WT_HTTP_FAILURE_NONE,
+    WT_HTTP_FAILURE_SETUP,
+    WT_HTTP_FAILURE_SEND,
+    WT_HTTP_FAILURE_RECEIVE,
+    WT_HTTP_FAILURE_STATUS,
+    WT_HTTP_FAILURE_READ,
+    WT_HTTP_FAILURE_TOO_LARGE,
+};
+
+struct wt_http_request {
+    const char *host;
+    int port;
+    bool secure;
+    const char *method;
+    const char *path;
+    const char *headers;
+    const char *body;
+    size_t body_len;
+    enum wt_http_proxy_mode proxy_mode;
+};
+
+struct wt_http_response {
+    enum wt_http_failure failure;
+    bool http_issued;
+    int http_status;
+    const char *retry_after;
+    const unsigned char *body;
+    size_t body_len;
+};
+
+typedef void (*wt_http_transport_fn)(void *ctx, void *talloc_ctx,
+                                    const struct wt_http_request *request,
+                                    struct wt_http_response *response);
+typedef int64_t (*wt_clock_fn)(void *ctx);
+
+struct wt_test_hooks {
+    wt_http_transport_fn transport;
+    void *transport_ctx;
+    wt_clock_fn monotonic_ms;
+    wt_clock_fn unix_ms;
+    void *clock_ctx;
+};
+
+struct whisper_translator *whisper_translator_create_for_test(
+    void *talloc_parent, enum wt_provider provider,
+    const char *source_lang, const char *target_lang,
+    const struct wt_openai_config *openai,
+    const struct wt_test_hooks *hooks);
+
+size_t whisper_translate_test_max_response_bytes(void);
+
+#endif

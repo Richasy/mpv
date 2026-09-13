@@ -52,15 +52,17 @@ struct wt_openai_config {
 // Translator status snapshot, filled by whisper_translator_get_status().
 struct wt_status {
     bool enabled;
-    bool paused;            // backoff active: skipping requests for retry_after_ms
+    bool paused;            // shared cooldown active: requests are rejected locally
     int  fail_count;
-    int  retry_after_ms;    // remaining ms in current backoff window (0 if not paused)
+    int  retry_after_ms;    // saturated remaining cooldown in ms (0 if not paused)
     char last_error[128];   // short ascii reason; "" if none
 };
 
 struct whisper_translator;
 
-// Create a Google/Azure translator. Caller owns the returned pointer.
+// Create a Google/Bing translator. The WT_PROVIDER_AZURE value is retained for
+// settings compatibility and selects Bing's Edge translation endpoint.
+// Caller owns the returned pointer.
 // source_lang: source language code (e.g. "auto", "en")
 // target_lang: target language code (e.g. "zh", "ja", "en")
 struct whisper_translator *whisper_translator_create(
@@ -85,12 +87,12 @@ struct wt_call_result {
     char *translated;        // success: talloc string. failure: NULL.
     int   http_status;       // 0 if no HTTP was issued (e.g. backoff)
     bool  rate_limited;      // 429 / equivalent
-    bool  http_issued;       // true iff an HTTP request was actually sent
-                             // out the wire (used by callers to distinguish
-                             // local short-circuits like backoff / config
-                             // errors from real provider calls; only the
-                             // latter should consume cost-protection budget)
-    int   retry_after_ms;    // parsed from Retry-After header (0 if absent)
+    bool  http_issued;       // true once the HTTP send was attempted,
+                             // including send/receive/read failures; false
+                             // for local admission or setup rejection (only
+                             // attempted sends consume request budget)
+    int   retry_after_ms;    // parsed header or local cooldown remainder;
+                             // saturated to INT_MAX, 0 if absent
     char  error[256];        // short reason on failure ("" on success)
 };
 

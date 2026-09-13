@@ -32,6 +32,7 @@
 #include "misc/node.h"
 #include "sub/dec_sub.h"
 
+#include "command.h"
 #include "core.h"
 #include "sub_translate.h"
 #include "translation.h"
@@ -75,6 +76,7 @@ struct sub_translate_state {
     bool needs_rebuild;
     char *error;
     char *unsupported;
+    char *last_status;
 };
 
 static struct sub_translate_state *get_state(struct MPContext *mpctx,
@@ -89,6 +91,21 @@ static struct sub_translate_state *get_state(struct MPContext *mpctx,
         mpctx->sub_translate = state;
     }
     return mpctx->sub_translate;
+}
+
+static void notify_status_if_changed(struct sub_translate_state *state)
+{
+    if (!state)
+        return;
+    char *status = sub_translate_get_status(state->mpctx, NULL);
+    if (!state->last_status ||
+        strcmp(state->last_status, status) != 0)
+    {
+        talloc_free(state->last_status);
+        state->last_status = talloc_strdup(state, status);
+        mp_notify_property(state->mpctx, "sub-translate-status");
+    }
+    talloc_free(status);
 }
 
 static void replace_message(char **field, void *parent, const char *message)
@@ -266,6 +283,7 @@ static void on_text_cue(void *ctx, const struct sub_text_cue *source)
     {
         if (cue->state == CUE_WAITING)
             submit_cue(state, cue);
+        notify_status_if_changed(state);
         return;
     } else {
         cue->revision++;
@@ -281,6 +299,7 @@ static void on_text_cue(void *ctx, const struct sub_text_cue *source)
     cue->text = talloc_strdup(cue, source->text);
     cue->state = CUE_WAITING;
     submit_cue(state, cue);
+    notify_status_if_changed(state);
 }
 
 static void feed_cue(struct sub_translate_state *state,
@@ -482,6 +501,7 @@ void sub_translate_set_enabled(struct MPContext *mpctx, bool enabled)
     } else {
         attach_current_source(state);
     }
+    notify_status_if_changed(state);
     mp_wakeup_core(mpctx);
 }
 
@@ -504,6 +524,7 @@ int sub_translate_set_config(struct MPContext *mpctx, const char *json,
         replace_message(&state->unsupported, state, NULL);
         if (state->enabled)
             attach_current_source(state);
+        notify_status_if_changed(state);
     }
     mp_wakeup_core(mpctx);
     return 0;
@@ -551,8 +572,10 @@ void sub_translate_update(struct MPContext *mpctx)
         state->needs_scan = true;
     }
 
-    if (!source_ready(state))
+    if (!source_ready(state)) {
+        notify_status_if_changed(state);
         return;
+    }
 
     mp_translation_drain(mpctx->translation,
                          MP_TRANSLATION_SOURCE_SUBTITLE,
@@ -579,6 +602,7 @@ void sub_translate_update(struct MPContext *mpctx)
                            playback - SUB_TRANSLATE_PAST_WINDOW,
                            wanted_end);
     }
+    notify_status_if_changed(state);
 }
 
 void sub_translate_seek(struct MPContext *mpctx)
@@ -587,6 +611,7 @@ void sub_translate_seek(struct MPContext *mpctx)
     if (!state || !state->enabled)
         return;
     reset_source_work(state, false);
+    notify_status_if_changed(state);
 }
 
 void sub_translate_on_sub_reinit(struct MPContext *mpctx,
@@ -597,6 +622,7 @@ void sub_translate_on_sub_reinit(struct MPContext *mpctx,
         mpctx->current_track[0][STREAM_SUB] == track)
     {
         attach_current_source(state);
+        notify_status_if_changed(state);
     }
 }
 
@@ -608,6 +634,7 @@ void sub_translate_on_sub_uninit(struct MPContext *mpctx,
         return;
     detach_source(state);
     reset_source_work(state, false);
+    notify_status_if_changed(state);
 }
 
 void sub_translate_stop_file(struct MPContext *mpctx)
@@ -621,6 +648,7 @@ void sub_translate_stop_file(struct MPContext *mpctx)
     state->output_track = NULL;
     replace_message(&state->error, state, NULL);
     replace_message(&state->unsupported, state, NULL);
+    notify_status_if_changed(state);
 }
 
 void sub_translate_destroy(struct MPContext *mpctx)

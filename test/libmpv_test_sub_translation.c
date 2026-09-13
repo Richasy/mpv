@@ -13,6 +13,33 @@
 
 #include "libmpv_common.h"
 
+#define STATUS_OBSERVER_ID 0x53544254
+
+static char observed_status[1024];
+
+static void reset_status_observation(void)
+{
+    observed_status[0] = '\0';
+}
+
+static void record_status_event(mpv_event *event)
+{
+    if (event->event_id != MPV_EVENT_PROPERTY_CHANGE ||
+        event->reply_userdata != STATUS_OBSERVER_ID)
+    {
+        return;
+    }
+    mpv_event_property *property = event->data;
+    if (!property || property->format != MPV_FORMAT_STRING ||
+        !property->data)
+    {
+        return;
+    }
+    char *value = *(char **)property->data;
+    snprintf(observed_status, sizeof(observed_status), "%s",
+             value ? value : "");
+}
+
 static char *get_string(const char *name)
 {
     char *value = mpv_get_property_string(ctx, name);
@@ -45,6 +72,7 @@ static void wait_for_file_loaded(void)
 {
     while (true) {
         mpv_event *event = wrap_wait_event();
+        record_status_event(event);
         if (event->event_id == MPV_EVENT_FILE_LOADED)
             return;
     }
@@ -55,11 +83,9 @@ static char *wait_for_status(const char *state)
     char expected[64];
     snprintf(expected, sizeof(expected), "\"state\":\"%s\"", state);
     for (int attempt = 0; attempt < 200; attempt++) {
-        char *status = get_string("sub-translate-status");
-        if (strstr(status, expected))
-            return status;
-        mpv_free(status);
-        mpv_wait_event(ctx, 0.05);
+        if (strstr(observed_status, expected))
+            return get_string("sub-translate-status");
+        record_status_event(mpv_wait_event(ctx, 0.05));
     }
     char *status = get_string("sub-translate-status");
     fail("Timed out waiting for state %s: %s\n", state, status);
@@ -70,12 +96,9 @@ static void wait_for_translated_count(int count)
     char expected[64];
     snprintf(expected, sizeof(expected), "\"translated\":%d", count);
     for (int attempt = 0; attempt < 200; attempt++) {
-        char *status = get_string("sub-translate-status");
-        bool ready = strstr(status, expected) != NULL;
-        mpv_free(status);
-        if (ready)
+        if (strstr(observed_status, expected))
             return;
-        mpv_wait_event(ctx, 0.05);
+        record_status_event(mpv_wait_event(ctx, 0.05));
     }
     fail("Timed out waiting for %d translated cues.\n", count);
 }
@@ -93,16 +116,18 @@ static void advance_to(double target)
             mpv_set_property(ctx, "pause", MPV_FORMAT_FLAG, &paused);
             return;
         }
-        mpv_wait_event(ctx, 0.05);
+        record_status_event(mpv_wait_event(ctx, 0.05));
     }
     fail("Timed out advancing playback to %.3f.\n", target);
 }
 
 static void seek_to_start(void)
 {
+    reset_status_observation();
     command(((const char *[]){"seek", "0", "absolute+exact", NULL}));
     while (true) {
         mpv_event *event = wrap_wait_event();
+        record_status_event(event);
         if (event->event_id == MPV_EVENT_PLAYBACK_RESTART)
             return;
     }
@@ -207,11 +232,12 @@ static void configure(const char *endpoint)
     mpv_free(masked);
 }
 
-static void test_embedded(const char *path)
+static void test_embedded(const char *path, const char *endpoint)
 {
     load_file(path);
     int64_t source_sid = get_int64("sid");
     int enabled = 1;
+    reset_status_observation();
     if (mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG,
                          &enabled) < 0)
     {
@@ -240,10 +266,19 @@ static void test_embedded(const char *path)
     seek_to_start();
     wait_for_translated_count(2);
     verify_current_cue("translated:foo", 0.0, 1.0);
+    reset_status_observation();
+    configure(endpoint);
+    status = wait_for_status("active");
+    mpv_free(status);
+    wait_for_translated_count(2);
+    verify_current_cue("translated:foo", 0.0, 1.0);
     verify_whisper_stayed_off();
 
     enabled = 0;
+    reset_status_observation();
     mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    status = wait_for_status("disabled");
+    mpv_free(status);
     if (get_int64("sid") != source_sid ||
         get_int64("secondary-sid") != -2)
     {
@@ -261,6 +296,7 @@ static void test_external(const char *video, const char *subtitle)
     load_file(video);
     command(((const char *[]){"sub-add", subtitle, "select", NULL}));
     int enabled = 1;
+    reset_status_observation();
     mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
     int paused = 0;
     mpv_set_property(ctx, "pause", MPV_FORMAT_FLAG, &paused);
@@ -274,7 +310,10 @@ static void test_external(const char *video, const char *subtitle)
     verify_current_cue("translated:bar", 1.0, 2.0);
     verify_whisper_stayed_off();
     enabled = 0;
+    reset_status_observation();
     mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    status = wait_for_status("disabled");
+    mpv_free(status);
 }
 
 static void test_bitmap(const char *video, const char *bitmap)
@@ -282,6 +321,7 @@ static void test_bitmap(const char *video, const char *bitmap)
     load_file(video);
     command(((const char *[]){"sub-add", bitmap, "select", NULL}));
     int enabled = 1;
+    reset_status_observation();
     mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
     char *status = wait_for_status("unsupported");
     if (!strstr(status, "bitmap-based") ||
@@ -292,7 +332,10 @@ static void test_bitmap(const char *video, const char *bitmap)
              status);
     mpv_free(status);
     enabled = 0;
+    reset_status_observation();
     mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    status = wait_for_status("disabled");
+    mpv_free(status);
 }
 
 static int count_occurrences(const char *text, const char *needle)
@@ -311,6 +354,7 @@ static void test_ass_dialogue(const char *video, const char *subtitle)
     load_file(video);
     command(((const char *[]){"sub-add", subtitle, "select", NULL}));
     int enabled = 1;
+    reset_status_observation();
     mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
     int paused = 0;
     mpv_set_property(ctx, "pause", MPV_FORMAT_FLAG, &paused);
@@ -335,7 +379,10 @@ static void test_ass_dialogue(const char *video, const char *subtitle)
         fail("Overlapping ASS cue times changed.\n");
 
     enabled = 0;
+    reset_status_observation();
     mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    char *status = wait_for_status("disabled");
+    mpv_free(status);
 }
 
 static void find_two_subtitles(int64_t *first, int64_t *second)
@@ -372,6 +419,7 @@ static void test_secondary_conflict(const char *path)
     set_track_id("sid", primary);
     set_track_id("secondary-sid", secondary);
     int enabled = 1;
+    reset_status_observation();
     mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
     char *status = wait_for_status("error");
     if (!strstr(status, "secondary subtitle track is already selected") ||
@@ -386,7 +434,10 @@ static void test_secondary_conflict(const char *path)
         fail("Translation hijacked a manually selected secondary track.\n");
     }
     enabled = 0;
+    reset_status_observation();
     mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    status = wait_for_status("disabled");
+    mpv_free(status);
 }
 
 int main(int argc, char **argv)
@@ -404,8 +455,16 @@ int main(int argc, char **argv)
     set_property_string("speed", "0.5");
     initialize();
     mpv_request_log_messages(ctx, "warn");
+    if (mpv_observe_property(
+            ctx, STATUS_OBSERVER_ID,
+            "sub-translate-status", MPV_FORMAT_STRING) < 0)
+    {
+        fail("Could not observe sub-translate-status.\n");
+    }
+    char *initial_status = wait_for_status("disabled");
+    mpv_free(initial_status);
     configure(argv[1]);
-    test_embedded(argv[2]);
+    test_embedded(argv[2], argv[1]);
     test_external(argv[3], argv[4]);
     test_bitmap(argv[3], argv[5]);
     test_secondary_conflict(argv[6]);

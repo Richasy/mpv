@@ -3540,7 +3540,10 @@ Property list
         }
 
     ``source_sid`` and ``output_sid`` are null when unavailable. The status
-    never contains subtitle text, provider URLs, or credentials.
+    never contains subtitle text, provider URLs, or credentials. Property
+    change notifications are emitted when this sanitized JSON changes,
+    including configuration, enablement, seek, source, queue/result, output
+    selection, and error transitions. Duplicate snapshots are coalesced.
 
 ``playlist-pos`` (RW)
     Current position on playlist. The first entry is on position 0. Writing to

@@ -79,6 +79,8 @@ struct dec_sub {
 
     double last_vo_pts;
     struct sd *sd;
+    sub_text_cue_fn text_cue_callback;
+    void *text_cue_callback_ctx;
 
     struct demux_packet *new_segment;
     struct demux_packet **cached_pkts;
@@ -103,11 +105,24 @@ static void update_subtitle_speed(struct dec_sub *sub)
     sub->sub_speed *= opts->sub_speed;
 }
 
+static bool uses_player_timeline(struct dec_sub *sub)
+{
+    const char *profile = sub->codec->codec_profile;
+    return profile && strcmp(profile, "translated") == 0;
+}
+
+static double subtitle_delay(struct dec_sub *sub)
+{
+    return sub->order < 0 || uses_player_timeline(sub)
+        ? 0.0 : sub->shared_opts->sub_delay[sub->order];
+}
+
 // Return the subtitle PTS used for a given video PTS.
 static double pts_to_subtitle(struct dec_sub *sub, double pts)
 {
-    struct mp_subtitle_shared_opts *opts = sub->shared_opts;
-    double delay = sub->order < 0 ? 0.0 : opts->sub_delay[sub->order];
+    if (uses_player_timeline(sub))
+        return pts;
+    double delay = subtitle_delay(sub);
 
     if (pts != MP_NOPTS_VALUE)
         pts = (pts * sub->play_dir - delay) / sub->sub_speed;
@@ -117,13 +132,27 @@ static double pts_to_subtitle(struct dec_sub *sub, double pts)
 
 static double pts_from_subtitle(struct dec_sub *sub, double pts)
 {
-    struct mp_subtitle_shared_opts *opts = sub->shared_opts;
-    double delay = sub->order < 0 ? 0.0 : opts->sub_delay[sub->order];
+    if (uses_player_timeline(sub))
+        return pts;
+    double delay = subtitle_delay(sub);
 
     if (pts != MP_NOPTS_VALUE)
         pts = (pts * sub->sub_speed + delay) * sub->play_dir;
 
     return pts;
+}
+
+static void dispatch_text_cue(void *ctx, const struct sub_text_cue *cue)
+{
+    struct dec_sub *sub = ctx;
+    if (!sub->text_cue_callback)
+        return;
+    double start = pts_from_subtitle(sub, cue->start);
+    double end = pts_from_subtitle(sub, cue->start + cue->duration);
+    struct sub_text_cue mapped = *cue;
+    mapped.start = MPMIN(start, end);
+    mapped.duration = fabs(end - start);
+    sub->text_cue_callback(sub->text_cue_callback_ctx, &mapped);
 }
 
 static void wakeup_demux(void *ctx)
@@ -173,6 +202,9 @@ static struct sd *init_decoder(struct dec_sub *sub)
             .attachments = sub->attachments,
             .codec = sub->codec,
             .lang = sub->lang,
+            .text_cue_callback =
+                sub->text_cue_callback ? dispatch_text_cue : NULL,
+            .text_cue_callback_ctx = sub,
             .preload_ok = true,
         };
 
@@ -318,7 +350,7 @@ static bool update_pkt_cache(struct dec_sub *sub, double video_pts)
     if (!pkt)
         return false;
 
-    double pts = video_pts + sub->shared_opts->sub_delay[sub->order];
+    double pts = video_pts + subtitle_delay(sub);
     double next_pts = next_pkt ? next_pkt->pts : INT_MAX;
     double end_pts = pkt->sub_duration >= 0 ? pkt->pts + pkt->sub_duration : INT_MAX;
 
@@ -336,6 +368,13 @@ static bool update_pkt_cache(struct dec_sub *sub, double video_pts)
         return true;
 
     return false;
+}
+
+static double subtitle_read_until(struct dec_sub *sub, double video_pts,
+                                  bool force)
+{
+    double delay = subtitle_delay(sub);
+    return delay < 0 || force ? video_pts : MP_NOPTS_VALUE;
 }
 
 // Read packets from the demuxer stream passed to sub_create(). Signals if
@@ -365,8 +404,7 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
             break;
 
         // (Use this mechanism only if sub_delay matters to avoid corner cases.)
-        double delay = sub->order < 0 ? 0.0 : sub->shared_opts->sub_delay[sub->order];
-        double min_pts = delay < 0 || force ? video_pts : MP_NOPTS_VALUE;
+        double min_pts = subtitle_read_until(sub, video_pts, force);
 
         struct demux_packet *pkt;
         int st = demux_read_packet_async_until(sub->sh, min_pts, &pkt);
@@ -513,10 +551,12 @@ int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
     int r = CONTROL_UNKNOWN;
     mp_mutex_lock(&sub->lock);
     bool propagate = false;
+    bool timing_changed = false;
     switch (cmd) {
     case SD_CTRL_SET_VIDEO_DEF_FPS:
         sub->video_fps = *(double *)arg;
         update_subtitle_speed(sub);
+        timing_changed = true;
         break;
     case SD_CTRL_SUB_STEP: {
         double *a = arg;
@@ -530,9 +570,12 @@ int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
     }
     case SD_CTRL_UPDATE_OPTS: {
         uint64_t flags = *(uint64_t *)arg;
-        if (m_config_cache_update(sub->opts_cache))
+        if (m_config_cache_update(sub->opts_cache)) {
             update_subtitle_speed(sub);
-        m_config_cache_update(sub->shared_opts_cache);
+            timing_changed = true;
+        }
+        if (m_config_cache_update(sub->shared_opts_cache))
+            timing_changed = true;
         propagate = true;
         if (flags & UPDATE_SUB_HARD) {
             // forget about the previous preload because
@@ -547,6 +590,11 @@ int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
     }
     if (propagate && sub->sd->driver->control)
         r = sub->sd->driver->control(sub->sd, cmd, arg);
+    if (timing_changed && sub->text_cue_callback &&
+        sub->sd->driver->emit_text_cues)
+    {
+        sub->sd->driver->emit_text_cues(sub->sd, -INFINITY, INFINITY);
+    }
     mp_mutex_unlock(&sub->lock);
     return r;
 }
@@ -632,6 +680,108 @@ struct sub_lines *sub_get_lines(struct dec_sub *sub)
         qsort(res->entries, res->num_entries, sizeof(res->entries[0]),
               sub_line_cmp);
     }
+
     mp_mutex_unlock(&sub->lock);
     return res;
+}
+
+bool sub_set_text_cue_callback(struct dec_sub *sub,
+                               sub_text_cue_fn callback, void *callback_ctx)
+{
+    if (!sub)
+        return false;
+    mp_mutex_lock(&sub->lock);
+    bool supported = sub->sd && sub->sd->driver->emit_text_cues;
+    sub->text_cue_callback = supported ? callback : NULL;
+    sub->text_cue_callback_ctx = supported ? callback_ctx : NULL;
+    if (sub->sd) {
+        sub->sd->text_cue_callback =
+            sub->text_cue_callback ? dispatch_text_cue : NULL;
+        sub->sd->text_cue_callback_ctx = sub;
+    }
+    mp_mutex_unlock(&sub->lock);
+    return supported;
+}
+
+bool sub_map_player_cue_to_subtitle(struct dec_sub *sub,
+                                    double player_start,
+                                    double player_duration,
+                                    double *subtitle_start,
+                                    double *subtitle_duration)
+{
+    if (!sub || !subtitle_start || !subtitle_duration ||
+        !isfinite(player_start) || !isfinite(player_duration) ||
+        player_duration < 0)
+    {
+        return false;
+    }
+    mp_mutex_lock(&sub->lock);
+    double start = pts_to_subtitle(sub, player_start);
+    double end = pts_to_subtitle(sub, player_start + player_duration);
+    *subtitle_start = MPMIN(start, end);
+    *subtitle_duration = fabs(end - start);
+    mp_mutex_unlock(&sub->lock);
+    return isfinite(*subtitle_start) && isfinite(*subtitle_duration);
+}
+
+void sub_test_packet_timing(const char *codec_profile,
+                            double secondary_delay,
+                            double video_pts,
+                            bool force,
+                            struct sub_packet_timing_probe *out)
+{
+    struct mp_subtitle_shared_opts shared = {
+        .sub_delay = {0.0, secondary_delay},
+    };
+    struct mp_codec_params codec = {
+        .codec_profile = (char *)codec_profile,
+    };
+    struct demux_packet *first =
+        talloc_zero(NULL, struct demux_packet);
+    struct demux_packet *second =
+        talloc_zero(NULL, struct demux_packet);
+    first->pts = 0.4;
+    first->sub_duration = 1.25;
+    second->pts = 1.65;
+    second->sub_duration = 1.25;
+    struct demux_packet *packets[] = {first, second};
+    struct dec_sub sub = {
+        .shared_opts = &shared,
+        .codec = &codec,
+        .order = 1,
+        .cached_pkts = packets,
+        .num_cached_pkts = 2,
+        .sub_visible = true,
+    };
+
+    bool advanced = update_pkt_cache(&sub, video_pts);
+    struct demux_packet *current =
+        packets[sub.cached_pkt_pos];
+    bool visible = is_packet_visible(current, video_pts);
+    *out = (struct sub_packet_timing_probe){
+        .visible = visible,
+        .sub_updated = advanced || sub.sub_visible != visible,
+        .cached_packet_index = sub.cached_pkt_pos,
+        .read_until = subtitle_read_until(&sub, video_pts, force),
+    };
+
+    for (int n = 0; n < 2; n++)
+        talloc_free(packets[n]);
+}
+
+bool sub_emit_text_cues(struct dec_sub *sub, double start, double end)
+{
+    if (!sub)
+        return false;
+    mp_mutex_lock(&sub->lock);
+    bool supported = sub->sd && sub->sd->driver->emit_text_cues;
+    if (supported && sub->text_cue_callback) {
+        double mapped_start = pts_to_subtitle(sub, start);
+        double mapped_end = pts_to_subtitle(sub, end);
+        sub->sd->driver->emit_text_cues(
+            sub->sd, MPMIN(mapped_start, mapped_end),
+            MPMAX(mapped_start, mapped_end));
+    }
+    mp_mutex_unlock(&sub->lock);
+    return supported;
 }

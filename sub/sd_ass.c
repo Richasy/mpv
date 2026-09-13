@@ -20,6 +20,7 @@
 #include <string.h>
 #include <math.h>
 #include <limits.h>
+#include <stdint.h>
 
 #include <libavutil/common.h>
 #include <ass/ass.h>
@@ -285,8 +286,12 @@ static void assobjects_init(struct sd *sd)
     // tagged via codec_profile in demux.c (demuxer_get_af_sub_locked).
     {
         const char *profile = sd->codec->codec_profile;
-        if (profile && strcmp(profile, "whisper") == 0)
+        if (profile &&
+            (strcmp(profile, "whisper") == 0 ||
+             strcmp(profile, "translated") == 0))
+        {
             ass_track_set_feature(ctx->ass_track, ASS_FEATURE_WRAP_UNICODE, 1);
+        }
     }
 #endif
 
@@ -386,7 +391,7 @@ static bool is_animated(const char *str)
 }
 
 // Note: pkt is not necessarily a fully valid refcounted packet.
-static void filter_and_add(struct sd *sd, struct demux_packet *pkt)
+static int filter_and_add(struct sd *sd, struct demux_packet *pkt)
 {
     struct sd_ass_priv *ctx = sd->priv;
     struct demux_packet *orig_pkt = pkt;
@@ -400,7 +405,7 @@ static void filter_and_add(struct sd *sd, struct demux_packet *pkt)
             talloc_free(pkt);
         pkt = npkt;
         if (!pkt)
-            return;
+            return -1;
     }
 
     ass_process_chunk(ctx->ass_track, pkt->buffer, pkt->len,
@@ -438,6 +443,7 @@ static void filter_and_add(struct sd *sd, struct demux_packet *pkt)
 
     if (pkt != orig_pkt)
         talloc_free(pkt);
+    return old_n_events;
 }
 
 // Test if the packet with the given file position and pts was already consumed.
@@ -470,10 +476,76 @@ static bool check_packet_seen(struct sd *sd, struct demux_packet *packet)
 
 #define UNKNOWN_DURATION (INT_MAX / 1000)
 
+static uint64_t cue_hash_value(uint64_t hash, uint64_t value)
+{
+    for (int n = 0; n < 8; n++) {
+        hash ^= value & 0xff;
+        hash *= UINT64_C(1099511628211);
+        value >>= 8;
+    }
+    return hash;
+}
+
+static uint64_t cue_identity(const ASS_Event *event)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = cue_hash_value(hash, (uint64_t)(uint32_t)event->ReadOrder);
+    hash = cue_hash_value(hash, (uint64_t)event->Start);
+    hash = cue_hash_value(hash, (uint64_t)(uint32_t)event->Layer);
+    hash = cue_hash_value(hash, (uint64_t)(uint32_t)event->Style);
+    for (const unsigned char *text =
+             (const unsigned char *)(event->Text ? event->Text : "");
+         *text; text++)
+    {
+        hash ^= *text;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static void emit_text_event(struct sd *sd, ASS_Event *event)
+{
+    if (!sd->text_cue_callback || !event->Text)
+        return;
+
+    char *plain = NULL;
+    bstr text = sd_ass_to_plaintext(&plain, event->Text);
+    bool visible = false;
+    for (int n = 0; n < text.len; n++) {
+        if (text.start[n] != ' ' && text.start[n] != '\t' &&
+            text.start[n] != '\r' && text.start[n] != '\n')
+        {
+            visible = true;
+            break;
+        }
+    }
+    if (visible) {
+        struct sub_text_cue cue = {
+            .id = cue_identity(event),
+            .start = event->Start / 1000.0,
+            .duration = event->Duration / 1000.0,
+            .text = plain,
+        };
+        sd->text_cue_callback(sd->text_cue_callback_ctx, &cue);
+    }
+    talloc_free(plain);
+}
+
+static void emit_text_events_from(struct sd *sd, int first)
+{
+    struct sd_ass_priv *ctx = sd->priv;
+    if (!sd->text_cue_callback)
+        return;
+    first = MPCLAMP(first, 0, ctx->ass_track->n_events);
+    for (int n = first; n < ctx->ass_track->n_events; n++)
+        emit_text_event(sd, &ctx->ass_track->events[n]);
+}
+
 static void decode(struct sd *sd, struct demux_packet *packet)
 {
     struct sd_ass_priv *ctx = sd->priv;
     ASS_Track *track = ctx->ass_track;
+    int publish_from = track->n_events;
 
     packet->sub_duration = packet->duration;
 
@@ -499,7 +571,9 @@ static void decode(struct sd *sd, struct demux_packet *packet)
                 .buffer = r[n],
                 .len = strlen(r[n]),
             };
-            filter_and_add(sd, &pkt2);
+            int added_from = filter_and_add(sd, &pkt2);
+            if (added_from >= 0)
+                publish_from = MPMIN(publish_from, added_from);
         }
         for (int n = track->n_events - 1; n >= 0; n--) {
             if (track->events[track->n_events - 1].Start == track->events[n].Start)
@@ -508,19 +582,24 @@ static void decode(struct sd *sd, struct demux_packet *packet)
                 if (track->events[n].Start < track->events[n + 1].Start) {
                     track->events[n].Duration = track->events[n + 1].Start -
                                                 track->events[n].Start;
+                    publish_from = MPMIN(publish_from, n);
                 } else if (track->events[n].Start == track->events[n + 1].Start) {
                     track->events[n].Duration = track->events[n + 1].Duration;
+                    publish_from = MPMIN(publish_from, n);
                 }
             }
             if (n > 0 && track->events[n].Start != track->events[n - 1].Start)
                 break;
         }
+        emit_text_events_from(sd, publish_from);
     } else {
         // Note that for this packet format, libass has an internal mechanism
         // for discarding duplicate (already seen) packets but we check this
         // anyways for our purposes for ASS subtitles.
         packet->seen = check_packet_seen(sd, packet);
-        filter_and_add(sd, packet);
+        int added_from = filter_and_add(sd, packet);
+        if (added_from >= 0)
+            emit_text_events_from(sd, added_from);
     }
 }
 
@@ -1073,6 +1152,22 @@ static struct sub_lines *get_lines(struct sd *sd)
     return res;
 }
 
+static void emit_text_cues(struct sd *sd, double start, double end)
+{
+    struct sd_ass_priv *ctx = sd->priv;
+    ASS_Track *track = ctx->ass_track;
+    for (int n = 0; n < track->n_events; n++) {
+        ASS_Event *event = &track->events[n];
+        double cue_start = event->Start / 1000.0;
+        double cue_end = (event->Start + event->Duration) / 1000.0;
+        if (isfinite(start) && cue_end < start)
+            continue;
+        if (isfinite(end) && cue_start > end)
+            continue;
+        emit_text_event(sd, event);
+    }
+}
+
 static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
 {
     struct sd_ass_priv *ctx = sd->priv;
@@ -1129,6 +1224,7 @@ const struct sd_functions sd_ass = {
     .get_text = get_text,
     .get_times = get_times,
     .get_lines = get_lines,
+    .emit_text_cues = emit_text_cues,
     .control = control,
     .reset = reset,
     .select = enable_output,

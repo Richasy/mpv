@@ -80,6 +80,156 @@ void json_skip_whitespace(char **src)
     eat_ws(src);
 }
 
+static void strict_skip_whitespace(const char **src)
+{
+    while (**src == ' ' || **src == '\t' ||
+           **src == '\n' || **src == '\r')
+    {
+        (*src)++;
+    }
+}
+
+static bool strict_hex(char c)
+{
+    return (c >= '0' && c <= '9') ||
+           (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+}
+
+static bool strict_string(const char **src)
+{
+    if (*(*src)++ != '"')
+        return false;
+    while (**src) {
+        unsigned char c = *(*src)++;
+        if (c == '"')
+            return true;
+        if (c < 0x20)
+            return false;
+        if (c != '\\')
+            continue;
+        char escape = *(*src)++;
+        if (!escape)
+            return false;
+        if (strchr("\"\\/bfnrt", escape))
+            continue;
+        if (escape != 'u')
+            return false;
+        for (int n = 0; n < 4; n++) {
+            if (!**src || !strict_hex(**src))
+                return false;
+            (*src)++;
+        }
+    }
+    return false;
+}
+
+static bool strict_number(const char **src)
+{
+    const char *cursor = *src;
+    if (*cursor == '-')
+        cursor++;
+    if (*cursor == '0') {
+        cursor++;
+        if (*cursor >= '0' && *cursor <= '9')
+            return false;
+    } else {
+        if (*cursor < '1' || *cursor > '9')
+            return false;
+        while (*cursor >= '0' && *cursor <= '9')
+            cursor++;
+    }
+    if (*cursor == '.') {
+        cursor++;
+        if (*cursor < '0' || *cursor > '9')
+            return false;
+        while (*cursor >= '0' && *cursor <= '9')
+            cursor++;
+    }
+    if (*cursor == 'e' || *cursor == 'E') {
+        cursor++;
+        if (*cursor == '+' || *cursor == '-')
+            cursor++;
+        if (*cursor < '0' || *cursor > '9')
+            return false;
+        while (*cursor >= '0' && *cursor <= '9')
+            cursor++;
+    }
+    *src = cursor;
+    return true;
+}
+
+static bool strict_value(const char **src, int max_depth)
+{
+    if (max_depth <= 0)
+        return false;
+    strict_skip_whitespace(src);
+    if (**src == '"')
+        return strict_string(src);
+    if (**src == '-' || (**src >= '0' && **src <= '9'))
+        return strict_number(src);
+    if (strncmp(*src, "true", 4) == 0) {
+        *src += 4;
+        return true;
+    }
+    if (strncmp(*src, "false", 5) == 0) {
+        *src += 5;
+        return true;
+    }
+    if (strncmp(*src, "null", 4) == 0) {
+        *src += 4;
+        return true;
+    }
+
+    char close;
+    if (**src == '{') {
+        close = '}';
+    } else if (**src == '[') {
+        close = ']';
+    } else {
+        return false;
+    }
+    bool object = close == '}';
+    (*src)++;
+    strict_skip_whitespace(src);
+    if (**src == close) {
+        (*src)++;
+        return true;
+    }
+
+    while (**src) {
+        if (object) {
+            if (**src != '"' || !strict_string(src))
+                return false;
+            strict_skip_whitespace(src);
+            if (*(*src)++ != ':')
+                return false;
+            strict_skip_whitespace(src);
+        }
+        if (!strict_value(src, max_depth - 1))
+            return false;
+        strict_skip_whitespace(src);
+        if (**src == close) {
+            (*src)++;
+            return true;
+        }
+        if (*(*src)++ != ',')
+            return false;
+        strict_skip_whitespace(src);
+        if (**src == close)
+            return false;
+    }
+    return false;
+}
+
+bool json_validate_strict(const char *src, int max_depth)
+{
+    if (!src || !strict_value(&src, max_depth))
+        return false;
+    strict_skip_whitespace(&src);
+    return !src[0];
+}
+
 static int read_id(void *ta_parent, struct mpv_node *dst, char **src)
 {
     char *start = *src;

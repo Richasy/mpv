@@ -29,7 +29,19 @@ on:
       ffmpeg_ref:
         description: 'Richasy/FFmpeg commit, branch, or tag'
         type: string
-        default: master
+        default: df21143bf252528f45d7ae56cc1d317ff00d4449
+      source_run_id:
+        description: 'Prior libmpv workflow run ID for artifact-only Azure retry'
+        type: string
+        default: ''
+      expected_source_sha:
+        description: 'Required full mpv commit SHA when source_run_id is set'
+        type: string
+        default: ''
+      expected_libplacebo_sha:
+        description: 'Required full libplacebo commit SHA when source_run_id is set'
+        type: string
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -37,6 +49,7 @@ concurrency:
 
 jobs:
   prepare:
+    if: inputs.source_run_id == ''
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
@@ -60,7 +73,7 @@ jobs:
 
   build:
     needs: prepare
-    if: needs.prepare.outputs.matrix != '{"include":[]}'
+    if: inputs.source_run_id == '' && needs.prepare.outputs.matrix != '{"include":[]}'
     runs-on: [self-hosted, Linux, X64]
     strategy:
       fail-fast: false
@@ -74,7 +87,7 @@ jobs:
       TARGET_ARCH: ${{ matrix.arch }}
       MPV_REPO: https://github.com/Richasy/mpv.git
       MPV_COMMIT: ${{ github.sha }}
-      FFMPEG_COMMIT: ${{ inputs.ffmpeg_ref || 'master' }}
+      FFMPEG_COMMIT: ${{ inputs.ffmpeg_ref || 'df21143bf252528f45d7ae56cc1d317ff00d4449' }}
       BUILD_TYPE: ${{ inputs.build_type }}
       BUILD_SUFFIX: ${{ inputs.build_type == 'debug' && '-debug' || '' }}
     steps:
@@ -93,6 +106,19 @@ jobs:
             video/filter/dlssnr/test_params.c video/filter/dlssnr/params.c \
             -lm -o /tmp/dlssnr-params-test
           /tmp/dlssnr-params-test
+
+      - name: Test subtitle translation policy
+        if: matrix.arch == 'x86_64'
+        run: |
+          mkdir -p build/preflight
+          cc -std=c11 -Wall -Wextra -Werror -I. \
+            test/sub_translate_policy.c player/sub_translate_policy.c \
+            -o build/preflight/sub-translate-policy-test
+          build/preflight/sub-translate-policy-test
+
+      - name: Test artifact-only Azure retry helper
+        if: matrix.arch == 'x86_64'
+        run: python3 test/retry_azure_artifact.py
 
       - name: Ensure PATH includes local bin
         run: echo "$HOME/.local/bin" >> $GITHUB_PATH
@@ -171,3 +197,105 @@ jobs:
             ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-build/CMakeFiles/CMakeOutput.log
             ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-build/CMakeFiles/CMakeError.log
           retention-days: 7
+
+  prepare-artifact-retry:
+    if: inputs.source_run_id != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          EXPECTED_LIBPLACEBO_SHA: ${{ inputs.expected_libplacebo_sha }}
+          FFMPEG_REF: ${{ inputs.ffmpeg_ref }}
+          UPLOAD_TARGET: ${{ inputs.upload_target }}
+          BUILD_X64: ${{ inputs.build_x64 }}
+          BUILD_ARM64: ${{ inputs.build_arm64 }}
+        run: |
+          if ! [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::source_run_id must be a numeric workflow run ID."
+            exit 1
+          fi
+          if ! [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::expected_source_sha must be a full commit SHA."
+            exit 1
+          fi
+          if ! [[ "$EXPECTED_LIBPLACEBO_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::expected_libplacebo_sha must be a full commit SHA."
+            exit 1
+          fi
+          if [ "$FFMPEG_REF" != "df21143bf252528f45d7ae56cc1d317ff00d4449" ]; then
+            echo "::error::Artifact retry requires the pinned Player FFmpeg commit."
+            exit 1
+          fi
+          if [ "$UPLOAD_TARGET" != "azure" ] && [ "$UPLOAD_TARGET" != "both" ]; then
+            echo "::error::Artifact retry publishes only to Azure; select azure or both."
+            exit 1
+          fi
+          entries=()
+          if [ "$BUILD_X64" = "true" ]; then
+            entries+=('{"arch":"x86_64","name":"x64"}')
+          fi
+          if [ "$BUILD_ARM64" = "true" ]; then
+            entries+=('{"arch":"aarch64","name":"arm64"}')
+          fi
+          if [ "${#entries[@]}" -eq 0 ]; then
+            echo "::error::Select at least one architecture to republish."
+            exit 1
+          fi
+          matrix="{\"include\":[$(IFS=,; echo "${entries[*]}")]}"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  retry-azure-publication:
+    needs: prepare-artifact-retry
+    if: inputs.source_run_id != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare-artifact-retry.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify artifact and retry Azure publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          EXPECTED_FFMPEG_SHA: ${{ inputs.ffmpeg_ref }}
+          EXPECTED_LIBPLACEBO_SHA: ${{ inputs.expected_libplacebo_sha }}
+          RETRY_ARCHITECTURE: ${{ matrix.name }}
+          RETRY_BUILD_TYPE: ${{ inputs.build_type }}
+        run: |
+          suffix=""
+          if [ "$RETRY_BUILD_TYPE" = "debug" ]; then
+            suffix="-debug"
+          fi
+          python3 ci/retry_azure_artifact.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-run-id "$SOURCE_RUN_ID" \
+            --expected-source-sha "$EXPECTED_SOURCE_SHA" \
+            --expected-ffmpeg-sha "$EXPECTED_FFMPEG_SHA" \
+            --expected-libplacebo-sha "$EXPECTED_LIBPLACEBO_SHA" \
+            --architecture "$RETRY_ARCHITECTURE" \
+            --build-type "$RETRY_BUILD_TYPE" \
+            --artifact-name "libmpv-${RETRY_ARCHITECTURE}${suffix}" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --staging-directory "$GITHUB_WORKSPACE/.artifact-retry/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$RETRY_ARCHITECTURE" \
+            --receipt "$GITHUB_WORKSPACE/artifact-retry-receipts/$SOURCE_RUN_ID/$RETRY_ARCHITECTURE.json"
+
+      - name: Upload publication receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: azure-retry-receipt-${{ inputs.source_run_id }}-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifact-retry-receipts/${{ inputs.source_run_id }}/${{ matrix.name }}.json
+          if-no-files-found: warn
+          retention-days: 30

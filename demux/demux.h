@@ -311,6 +311,9 @@ bool demux_free_async_finish(struct demux_free_async_state *state);
 
 void demuxer_feed_caption(struct sh_stream *stream, demux_packet_t *dp);
 void demuxer_feed_af_sub(struct sh_stream *stream, demux_packet_t *dp);
+struct sh_stream *demuxer_ensure_translated_sub(struct demuxer *demuxer);
+void demuxer_feed_translated_sub(struct demuxer *demuxer, demux_packet_t *dp);
+void demux_clear_translated_sub_queue(struct demuxer *demuxer);
 
 // Drop all queued packets from the af_sub virtual subtitle stream attached to
 // `audio_stream` (created lazily on first demuxer_feed_af_sub call). Resets

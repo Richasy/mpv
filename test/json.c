@@ -91,5 +91,14 @@ int main(void)
         assert_true(equal_mpv_node(&e->out_data, &res));
         talloc_free(tmp);
     }
+    assert_true(json_validate_strict(
+        "{\"provider\":\"google\",\"target_lang\":\"zh\"}",
+        MAX_JSON_DEPTH));
+    assert_false(json_validate_strict(
+        "{provider:\"google\",target_lang:\"zh\",}",
+        MAX_JSON_DEPTH));
+    assert_false(json_validate_strict(
+        "{\"provider\"=\"google\",\"target_lang\":\"zh\"}",
+        MAX_JSON_DEPTH));
     return 0;
 }

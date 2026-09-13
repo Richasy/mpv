@@ -1,0 +1,3 @@
+add `sub-translate-config`, `sub-translate`, and `sub-translate-status`
+properties for shared native translation of selected text subtitle tracks;
+generated output uses codec profile `translated`

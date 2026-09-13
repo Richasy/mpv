@@ -70,6 +70,8 @@
 #include "client.h"
 #include "command.h"
 #include "screenshot.h"
+#include "sub_translate.h"
+#include "translation.h"
 
 #include "stream/stream_curl.h"
 
@@ -190,6 +192,9 @@ void mp_destroy(struct MPContext *mpctx)
     encode_lavc_free(mpctx->encode_lavc_ctx);
     mpctx->encode_lavc_ctx = NULL;
 
+    sub_translate_destroy(mpctx);
+    mpctx_destroy_translation(mpctx);
+    mp_mutex_destroy(&mpctx->translation_lock);
     command_uninit(mpctx);
     disc_nav_destroy(mpctx);
 
@@ -289,6 +294,7 @@ struct MPContext *mp_create(void)
     };
 
     mp_mutex_init(&mpctx->abort_lock);
+    mp_mutex_init(&mpctx->translation_lock);
 
     mpctx->global = talloc_zero(mpctx, struct mpv_global);
 

@@ -194,6 +194,7 @@ struct demux_internal {
 
     struct sh_stream **streams;
     int num_streams;
+    struct sh_stream *translated_sub;
 
     char *meta_charset;
 
@@ -473,9 +474,8 @@ struct demux_stream {
     struct sh_stream *af_sub;
     bool ignore_eof;        // ignore stream in underrun detection
     // True for streams whose packets are pushed in externally rather than
-    // produced by the source demuxer (e.g. CC tracks fed via
-    // demuxer_feed_caption(), whisper sub tracks fed via
-    // demuxer_feed_af_sub()). These must NOT be involved in refresh
+    // produced by the source demuxer (e.g. CC, Whisper, and translated
+    // subtitle tracks). These must NOT be involved in refresh
     // seeks: a source-level seek cannot replay their packets, and putting
     // them into refreshing mode would drop the next externally-fed packet.
     bool is_virtual;
@@ -1525,6 +1525,110 @@ void demuxer_feed_af_sub(struct sh_stream *stream, demux_packet_t *dp)
     dp->dts = MP_ADD_PTS(dp->dts, -in->ts_offset);
     dp->stream = sh->index;
     add_packet_locked(sh, dp);
+    mp_mutex_unlock(&in->lock);
+}
+
+static struct sh_stream *get_translated_sub_locked(struct demux_internal *in)
+{
+    struct sh_stream *sh = in->translated_sub;
+    if (sh)
+        return sh;
+
+    sh = demux_alloc_sh_stream(STREAM_SUB);
+    if (!sh)
+        return NULL;
+    sh->codec->codec = "ass";
+    sh->codec->codec_profile = "translated";
+    sh->title = talloc_strdup(sh, "Translated");
+    sh->default_track = false;
+
+    static const char ass_header[] =
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        "PlayResX: 1920\n"
+        "PlayResY: 1080\n"
+        "WrapStyle: 0\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,"
+        "OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,"
+        "ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
+        "Alignment,MarginL,MarginR,MarginV,Encoding\n"
+        "Style: Default,Sans,60,&H00FFFFFF,&H000000FF,"
+        "&H00000000,&H80000000,0,0,0,0,"
+        "100,100,0,0,1,3,1,"
+        "2,20,20,50,1\n"
+        "\n"
+        "[Events]\n"
+        "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n";
+
+    sh->codec->extradata =
+        talloc_memdup(sh, (void *)ass_header, sizeof(ass_header) - 1);
+    sh->codec->extradata_size = sizeof(ass_header) - 1;
+    in->translated_sub = sh;
+    demux_add_sh_stream_locked(in, sh);
+    sh->ds->ignore_eof = true;
+    sh->ds->is_virtual = true;
+    sh->ds->selected = true;
+    update_stream_selection_state(in, sh->ds);
+    return sh;
+}
+
+struct sh_stream *demuxer_ensure_translated_sub(struct demuxer *demuxer)
+{
+    if (!demuxer || !demuxer->in)
+        return NULL;
+    struct demux_internal *in = demuxer->in;
+    mp_mutex_lock(&in->lock);
+    struct sh_stream *sh = get_translated_sub_locked(in);
+    mp_mutex_unlock(&in->lock);
+    return sh;
+}
+
+void demuxer_feed_translated_sub(struct demuxer *demuxer, demux_packet_t *dp)
+{
+    if (!demuxer || !demuxer->in) {
+        talloc_free(dp);
+        return;
+    }
+    struct demux_internal *in = demuxer->in;
+    mp_mutex_lock(&in->lock);
+    struct sh_stream *sh = get_translated_sub_locked(in);
+    if (!sh) {
+        mp_mutex_unlock(&in->lock);
+        talloc_free(dp);
+        return;
+    }
+    dp->keyframe = true;
+    dp->pts = MP_ADD_PTS(dp->pts, -in->ts_offset);
+    dp->dts = MP_ADD_PTS(dp->dts, -in->ts_offset);
+    dp->stream = sh->index;
+    add_packet_locked(sh, dp);
+    mp_mutex_unlock(&in->lock);
+}
+
+void demux_clear_translated_sub_queue(struct demuxer *demuxer)
+{
+    if (!demuxer || !demuxer->in)
+        return;
+    struct demux_internal *in = demuxer->in;
+    mp_mutex_lock(&in->lock);
+    struct sh_stream *sh = in->translated_sub;
+    if (sh && sh->ds) {
+        struct demux_stream *ds = sh->ds;
+        for (int n = 0; n < in->num_ranges; n++) {
+            struct demux_cached_range *range = in->ranges[n];
+            if (ds->index < range->num_streams &&
+                range->streams[ds->index])
+            {
+                clear_queue(range->streams[ds->index]);
+                update_seek_ranges(range);
+            }
+        }
+        ds_clear_reader_state(ds, false);
+        ds->refreshing = false;
+        wakeup_ds(ds);
+    }
     mp_mutex_unlock(&in->lock);
 }
 

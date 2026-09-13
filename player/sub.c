@@ -33,6 +33,7 @@
 #include "video/mp_image.h"
 
 #include "core.h"
+#include "sub_translate.h"
 
 // 0: primary sub, 1: secondary sub, -1: not selected
 static int get_order(struct MPContext *mpctx, struct track *track)
@@ -71,20 +72,15 @@ void reset_subtitle_state(struct MPContext *mpctx)
     term_osd_clear_subs(mpctx);
 }
 
-// Reset the auto-generated whisper subtitle track (lazy af_sub child of the
-// active audio stream, exposed as a sub track tagged with codec_profile
-// "whisper"). Drops the dec_sub packet cache and currently displayed text.
-// Pairs with demux_clear_af_sub_queue when invalidating in-flight whisper
-// captions due to language / translator change. Safe to call from core
-// thread; no-op if no whisper sub track is present.
-void reset_whisper_subtitle_track(struct MPContext *mpctx)
+static void reset_generated_subtitle_track(struct MPContext *mpctx,
+                                           const char *profile)
 {
     bool any = false;
     for (int n = 0; n < mpctx->num_tracks; n++) {
         struct track *t = mpctx->tracks[n];
         if (t && t->type == STREAM_SUB && t->stream &&
             t->stream->codec && t->stream->codec->codec_profile &&
-            strcmp(t->stream->codec->codec_profile, "whisper") == 0)
+            strcmp(t->stream->codec->codec_profile, profile) == 0)
         {
             if (t->d_sub) {
                 // SD_CTRL_RESET_SOFT forces sd_ass to ass_flush_events()
@@ -101,6 +97,7 @@ void reset_whisper_subtitle_track(struct MPContext *mpctx)
             any = true;
         }
     }
+
     if (any) {
         term_osd_clear_subs(mpctx);
         redraw_subs(mpctx);
@@ -108,9 +105,26 @@ void reset_whisper_subtitle_track(struct MPContext *mpctx)
     }
 }
 
+// Reset the auto-generated whisper subtitle track (lazy af_sub child of the
+// active audio stream, exposed as a sub track tagged with codec_profile
+// "whisper"). Drops the dec_sub packet cache and currently displayed text.
+// Pairs with demux_clear_af_sub_queue when invalidating in-flight whisper
+// captions due to language / translator change. Safe to call from core
+// thread; no-op if no whisper sub track is present.
+void reset_whisper_subtitle_track(struct MPContext *mpctx)
+{
+    reset_generated_subtitle_track(mpctx, "whisper");
+}
+
+void reset_translated_subtitle_track(struct MPContext *mpctx)
+{
+    reset_generated_subtitle_track(mpctx, "translated");
+}
+
 void uninit_sub(struct MPContext *mpctx, struct track *track)
 {
     if (track && track->d_sub) {
+        sub_translate_on_sub_uninit(mpctx, track);
         int order = get_order(mpctx, track);
         reset_subtitles(mpctx, track);
         sub_select(track->d_sub, false);
@@ -267,6 +281,7 @@ void reinit_sub(struct MPContext *mpctx, struct track *track)
     sub_select(track->d_sub, true);
     int order = get_order(mpctx, track);
     osd_set_sub(mpctx->osd, order, track->d_sub);
+    sub_translate_on_sub_reinit(mpctx, track);
 
     // When paused we have to wait for packets to be available.
     // Retry on a timeout until we get a packet. If still not successful,

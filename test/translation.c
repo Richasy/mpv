@@ -467,6 +467,13 @@ static void test_errors_and_cancellation(void)
     struct mp_translation *translation =
         create_translation(&wake, &first);
     struct collector collector = {0};
+    struct mp_translation_limits cache_limits = {
+        .enabled = true,
+        .horizon_sec = 60,
+        .reuse_cache_capacity = 16,
+        .reuse_cache_window_ms = 60000,
+    };
+    mp_translation_set_limits(translation, &cache_limits);
 
     first.fail = true;
     int previous = wake.count;

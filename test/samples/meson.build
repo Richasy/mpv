@@ -149,7 +149,7 @@ test(
     depends: [sub_translation_test, sub_translation_embedded,
               sub_translation_dual, sub_translation_video],
     suite: 'libmpv',
-    timeout: 45,
+    timeout: 90,
 )
 
 

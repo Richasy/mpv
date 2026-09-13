@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import urllib.parse
+from pathlib import Path
 
 
 class TranslationServer(http.server.ThreadingHTTPServer):
@@ -54,12 +55,23 @@ def main():
     server = TranslationServer()
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
+    dense_path = Path(sys.argv[3]).with_name("sub-translation-dense.srt")
+    dense_path.write_text(
+        "".join(
+            f"{index + 1}\n"
+            "00:00:05,000 --> 00:00:20,000\n"
+            f"dense-{index:03d}\n\n"
+            for index in range(160)
+        ),
+        encoding="utf-8",
+    )
     try:
         process = subprocess.run(
             [
                 sys.argv[1],
                 f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
                 *sys.argv[2:],
+                str(dense_path),
             ],
             text=True,
             encoding="utf-8",
@@ -78,9 +90,10 @@ def main():
             )
         with server.lock:
             requests = list(server.requests)
-        allowed = {"foo", "bar", "Hello\nworld", "I", "Repeat"}
-        if not allowed.issubset(requests) or any(
-            text not in allowed for text in requests
+        expected = {"foo", "bar", "Hello\nworld", "I", "Repeat"}
+        expected.update(f"dense-{index:03d}" for index in range(160))
+        if not expected.issubset(requests) or any(
+            text not in expected for text in requests
         ):
             raise RuntimeError(
                 f"unexpected translated request set: {requests!r}"
@@ -94,6 +107,7 @@ def main():
         server.shutdown()
         worker.join(timeout=3)
         server.server_close()
+        dense_path.unlink(missing_ok=True)
         if worker.is_alive():
             raise RuntimeError("translation fixture server did not stop")
 

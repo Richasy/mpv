@@ -111,13 +111,18 @@ static bool uses_player_timeline(struct dec_sub *sub)
     return profile && strcmp(profile, "translated") == 0;
 }
 
+static double subtitle_delay(struct dec_sub *sub)
+{
+    return sub->order < 0 || uses_player_timeline(sub)
+        ? 0.0 : sub->shared_opts->sub_delay[sub->order];
+}
+
 // Return the subtitle PTS used for a given video PTS.
 static double pts_to_subtitle(struct dec_sub *sub, double pts)
 {
     if (uses_player_timeline(sub))
         return pts;
-    struct mp_subtitle_shared_opts *opts = sub->shared_opts;
-    double delay = sub->order < 0 ? 0.0 : opts->sub_delay[sub->order];
+    double delay = subtitle_delay(sub);
 
     if (pts != MP_NOPTS_VALUE)
         pts = (pts * sub->play_dir - delay) / sub->sub_speed;
@@ -129,8 +134,7 @@ static double pts_from_subtitle(struct dec_sub *sub, double pts)
 {
     if (uses_player_timeline(sub))
         return pts;
-    struct mp_subtitle_shared_opts *opts = sub->shared_opts;
-    double delay = sub->order < 0 ? 0.0 : opts->sub_delay[sub->order];
+    double delay = subtitle_delay(sub);
 
     if (pts != MP_NOPTS_VALUE)
         pts = (pts * sub->sub_speed + delay) * sub->play_dir;
@@ -346,7 +350,7 @@ static bool update_pkt_cache(struct dec_sub *sub, double video_pts)
     if (!pkt)
         return false;
 
-    double pts = video_pts + sub->shared_opts->sub_delay[sub->order];
+    double pts = video_pts + subtitle_delay(sub);
     double next_pts = next_pkt ? next_pkt->pts : INT_MAX;
     double end_pts = pkt->sub_duration >= 0 ? pkt->pts + pkt->sub_duration : INT_MAX;
 
@@ -393,7 +397,7 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
             break;
 
         // (Use this mechanism only if sub_delay matters to avoid corner cases.)
-        double delay = sub->order < 0 ? 0.0 : sub->shared_opts->sub_delay[sub->order];
+        double delay = subtitle_delay(sub);
         double min_pts = delay < 0 || force ? video_pts : MP_NOPTS_VALUE;
 
         struct demux_packet *pkt;

@@ -92,16 +92,21 @@ static char *wait_for_status(const char *state)
     fail("Timed out waiting for state %s: %s\n", state, status);
 }
 
-static void wait_for_translated_count(int count)
+static void wait_for_translated_count_timeout(int count, int attempts)
 {
     char expected[64];
     snprintf(expected, sizeof(expected), "\"translated\":%d", count);
-    for (int attempt = 0; attempt < 200; attempt++) {
+    for (int attempt = 0; attempt < attempts; attempt++) {
         if (strstr(observed_status, expected))
             return;
         record_status_event(mpv_wait_event(ctx, 0.05));
     }
     fail("Timed out waiting for %d translated cues.\n", count);
+}
+
+static void wait_for_translated_count(int count)
+{
+    wait_for_translated_count_timeout(count, 200);
 }
 
 static void advance_to(double target)
@@ -243,7 +248,7 @@ static void configure(const char *endpoint)
 static void test_embedded(const char *path, const char *endpoint)
 {
     double primary_delay = 0.4;
-    double secondary_delay = -0.3;
+    double secondary_delay = 10.0;
     double subtitle_speed = 1.25;
     mpv_set_property(ctx, "sub-delay", MPV_FORMAT_DOUBLE, &primary_delay);
     mpv_set_property(ctx, "secondary-sub-delay",
@@ -465,9 +470,30 @@ static void test_secondary_conflict(const char *path)
     mpv_free(status);
 }
 
+static void test_dense_preload(const char *video, const char *subtitle)
+{
+    load_file(video);
+    command(((const char *[]){"sub-add", subtitle, "select", NULL}));
+    int enabled = 1;
+    reset_status_observation();
+    mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    wait_for_translated_count_timeout(160, 800);
+    char *status = wait_for_status("active");
+    if (!strstr(status, "\"pending\":0"))
+        fail("Dense source retained pending cues: %s\n", status);
+    mpv_free(status);
+    if (get_int64("secondary-sid") < 1)
+        fail("Dense source did not retain its translated output.\n");
+    enabled = 0;
+    reset_status_observation();
+    mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    status = wait_for_status("disabled");
+    mpv_free(status);
+}
+
 int main(int argc, char **argv)
 {
-    if (argc != 8)
+    if (argc != 9)
         return 1;
     ctx = mpv_create();
     if (!ctx)
@@ -494,6 +520,7 @@ int main(int argc, char **argv)
     test_bitmap(argv[3], argv[5]);
     test_secondary_conflict(argv[6]);
     test_ass_dialogue(argv[3], argv[7]);
+    test_dense_preload(argv[3], argv[8]);
     command_string("quit");
     while (wrap_wait_event()->event_id != MPV_EVENT_SHUTDOWN) {}
     return 0;

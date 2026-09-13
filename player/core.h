@@ -508,6 +508,8 @@ typedef struct MPContext {
     struct mp_als *als_state; // lazily initialized on first use
 
     struct whisper_lookahead *whisper_lookahead;
+    mp_mutex translation_lock;
+    bool translation_init_attempted;
     struct mp_translation *translation;
     struct sub_translate_state *sub_translate;
     // Circuit breaker: remembers the whisper-lookahead opts string for which

@@ -42,6 +42,7 @@
 
 enum cue_state {
     CUE_WAITING = 0,
+    CUE_DEFERRED,
     CUE_PENDING,
     CUE_TRANSLATED,
 };
@@ -238,8 +239,8 @@ static bool cue_in_window(struct sub_translate_state *state,
            end >= playback - SUB_TRANSLATE_PAST_WINDOW;
 }
 
-static void submit_cue(struct sub_translate_state *state,
-                       struct translated_cue *cue)
+static enum mp_translation_submit_result submit_cue(
+    struct sub_translate_state *state, struct translated_cue *cue)
 {
     enum mp_translation_submit_result result =
         mp_translation_submit(
@@ -249,15 +250,19 @@ static void submit_cue(struct sub_translate_state *state,
             cue->start, cue->duration, 0);
     if (result == MP_TRANSLATION_SUBMIT_QUEUED) {
         cue->state = CUE_PENDING;
-        return;
+        return result;
     }
-    cue->state = CUE_WAITING;
-    if (result == MP_TRANSLATION_SUBMIT_NO_BACKEND)
+    cue->state = result == MP_TRANSLATION_SUBMIT_BACKPRESSURE
+        ? CUE_DEFERRED : CUE_WAITING;
+    if (result == MP_TRANSLATION_SUBMIT_NO_BACKEND) {
         set_error(state, "sub-translate-config is disabled");
-    else if (result == MP_TRANSLATION_SUBMIT_TOO_LATE)
+    } else if (result == MP_TRANSLATION_SUBMIT_TOO_LATE) {
+        cue->state = CUE_WAITING;
         set_error(state, "translation skipped because the cue is too late");
-    else if (result == MP_TRANSLATION_SUBMIT_INACTIVE)
+    } else if (result == MP_TRANSLATION_SUBMIT_INACTIVE) {
         set_error(state, "subtitle translation source is inactive");
+    }
+    return result;
 }
 
 static void on_text_cue(void *ctx, const struct sub_text_cue *source)
@@ -305,17 +310,23 @@ static void on_text_cue(void *ctx, const struct sub_text_cue *source)
 static void feed_cue(struct sub_translate_state *state,
                      struct translated_cue *cue)
 {
-    if (!state->mpctx->demuxer || !cue->translated)
+    if (!state->mpctx->demuxer || !cue->translated ||
+        !state->output_track || !state->output_track->d_sub)
+    {
         return;
+    }
     if (secondary_conflict(state)) {
         set_error(state, "secondary subtitle track is already selected");
         return;
     }
 
-    state->output_stream =
-        demuxer_ensure_translated_sub(state->mpctx->demuxer);
-    if (!state->output_stream) {
-        set_error(state, "translated subtitle track is unavailable");
+    double pts;
+    double duration;
+    if (!sub_map_player_cue_to_subtitle(
+            state->output_track->d_sub, cue->start, cue->duration,
+            &pts, &duration))
+    {
+        set_error(state, "translated subtitle timing is unavailable");
         return;
     }
 
@@ -332,16 +343,31 @@ static void feed_cue(struct sub_translate_state *state,
         set_error(state, "translated subtitle packet allocation failed");
         return;
     }
-    packet->pts = cue->start;
-    packet->dts = cue->start;
-    packet->duration = cue->duration;
-    packet->sub_duration = cue->duration;
+    packet->pts = pts;
+    packet->dts = pts;
+    packet->duration = duration;
+    packet->sub_duration = duration;
     demuxer_feed_translated_sub(state->mpctx->demuxer, packet);
     talloc_free(line);
 }
 
 static void rebuild_output(struct sub_translate_state *state)
 {
+    if (!state->output_stream && state->mpctx->demuxer) {
+        state->output_stream =
+            demuxer_ensure_translated_sub(state->mpctx->demuxer);
+    }
+    if (!state->output_stream) {
+        set_error(state, "translated subtitle track is unavailable");
+        state->needs_rebuild = true;
+        return;
+    }
+    if (!state->output_track)
+        state->output_track = find_output_track(state);
+    if (!state->output_track || !state->output_track->d_sub) {
+        state->needs_rebuild = true;
+        return;
+    }
     clear_output(state, false);
     for (int n = 0; n < state->num_cues; n++) {
         if (state->cues[n]->state == CUE_TRANSLATED)
@@ -390,6 +416,20 @@ static void prune_cues(struct sub_translate_state *state, double playback)
             MP_TARRAY_REMOVE_AT(state->cues, state->num_cues, n);
         } else {
             n++;
+        }
+    }
+}
+
+static void retry_deferred_cues(struct sub_translate_state *state)
+{
+    for (int n = 0; n < state->num_cues; n++) {
+        struct translated_cue *cue = state->cues[n];
+        if (cue->state != CUE_DEFERRED)
+            continue;
+        if (submit_cue(state, cue) ==
+            MP_TRANSLATION_SUBMIT_BACKPRESSURE)
+        {
+            break;
         }
     }
 }
@@ -580,6 +620,7 @@ void sub_translate_update(struct MPContext *mpctx)
     mp_translation_drain(mpctx->translation,
                          MP_TRANSLATION_SOURCE_SUBTITLE,
                          accept_result, state);
+    retry_deferred_cues(state);
     if (state->needs_rebuild)
         rebuild_output(state);
 
@@ -686,6 +727,8 @@ char *sub_translate_get_status(struct MPContext *mpctx, void *talloc_parent)
                 mpctx->translation,
                 MP_TRANSLATION_SOURCE_SUBTITLE);
         }
+        for (int n = 0; n < state->num_cues; n++)
+            pending += state->cues[n]->state == CUE_DEFERRED;
         error = state->error ? state->error : state->unsupported;
         if (!state->enabled) {
             name = "disabled";

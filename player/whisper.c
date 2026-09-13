@@ -606,8 +606,11 @@ static void inject_subtitle(struct whisper_lookahead *wl,
     if (submitted == MP_TRANSLATION_SUBMIT_QUEUED)
         return;
 
-    const char *tag = submitted == MP_TRANSLATION_SUBMIT_TOO_LATE
-        ? "original-slack-skip" : "original-no-translator";
+    const char *tag = "original-no-translator";
+    if (submitted == MP_TRANSLATION_SUBMIT_TOO_LATE)
+        tag = "original-slack-skip";
+    else if (submitted == MP_TRANSLATION_SUBMIT_BACKPRESSURE)
+        tag = "original-backpressure";
     wl_feed_subtitle_text(wl, text, pts, dur, tag);
 }
 
@@ -1712,6 +1715,9 @@ void whisper_lookahead_start(struct MPContext *mpctx, const char *whisper_opts)
     mp_mutex_init(&wl->queue_lock);
     mp_cond_init(&wl->queue_cv);
 
+    // Publish the shared scheduler from the core thread before the async
+    // Whisper initializer can register its producer.
+    mpctx_get_translation(mpctx);
     mpctx->whisper_lookahead = wl;
 
     // Publish initial snapshot so the worker has something to do as soon as

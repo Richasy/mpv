@@ -62,8 +62,82 @@ struct collector {
     int count;
 };
 
+struct dense_collector {
+    bool seen[256];
+    int count;
+};
+
+#define INIT_THREAD_COUNT 16
+
+struct init_race {
+    struct MPContext *mpctx;
+    mp_mutex lock;
+    mp_cond condition;
+    int ready;
+    bool start;
+    struct mp_translation *instances[INIT_THREAD_COUNT];
+};
+
+struct init_thread_arg {
+    struct init_race *race;
+    int index;
+};
+
 void mp_wakeup_core(struct MPContext *mpctx)
 {
+}
+
+static MP_THREAD_VOID initialize_translation(void *ctx)
+{
+    struct init_thread_arg *arg = ctx;
+    mp_mutex_lock(&arg->race->lock);
+    arg->race->ready++;
+    mp_cond_broadcast(&arg->race->condition);
+    while (!arg->race->start)
+        mp_cond_wait(&arg->race->condition, &arg->race->lock);
+    mp_mutex_unlock(&arg->race->lock);
+    arg->race->instances[arg->index] =
+        mpctx_get_translation(arg->race->mpctx);
+    MP_THREAD_RETURN();
+}
+
+static void test_concurrent_context_initialization(void)
+{
+    struct MPContext *mpctx = talloc_zero(NULL, struct MPContext);
+    mp_mutex_init(&mpctx->translation_lock);
+    struct init_race race = {.mpctx = mpctx};
+    mp_mutex_init(&race.lock);
+    mp_cond_init(&race.condition);
+    struct init_thread_arg args[INIT_THREAD_COUNT];
+    mp_thread threads[INIT_THREAD_COUNT];
+
+    for (int n = 0; n < INIT_THREAD_COUNT; n++) {
+        args[n] = (struct init_thread_arg){.race = &race, .index = n};
+        assert_int_equal(
+            mp_thread_create(&threads[n], initialize_translation, &args[n]),
+            0);
+    }
+
+    mp_mutex_lock(&race.lock);
+    while (race.ready != INIT_THREAD_COUNT)
+        mp_cond_wait(&race.condition, &race.lock);
+    race.start = true;
+    mp_cond_broadcast(&race.condition);
+    mp_mutex_unlock(&race.lock);
+
+    for (int n = 0; n < INIT_THREAD_COUNT; n++)
+        mp_thread_join(threads[n]);
+    mp_require(race.instances[0]);
+    for (int n = 1; n < INIT_THREAD_COUNT; n++)
+        mp_require(race.instances[n] == race.instances[0]);
+    mp_require(mpctx->translation == race.instances[0]);
+
+    mpctx_destroy_translation(mpctx);
+    mp_require(!mpctx->translation);
+    mp_mutex_destroy(&mpctx->translation_lock);
+    mp_cond_destroy(&race.condition);
+    mp_mutex_destroy(&race.lock);
+    talloc_free(mpctx);
 }
 
 static void wake_test(void *ctx)
@@ -170,6 +244,17 @@ static void collect_result(
     };
 }
 
+static void collect_dense_result(
+    void *ctx, const struct mp_translation_result *result)
+{
+    struct dense_collector *collector = ctx;
+    mp_require(result->cue_id < MP_ARRAY_SIZE(collector->seen));
+    mp_require(!collector->seen[result->cue_id]);
+    mp_require(result->translated);
+    collector->seen[result->cue_id] = true;
+    collector->count++;
+}
+
 static void clear_collector(struct collector *collector)
 {
     for (int n = 0; n < collector->count; n++) {
@@ -256,6 +341,15 @@ static void test_producers_and_identity(void)
     assert_int_equal(collector.results[0].cue_id, 42);
     assert_int_equal(collector.results[1].cue_id, 43);
     clear_collector(&collector);
+
+    int calls_before_late = backend.calls;
+    mp_translation_set_playback_pts(translation, 30);
+    assert_int_equal(
+        mp_translation_submit(
+            translation, MP_TRANSLATION_SOURCE_SUBTITLE,
+            44, 1, "late", 20, 2, 0),
+        MP_TRANSLATION_SUBMIT_TOO_LATE);
+    assert_int_equal(backend.calls, calls_before_late);
 
     mp_translation_destroy(&translation);
     uninit_backend(&backend);
@@ -396,7 +490,7 @@ static void test_errors_and_cancellation(void)
     previous = wake.count;
     mp_translation_submit(
         translation, MP_TRANSLATION_SOURCE_SUBTITLE,
-        11, 1, "stale", 10, 4, 0);
+        11, 1, "same", 10, 4, 0);
     wait_for_backend(&first, false);
     mp_translation_set_backend(translation, &fake_ops, &second);
     mp_mutex_lock(&first.lock);
@@ -413,12 +507,13 @@ static void test_errors_and_cancellation(void)
     previous = wake.count;
     mp_translation_submit(
         translation, MP_TRANSLATION_SOURCE_SUBTITLE,
-        12, 2, "fresh", 15, 4, 0);
+        12, 2, "same", 15, 4, 0);
     wait_for_wake(&wake, previous);
     mp_translation_drain(
         translation, MP_TRANSLATION_SOURCE_SUBTITLE,
         collect_result, &collector);
-    assert_string_equal(collector.results[0].translated, "new:fresh");
+    assert_string_equal(collector.results[0].translated, "new:same");
+    assert_int_equal(second.calls, 1);
     clear_collector(&collector);
 
     second.block = true;
@@ -463,6 +558,86 @@ static void test_errors_and_cancellation(void)
     mp_mutex_destroy(&wake.lock);
 }
 
+static void drain_dense_results(struct mp_translation *translation,
+                                struct wake_state *wake,
+                                struct dense_collector *collector,
+                                int expected)
+{
+    while (collector->count < expected) {
+        int previous = wake->count;
+        mp_translation_drain(
+            translation, MP_TRANSLATION_SOURCE_SUBTITLE,
+            collect_dense_result, collector);
+        if (collector->count >= expected)
+            return;
+        wait_for_wake(wake, previous);
+    }
+}
+
+static void test_dense_result_backpressure(void)
+{
+    struct wake_state wake = {0};
+    mp_mutex_init(&wake.lock);
+    mp_cond_init(&wake.condition);
+    struct fake_backend backend;
+    init_backend(&backend, "dense:");
+    backend.block = true;
+    struct mp_translation *translation =
+        create_translation(&wake, &backend);
+    struct mp_translation_limits limits = {.enabled = false};
+    mp_translation_set_limits(translation, &limits);
+
+    bool deferred[256] = {0};
+    int accepted = 0;
+    int deferred_count = 0;
+    for (int n = 0; n < MP_ARRAY_SIZE(deferred); n++) {
+        char text[32];
+        snprintf(text, sizeof(text), "cue-%d", n);
+        enum mp_translation_submit_result result =
+            mp_translation_submit(
+                translation, MP_TRANSLATION_SOURCE_SUBTITLE,
+                n, 1, text, 10 + n, 2, 0);
+        if (result == MP_TRANSLATION_SUBMIT_QUEUED) {
+            accepted++;
+        } else {
+            assert_int_equal(result,
+                             MP_TRANSLATION_SUBMIT_BACKPRESSURE);
+            deferred[n] = true;
+            deferred_count++;
+        }
+    }
+    assert_int_equal(accepted, 128);
+    assert_int_equal(deferred_count, 128);
+
+    wait_for_backend(&backend, false);
+    mp_mutex_lock(&backend.lock);
+    backend.released = true;
+    mp_cond_broadcast(&backend.condition);
+    mp_mutex_unlock(&backend.lock);
+
+    struct dense_collector collector = {0};
+    drain_dense_results(translation, &wake, &collector, accepted);
+    for (int n = 0; n < MP_ARRAY_SIZE(deferred); n++) {
+        if (!deferred[n])
+            continue;
+        char text[32];
+        snprintf(text, sizeof(text), "cue-%d", n);
+        assert_int_equal(
+            mp_translation_submit(
+                translation, MP_TRANSLATION_SOURCE_SUBTITLE,
+                n, 1, text, 10 + n, 2, 0),
+            MP_TRANSLATION_SUBMIT_QUEUED);
+    }
+    drain_dense_results(
+        translation, &wake, &collector, MP_ARRAY_SIZE(deferred));
+    assert_int_equal(collector.count, MP_ARRAY_SIZE(deferred));
+
+    mp_translation_destroy(&translation);
+    uninit_backend(&backend);
+    mp_cond_destroy(&wake.condition);
+    mp_mutex_destroy(&wake.lock);
+}
+
 static void test_config_and_source_policy(void)
 {
     char *error = NULL;
@@ -495,6 +670,19 @@ static void test_config_and_source_policy(void)
     error = NULL;
     assert_false(mp_translation_validate_common_config(
         "{\"provider\":\"google\",\"source_lang\":\"auto\"}", &error));
+    talloc_free(error);
+    error = NULL;
+    assert_false(mp_translation_validate_common_config(
+        "{provider:\"google\",target_lang:\"zh\",}", &error));
+    talloc_free(error);
+    error = NULL;
+    assert_false(mp_translation_validate_common_config(
+        "{\"provider\"=\"google\",\"target_lang\":\"zh\"}", &error));
+    talloc_free(error);
+    error = NULL;
+    assert_false(mp_translation_validate_common_config(
+        "{\"provider\":\"google\",\"target_lang\":\"zh\","
+        "\"limits\":{\"rpm_limit\":-1}}", &error));
     talloc_free(error);
 
     assert_int_equal(
@@ -559,9 +747,23 @@ static void test_config_and_source_policy(void)
     mp_translation_get_limits(translation, &limits);
     assert_int_equal(limits.horizon_sec, 33);
     assert_int_equal(limits.seek_debounce_ms, 25);
+    assert_int_equal(
+        mp_translation_set_legacy_limits(
+            translation,
+            "{\"horizon_sec\":-1,\"seek_debounce_ms\":-1,"
+            "\"min_text_chars\":-1,\"rpm_limit\":-1,"
+            "\"session_request_limit\":-1}"),
+        0);
+    mp_translation_get_limits(translation, &limits);
+    assert_int_equal(limits.horizon_sec, 60);
+    assert_int_equal(limits.seek_debounce_ms, 1500);
+    assert_int_equal(limits.min_text_chars, 2);
+    assert_int_equal(limits.rpm_limit, 0);
+    assert_int_equal(limits.session_request_limit, 0);
     char *status = mp_translation_get_legacy_status(translation, NULL);
     mp_require(status);
-    mp_require(strstr(status, "\"horizon_sec\":33"));
+    mp_require(strstr(status, "\"horizon_sec\":60"));
+    mp_require(strstr(status, "\"seek_debounce_ms\":1500"));
     mp_require(strstr(status, "\"session_req_used\":0"));
     talloc_free(status);
     mp_translation_stop_legacy_whisper(translation);
@@ -574,9 +776,11 @@ static void test_config_and_source_policy(void)
 int main(void)
 {
     mp_time_init();
+    test_concurrent_context_initialization();
     test_producers_and_identity();
     test_source_specific_filters();
     test_errors_and_cancellation();
+    test_dense_result_backpressure();
     test_config_and_source_policy();
     return 0;
 }

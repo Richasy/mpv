@@ -3458,7 +3458,9 @@ Property list
 
 ``sub-translate-config`` (RW)
     Configure the shared native subtitle translator with a JSON string. The
-    configuration is validated and applied atomically. An empty string
+    configuration uses strict JSON syntax and is validated and applied
+    atomically. Bare keys, ``=`` separators, and trailing commas are rejected.
+    An empty string
     disables shared translation without changing ``sub-translate`` or
     ``whisper-lookahead``.
 
@@ -3515,15 +3517,20 @@ Property list
     external subtitle files and text subtitle streams embedded in containers.
     Bitmap subtitles are reported as unsupported; OCR and hard-subtitle
     recognition are not performed. Translation consumes decoded dialogue text,
-    preserves each cue's timing and identity (including overlaps), and escapes
-    translated text before placing it in the generated ASS stream. Short and
+    preserves each cue's player-timeline timing and identity (including
+    overlaps), compensates independently for primary and secondary subtitle
+    delay/speed transforms, and escapes translated text before placing it in
+    the generated ASS stream. The owned output uses player-timeline timestamps,
+    so secondary delay/speed settings cannot shift it away from its source.
+    Short and
     repeated source cues are not subjected to Whisper's ASR-specific filters.
 
     Disabling the property, seeking, changing the primary subtitle, unloading
     the file, or replacing the common configuration invalidates queued work and
     clears only the owned generated output. A bounded look-ahead window is used,
     so a slow provider can legitimately miss a cue rather than delaying or
-    retiming it.
+    retiming it. Admission is bounded; cues deferred by backpressure are
+    retried after completed results are drained.
 
 ``sub-translate-status``
     Read-only JSON status for ordinary subtitle translation:

@@ -4,6 +4,7 @@
  */
 
 #include <inttypes.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -164,7 +165,8 @@ static void verify_current_cue(const char *expected,
             double end;
             get_property("secondary-sub-start", MPV_FORMAT_DOUBLE, &start);
             get_property("secondary-sub-end", MPV_FORMAT_DOUBLE, &end);
-            if (start != expected_start || end != expected_end)
+            if (fabs(start - expected_start) > 0.000001 ||
+                fabs(end - expected_end) > 0.000001)
                 fail("Translated cue timing changed.\n");
             return;
         }
@@ -219,21 +221,34 @@ static void configure(const char *endpoint)
         fail("Could not allocate config snapshot.\n");
     strcpy(before_invalid, masked);
     mpv_free(masked);
-    if (mpv_set_property_string(
-            ctx, "sub-translate-config",
-            "{\"provider\":\"invalid\",\"target_lang\":\"zh\"}") >= 0)
-    {
-        fail("Invalid common translation config was accepted.\n");
+    const char *invalid[] = {
+        "{\"provider\":\"invalid\",\"target_lang\":\"zh\"}",
+        "{provider:\"google\",target_lang:\"zh\",}",
+        "{\"provider\"=\"google\",\"target_lang\":\"zh\"}",
+    };
+    for (int n = 0; n < (int)(sizeof(invalid) / sizeof(invalid[0])); n++) {
+        if (mpv_set_property_string(
+                ctx, "sub-translate-config", invalid[n]) >= 0)
+        {
+            fail("Invalid common translation config was accepted.\n");
+        }
+        masked = get_string("sub-translate-config");
+        if (strcmp(masked, before_invalid) != 0)
+            fail("Rejected config changed the active translation config.\n");
+        mpv_free(masked);
     }
-    masked = get_string("sub-translate-config");
-    if (strcmp(masked, before_invalid) != 0)
-        fail("Rejected config changed the active translation config.\n");
     free(before_invalid);
-    mpv_free(masked);
 }
 
 static void test_embedded(const char *path, const char *endpoint)
 {
+    double primary_delay = 0.4;
+    double secondary_delay = -0.3;
+    double subtitle_speed = 1.25;
+    mpv_set_property(ctx, "sub-delay", MPV_FORMAT_DOUBLE, &primary_delay);
+    mpv_set_property(ctx, "secondary-sub-delay",
+                     MPV_FORMAT_DOUBLE, &secondary_delay);
+    mpv_set_property(ctx, "sub-speed", MPV_FORMAT_DOUBLE, &subtitle_speed);
     load_file(path);
     int64_t source_sid = get_int64("sid");
     int enabled = 1;
@@ -260,18 +275,21 @@ static void test_embedded(const char *path, const char *endpoint)
     int64_t output_sid = get_int64("secondary-sid");
     if (output_sid < 1 || output_sid == source_sid)
         fail("Translated output was not selected as an owned companion.\n");
-    verify_current_cue("translated:foo", 0.0, 1.0);
-    advance_to(1.1);
-    verify_current_cue("translated:bar", 1.0, 2.0);
+    advance_to(0.6);
+    verify_current_cue("translated:foo", 0.4, 1.65);
+    advance_to(1.8);
+    verify_current_cue("translated:bar", 1.65, 2.9);
     seek_to_start();
     wait_for_translated_count(2);
-    verify_current_cue("translated:foo", 0.0, 1.0);
+    advance_to(0.6);
+    verify_current_cue("translated:foo", 0.4, 1.65);
     reset_status_observation();
     configure(endpoint);
     status = wait_for_status("active");
     mpv_free(status);
     wait_for_translated_count(2);
-    verify_current_cue("translated:foo", 0.0, 1.0);
+    advance_to(0.6);
+    verify_current_cue("translated:foo", 0.4, 1.65);
     verify_whisper_stayed_off();
 
     enabled = 0;
@@ -289,6 +307,13 @@ static void test_embedded(const char *path, const char *endpoint)
         fail("Disabling text processing cleared common configuration.\n");
     mpv_free(config);
 
+    primary_delay = 0;
+    secondary_delay = 0;
+    subtitle_speed = 1;
+    mpv_set_property(ctx, "sub-delay", MPV_FORMAT_DOUBLE, &primary_delay);
+    mpv_set_property(ctx, "secondary-sub-delay",
+                     MPV_FORMAT_DOUBLE, &secondary_delay);
+    mpv_set_property(ctx, "sub-speed", MPV_FORMAT_DOUBLE, &subtitle_speed);
 }
 
 static void test_external(const char *video, const char *subtitle)

@@ -41,6 +41,7 @@
 #define TRANSLATION_WORKERS_MAX 8
 #define TRANSLATION_PENDING_MAX 1024
 #define TRANSLATION_RESULTS_MAX 128
+#define TRANSLATION_OUTSTANDING_MAX 128
 #define TRANSLATION_MIN_SLACK 1.0
 #define TRANSLATION_DRAIN_EPSILON 0.05
 #define TRANSLATION_DEFER_MS 200
@@ -57,6 +58,7 @@
 struct translation_task {
     enum mp_translation_source source;
     uint64_t generation;
+    uint64_t backend_epoch;
     uint64_t cue_id;
     uint64_t revision;
     int seq;
@@ -69,6 +71,7 @@ struct translation_task {
 struct translation_result {
     enum mp_translation_source source;
     uint64_t generation;
+    uint64_t backend_epoch;
     uint64_t cue_id;
     uint64_t revision;
     int seq;
@@ -85,6 +88,7 @@ struct translation_result {
 struct translation_cache_entry {
     char *text;
     char *translated;
+    uint64_t backend_epoch;
     int64_t inserted_ms;
     int64_t first_seen_ms;
     int hit_count;
@@ -110,6 +114,7 @@ struct mp_translation {
     double playback_pts;
     struct mp_translation_backend_ops backend_ops;
     void *backend;
+    uint64_t backend_epoch;
 
     bool common_explicit;
     bool common_enabled;
@@ -122,6 +127,7 @@ struct mp_translation {
     int pending_capacity;
     int next_seq;
     int in_flight[MP_TRANSLATION_SOURCE_COUNT];
+    int outstanding[MP_TRANSLATION_SOURCE_COUNT];
 
     mp_mutex result_lock;
     struct translation_result **results;
@@ -246,12 +252,15 @@ static char *normalize_cache_text(void *parent, const char *text)
 }
 
 static struct translation_cache_entry *cache_lookup(
-    struct mp_translation *translation, const char *text)
+    struct mp_translation *translation, const char *text,
+    uint64_t backend_epoch)
 {
     if (!translation->cache || !text || translation->cache_size == 0)
         return NULL;
     for (int n = 0; n < translation->cache_size; n++) {
-        if (strcmp(translation->cache[n].text, text) == 0) {
+        if (translation->cache[n].backend_epoch == backend_epoch &&
+            strcmp(translation->cache[n].text, text) == 0)
+        {
             if (n > 0) {
                 struct translation_cache_entry entry = translation->cache[n];
                 memmove(&translation->cache[1], &translation->cache[0],
@@ -303,13 +312,14 @@ static void reset_session_locked(struct mp_translation *translation)
 }
 
 static void cache_put(struct mp_translation *translation, const char *text,
-                      const char *translated)
+                      const char *translated, uint64_t backend_epoch)
 {
     int capacity = translation->limits.reuse_cache_capacity;
     if (capacity <= 0 || !text || !translated)
         return;
 
-    struct translation_cache_entry *entry = cache_lookup(translation, text);
+    struct translation_cache_entry *entry =
+        cache_lookup(translation, text, backend_epoch);
     int64_t now = wall_ms();
     if (entry) {
         talloc_free(entry->translated);
@@ -342,6 +352,7 @@ static void cache_put(struct mp_translation *translation, const char *text,
     translation->cache[0] = (struct translation_cache_entry){
         .text = talloc_strdup(translation->cache, text),
         .translated = talloc_strdup(translation->cache, translated),
+        .backend_epoch = backend_epoch,
         .inserted_ms = now,
         .first_seen_ms = now,
         .hit_count = 1,
@@ -349,7 +360,7 @@ static void cache_put(struct mp_translation *translation, const char *text,
 }
 
 static bool repeat_record_hit(struct mp_translation *translation,
-                              const char *text)
+                              const char *text, uint64_t backend_epoch)
 {
     if (!text || translation->limits.repeat_loop_threshold <= 0 ||
         translation->limits.repeat_loop_window_ms <= 0)
@@ -358,7 +369,8 @@ static bool repeat_record_hit(struct mp_translation *translation,
     }
 
     int64_t now = wall_ms();
-    struct translation_cache_entry *entry = cache_lookup(translation, text);
+    struct translation_cache_entry *entry =
+        cache_lookup(translation, text, backend_epoch);
     if (!entry) {
         int capacity = translation->limits.reuse_cache_capacity;
         if (capacity <= 0)
@@ -388,6 +400,7 @@ static bool repeat_record_hit(struct mp_translation *translation,
         }
         translation->cache[0] = (struct translation_cache_entry){
             .text = talloc_strdup(translation->cache, text),
+            .backend_epoch = backend_epoch,
             .first_seen_ms = now,
             .hit_count = 1,
         };
@@ -461,22 +474,37 @@ static void rollback_request(struct mp_translation *translation)
         translation->rpm_tokens += 1.0;
 }
 
-static uint64_t current_generation(
-    struct mp_translation *translation, enum mp_translation_source source)
+static bool task_is_current(struct mp_translation *translation,
+                            enum mp_translation_source source,
+                            uint64_t generation, uint64_t backend_epoch)
 {
-    uint64_t generation;
+    bool current;
     mp_mutex_lock(&translation->state_lock);
-    generation = translation->source_generation[source];
+    current = translation->source_generation[source] == generation &&
+              translation->backend_epoch == backend_epoch;
     mp_mutex_unlock(&translation->state_lock);
-    return generation;
+    return current;
+}
+
+static bool backend_is_current(struct mp_translation *translation,
+                               uint64_t backend_epoch)
+{
+    bool current;
+    mp_mutex_lock(&translation->state_lock);
+    current = translation->backend_epoch == backend_epoch;
+    mp_mutex_unlock(&translation->state_lock);
+    return current;
 }
 
 static void *acquire_backend(struct mp_translation *translation,
+                             uint64_t backend_epoch,
                              struct mp_translation_backend_ops *ops)
 {
     void *backend = NULL;
     mp_mutex_lock(&translation->state_lock);
-    if (translation->backend && translation->backend_ops.acquire) {
+    if (translation->backend_epoch == backend_epoch &&
+        translation->backend && translation->backend_ops.acquire)
+    {
         *ops = translation->backend_ops;
         backend = ops->acquire(translation->backend);
     }
@@ -507,9 +535,13 @@ static void push_result(struct mp_translation *translation,
         mp_mutex_unlock(&translation->pending_lock);
     }
 
-    if (result->generation !=
-        current_generation(translation, result->source))
+    if (!task_is_current(translation, result->source,
+                         result->generation, result->backend_epoch))
     {
+        mp_mutex_lock(&translation->pending_lock);
+        if (translation->outstanding[result->source] > 0)
+            translation->outstanding[result->source]--;
+        mp_mutex_unlock(&translation->pending_lock);
         talloc_free(result);
         if (translation->wakeup)
             translation->wakeup(translation->wakeup_ctx);
@@ -528,13 +560,7 @@ static void push_result(struct mp_translation *translation,
             translation->result_capacity = capacity;
         }
     }
-    if (translation->num_results >= TRANSLATION_RESULTS_MAX) {
-        talloc_free(translation->results[0]);
-        memmove(&translation->results[0], &translation->results[1],
-                sizeof(*translation->results) *
-                    (translation->num_results - 1));
-        translation->num_results--;
-    }
+    mp_assert(translation->num_results < TRANSLATION_RESULTS_MAX);
     translation->results[translation->num_results++] = result;
     mp_mutex_unlock(&translation->result_lock);
 
@@ -550,6 +576,7 @@ static MP_THREAD_VOID translation_worker(void *arg)
     while (!atomic_load(&translation->terminate)) {
         struct translation_task *task = NULL;
         bool saw_future = false;
+        bool removed_stale = false;
 
         mp_mutex_lock(&translation->pending_lock);
         while (translation->num_pending == 0 &&
@@ -573,18 +600,24 @@ static MP_THREAD_VOID translation_worker(void *arg)
 
         double playback_pts;
         uint64_t generations[MP_TRANSLATION_SOURCE_COUNT];
+        uint64_t backend_epoch;
         mp_mutex_lock(&translation->state_lock);
         playback_pts = translation->playback_pts;
         memcpy(generations, translation->source_generation,
                sizeof(generations));
+        backend_epoch = translation->backend_epoch;
         mp_mutex_unlock(&translation->state_lock);
 
         int64_t now = wall_ms();
         for (int n = 0; n < translation->num_pending; ) {
             struct translation_task *candidate = translation->pending[n];
             bool stale = candidate->generation !=
-                         generations[candidate->source];
+                         generations[candidate->source] ||
+                         candidate->backend_epoch != backend_epoch;
             if (stale) {
+                if (translation->outstanding[candidate->source] > 0)
+                    translation->outstanding[candidate->source]--;
+                removed_stale = true;
                 talloc_free(candidate);
                 MP_TARRAY_REMOVE_AT(translation->pending,
                                     translation->num_pending, n);
@@ -616,6 +649,8 @@ static MP_THREAD_VOID translation_worker(void *arg)
             break;
         }
         mp_mutex_unlock(&translation->pending_lock);
+        if (removed_stale && translation->wakeup)
+            translation->wakeup(translation->wakeup_ctx);
 
         if (!task) {
             if (saw_future) {
@@ -627,14 +662,18 @@ static MP_THREAD_VOID translation_worker(void *arg)
             continue;
         }
 
-        if (task->generation !=
-            current_generation(translation, task->source))
+        if (!task_is_current(translation, task->source,
+                             task->generation, task->backend_epoch))
         {
             mp_mutex_lock(&translation->pending_lock);
             if (translation->in_flight[task->source] > 0)
                 translation->in_flight[task->source]--;
+            if (translation->outstanding[task->source] > 0)
+                translation->outstanding[task->source]--;
             mp_mutex_unlock(&translation->pending_lock);
             talloc_free(task);
+            if (translation->wakeup)
+                translation->wakeup(translation->wakeup_ctx);
             continue;
         }
 
@@ -642,6 +681,7 @@ static MP_THREAD_VOID translation_worker(void *arg)
             talloc_zero(NULL, struct translation_result);
         result->source = task->source;
         result->generation = task->generation;
+        result->backend_epoch = task->backend_epoch;
         result->cue_id = task->cue_id;
         result->revision = task->revision;
         result->seq = task->seq;
@@ -671,7 +711,8 @@ static MP_THREAD_VOID translation_worker(void *arg)
         if (normalized) {
             mp_mutex_lock(&translation->limits_lock);
             struct translation_cache_entry *entry =
-                cache_lookup(translation, normalized);
+                cache_lookup(translation, normalized,
+                             task->backend_epoch);
             bool reused = false;
             int64_t current_ms = wall_ms();
             if (entry && entry->translated &&
@@ -689,7 +730,8 @@ static MP_THREAD_VOID translation_worker(void *arg)
             if (!reused &&
                 (task->flags & MP_TRANSLATION_FILTER_REPEAT))
             {
-                repeated = repeat_record_hit(translation, normalized);
+                repeated = repeat_record_hit(
+                    translation, normalized, task->backend_epoch);
                 if (repeated)
                     translation->loop_skipped++;
             }
@@ -727,7 +769,8 @@ static MP_THREAD_VOID translation_worker(void *arg)
         }
 
         struct mp_translation_backend_ops ops = {0};
-        void *backend = acquire_backend(translation, &ops);
+        void *backend = acquire_backend(
+            translation, task->backend_epoch, &ops);
         struct wt_call_result call = {0};
         if (backend) {
             void *tmp = talloc_new(NULL);
@@ -744,12 +787,15 @@ static MP_THREAD_VOID translation_worker(void *arg)
             result->error = talloc_strdup(result, "no translator");
         }
 
-        if (limits.enabled) {
+        bool current_backend =
+            backend_is_current(translation, task->backend_epoch);
+        if (limits.enabled && current_backend) {
             mp_mutex_lock(&translation->limits_lock);
             if (!call.http_issued)
                 rollback_request(translation);
             if (result->translated && normalized)
-                cache_put(translation, normalized, result->translated);
+                cache_put(translation, normalized, result->translated,
+                          task->backend_epoch);
             mp_mutex_unlock(&translation->limits_lock);
         }
 
@@ -776,6 +822,7 @@ struct mp_translation *mp_translation_create(
     translation->wakeup = wakeup;
     translation->wakeup_ctx = wakeup_ctx;
     translation->playback_pts = NAN;
+    translation->backend_epoch = 1;
     for (int n = 0; n < MP_TRANSLATION_SOURCE_COUNT; n++)
         translation->source_generation[n] = 1;
 
@@ -832,9 +879,13 @@ static void clear_queues(struct mp_translation *translation, int source)
     mp_mutex_lock(&translation->pending_lock);
     for (int n = 0; n < translation->num_pending; ) {
         if (source < 0 || translation->pending[n]->source == source) {
+            enum mp_translation_source task_source =
+                translation->pending[n]->source;
             talloc_free(translation->pending[n]);
             MP_TARRAY_REMOVE_AT(translation->pending,
                                 translation->num_pending, n);
+            if (translation->outstanding[task_source] > 0)
+                translation->outstanding[task_source]--;
         } else {
             n++;
         }
@@ -845,9 +896,15 @@ static void clear_queues(struct mp_translation *translation, int source)
     mp_mutex_lock(&translation->result_lock);
     for (int n = 0; n < translation->num_results; ) {
         if (source < 0 || translation->results[n]->source == source) {
+            enum mp_translation_source result_source =
+                translation->results[n]->source;
             talloc_free(translation->results[n]);
             MP_TARRAY_REMOVE_AT(translation->results,
                                 translation->num_results, n);
+            mp_mutex_lock(&translation->pending_lock);
+            if (translation->outstanding[result_source] > 0)
+                translation->outstanding[result_source]--;
+            mp_mutex_unlock(&translation->pending_lock);
         } else {
             n++;
         }
@@ -921,6 +978,7 @@ static bool replace_backend_locked(
     translation->backend_ops = ops
         ? *ops : (struct mp_translation_backend_ops){0};
     translation->backend = backend;
+    translation->backend_epoch++;
     for (int n = 0; n < MP_TRANSLATION_SOURCE_COUNT; n++)
         translation->source_generation[n]++;
     mp_mutex_unlock(&translation->state_lock);
@@ -1053,11 +1111,13 @@ enum mp_translation_submit_result mp_translation_submit(
         return MP_TRANSLATION_SUBMIT_INACTIVE;
 
     uint64_t generation;
+    uint64_t backend_epoch;
     double playback_pts;
     bool active;
     bool backend;
     mp_mutex_lock(&translation->state_lock);
     generation = translation->source_generation[source];
+    backend_epoch = translation->backend_epoch;
     playback_pts = translation->playback_pts;
     active = translation->source_active[source];
     backend = translation->backend != NULL;
@@ -1078,6 +1138,7 @@ enum mp_translation_submit_result mp_translation_submit(
     *task = (struct translation_task){
         .source = source,
         .generation = generation,
+        .backend_epoch = backend_epoch,
         .cue_id = cue_id,
         .revision = revision,
         .pts = pts,
@@ -1086,8 +1147,19 @@ enum mp_translation_submit_result mp_translation_submit(
         .text = talloc_strdup(task, text),
     };
 
-    struct translation_result *evicted = NULL;
     mp_mutex_lock(&translation->pending_lock);
+    int outstanding = 0;
+    for (int n = 0; n < MP_TRANSLATION_SOURCE_COUNT; n++)
+        outstanding += translation->outstanding[n];
+    if (outstanding >= TRANSLATION_OUTSTANDING_MAX) {
+        mp_mutex_unlock(&translation->pending_lock);
+        talloc_free(task);
+        mp_mutex_lock(&translation->limits_lock);
+        translation->queue_overflow++;
+        mp_mutex_unlock(&translation->limits_lock);
+        return MP_TRANSLATION_SUBMIT_BACKPRESSURE;
+    }
+    translation->outstanding[source]++;
     task->seq = translation->next_seq++;
     if (translation->num_pending >= translation->pending_capacity) {
         int capacity = translation->pending_capacity
@@ -1100,42 +1172,11 @@ enum mp_translation_submit_result mp_translation_submit(
             translation->pending_capacity = capacity;
         }
     }
-    if (translation->num_pending >= TRANSLATION_PENDING_MAX) {
-        int farthest = 0;
-        for (int n = 1; n < translation->num_pending; n++) {
-            if (translation->pending[n]->pts >
-                translation->pending[farthest]->pts)
-            {
-                farthest = n;
-            }
-        }
-        struct translation_task *old = translation->pending[farthest];
-        MP_TARRAY_REMOVE_AT(translation->pending,
-                            translation->num_pending, farthest);
-        evicted = talloc_zero(NULL, struct translation_result);
-        *evicted = (struct translation_result){
-            .source = old->source,
-            .generation = old->generation,
-            .cue_id = old->cue_id,
-            .revision = old->revision,
-            .seq = old->seq,
-            .pts = old->pts,
-            .duration = old->duration,
-            .text = talloc_strdup(evicted, old->text),
-            .error = talloc_strdup(evicted, "queue overflow"),
-            .kind = MP_TRANSLATION_RESULT_FALLBACK_QUEUE,
-        };
-        talloc_free(old);
-        mp_mutex_lock(&translation->limits_lock);
-        translation->queue_overflow++;
-        mp_mutex_unlock(&translation->limits_lock);
-    }
+    mp_assert(translation->num_pending < TRANSLATION_PENDING_MAX);
     translation->pending[translation->num_pending++] = task;
     mp_cond_signal(&translation->pending_cv);
     mp_mutex_unlock(&translation->pending_lock);
 
-    if (evicted)
-        push_result(translation, evicted);
     return MP_TRANSLATION_SUBMIT_QUEUED;
 }
 
@@ -1176,15 +1217,23 @@ void mp_translation_drain(
     }
 
     uint64_t generation;
+    uint64_t backend_epoch;
     double playback_pts;
     mp_mutex_lock(&translation->state_lock);
     generation = translation->source_generation[source];
+    backend_epoch = translation->backend_epoch;
     playback_pts = translation->playback_pts;
     mp_mutex_unlock(&translation->state_lock);
 
     for (int n = 0; n < count; n++) {
         struct translation_result *result = batch[n];
-        if (result->generation != generation) {
+        if (result->generation != generation ||
+            result->backend_epoch != backend_epoch)
+        {
+            mp_mutex_lock(&translation->pending_lock);
+            if (translation->outstanding[source] > 0)
+                translation->outstanding[source]--;
+            mp_mutex_unlock(&translation->pending_lock);
             talloc_free(result);
             continue;
         }
@@ -1215,6 +1264,10 @@ void mp_translation_drain(
             .kind = result->kind,
         };
         callback(callback_ctx, &public_result);
+        mp_mutex_lock(&translation->pending_lock);
+        if (translation->outstanding[source] > 0)
+            translation->outstanding[source]--;
+        mp_mutex_unlock(&translation->pending_lock);
         talloc_free(result);
     }
     talloc_free(batch);
@@ -1225,16 +1278,10 @@ int mp_translation_pending_count(
 {
     if (!translation || !valid_source(source))
         return 0;
-    int count = 0;
+    int count;
     mp_mutex_lock(&translation->pending_lock);
-    count += translation->in_flight[source];
-    for (int n = 0; n < translation->num_pending; n++)
-        count += translation->pending[n]->source == source;
+    count = translation->outstanding[source];
     mp_mutex_unlock(&translation->pending_lock);
-    mp_mutex_lock(&translation->result_lock);
-    for (int n = 0; n < translation->num_results; n++)
-        count += translation->results[n]->source == source;
-    mp_mutex_unlock(&translation->result_lock);
     return count;
 }
 
@@ -1314,7 +1361,9 @@ static int apply_limits_map(struct mp_translation_limits *limits,
                 return -1;
             }
             continue;
-        } else if (integer < 0 || integer > INT_MAX) {
+        } else if (integer < INT_MIN || integer > INT_MAX ||
+                   (strict && integer < 0))
+        {
             set_error(error, "translation limit value is out of range");
             return -1;
         }
@@ -1425,6 +1474,11 @@ static int parse_common_config(void *parent, const char *json,
     memset(out, 0, sizeof(*out));
     out->limits = (struct mp_translation_limits){.enabled = true};
     limits_apply_defaults(&out->limits);
+
+    if (!json_validate_strict(json, MAX_JSON_DEPTH)) {
+        set_error(error, "translation config must use strict JSON syntax");
+        return -1;
+    }
 
     char *cursor = talloc_strdup(parent, json);
     struct mpv_node root = {0};
@@ -1995,15 +2049,22 @@ struct mp_translation *mpctx_get_translation(struct MPContext *mpctx)
 {
     if (!mpctx)
         return NULL;
-    if (!mpctx->translation) {
+    mp_mutex_lock(&mpctx->translation_lock);
+    if (!mpctx->translation && !mpctx->translation_init_attempted) {
+        mpctx->translation_init_attempted = true;
         mpctx->translation = mp_translation_create(
             mpctx, mpctx->log, wake_mpctx, mpctx);
     }
-    return mpctx->translation;
+    struct mp_translation *translation = mpctx->translation;
+    mp_mutex_unlock(&mpctx->translation_lock);
+    return translation;
 }
 
 void mpctx_destroy_translation(struct MPContext *mpctx)
 {
-    if (mpctx)
-        mp_translation_destroy(&mpctx->translation);
+    if (!mpctx)
+        return;
+    mp_mutex_lock(&mpctx->translation_lock);
+    mp_translation_destroy(&mpctx->translation);
+    mp_mutex_unlock(&mpctx->translation_lock);
 }

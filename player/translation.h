@@ -43,6 +43,7 @@ enum mp_translation_submit_result {
     MP_TRANSLATION_SUBMIT_NO_BACKEND,
     MP_TRANSLATION_SUBMIT_TOO_LATE,
     MP_TRANSLATION_SUBMIT_INACTIVE,
+    MP_TRANSLATION_SUBMIT_BACKPRESSURE,
 };
 
 enum mp_translation_result_kind {

@@ -83,6 +83,11 @@ bool sub_set_text_cue_callback(struct dec_sub *sub,
 // Re-emit decoded text cues overlapping [start, end]. This is a decoder tap,
 // not an OSD text snapshot, and can include overlapping or future cues.
 bool sub_emit_text_cues(struct dec_sub *sub, double start, double end);
+bool sub_map_player_cue_to_subtitle(struct dec_sub *sub,
+                                    double player_start,
+                                    double player_duration,
+                                    double *subtitle_start,
+                                    double *subtitle_duration);
 
 void sub_reset(struct dec_sub *sub);
 void sub_select(struct dec_sub *sub, bool selected);

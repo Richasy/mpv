@@ -194,6 +194,7 @@ void mp_destroy(struct MPContext *mpctx)
 
     sub_translate_destroy(mpctx);
     mpctx_destroy_translation(mpctx);
+    mp_mutex_destroy(&mpctx->translation_lock);
     command_uninit(mpctx);
     disc_nav_destroy(mpctx);
 
@@ -293,6 +294,7 @@ struct MPContext *mp_create(void)
     };
 
     mp_mutex_init(&mpctx->abort_lock);
+    mp_mutex_init(&mpctx->translation_lock);
 
     mpctx->global = talloc_zero(mpctx, struct mpv_global);
 

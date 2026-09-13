@@ -883,7 +883,11 @@ static char *google_extract_translation(void *talloc_ctx,
         }
         struct mpv_node *trans = node_map_get(sentence, "trans");
         struct mpv_node *translit = node_map_get(sentence, "translit");
-        if (translit && translit->format != MPV_FORMAT_STRING) {
+        struct mpv_node *src_translit =
+            node_map_get(sentence, "src_translit");
+        if ((translit && translit->format != MPV_FORMAT_STRING) ||
+            (src_translit && src_translit->format != MPV_FORMAT_STRING))
+        {
             talloc_free(translated);
             talloc_free(tmp);
             return NULL;
@@ -897,7 +901,7 @@ static char *google_extract_translation(void *talloc_ctx,
             translated = talloc_asprintf_append(
                 translated, "%s", trans->u.string);
             found_nonempty |= trans->u.string[0] != '\0';
-        } else if (!translit) {
+        } else if (!translit && !src_translit) {
             talloc_free(translated);
             talloc_free(tmp);
             return NULL;

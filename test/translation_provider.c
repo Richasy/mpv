@@ -252,7 +252,7 @@ static void test_google_request_and_response(void)
         "{\"sentences\":["
         "{\"trans\":\"  안녕\\n\",\"orig\":\"hello\"},"
         "{\"trans\":\"\\ud55c\\uad6d \\ud83d\\ude00 &amp;  \",\"orig\":\"world\"},"
-        "{\"translit\":\"annyeong\"}]}");
+        "{\"src_translit\":\"annyeong\"}]}");
     struct whisper_translator *translator = create_translator(
         WT_PROVIDER_GOOGLE, "AUTO", "KO", &transport, &clock);
     mp_require(translator);

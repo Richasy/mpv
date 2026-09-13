@@ -102,6 +102,8 @@ struct mp_translation *mp_translation_create(
     mp_translation_wakeup_fn wakeup, void *wakeup_ctx);
 void mp_translation_destroy(struct mp_translation **translation);
 
+// Replace the backend and transfer its initial reference to the scheduler.
+// The backend operations must make acquired references safe across threads.
 void mp_translation_set_backend(
     struct mp_translation *translation,
     const struct mp_translation_backend_ops *ops,

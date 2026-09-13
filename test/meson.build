@@ -93,6 +93,21 @@ test('gl-video', gl_video)
 json = executable('json', 'json.c', include_directories: [incdir, incdir_public], link_with: test_utils)
 test('json', json)
 
+translation_objects = libmpv.extract_objects(
+    'player/translation.c',
+    'player/whisper_translate.c',
+    'player/sub_translate_utils.c',
+)
+translation_test = executable(
+    'translation',
+    'translation.c',
+    include_directories: incdir,
+    objects: translation_objects,
+    dependencies: [cc.find_library('winhttp')],
+    link_with: test_utils,
+)
+test('translation', translation_test)
+
 linked_list = executable('linked-list', files('linked_list.c'), include_directories: incdir)
 test('linked-list', linked_list)
 

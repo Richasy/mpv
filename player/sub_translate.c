@@ -237,6 +237,10 @@ static void submit_cue(struct sub_translate_state *state,
     cue->state = CUE_WAITING;
     if (result == MP_TRANSLATION_SUBMIT_NO_BACKEND)
         set_error(state, "sub-translate-config is disabled");
+    else if (result == MP_TRANSLATION_SUBMIT_TOO_LATE)
+        set_error(state, "translation skipped because the cue is too late");
+    else if (result == MP_TRANSLATION_SUBMIT_INACTIVE)
+        set_error(state, "subtitle translation source is inactive");
 }
 
 static void on_text_cue(void *ctx, const struct sub_text_cue *source)

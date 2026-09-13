@@ -3456,6 +3456,92 @@ Property list
 ``secondary-sub-lines``
     Same as ``sub-lines``, but for the secondary subtitles.
 
+``sub-translate-config`` (RW)
+    Configure the shared native subtitle translator with a JSON string. The
+    configuration is validated and applied atomically. An empty string
+    disables shared translation without changing ``sub-translate`` or
+    ``whisper-lookahead``.
+
+    The object has the following fields:
+
+    ``provider``
+        Required. One of ``google``, ``azure``, or ``ai``.
+
+    ``source_lang``
+        Source language tag. Missing or empty values use ``auto``.
+
+    ``target_lang``
+        Required non-empty target language tag.
+
+    ``ai``
+        Required object for the ``ai`` provider and null or absent for the
+        other providers. It accepts ``endpoint``, ``model``, ``api_key``,
+        ``source_lang``, ``target_lang``, ``system_prompt``, ``context_size``,
+        ``max_tokens``, and ``timeout_ms``. ``endpoint`` and ``model`` are
+        required. Nested language values override the common language values.
+        ``context_size`` remains accepted for compatibility but is ignored
+        because requests are stateless. ``system_prompt`` intentionally keeps
+        the field spelling used by ``whisper-ai-translate``. Reading the
+        property masks a non-empty ``api_key``.
+
+    ``limits``
+        Optional object using the existing ``whisper-translate-limits`` field
+        names: ``enabled``, ``horizon_sec``, ``seek_debounce_ms``,
+        ``min_text_chars``, ``reuse_cache_capacity``,
+        ``reuse_cache_window_ms``, ``repeat_loop_threshold``,
+        ``repeat_loop_window_ms``, ``rpm_limit``, and
+        ``session_request_limit``.
+
+    Once this property has been set, including to an empty string, it is the
+    translation configuration authority for the lifetime of the player
+    instance. It supersedes legacy Whisper translator settings. If it is never
+    set, ``whisper-ai-translate``, ``whisper-translate-limits``, and the
+    ``translate_provider``/``translate_to`` members of ``whisper-lookahead``
+    retain their previous behavior.
+
+``sub-translate`` (RW)
+    Enable translation of the selected primary text subtitle. The default is
+    ``no``. This flag is independent from ``whisper-lookahead`` and does not
+    load a Whisper model, create an audio filter, or require an audio track.
+
+    The selected source remains the primary subtitle. mpv creates an owned
+    companion subtitle track with codec profile ``translated`` and selects it
+    as the secondary subtitle. If a different secondary subtitle is already
+    selected, translation reports an error and leaves both user selections
+    unchanged. Generated ``whisper`` and ``translated`` tracks are never used
+    as input.
+
+    Text formats decoded by mpv's ASS subtitle decoder are supported, including
+    external subtitle files and text subtitle streams embedded in containers.
+    Bitmap subtitles are reported as unsupported; OCR and hard-subtitle
+    recognition are not performed. Translation consumes decoded dialogue text,
+    preserves each cue's timing and identity (including overlaps), and escapes
+    translated text before placing it in the generated ASS stream. Short and
+    repeated source cues are not subjected to Whisper's ASR-specific filters.
+
+    Disabling the property, seeking, changing the primary subtitle, unloading
+    the file, or replacing the common configuration invalidates queued work and
+    clears only the owned generated output. A bounded look-ahead window is used,
+    so a slow provider can legitimately miss a cue rather than delaying or
+    retiming it.
+
+``sub-translate-status``
+    Read-only JSON status for ordinary subtitle translation:
+
+    ::
+
+        {
+            "state": "disabled|idle|translating|active|unsupported|error",
+            "source_sid": 1,
+            "output_sid": 2,
+            "translated": 12,
+            "pending": 3,
+            "error": null
+        }
+
+    ``source_sid`` and ``output_sid`` are null when unavailable. The status
+    never contains subtitle text, provider URLs, or credentials.
+
 ``playlist-pos`` (RW)
     Current position on playlist. The first entry is on position 0. Writing to
     this property may start playback at the new position.

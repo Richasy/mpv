@@ -109,6 +109,15 @@ translation_test = executable(
 )
 test('translation', translation_test)
 
+subtitle_timing = executable(
+    'subtitle-timing',
+    'subtitle_timing.c',
+    include_directories: incdir,
+    objects: libmpv.extract_all_objects(recursive: true),
+    dependencies: dependencies,
+)
+test('subtitle-timing', subtitle_timing)
+
 linked_list = executable('linked-list', files('linked_list.c'), include_directories: incdir)
 test('linked-list', linked_list)
 

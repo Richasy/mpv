@@ -89,6 +89,21 @@ bool sub_map_player_cue_to_subtitle(struct dec_sub *sub,
                                     double *subtitle_start,
                                     double *subtitle_duration);
 
+struct sub_packet_timing_probe {
+    bool visible;
+    bool sub_updated;
+    int cached_packet_index;
+    double read_until;
+};
+
+// Internal deterministic probe for the packet visibility/read-ahead decisions
+// used by sub_read_packets(). This is intentionally not part of libmpv's API.
+void sub_test_packet_timing(const char *codec_profile,
+                            double secondary_delay,
+                            double video_pts,
+                            bool force,
+                            struct sub_packet_timing_probe *out);
+
 void sub_reset(struct dec_sub *sub);
 void sub_select(struct dec_sub *sub, bool selected);
 void sub_set_recorder_sink(struct dec_sub *sub, struct mp_recorder_sink *sink);

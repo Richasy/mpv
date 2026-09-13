@@ -370,6 +370,13 @@ static bool update_pkt_cache(struct dec_sub *sub, double video_pts)
     return false;
 }
 
+static double subtitle_read_until(struct dec_sub *sub, double video_pts,
+                                  bool force)
+{
+    double delay = subtitle_delay(sub);
+    return delay < 0 || force ? video_pts : MP_NOPTS_VALUE;
+}
+
 // Read packets from the demuxer stream passed to sub_create(). Signals if
 // enough packets were read and if the subtitle state updated in anyway. If
 // packets_read is false, the player should wait until the demuxer signals new
@@ -397,8 +404,7 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
             break;
 
         // (Use this mechanism only if sub_delay matters to avoid corner cases.)
-        double delay = subtitle_delay(sub);
-        double min_pts = delay < 0 || force ? video_pts : MP_NOPTS_VALUE;
+        double min_pts = subtitle_read_until(sub, video_pts, force);
 
         struct demux_packet *pkt;
         int st = demux_read_packet_async_until(sub->sh, min_pts, &pkt);
@@ -716,6 +722,51 @@ bool sub_map_player_cue_to_subtitle(struct dec_sub *sub,
     *subtitle_duration = fabs(end - start);
     mp_mutex_unlock(&sub->lock);
     return isfinite(*subtitle_start) && isfinite(*subtitle_duration);
+}
+
+void sub_test_packet_timing(const char *codec_profile,
+                            double secondary_delay,
+                            double video_pts,
+                            bool force,
+                            struct sub_packet_timing_probe *out)
+{
+    struct mp_subtitle_shared_opts shared = {
+        .sub_delay = {0.0, secondary_delay},
+    };
+    struct mp_codec_params codec = {
+        .codec_profile = (char *)codec_profile,
+    };
+    struct demux_packet *first =
+        talloc_zero(NULL, struct demux_packet);
+    struct demux_packet *second =
+        talloc_zero(NULL, struct demux_packet);
+    first->pts = 0.4;
+    first->sub_duration = 1.25;
+    second->pts = 1.65;
+    second->sub_duration = 1.25;
+    struct demux_packet *packets[] = {first, second};
+    struct dec_sub sub = {
+        .shared_opts = &shared,
+        .codec = &codec,
+        .order = 1,
+        .cached_pkts = packets,
+        .num_cached_pkts = 2,
+        .sub_visible = true,
+    };
+
+    bool advanced = update_pkt_cache(&sub, video_pts);
+    struct demux_packet *current =
+        packets[sub.cached_pkt_pos];
+    bool visible = is_packet_visible(current, video_pts);
+    *out = (struct sub_packet_timing_probe){
+        .visible = visible,
+        .sub_updated = advanced || sub.sub_visible != visible,
+        .cached_packet_index = sub.cached_pkt_pos,
+        .read_until = subtitle_read_until(&sub, video_pts, force),
+    };
+
+    for (int n = 0; n < 2; n++)
+        talloc_free(packets[n]);
 }
 
 bool sub_emit_text_cues(struct dec_sub *sub, double start, double end)

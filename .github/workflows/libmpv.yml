@@ -38,6 +38,10 @@ on:
         description: 'Required full mpv commit SHA when source_run_id is set'
         type: string
         default: ''
+      expected_libplacebo_sha:
+        description: 'Required full libplacebo commit SHA when source_run_id is set'
+        type: string
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -205,6 +209,7 @@ jobs:
         env:
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          EXPECTED_LIBPLACEBO_SHA: ${{ inputs.expected_libplacebo_sha }}
           FFMPEG_REF: ${{ inputs.ffmpeg_ref }}
           UPLOAD_TARGET: ${{ inputs.upload_target }}
           BUILD_X64: ${{ inputs.build_x64 }}
@@ -216,6 +221,10 @@ jobs:
           fi
           if ! [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
             echo "::error::expected_source_sha must be a full commit SHA."
+            exit 1
+          fi
+          if ! [[ "$EXPECTED_LIBPLACEBO_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::expected_libplacebo_sha must be a full commit SHA."
             exit 1
           fi
           if [ "$FFMPEG_REF" != "df21143bf252528f45d7ae56cc1d317ff00d4449" ]; then
@@ -261,6 +270,7 @@ jobs:
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
           EXPECTED_FFMPEG_SHA: ${{ inputs.ffmpeg_ref }}
+          EXPECTED_LIBPLACEBO_SHA: ${{ inputs.expected_libplacebo_sha }}
           RETRY_ARCHITECTURE: ${{ matrix.name }}
           RETRY_BUILD_TYPE: ${{ inputs.build_type }}
         run: |
@@ -273,6 +283,7 @@ jobs:
             --source-run-id "$SOURCE_RUN_ID" \
             --expected-source-sha "$EXPECTED_SOURCE_SHA" \
             --expected-ffmpeg-sha "$EXPECTED_FFMPEG_SHA" \
+            --expected-libplacebo-sha "$EXPECTED_LIBPLACEBO_SHA" \
             --architecture "$RETRY_ARCHITECTURE" \
             --build-type "$RETRY_BUILD_TYPE" \
             --artifact-name "libmpv-${RETRY_ARCHITECTURE}${suffix}" \

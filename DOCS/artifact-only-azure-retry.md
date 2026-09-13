@@ -6,10 +6,11 @@ restricted to `Richasy/mpv`, workflow ID `235091400`, and
 `.github/workflows/libmpv.yml`.
 
 Set `source_run_id` to the exact prior workflow run and provide its full
-40-character `expected_source_sha`. In retry mode, `build_x64` and
-`build_arm64` select which existing artifacts are published. `upload_target`
-must be `azure` or `both`; both values perform only the Azure retry because
-the source GitHub artifact is reused in place rather than repackaged.
+40-character `expected_source_sha` and `expected_libplacebo_sha`. In retry
+mode, `build_x64` and `build_arm64` select which existing artifacts are
+published. `upload_target` must be `azure` or `both`; both values perform only
+the Azure retry because the source GitHub artifact is reused in place rather
+than repackaged.
 
 For the x64 retry from run `34752654492`:
 
@@ -19,6 +20,7 @@ gh workflow run libmpv.yml \
   --ref richasy/subtitle-translation \
   -f source_run_id=34752654492 \
   -f expected_source_sha=8b898bb5fac0d2df8de1451be13e57a130a100cd \
+  -f expected_libplacebo_sha=3330a515d62139259c26239014f286e233bd3a5c \
   -f build_x64=true \
   -f build_arm64=false \
   -f upload_target=azure \
@@ -39,8 +41,8 @@ The retry helper verifies:
 - successful architecture build and GitHub artifact-upload steps;
 - exactly one non-expired artifact with the expected architecture/build name;
 - the downloaded archive SHA-256 against GitHub artifact metadata;
-- exact `build-info.txt` values for mpv, FFmpeg, target architecture, and
-  build type, plus a full libplacebo commit and Clang compiler identity;
+- exact `build-info.txt` values for mpv, FFmpeg, libplacebo, target
+  architecture, and build type, plus a Clang compiler identity;
 - required `libmpv-2.dll`, `libmpv-2.pdb`, and `build-info.txt` files.
 
 Uploads use the existing `AZURE_STORAGE_CONNECTION_STRING` secret implicitly

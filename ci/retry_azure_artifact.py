@@ -281,7 +281,7 @@ def parse_build_info(path):
 
 
 def validate_payload(payload, expected_sha, expected_ffmpeg,
-                     target_arch, build_type):
+                     expected_libplacebo, target_arch, build_type):
     build_infos = list(payload.rglob("build-info.txt"))
     if len(build_infos) != 1:
         raise RetryError("artifact must contain exactly one build-info.txt")
@@ -304,6 +304,8 @@ def validate_payload(payload, expected_sha, expected_ffmpeg,
         raise RetryError("build-info ffmpeg_commit does not match")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", info["libplacebo_commit"]):
         raise RetryError("build-info libplacebo_commit is not a full SHA")
+    if info["libplacebo_commit"].lower() != expected_libplacebo:
+        raise RetryError("build-info libplacebo_commit does not match")
     if info["target_arch"] != target_arch:
         raise RetryError("build-info target_arch does not match")
     if info["build_type"] != build_type:
@@ -386,6 +388,7 @@ def parse_args():
     parser.add_argument("--source-run-id", required=True, type=int)
     parser.add_argument("--expected-source-sha", required=True)
     parser.add_argument("--expected-ffmpeg-sha", required=True)
+    parser.add_argument("--expected-libplacebo-sha", required=True)
     parser.add_argument("--architecture", required=True,
                         choices=("x64", "arm64"))
     parser.add_argument("--build-type", required=True,
@@ -418,6 +421,15 @@ def main():
             "max_attempts": args.upload_attempts,
             "operation_timeout_seconds": args.upload_timeout_seconds,
             "retry_delay_seconds": args.retry_delay_seconds,
+        },
+        "provenance_policy": {
+            "expected_mpv_commit": args.expected_source_sha.lower(),
+            "expected_ffmpeg_commit": args.expected_ffmpeg_sha.lower(),
+            "expected_libplacebo_commit":
+                args.expected_libplacebo_sha.lower(),
+            "expected_target_arch":
+                "x86_64" if args.architecture == "x64" else "aarch64",
+            "expected_build_type": args.build_type,
         },
         "publication": {
             "run_id": publication_run_id,
@@ -465,6 +477,11 @@ def main():
             raise RetryError("expected source SHA must be a full commit SHA")
         if not re.fullmatch(r"[0-9a-fA-F]{40}", args.expected_ffmpeg_sha):
             raise RetryError("expected FFmpeg SHA must be a full commit SHA")
+        if not re.fullmatch(
+            r"[0-9a-fA-F]{40}", args.expected_libplacebo_sha
+        ):
+            raise RetryError(
+                "expected libplacebo SHA must be a full commit SHA")
         if not os.environ.get("AZURE_STORAGE_CONNECTION_STRING"):
             raise RetryError("AZURE_STORAGE_CONNECTION_STRING is unavailable")
         if args.upload_attempts < 1 or args.upload_attempts > 5:
@@ -495,6 +512,7 @@ def main():
         root, files, build_info, hashes = validate_payload(
             payload, args.expected_source_sha.lower(),
             args.expected_ffmpeg_sha.lower(),
+            args.expected_libplacebo_sha.lower(),
             "x86_64" if args.architecture == "x64" else "aarch64",
             args.build_type)
 

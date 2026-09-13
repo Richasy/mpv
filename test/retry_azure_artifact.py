@@ -151,6 +151,7 @@ def run_helper(root, state, case, expect_success, architecture="x64"):
             "--source-run-id", str(RUN_ID),
             "--expected-source-sha", SOURCE_SHA,
             "--expected-ffmpeg-sha", FFMPEG_SHA,
+            "--expected-libplacebo-sha", LIBPLACEBO_SHA,
             "--architecture", architecture,
             "--build-type", "release",
             "--artifact-name", f"libmpv-{architecture}",
@@ -190,6 +191,10 @@ def verify_success(root, archive):
     assert receipt["build_info"]["mpv_commit"] == SOURCE_SHA
     assert receipt["build_info"]["ffmpeg_commit"] == FFMPEG_SHA
     assert receipt["build_info"]["libplacebo_commit"] == LIBPLACEBO_SHA
+    assert (
+        receipt["provenance_policy"]["expected_libplacebo_commit"] ==
+        LIBPLACEBO_SHA
+    )
     assert final_state["upload_attempts"]["native/x64/ggml-base.dll"] == 2
 
     for name in (
@@ -229,11 +234,13 @@ def verify_failure(root, archive, case, mutate):
     state = base_state(root, archive)
     mutate(state)
     receipt, final_state = run_helper(root, state, case, False)
+    data = None
     if receipt.exists():
         data = json.loads(receipt.read_text(encoding="utf-8"))
         assert data["status"] == "failed"
         assert "fixture-secret" not in json.dumps(data)
     assert not final_state.get("upload_attempts")
+    return data
 
 
 def verify_nontransient_upload_failure(root, archive):
@@ -345,6 +352,27 @@ def main():
             }),
         )
 
+        wrong_libplacebo = root / "wrong-libplacebo.zip"
+        write_zip(
+            wrong_libplacebo,
+            f"mpv_commit={SOURCE_SHA}\n"
+            f"ffmpeg_commit={FFMPEG_SHA}\n"
+            f"libplacebo_commit={'2' * 40}\n"
+            "target_arch=x86_64\n"
+            "build_type=release\n"
+            "compiler=clang version 21.1.8\n",
+        )
+        wrong_libplacebo_receipt = verify_failure(
+            root, wrong_libplacebo, "wrong-libplacebo",
+            lambda state: state["artifacts"]["artifacts"][0].update({
+                "digest": f"sha256:{sha256(wrong_libplacebo)}",
+            }),
+        )
+        assert (
+            wrong_libplacebo_receipt["error"] ==
+            "build-info libplacebo_commit does not match"
+        )
+
         wrong_arch = root / "wrong-arch.zip"
         write_zip(wrong_arch, target_arch="aarch64")
         verify_failure(
@@ -384,6 +412,7 @@ def main():
                 "--source-run-id", str(RUN_ID),
                 "--expected-source-sha", SOURCE_SHA,
                 "--expected-ffmpeg-sha", FFMPEG_SHA,
+                "--expected-libplacebo-sha", LIBPLACEBO_SHA,
                 "--architecture", "x64",
                 "--build-type", "release",
                 "--artifact-name", "libmpv-x64",

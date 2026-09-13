@@ -8,6 +8,7 @@ import sys
 import threading
 import urllib.parse
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 class TranslationServer(http.server.ThreadingHTTPServer):
@@ -46,25 +47,10 @@ class TranslationHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-def main():
-    if len(sys.argv) != 8:
-        raise SystemExit(
-            "expected executable, embedded, video, external, bitmap, dual, "
-            "and ASS fixtures"
-        )
+def run_test(dense_path):
     server = TranslationServer()
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
-    dense_path = Path(sys.argv[3]).with_name("sub-translation-dense.srt")
-    dense_path.write_text(
-        "".join(
-            f"{index + 1}\n"
-            "00:00:05,000 --> 00:00:20,000\n"
-            f"dense-{index:03d}\n\n"
-            for index in range(160)
-        ),
-        encoding="utf-8",
-    )
     try:
         process = subprocess.run(
             [
@@ -107,9 +93,28 @@ def main():
         server.shutdown()
         worker.join(timeout=3)
         server.server_close()
-        dense_path.unlink(missing_ok=True)
         if worker.is_alive():
             raise RuntimeError("translation fixture server did not stop")
+
+
+def main():
+    if len(sys.argv) != 8:
+        raise SystemExit(
+            "expected executable, embedded, video, external, bitmap, dual, "
+            "and ASS fixtures"
+        )
+    with TemporaryDirectory(prefix="mpv-sub-translation-") as directory:
+        dense_path = Path(directory) / "dense.srt"
+        dense_path.write_text(
+            "".join(
+                f"{index + 1}\n"
+                "00:00:05,000 --> 00:00:20,000\n"
+                f"dense-{index:03d}\n\n"
+                for index in range(160)
+            ),
+            encoding="utf-8",
+        )
+        run_test(dense_path)
 
 
 if __name__ == "__main__":

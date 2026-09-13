@@ -1279,6 +1279,8 @@ static bool node_is_integer(struct mpv_node *node, bool strict,
     }
     if (node->format == MPV_FORMAT_DOUBLE &&
         isfinite(node->u.double_) &&
+        node->u.double_ >= (double)INT64_MIN &&
+        node->u.double_ <= (double)INT64_MAX &&
         (!strict || floor(node->u.double_) == node->u.double_))
     {
         *value = node->u.double_;
@@ -1430,6 +1432,11 @@ static int parse_common_config(void *parent, const char *json,
         root.format != MPV_FORMAT_NODE_MAP)
     {
         set_error(error, "translation config must be a JSON object");
+        return -1;
+    }
+    json_skip_whitespace(&cursor);
+    if (cursor[0]) {
+        set_error(error, "translation config contains trailing data");
         return -1;
     }
 

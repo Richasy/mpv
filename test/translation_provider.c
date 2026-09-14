@@ -79,6 +79,15 @@ struct call_thread {
     void *tmp;
 };
 
+struct winhttp_call_thread {
+    struct wt_test_winhttp_client *client;
+    const void *body;
+    size_t body_len;
+    struct wt_call_result result;
+    struct wt_test_finalization_receipt *receipt;
+    void *tmp;
+};
+
 static void configure_process_local_failure_policy(void)
 {
     SetErrorMode(
@@ -120,14 +129,18 @@ enum loopback_mode {
     LOOPBACK_STALL,
     LOOPBACK_SLOW_DRIP,
     LOOPBACK_COOKIE,
+    LOOPBACK_STALL_NO_READ,
+    LOOPBACK_OVERLAP_STALL,
 };
 
 struct loopback_server {
     SOCKET listener;
     mp_thread thread;
     HANDLE release_event;
+    HANDLE accepted_event;
     enum loopback_mode mode;
     int port;
+    volatile LONG accepted_count;
     bool second_request_had_cookie;
 };
 
@@ -170,8 +183,24 @@ static bool receive_synthetic_request(SOCKET socket, char *buffer,
         length += received;
         buffer[length] = '\0';
         char *headers_end = strstr(buffer, "\r\n\r\n");
-        if (headers_end && expected < 0)
-            expected = (int)(headers_end + 4 - buffer) + 9;
+        if (headers_end && expected < 0) {
+            int body_length = 0;
+            const char *line = buffer;
+            while (line < headers_end) {
+                const char *end = strstr(line, "\r\n");
+                if (!end || end > headers_end)
+                    break;
+                if (end - line >= 15 &&
+                    _strnicmp(line, "Content-Length:", 15) == 0)
+                {
+                    body_length = atoi(line + 15);
+                    break;
+                }
+                line = end + 2;
+            }
+            expected =
+                (int)(headers_end + 4 - buffer) + body_length;
+        }
         if (expected >= 0 && length >= expected)
             return true;
     }
@@ -181,11 +210,38 @@ static bool receive_synthetic_request(SOCKET socket, char *buffer,
 static MP_THREAD_VOID run_loopback_server(void *opaque)
 {
     struct loopback_server *server = opaque;
+    if (server->mode == LOOPBACK_OVERLAP_STALL) {
+        SOCKET clients[2] = {INVALID_SOCKET, INVALID_SOCKET};
+        for (int n = 0; n < 2; n++) {
+            clients[n] = accept(server->listener, NULL, NULL);
+            if (clients[n] == INVALID_SOCKET)
+                break;
+            if (InterlockedIncrement(&server->accepted_count) == 2)
+                SetEvent(server->accepted_event);
+        }
+        WaitForSingleObject(server->release_event, 5000);
+        for (int n = 0; n < 2; n++) {
+            if (clients[n] != INVALID_SOCKET) {
+                shutdown(clients[n], SD_BOTH);
+                closesocket(clients[n]);
+            }
+        }
+        MP_THREAD_RETURN();
+    }
+
     int requests = server->mode == LOOPBACK_COOKIE ? 2 : 1;
     for (int n = 0; n < requests; n++) {
         SOCKET client = accept(server->listener, NULL, NULL);
         if (client == INVALID_SOCKET)
             break;
+        InterlockedIncrement(&server->accepted_count);
+        SetEvent(server->accepted_event);
+        if (server->mode == LOOPBACK_STALL_NO_READ) {
+            WaitForSingleObject(server->release_event, 5000);
+            shutdown(client, SD_BOTH);
+            closesocket(client);
+            continue;
+        }
         char request[8192] = {0};
         bool received = receive_synthetic_request(
             client, request, sizeof(request));
@@ -256,7 +312,9 @@ static void init_loopback_server(struct loopback_server *server,
         0);
     server->port = ntohs(address.sin_port);
     server->release_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    server->accepted_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     mp_require(server->release_event);
+    mp_require(server->accepted_event);
     assert_int_equal(
         mp_thread_create(&server->thread, run_loopback_server, server), 0);
 }
@@ -268,19 +326,26 @@ static void destroy_loopback_server(struct loopback_server *server)
     closesocket(server->listener);
     mp_thread_join(server->thread);
     CloseHandle(server->release_event);
+    CloseHandle(server->accepted_event);
     WSACleanup();
 }
 
-static void wait_for_async_cleanup(void)
+static struct wt_test_finalization_status wait_for_finalization(
+    struct wt_test_finalization_receipt **receipt)
 {
-    int64_t deadline = GetTickCount64() + 2000;
-    while (whisper_translate_test_active_async_requests() != 0 &&
-           GetTickCount64() < deadline)
-    {
-        Sleep(1);
-    }
-    assert_int_equal(
-        whisper_translate_test_active_async_requests(), 0);
+    struct wt_test_finalization_status status;
+    assert_true(whisper_translate_test_finalization_wait(
+        *receipt, 5000, &status));
+    whisper_translate_test_finalization_release(receipt);
+    assert_true(status.finalized);
+    assert_int_equal(status.closing_notifications, 1);
+    assert_false(status.closing_handle_mismatch);
+    assert_true(status.closing_thread_id > 0);
+    assert_true(status.finalizer_thread_id > 0);
+    assert_true(
+        status.closing_thread_id != status.finalizer_thread_id);
+    assert_int_equal(status.connection_close_count, 1);
+    return status;
 }
 
 static int64_t fake_monotonic_ms(void *ctx)
@@ -450,8 +515,24 @@ static MP_THREAD_VOID call_translate(void *ctx)
     MP_THREAD_RETURN();
 }
 
+static MP_THREAD_VOID call_winhttp(void *ctx)
+{
+    struct winhttp_call_thread *call = ctx;
+    call->tmp = talloc_new(NULL);
+    whisper_translate_test_winhttp_call_body(
+        call->client, call->tmp, call->body, call->body_len,
+        &call->result, &call->receipt);
+    MP_THREAD_RETURN();
+}
+
 static void destroy_call(struct call_thread *call)
 {
+    talloc_free(call->tmp);
+}
+
+static void destroy_winhttp_call(struct winhttp_call_thread *call)
+{
+    whisper_translate_test_finalization_release(&call->receipt);
     talloc_free(call->tmp);
 }
 
@@ -945,8 +1026,10 @@ static void test_production_transport_total_deadline(void)
         mp_require(client);
         void *tmp = talloc_new(NULL);
         struct wt_call_result result;
+        struct wt_test_finalization_receipt *receipt = NULL;
         int64_t started = GetTickCount64();
-        whisper_translate_test_winhttp_call(client, tmp, &result);
+        whisper_translate_test_winhttp_call(
+            client, tmp, &result, &receipt);
         int64_t elapsed = GetTickCount64() - started;
         assert_true(result.http_issued);
         assert_string_equal(result.error, "google: request timed out");
@@ -955,7 +1038,11 @@ static void test_production_transport_total_deadline(void)
         whisper_translate_test_winhttp_destroy(&client);
         talloc_free(tmp);
         destroy_loopback_server(&server);
-        wait_for_async_cleanup();
+        struct wt_test_finalization_status finalized =
+            wait_for_finalization(&receipt);
+        assert_int_equal(finalized.translator_destroy_count, 1);
+        assert_int_equal(
+            whisper_translate_test_active_async_requests(), 0);
     }
 }
 
@@ -971,17 +1058,108 @@ static void test_production_transport_cookie_policy(void)
         void *tmp = talloc_new(NULL);
         struct wt_call_result first;
         struct wt_call_result second;
-        whisper_translate_test_winhttp_call(client, tmp, &first);
-        whisper_translate_test_winhttp_call(client, tmp, &second);
+        struct wt_test_finalization_receipt *first_receipt = NULL;
+        struct wt_test_finalization_receipt *second_receipt = NULL;
+        whisper_translate_test_winhttp_call(
+            client, tmp, &first, &first_receipt);
+        struct wt_test_finalization_status first_finalized =
+            wait_for_finalization(&first_receipt);
+        assert_int_equal(first_finalized.translator_destroy_count, 0);
+        whisper_translate_test_winhttp_call(
+            client, tmp, &second, &second_receipt);
         assert_string_equal(first.translated, "ok");
         assert_string_equal(second.translated, "ok");
         whisper_translate_test_winhttp_destroy(&client);
         destroy_loopback_server(&server);
-        wait_for_async_cleanup();
+        struct wt_test_finalization_status second_finalized =
+            wait_for_finalization(&second_receipt);
+        assert_int_equal(second_finalized.translator_destroy_count, 1);
+        assert_int_equal(
+            whisper_translate_test_active_async_requests(), 0);
         assert_int_equal(
             server.second_request_had_cookie, !disabled);
         talloc_free(tmp);
     }
+}
+
+static void test_production_transport_overlapping_cleanup(void)
+{
+    struct loopback_server server;
+    init_loopback_server(&server, LOOPBACK_OVERLAP_STALL);
+    struct wt_test_winhttp_client *client =
+        whisper_translate_test_winhttp_create(
+            server.port, 300, true);
+    mp_require(client);
+    static const char body[] = "overlap";
+    struct winhttp_call_thread calls[2] = {
+        {.client = client, .body = body, .body_len = sizeof(body) - 1},
+        {.client = client, .body = body, .body_len = sizeof(body) - 1},
+    };
+    mp_thread threads[2];
+    for (int n = 0; n < 2; n++) {
+        assert_int_equal(
+            mp_thread_create(&threads[n], call_winhttp, &calls[n]), 0);
+    }
+    assert_int_equal(
+        WaitForSingleObject(server.accepted_event, 5000),
+        WAIT_OBJECT_0);
+    for (int n = 0; n < 2; n++)
+        mp_thread_join(threads[n]);
+    whisper_translate_test_winhttp_destroy(&client);
+    destroy_loopback_server(&server);
+
+    int translator_destroyed = 0;
+    for (int n = 0; n < 2; n++) {
+        assert_true(calls[n].result.http_issued);
+        assert_string_equal(
+            calls[n].result.error, "google: request timed out");
+        struct wt_test_finalization_status finalized =
+            wait_for_finalization(&calls[n].receipt);
+        translator_destroyed += finalized.translator_destroy_count;
+        destroy_winhttp_call(&calls[n]);
+    }
+    assert_int_equal(translator_destroyed, 1);
+    assert_int_equal(
+        whisper_translate_test_active_async_requests(), 0);
+}
+
+static void test_production_transport_owns_post_body(void)
+{
+    struct loopback_server server;
+    init_loopback_server(&server, LOOPBACK_STALL_NO_READ);
+    struct wt_test_winhttp_client *client =
+        whisper_translate_test_winhttp_create(
+            server.port, 150, true);
+    mp_require(client);
+    size_t body_len = 4 * 1024 * 1024;
+    unsigned char *body = VirtualAlloc(
+        NULL, body_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    mp_require(body);
+    memset(body, 0x5a, body_len);
+
+    void *tmp = talloc_new(NULL);
+    struct wt_call_result result;
+    struct wt_test_finalization_receipt *receipt = NULL;
+    whisper_translate_test_winhttp_call_body(
+        client, tmp, body, body_len, &result, &receipt);
+    assert_int_equal(
+        WaitForSingleObject(server.accepted_event, 5000),
+        WAIT_OBJECT_0);
+    assert_true(result.http_issued);
+    assert_string_equal(result.error, "google: request timed out");
+    memset(body, 0xdd, body_len);
+    DWORD old_protection = 0;
+    assert_true(VirtualProtect(
+        body, body_len, PAGE_NOACCESS, &old_protection));
+    whisper_translate_test_winhttp_destroy(&client);
+    destroy_loopback_server(&server);
+    struct wt_test_finalization_status finalized =
+        wait_for_finalization(&receipt);
+    assert_int_equal(finalized.translator_destroy_count, 1);
+    assert_int_equal(
+        whisper_translate_test_active_async_requests(), 0);
+    assert_true(VirtualFree(body, 0, MEM_RELEASE));
+    talloc_free(tmp);
 }
 
 static const char *rate_name(enum wt_provider provider)
@@ -1475,6 +1653,8 @@ static void run_offline_tests(void)
     test_transport_failures();
     test_production_transport_total_deadline();
     test_production_transport_cookie_policy();
+    test_production_transport_overlapping_cleanup();
+    test_production_transport_owns_post_body();
     test_common_rate_limit();
     test_retry_after_date_default_and_saturation();
     test_zero_retry_after_serialized_probe();

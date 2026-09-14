@@ -87,6 +87,17 @@ struct whisper_translator *whisper_translator_create_for_test(
 size_t whisper_translate_test_max_response_bytes(void);
 
 struct wt_test_winhttp_client;
+struct wt_test_finalization_receipt;
+
+struct wt_test_finalization_status {
+    bool finalized;
+    int closing_notifications;
+    bool closing_handle_mismatch;
+    unsigned closing_thread_id;
+    unsigned finalizer_thread_id;
+    int connection_close_count;
+    int translator_destroy_count;
+};
 
 // Fixed 127.0.0.1:/synthetic harness for the ordinary WinHTTP transport.
 // Only the ephemeral fixture port, total deadline, and cookie policy vary.
@@ -94,9 +105,19 @@ struct wt_test_winhttp_client *whisper_translate_test_winhttp_create(
     int port, int timeout_ms, bool disable_cookies);
 void whisper_translate_test_winhttp_call(
     struct wt_test_winhttp_client *client, void *talloc_ctx,
-    struct wt_call_result *out);
+    struct wt_call_result *out,
+    struct wt_test_finalization_receipt **receipt);
+void whisper_translate_test_winhttp_call_body(
+    struct wt_test_winhttp_client *client, void *talloc_ctx,
+    const void *body, size_t body_len, struct wt_call_result *out,
+    struct wt_test_finalization_receipt **receipt);
 void whisper_translate_test_winhttp_destroy(
     struct wt_test_winhttp_client **client);
+bool whisper_translate_test_finalization_wait(
+    struct wt_test_finalization_receipt *receipt, int timeout_ms,
+    struct wt_test_finalization_status *out);
+void whisper_translate_test_finalization_release(
+    struct wt_test_finalization_receipt **receipt);
 int whisper_translate_test_active_async_requests(void);
 
 #endif

@@ -3551,9 +3551,12 @@ Property list
     secondary per-operation limits. Each Google or Bing request also has one
     monotonic five-second total deadline spanning all phases and body reads;
     ``ai`` uses its configured timeout, still capped at five seconds. Requests
-    use asynchronous WinHTTP cancellation, retain their context until the final
-    handle-closing callback, and disable redirects. Google and Bing additionally
-    disable WinHTTP cookies; the existing ``ai`` cookie behavior is unchanged.
+    use asynchronous WinHTTP cancellation and disable redirects. WinHTTP
+    callbacks only record operation completion or final handle closure; a
+    separate process-owned cleanup thread releases the connection, translator,
+    buffers, and context after the final callback and initiating caller have
+    both drained. Google and Bing additionally disable WinHTTP cookies; the
+    existing ``ai`` cookie behavior is unchanged.
     See the Microsoft WinHTTP documentation for
     `timeouts
     <https://learn.microsoft.com/en-us/windows/win32/api/winhttp/nf-winhttp-winhttpsettimeouts>`_,

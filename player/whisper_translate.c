@@ -416,82 +416,290 @@ static bool parse_endpoint_url(void *parent, const char *url,
 
 // --- HTTP request helpers ---
 
+static bool whisper_translator_release_internal(
+    struct whisper_translator **tr);
+
 static atomic_int active_async_requests;
 
-struct wt_async_request {
+enum wt_async_signal {
+    WT_ASYNC_SIGNAL_NONE,
+    WT_ASYNC_SIGNAL_SEND_COMPLETE,
+    WT_ASYNC_SIGNAL_HEADERS_AVAILABLE,
+    WT_ASYNC_SIGNAL_DATA_AVAILABLE,
+    WT_ASYNC_SIGNAL_READ_COMPLETE,
+    WT_ASYNC_SIGNAL_REQUEST_ERROR,
+};
+
+struct wt_test_finalization_receipt {
     atomic_int refs;
+    HANDLE finalized_event;
+    atomic_int finalized;
+    atomic_int closing_notifications;
+    atomic_int closing_handle_mismatch;
+    atomic_uint closing_thread_id;
+    atomic_uint finalizer_thread_id;
+    atomic_int connection_close_count;
+    atomic_int translator_destroy_count;
+};
+
+struct wt_async_request {
     struct whisper_translator *translator;
     CRITICAL_SECTION lock;
-    HANDLE done_event;
+    HANDLE operation_event;
     HINTERNET connection;
-    HINTERNET request;
-    int64_t deadline_ms;
-    bool finished;
+    HINTERNET expected_request;
+    struct wt_test_finalization_receipt *receipt;
+    struct wt_async_request *next_cleanup;
+    volatile LONG owner_active;
+    volatile LONG callbacks_active;
+    volatile LONG cleanup_submitted;
+    bool logical_finished;
     bool issued;
     enum wt_http_failure failure;
     enum wt_http_failure pending_failure;
+    enum wt_async_signal signal;
+    DWORD request_error;
+    DWORD data_available;
+    DWORD read_complete;
     int http_status;
     char *retry_after;
+    unsigned char *request_body;
+    size_t request_body_len;
+    unsigned char io_buffer[8192];
     unsigned char *body;
     size_t body_len;
-    size_t pending_read;
+    size_t body_capacity;
     bool has_content_length;
     DWORD content_length;
+    int64_t deadline_ms;
 };
 
-static void async_request_release(struct wt_async_request *ctx);
+struct wt_async_cleanup_service {
+    INIT_ONCE once;
+    CRITICAL_SECTION lock;
+    CONDITION_VARIABLE condition;
+    HANDLE thread;
+    struct wt_async_request *head;
+    struct wt_async_request *tail;
+};
 
-static void async_request_destroy(struct wt_async_request *ctx)
+static struct wt_async_cleanup_service async_cleanup_service = {
+    .once = INIT_ONCE_STATIC_INIT,
+};
+
+static struct wt_test_finalization_receipt *receipt_create(void)
 {
-    if (ctx->connection)
-        WinHttpCloseHandle(ctx->connection);
-    if (ctx->done_event)
-        CloseHandle(ctx->done_event);
-    free(ctx->retry_after);
-    free(ctx->body);
-    DeleteCriticalSection(&ctx->lock);
-    whisper_translator_release(&ctx->translator);
-    atomic_fetch_sub_explicit(
-        &active_async_requests, 1, memory_order_acq_rel);
-    free(ctx);
+    struct wt_test_finalization_receipt *receipt =
+        calloc(1, sizeof(*receipt));
+    if (!receipt)
+        abort();
+    atomic_init(&receipt->refs, 1);
+    atomic_init(&receipt->finalized, 0);
+    atomic_init(&receipt->closing_notifications, 0);
+    atomic_init(&receipt->closing_handle_mismatch, 0);
+    atomic_init(&receipt->closing_thread_id, 0);
+    atomic_init(&receipt->finalizer_thread_id, 0);
+    atomic_init(&receipt->connection_close_count, 0);
+    atomic_init(&receipt->translator_destroy_count, 0);
+    receipt->finalized_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!receipt->finalized_event) {
+        free(receipt);
+        return NULL;
+    }
+    return receipt;
 }
 
-static void async_request_addref(struct wt_async_request *ctx)
+static void receipt_addref(struct wt_test_finalization_receipt *receipt)
 {
-    atomic_fetch_add_explicit(&ctx->refs, 1, memory_order_acq_rel);
+    atomic_fetch_add_explicit(&receipt->refs, 1, memory_order_acq_rel);
 }
 
-static void async_request_release(struct wt_async_request *ctx)
+void whisper_translate_test_finalization_release(
+    struct wt_test_finalization_receipt **receipt)
 {
+    if (!receipt || !*receipt)
+        return;
+    struct wt_test_finalization_receipt *value = *receipt;
+    *receipt = NULL;
     if (atomic_fetch_sub_explicit(
-            &ctx->refs, 1, memory_order_acq_rel) == 1)
+            &value->refs, 1, memory_order_acq_rel) == 1)
     {
-        async_request_destroy(ctx);
+        CloseHandle(value->finalized_event);
+        free(value);
     }
 }
 
-static struct wt_async_request *async_request_create(
-    struct whisper_translator *tr, HINTERNET connection, HINTERNET request,
-    int64_t deadline_ms)
+bool whisper_translate_test_finalization_wait(
+    struct wt_test_finalization_receipt *receipt, int timeout_ms,
+    struct wt_test_finalization_status *out)
 {
+    if (out)
+        *out = (struct wt_test_finalization_status){0};
+    if (!receipt || timeout_ms < 0)
+        return false;
+    DWORD result = WaitForSingleObject(
+        receipt->finalized_event, (DWORD)timeout_ms);
+    if (result != WAIT_OBJECT_0)
+        return false;
+    if (out) {
+        out->finalized = atomic_load_explicit(
+            &receipt->finalized, memory_order_acquire) != 0;
+        out->closing_notifications = atomic_load_explicit(
+            &receipt->closing_notifications, memory_order_acquire);
+        out->closing_handle_mismatch = atomic_load_explicit(
+            &receipt->closing_handle_mismatch, memory_order_acquire) != 0;
+        out->closing_thread_id = atomic_load_explicit(
+            &receipt->closing_thread_id, memory_order_acquire);
+        out->finalizer_thread_id = atomic_load_explicit(
+            &receipt->finalizer_thread_id, memory_order_acquire);
+        out->connection_close_count = atomic_load_explicit(
+            &receipt->connection_close_count, memory_order_acquire);
+        out->translator_destroy_count = atomic_load_explicit(
+            &receipt->translator_destroy_count, memory_order_acquire);
+    }
+    return true;
+}
+
+static void async_finalize_resources(struct wt_async_request *ctx)
+{
+    struct wt_test_finalization_receipt *receipt = ctx->receipt;
+    atomic_store_explicit(
+        &receipt->finalizer_thread_id, GetCurrentThreadId(),
+        memory_order_release);
+
+    if (ctx->connection) {
+        WinHttpCloseHandle(ctx->connection);
+        ctx->connection = NULL;
+        atomic_fetch_add_explicit(
+            &receipt->connection_close_count, 1, memory_order_acq_rel);
+    }
+    if (whisper_translator_release_internal(&ctx->translator)) {
+        atomic_fetch_add_explicit(
+            &receipt->translator_destroy_count, 1, memory_order_acq_rel);
+    }
+    if (ctx->operation_event)
+        CloseHandle(ctx->operation_event);
+    free(ctx->retry_after);
+    free(ctx->request_body);
+    free(ctx->body);
+    DeleteCriticalSection(&ctx->lock);
+    free(ctx);
+
+    atomic_fetch_sub_explicit(
+        &active_async_requests, 1, memory_order_acq_rel);
+    atomic_store_explicit(&receipt->finalized, 1, memory_order_release);
+    SetEvent(receipt->finalized_event);
+    whisper_translate_test_finalization_release(&receipt);
+}
+
+static MP_THREAD_VOID async_cleanup_thread(void *opaque)
+{
+    struct wt_async_cleanup_service *service = opaque;
+    while (true) {
+        EnterCriticalSection(&service->lock);
+        while (!service->head) {
+            SleepConditionVariableCS(
+                &service->condition, &service->lock, INFINITE);
+        }
+        struct wt_async_request *ctx = service->head;
+        service->head = ctx->next_cleanup;
+        if (!service->head)
+            service->tail = NULL;
+        LeaveCriticalSection(&service->lock);
+
+        while (InterlockedCompareExchange(
+                   &ctx->owner_active, 0, 0) != 0 ||
+               InterlockedCompareExchange(
+                   &ctx->callbacks_active, 0, 0) != 0)
+        {
+            SwitchToThread();
+        }
+        async_finalize_resources(ctx);
+    }
+    MP_THREAD_RETURN();
+}
+
+static BOOL CALLBACK async_cleanup_initialize(
+    PINIT_ONCE once, void *parameter, void **context)
+{
+    (void)once;
+    (void)parameter;
+    (void)context;
+    InitializeCriticalSection(&async_cleanup_service.lock);
+    InitializeConditionVariable(&async_cleanup_service.condition);
+    async_cleanup_service.thread = (HANDLE)_beginthreadex(
+        NULL, 0, async_cleanup_thread,
+        &async_cleanup_service, 0, NULL);
+    return async_cleanup_service.thread != NULL;
+}
+
+static bool async_cleanup_ensure(void)
+{
+    return InitOnceExecuteOnce(
+        &async_cleanup_service.once,
+        async_cleanup_initialize, NULL, NULL);
+}
+
+static void async_cleanup_enqueue(struct wt_async_request *ctx)
+{
+    EnterCriticalSection(&async_cleanup_service.lock);
+    if (async_cleanup_service.tail) {
+        async_cleanup_service.tail->next_cleanup = ctx;
+    } else {
+        async_cleanup_service.head = ctx;
+    }
+    async_cleanup_service.tail = ctx;
+    WakeConditionVariable(&async_cleanup_service.condition);
+    LeaveCriticalSection(&async_cleanup_service.lock);
+}
+
+static struct wt_async_request *async_request_create(
+    struct whisper_translator *tr, HINTERNET connection,
+    HINTERNET request, const struct wt_http_request *source,
+    int64_t deadline_ms,
+    struct wt_test_finalization_receipt **out_receipt)
+{
+    if (!async_cleanup_ensure())
+        return NULL;
     struct wt_async_request *ctx = calloc(1, sizeof(*ctx));
     if (!ctx)
         abort();
-    atomic_init(&ctx->refs, 1);
     atomic_fetch_add_explicit(
         &active_async_requests, 1, memory_order_acq_rel);
     ctx->translator = whisper_translator_acquire(tr);
     ctx->connection = connection;
-    ctx->request = request;
-    ctx->deadline_ms = deadline_ms;
+    ctx->expected_request = request;
     ctx->failure = WT_HTTP_FAILURE_SETUP;
+    ctx->deadline_ms = deadline_ms;
+    ctx->owner_active = 1;
     InitializeCriticalSection(&ctx->lock);
-    ctx->done_event = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (!ctx->done_event) {
-        ctx->connection = NULL;
-        ctx->request = NULL;
-        async_request_release(ctx);
+    ctx->operation_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    ctx->receipt = receipt_create();
+    if (source->body_len) {
+        ctx->request_body = malloc(source->body_len);
+        if (!ctx->request_body)
+            abort();
+        memcpy(ctx->request_body, source->body, source->body_len);
+        ctx->request_body_len = source->body_len;
+    }
+    if (!ctx->operation_event || !ctx->receipt) {
+        if (ctx->operation_event)
+            CloseHandle(ctx->operation_event);
+        if (ctx->receipt) {
+            whisper_translate_test_finalization_release(
+                &ctx->receipt);
+        }
+        free(ctx->request_body);
+        DeleteCriticalSection(&ctx->lock);
+        whisper_translator_release(&ctx->translator);
+        atomic_fetch_sub_explicit(
+            &active_async_requests, 1, memory_order_acq_rel);
+        free(ctx);
         return NULL;
+    }
+    if (out_receipt) {
+        receipt_addref(ctx->receipt);
+        *out_receipt = ctx->receipt;
     }
     return ctx;
 }
@@ -499,21 +707,76 @@ static struct wt_async_request *async_request_create(
 static void async_finish_locked(struct wt_async_request *ctx,
                                 enum wt_http_failure failure)
 {
-    if (ctx->finished)
-        return;
-    ctx->finished = true;
+    ctx->logical_finished = true;
     ctx->failure = failure;
-    SetEvent(ctx->done_event);
 }
 
-static void async_start_locked(struct wt_async_request *ctx,
-                               enum wt_http_failure failure, BOOL started)
+static void async_prepare_operation(
+    struct wt_async_request *ctx,
+    enum wt_http_failure pending_failure)
+{
+    ResetEvent(ctx->operation_event);
+    EnterCriticalSection(&ctx->lock);
+    ctx->signal = WT_ASYNC_SIGNAL_NONE;
+    ctx->request_error = ERROR_SUCCESS;
+    ctx->data_available = 0;
+    ctx->read_complete = 0;
+    ctx->pending_failure = pending_failure;
+    LeaveCriticalSection(&ctx->lock);
+}
+
+static bool async_start_operation(
+    struct wt_async_request *ctx,
+    enum wt_http_failure failure, BOOL started)
 {
     if (started)
-        return;
+        return true;
     DWORD error = GetLastError();
-    if (error != ERROR_IO_PENDING)
-        async_finish_locked(ctx, failure);
+    if (error == ERROR_IO_PENDING)
+        return true;
+    EnterCriticalSection(&ctx->lock);
+    async_finish_locked(ctx, failure);
+    ctx->request_error = error;
+    LeaveCriticalSection(&ctx->lock);
+    return false;
+}
+
+static DWORD remaining_timeout_ms(int64_t deadline_ms, int64_t now_ms)
+{
+    if (deadline_ms <= now_ms)
+        return 0;
+    int64_t remaining = deadline_ms - now_ms;
+    return remaining > MAXDWORD ? MAXDWORD : (DWORD)remaining;
+}
+
+static bool async_wait_operation(
+    struct wt_async_request *ctx, enum wt_async_signal expected)
+{
+    DWORD wait = remaining_timeout_ms(
+        ctx->deadline_ms,
+        translator_monotonic_ms(ctx->translator));
+    DWORD wait_result = WaitForSingleObject(ctx->operation_event, wait);
+    EnterCriticalSection(&ctx->lock);
+    if (wait_result != WAIT_OBJECT_0) {
+        async_finish_locked(
+            ctx, wait_result == WAIT_TIMEOUT
+                ? WT_HTTP_FAILURE_TIMEOUT
+                : ctx->pending_failure);
+        LeaveCriticalSection(&ctx->lock);
+        return false;
+    }
+    if (ctx->signal == WT_ASYNC_SIGNAL_REQUEST_ERROR) {
+        async_finish_locked(ctx, ctx->pending_failure);
+        LeaveCriticalSection(&ctx->lock);
+        return false;
+    }
+    if (ctx->signal != expected) {
+        async_finish_locked(ctx, ctx->pending_failure);
+        LeaveCriticalSection(&ctx->lock);
+        return false;
+    }
+    LeaveCriticalSection(&ctx->lock);
+    return true;
 }
 
 static char *query_retry_after(HINTERNET request)
@@ -558,16 +821,6 @@ static char *query_retry_after(HINTERNET request)
     return value;
 }
 
-static void async_query_available_locked(struct wt_async_request *ctx)
-{
-    if (!ctx->request || ctx->finished)
-        return;
-    ctx->pending_failure = WT_HTTP_FAILURE_READ;
-    async_start_locked(
-        ctx, WT_HTTP_FAILURE_READ,
-        WinHttpQueryDataAvailable(ctx->request, NULL));
-}
-
 static void CALLBACK winhttp_status_callback(
     HINTERNET handle, DWORD_PTR context, DWORD status,
     LPVOID status_info, DWORD status_info_length)
@@ -576,135 +829,198 @@ static void CALLBACK winhttp_status_callback(
         (struct wt_async_request *)context;
     if (!ctx)
         return;
+    InterlockedIncrement(&ctx->callbacks_active);
+
     if (status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) {
-        async_request_release(ctx);
+        atomic_fetch_add_explicit(
+            &ctx->receipt->closing_notifications, 1,
+            memory_order_acq_rel);
+        if (handle != ctx->expected_request) {
+            atomic_store_explicit(
+                &ctx->receipt->closing_handle_mismatch, 1,
+                memory_order_release);
+        }
+        atomic_store_explicit(
+            &ctx->receipt->closing_thread_id, GetCurrentThreadId(),
+            memory_order_release);
+        if (InterlockedCompareExchange(
+                &ctx->cleanup_submitted, 1, 0) == 0)
+        {
+            async_cleanup_enqueue(ctx);
+        }
+        InterlockedDecrement(&ctx->callbacks_active);
         return;
     }
 
     EnterCriticalSection(&ctx->lock);
-    if (ctx->finished) {
-        LeaveCriticalSection(&ctx->lock);
-        return;
+    if (!ctx->logical_finished) {
+        switch (status) {
+        case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE:
+            ctx->signal = WT_ASYNC_SIGNAL_SEND_COMPLETE;
+            SetEvent(ctx->operation_event);
+            break;
+        case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE:
+            ctx->signal = WT_ASYNC_SIGNAL_HEADERS_AVAILABLE;
+            SetEvent(ctx->operation_event);
+            break;
+        case WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE:
+            if (status_info &&
+                status_info_length == sizeof(DWORD))
+            {
+                ctx->data_available = *(DWORD *)status_info;
+                ctx->signal = WT_ASYNC_SIGNAL_DATA_AVAILABLE;
+            } else {
+                ctx->signal = WT_ASYNC_SIGNAL_REQUEST_ERROR;
+            }
+            SetEvent(ctx->operation_event);
+            break;
+        case WINHTTP_CALLBACK_STATUS_READ_COMPLETE:
+            if (status_info == ctx->io_buffer &&
+                status_info_length <= sizeof(ctx->io_buffer))
+            {
+                ctx->read_complete = status_info_length;
+                ctx->signal = WT_ASYNC_SIGNAL_READ_COMPLETE;
+            } else {
+                ctx->signal = WT_ASYNC_SIGNAL_REQUEST_ERROR;
+            }
+            SetEvent(ctx->operation_event);
+            break;
+        case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR:
+            if (status_info &&
+                status_info_length == sizeof(WINHTTP_ASYNC_RESULT))
+            {
+                WINHTTP_ASYNC_RESULT *error = status_info;
+                ctx->request_error = error->dwError;
+            }
+            ctx->signal = WT_ASYNC_SIGNAL_REQUEST_ERROR;
+            SetEvent(ctx->operation_event);
+            break;
+        }
     }
-    if (translator_monotonic_ms(ctx->translator) >= ctx->deadline_ms) {
-        async_finish_locked(ctx, WT_HTTP_FAILURE_TIMEOUT);
-        LeaveCriticalSection(&ctx->lock);
-        return;
-    }
+    LeaveCriticalSection(&ctx->lock);
+    InterlockedDecrement(&ctx->callbacks_active);
+}
 
-    switch (status) {
-    case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE:
-        ctx->pending_failure = WT_HTTP_FAILURE_RECEIVE;
-        async_start_locked(
-            ctx, WT_HTTP_FAILURE_RECEIVE,
-            WinHttpReceiveResponse(handle, NULL));
-        break;
-    case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE: {
-        DWORD status_code = 0;
-        DWORD status_size = sizeof(status_code);
-        if (!WinHttpQueryHeaders(
-                handle,
-                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &status_size,
-                WINHTTP_NO_HEADER_INDEX))
+static bool async_read_response(struct wt_async_request *ctx)
+{
+    while (true) {
+        if (translator_monotonic_ms(ctx->translator) >=
+            ctx->deadline_ms)
         {
-            async_finish_locked(ctx, WT_HTTP_FAILURE_STATUS);
-            break;
+            EnterCriticalSection(&ctx->lock);
+            async_finish_locked(ctx, WT_HTTP_FAILURE_TIMEOUT);
+            LeaveCriticalSection(&ctx->lock);
+            return false;
         }
-        ctx->http_status = (int)status_code;
-        ctx->retry_after = query_retry_after(handle);
-        if (status_code != 200) {
-            async_finish_locked(ctx, WT_HTTP_FAILURE_NONE);
-            break;
+        async_prepare_operation(ctx, WT_HTTP_FAILURE_READ);
+        if (!async_start_operation(
+                ctx, WT_HTTP_FAILURE_READ,
+                WinHttpQueryDataAvailable(
+                    ctx->expected_request, NULL)) ||
+            !async_wait_operation(
+                ctx, WT_ASYNC_SIGNAL_DATA_AVAILABLE))
+        {
+            return false;
         }
 
-        DWORD length_size = sizeof(ctx->content_length);
-        ctx->has_content_length = WinHttpQueryHeaders(
-            handle,
-            WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX, &ctx->content_length,
-            &length_size, WINHTTP_NO_HEADER_INDEX);
-        if (ctx->has_content_length &&
-            ctx->content_length > WT_MAX_RESPONSE_BYTES)
-        {
-            async_finish_locked(ctx, WT_HTTP_FAILURE_TOO_LARGE);
-            break;
-        }
-        async_query_available_locked(ctx);
-        break;
-    }
-    case WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE: {
-        if (!status_info || status_info_length != sizeof(DWORD)) {
-            async_finish_locked(ctx, WT_HTTP_FAILURE_READ);
-            break;
-        }
-        DWORD available = *(DWORD *)status_info;
+        EnterCriticalSection(&ctx->lock);
+        DWORD available = ctx->data_available;
+        LeaveCriticalSection(&ctx->lock);
         if (!available) {
             if (ctx->has_content_length &&
                 ctx->body_len != ctx->content_length)
             {
+                EnterCriticalSection(&ctx->lock);
                 async_finish_locked(ctx, WT_HTTP_FAILURE_READ);
-            } else {
-                async_finish_locked(ctx, WT_HTTP_FAILURE_NONE);
+                LeaveCriticalSection(&ctx->lock);
+                return false;
             }
-            break;
+            return true;
         }
         if (available > WT_MAX_RESPONSE_BYTES - ctx->body_len) {
+            EnterCriticalSection(&ctx->lock);
             async_finish_locked(ctx, WT_HTTP_FAILURE_TOO_LARGE);
-            break;
+            LeaveCriticalSection(&ctx->lock);
+            return false;
         }
-        unsigned char *body = realloc(
-            ctx->body, ctx->body_len + available + 1);
-        if (!body)
-            abort();
-        ctx->body = body;
-        ctx->pending_read = available;
-        ctx->pending_failure = WT_HTTP_FAILURE_READ;
-        async_start_locked(
-            ctx, WT_HTTP_FAILURE_READ,
-            WinHttpReadData(
-                handle, ctx->body + ctx->body_len, available, NULL));
-        break;
-    }
-    case WINHTTP_CALLBACK_STATUS_READ_COMPLETE:
-        if (!status_info_length ||
-            status_info_length > ctx->pending_read ||
-            ctx->body_len >
-                WT_MAX_RESPONSE_BYTES - status_info_length)
+
+        DWORD read_size = available < sizeof(ctx->io_buffer)
+            ? available : sizeof(ctx->io_buffer);
+        async_prepare_operation(ctx, WT_HTTP_FAILURE_READ);
+        if (!async_start_operation(
+                ctx, WT_HTTP_FAILURE_READ,
+                WinHttpReadData(
+                    ctx->expected_request, ctx->io_buffer,
+                    read_size, NULL)) ||
+            !async_wait_operation(
+                ctx, WT_ASYNC_SIGNAL_READ_COMPLETE))
         {
-            async_finish_locked(ctx, WT_HTTP_FAILURE_READ);
-            break;
+            return false;
         }
-        ctx->body_len += status_info_length;
+
+        EnterCriticalSection(&ctx->lock);
+        DWORD read = ctx->read_complete;
+        LeaveCriticalSection(&ctx->lock);
+        if (!read || read > read_size) {
+            EnterCriticalSection(&ctx->lock);
+            async_finish_locked(ctx, WT_HTTP_FAILURE_READ);
+            LeaveCriticalSection(&ctx->lock);
+            return false;
+        }
+        if (ctx->body_capacity < ctx->body_len + read + 1) {
+            size_t capacity = ctx->body_capacity
+                ? ctx->body_capacity : sizeof(ctx->io_buffer);
+            while (capacity < ctx->body_len + read + 1)
+                capacity *= 2;
+            unsigned char *body = realloc(ctx->body, capacity);
+            if (!body)
+                abort();
+            ctx->body = body;
+            ctx->body_capacity = capacity;
+        }
+        memcpy(ctx->body + ctx->body_len, ctx->io_buffer, read);
+        ctx->body_len += read;
         ctx->body[ctx->body_len] = '\0';
-        ctx->pending_read = 0;
-        async_query_available_locked(ctx);
-        break;
-    case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR:
-        async_finish_locked(
-            ctx, ctx->pending_failure
-                ? ctx->pending_failure : WT_HTTP_FAILURE_RECEIVE);
-        break;
+    }
+}
+
+static void async_copy_response(
+    struct wt_async_request *ctx, void *talloc_ctx,
+    struct wt_http_response *response)
+{
+    EnterCriticalSection(&ctx->lock);
+    response->failure = ctx->failure;
+    response->http_issued = ctx->issued;
+    response->http_status = ctx->http_status;
+    if (ctx->retry_after)
+        response->retry_after =
+            talloc_strdup(talloc_ctx, ctx->retry_after);
+    if (ctx->body_len) {
+        response->body = talloc_memdup(
+            talloc_ctx, ctx->body, ctx->body_len);
+        response->body_len = ctx->body_len;
     }
     LeaveCriticalSection(&ctx->lock);
 }
 
-static DWORD remaining_timeout_ms(int64_t deadline_ms, int64_t now_ms)
+static void async_finalize_unbound(struct wt_async_request *ctx)
 {
-    if (deadline_ms <= now_ms)
-        return 0;
-    int64_t remaining = deadline_ms - now_ms;
-    return remaining > MAXDWORD ? MAXDWORD : (DWORD)remaining;
+    InterlockedExchange(&ctx->owner_active, 0);
+    async_finalize_resources(ctx);
 }
 
-static void winhttp_transport(void *opaque, void *talloc_ctx,
-                              const struct wt_http_request *request,
-                              struct wt_http_response *response)
+static void winhttp_transport_impl(
+    void *opaque, void *talloc_ctx,
+    const struct wt_http_request *request,
+    struct wt_http_response *response,
+    struct wt_test_finalization_receipt **out_receipt)
 {
     struct whisper_translator *tr = opaque;
     *response = (struct wt_http_response){
         .failure = WT_HTTP_FAILURE_SETUP,
     };
+    if (out_receipt)
+        *out_receipt = NULL;
 
     int timeout_ms = request->timeout_ms > 0
         ? request->timeout_ms : WT_MAX_TIMEOUT_MS;
@@ -746,42 +1062,11 @@ static void winhttp_transport(void *opaque, void *talloc_ctx,
         return;
     }
 
-    struct wt_async_request *ctx =
-        async_request_create(tr, connection, handle, deadline_ms);
+    struct wt_async_request *ctx = async_request_create(
+        tr, connection, handle, request, deadline_ms, out_receipt);
     if (!ctx) {
         WinHttpCloseHandle(handle);
         WinHttpCloseHandle(connection);
-        talloc_free(tmp);
-        return;
-    }
-
-    DWORD callback_flags =
-        WINHTTP_CALLBACK_FLAG_SENDREQUEST_COMPLETE |
-        WINHTTP_CALLBACK_FLAG_HEADERS_AVAILABLE |
-        WINHTTP_CALLBACK_FLAG_DATA_AVAILABLE |
-        WINHTTP_CALLBACK_FLAG_READ_COMPLETE |
-        WINHTTP_CALLBACK_FLAG_REQUEST_ERROR |
-        WINHTTP_CALLBACK_FLAG_HANDLES;
-    if (WinHttpSetStatusCallback(
-            handle, winhttp_status_callback, callback_flags, 0) ==
-        WINHTTP_INVALID_STATUS_CALLBACK)
-    {
-        ctx->request = NULL;
-        WinHttpCloseHandle(handle);
-        async_request_release(ctx);
-        talloc_free(tmp);
-        return;
-    }
-
-    DWORD_PTR context = (DWORD_PTR)ctx;
-    async_request_addref(ctx);
-    if (!WinHttpSetOption(handle, WINHTTP_OPTION_CONTEXT_VALUE,
-                          &context, sizeof(context)))
-    {
-        async_request_release(ctx);
-        ctx->request = NULL;
-        WinHttpCloseHandle(handle);
-        async_request_release(ctx);
         talloc_free(tmp);
         return;
     }
@@ -796,64 +1081,121 @@ static void winhttp_transport(void *opaque, void *talloc_ctx,
         setup_ok = WinHttpAddRequestHeaders(
             handle, headers, (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
     }
-
-    EnterCriticalSection(&ctx->lock);
-    if (!setup_ok) {
-        async_finish_locked(ctx, WT_HTTP_FAILURE_SETUP);
-    } else if (translator_monotonic_ms(tr) >= deadline_ms) {
-        async_finish_locked(ctx, WT_HTTP_FAILURE_TIMEOUT);
-    } else {
-        ctx->issued = true;
-        ctx->pending_failure = WT_HTTP_FAILURE_SEND;
-        async_start_locked(
-            ctx, WT_HTTP_FAILURE_SEND,
-            WinHttpSendRequest(
-                handle, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                request->body_len
-                    ? (LPVOID)request->body
-                    : WINHTTP_NO_REQUEST_DATA,
-                (DWORD)request->body_len,
-                (DWORD)request->body_len, 0));
+    DWORD_PTR context = (DWORD_PTR)ctx;
+    if (setup_ok) {
+        setup_ok = WinHttpSetOption(
+            handle, WINHTTP_OPTION_CONTEXT_VALUE,
+            &context, sizeof(context));
     }
-    LeaveCriticalSection(&ctx->lock);
 
-    DWORD wait = remaining_timeout_ms(
-        deadline_ms, translator_monotonic_ms(tr));
-    DWORD wait_result = WaitForSingleObject(ctx->done_event, wait);
-    EnterCriticalSection(&ctx->lock);
-    if (!ctx->finished) {
-        async_finish_locked(
-            ctx, wait_result == WAIT_TIMEOUT
-                ? WT_HTTP_FAILURE_TIMEOUT
-                : WT_HTTP_FAILURE_RECEIVE);
+    DWORD callback_flags =
+        WINHTTP_CALLBACK_FLAG_SENDREQUEST_COMPLETE |
+        WINHTTP_CALLBACK_FLAG_HEADERS_AVAILABLE |
+        WINHTTP_CALLBACK_FLAG_DATA_AVAILABLE |
+        WINHTTP_CALLBACK_FLAG_READ_COMPLETE |
+        WINHTTP_CALLBACK_FLAG_REQUEST_ERROR |
+        WINHTTP_CALLBACK_FLAG_HANDLES;
+    if (!setup_ok ||
+        WinHttpSetStatusCallback(
+            handle, winhttp_status_callback, callback_flags, 0) ==
+        WINHTTP_INVALID_STATUS_CALLBACK)
+    {
+        response->failure = WT_HTTP_FAILURE_SETUP;
+        WinHttpCloseHandle(handle);
+        async_finalize_unbound(ctx);
+        talloc_free(tmp);
+        return;
     }
-    response->failure = ctx->failure;
-    response->http_issued = ctx->issued;
-    response->http_status = ctx->http_status;
-    if (ctx->retry_after)
-        response->retry_after =
-            talloc_strdup(talloc_ctx, ctx->retry_after);
-    if (ctx->body_len) {
-        response->body = talloc_memdup(
-            talloc_ctx, ctx->body, ctx->body_len);
-        response->body_len = ctx->body_len;
-    }
-    HINTERNET request_handle = ctx->request;
-    ctx->request = NULL;
-    LeaveCriticalSection(&ctx->lock);
 
-    // Async cancellation is requested only after publishing the NULL handle.
-    // HANDLE_CLOSING owns the callback reference and is WinHTTP's final use of
-    // the context.
-    if (request_handle) {
-        if (!WinHttpCloseHandle(request_handle)) {
-            mp_warn(tr->log, "translate: WinHttpCloseHandle failed (%lu)\n",
-                    GetLastError());
+    async_prepare_operation(ctx, WT_HTTP_FAILURE_SEND);
+    ctx->issued = true;
+    bool complete = async_start_operation(
+        ctx, WT_HTTP_FAILURE_SEND,
+        WinHttpSendRequest(
+            handle, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            ctx->request_body_len
+                ? ctx->request_body : WINHTTP_NO_REQUEST_DATA,
+            (DWORD)ctx->request_body_len,
+            (DWORD)ctx->request_body_len,
+            (DWORD_PTR)ctx)) &&
+        async_wait_operation(
+            ctx, WT_ASYNC_SIGNAL_SEND_COMPLETE);
+
+    if (complete) {
+        async_prepare_operation(ctx, WT_HTTP_FAILURE_RECEIVE);
+        complete = async_start_operation(
+            ctx, WT_HTTP_FAILURE_RECEIVE,
+            WinHttpReceiveResponse(handle, NULL)) &&
+            async_wait_operation(
+                ctx, WT_ASYNC_SIGNAL_HEADERS_AVAILABLE);
+    }
+
+    if (complete) {
+        DWORD status_code = 0;
+        DWORD status_size = sizeof(status_code);
+        if (!WinHttpQueryHeaders(
+                handle,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &status_code,
+                &status_size, WINHTTP_NO_HEADER_INDEX))
+        {
+            EnterCriticalSection(&ctx->lock);
+            async_finish_locked(ctx, WT_HTTP_FAILURE_STATUS);
+            LeaveCriticalSection(&ctx->lock);
+            complete = false;
+        } else {
+            ctx->http_status = (int)status_code;
+            ctx->retry_after = query_retry_after(handle);
+            DWORD length_size = sizeof(ctx->content_length);
+            ctx->has_content_length = WinHttpQueryHeaders(
+                handle,
+                WINHTTP_QUERY_CONTENT_LENGTH |
+                    WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                &ctx->content_length, &length_size,
+                WINHTTP_NO_HEADER_INDEX);
+            if (ctx->has_content_length &&
+                ctx->content_length > WT_MAX_RESPONSE_BYTES)
+            {
+                EnterCriticalSection(&ctx->lock);
+                async_finish_locked(
+                    ctx, WT_HTTP_FAILURE_TOO_LARGE);
+                LeaveCriticalSection(&ctx->lock);
+                complete = false;
+            } else if (status_code == 200) {
+                complete = async_read_response(ctx);
+            }
         }
     }
-    async_request_release(ctx);
+
+    EnterCriticalSection(&ctx->lock);
+    if (!ctx->logical_finished) {
+        async_finish_locked(
+            ctx, complete
+                ? WT_HTTP_FAILURE_NONE : ctx->failure);
+    }
+    LeaveCriticalSection(&ctx->lock);
+    async_copy_response(ctx, talloc_ctx, response);
+
+    // After close, HANDLE_CLOSING owns the transition to the non-WinHTTP
+    // finalizer. The initiating owner publishes its drain as its final access.
+    if (!WinHttpCloseHandle(handle)) {
+        mp_warn(tr->log, "translate: WinHttpCloseHandle failed (%lu)\n",
+                GetLastError());
+    }
+    InterlockedExchange(&ctx->owner_active, 0);
     talloc_free(tmp);
 }
+
+static void winhttp_transport(
+    void *opaque, void *talloc_ctx,
+    const struct wt_http_request *request,
+    struct wt_http_response *response)
+{
+    winhttp_transport_impl(
+        opaque, talloc_ctx, request, response, NULL);
+}
+
 
 struct wt_retry_after {
     bool present;
@@ -2035,16 +2377,18 @@ struct wt_test_winhttp_client *whisper_translate_test_winhttp_create(
     return client;
 }
 
-void whisper_translate_test_winhttp_call(
+void whisper_translate_test_winhttp_call_body(
     struct wt_test_winhttp_client *client, void *talloc_ctx,
-    struct wt_call_result *out)
+    const void *body, size_t body_len, struct wt_call_result *out,
+    struct wt_test_finalization_receipt **receipt)
 {
     memset(out, 0, sizeof(*out));
+    if (receipt)
+        *receipt = NULL;
     if (!client) {
         set_err(out, "google: request setup failed");
         return;
     }
-    static const char body[] = "synthetic";
     struct wt_http_request request = {
         .host = "127.0.0.1",
         .port = client->port,
@@ -2053,19 +2397,61 @@ void whisper_translate_test_winhttp_call(
         .path = "/synthetic",
         .headers = "Content-Type: text/plain; charset=utf-8\r\n",
         .body = body,
-        .body_len = sizeof(body) - 1,
+        .body_len = body_len,
         .proxy_mode = WT_HTTP_PROXY_NONE,
         .disable_cookies = client->disable_cookies,
         .timeout_ms = client->timeout_ms,
     };
-    struct wt_http_observation observation = {0};
-    char *response = NULL;
-    if (perform_http(
-            client->translator, talloc_ctx, &request, out,
-            &observation, &response))
-    {
-        out->translated = response;
+    struct wt_http_response response = {0};
+    winhttp_transport_impl(
+        client->translator, talloc_ctx, &request,
+        &response, receipt);
+    out->http_issued = response.http_issued;
+    out->http_status = response.http_status;
+    out->rate_limited = response.http_status == 429;
+    switch (response.failure) {
+    case WT_HTTP_FAILURE_NONE:
+        if (response.http_status == 200 && response.body) {
+            out->translated = talloc_strndup(
+                talloc_ctx, (char *)response.body,
+                response.body_len);
+        } else {
+            set_err(out, "google: HTTP %d", response.http_status);
+        }
+        break;
+    case WT_HTTP_FAILURE_SETUP:
+        set_err(out, "google: request setup failed");
+        break;
+    case WT_HTTP_FAILURE_SEND:
+        set_err(out, "google: request send failed");
+        break;
+    case WT_HTTP_FAILURE_RECEIVE:
+        set_err(out, "google: response receive failed");
+        break;
+    case WT_HTTP_FAILURE_STATUS:
+        set_err(out, "google: invalid HTTP status");
+        break;
+    case WT_HTTP_FAILURE_READ:
+        set_err(out, "google: response read failed");
+        break;
+    case WT_HTTP_FAILURE_TOO_LARGE:
+        set_err(out, "google: response too large");
+        break;
+    case WT_HTTP_FAILURE_TIMEOUT:
+        set_err(out, "google: request timed out");
+        break;
     }
+}
+
+void whisper_translate_test_winhttp_call(
+    struct wt_test_winhttp_client *client, void *talloc_ctx,
+    struct wt_call_result *out,
+    struct wt_test_finalization_receipt **receipt)
+{
+    static const char body[] = "synthetic";
+    whisper_translate_test_winhttp_call_body(
+        client, talloc_ctx, body, sizeof(body) - 1,
+        out, receipt);
 }
 
 void whisper_translate_test_winhttp_destroy(
@@ -2103,14 +2489,25 @@ static void whisper_translator_real_destroy(struct whisper_translator *t)
     talloc_free(t);
 }
 
-void whisper_translator_release(struct whisper_translator **tr)
+static bool whisper_translator_release_internal(
+    struct whisper_translator **tr)
 {
     if (!tr || !*tr)
-        return;
+        return false;
     struct whisper_translator *t = *tr;
     *tr = NULL;
-    if (atomic_fetch_sub_explicit(&t->refcount, 1, memory_order_acq_rel) == 1)
+    if (atomic_fetch_sub_explicit(
+            &t->refcount, 1, memory_order_acq_rel) == 1)
+    {
         whisper_translator_real_destroy(t);
+        return true;
+    }
+    return false;
+}
+
+void whisper_translator_release(struct whisper_translator **tr)
+{
+    whisper_translator_release_internal(tr);
 }
 
 void whisper_translator_destroy(struct whisper_translator **tr)

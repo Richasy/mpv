@@ -418,11 +418,9 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
 
         // (Use this mechanism only if sub_delay matters to avoid corner cases.)
         double min_pts = subtitle_read_until(sub, video_pts, force);
-        double read_ahead_pts = subtitle_read_ahead_until(sub, video_pts);
 
         struct demux_packet *pkt;
         int st = demux_read_packet_async_until(sub->sh, min_pts, &pkt);
-        demux_request_read_ahead(sub->sh, read_ahead_pts);
         // Note: "wait" (st==0) happens with non-interleaved streams only, and
         // then we should stop the playloop until a new enough packet has been
         // seen (or the subtitle decoder's queue is full). This usually does not
@@ -452,6 +450,10 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
         if (!(sub->preload_attempted && sub->sd->preload_ok))
             sub->sd->driver->decode(sub->sd, pkt);
     }
+    // Keep the playback wakeup boundary until its required read has settled.
+    if (*packets_read)
+        demux_request_read_ahead(sub->sh, subtitle_read_ahead_until(sub, video_pts));
+
     if (sub->cached_pkts && sub->num_cached_pkts) {
         bool visible = is_packet_visible(sub->cached_pkts[sub->cached_pkt_pos], video_pts);
         *sub_updated = update_pkt_cache(sub, video_pts) || sub->sub_visible != visible;

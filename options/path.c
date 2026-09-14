@@ -108,12 +108,20 @@ static const char *mp_get_platform_path(void *talloc_ctx,
 void mp_init_paths(struct mpv_global *global, struct MPOpts *opts)
 {
     TA_FREEP(&global->configdir);
+    TA_FREEP(&global->explicit_configdir);
 
     const char *force_configdir = getenv("MPV_HOME");
-    if (opts->force_configdir && opts->force_configdir[0])
+    bool has_explicit_configdir =
+        opts->force_configdir && opts->force_configdir[0];
+    if (has_explicit_configdir)
         force_configdir = opts->force_configdir;
-    if (!opts->load_config)
+    if (!opts->load_config) {
+        if (has_explicit_configdir) {
+            global->explicit_configdir =
+                mp_get_user_path(global, global, force_configdir);
+        }
         force_configdir = "";
+    }
 
     global->configdir = mp_get_user_path(global, global, force_configdir);
 }
@@ -193,7 +201,13 @@ char *mp_get_user_path(void *talloc_ctx, struct mpv_global *global,
         if (bstr_split_tok(bpath, "/", &prefix, &rest)) {
             const char *rest0 = rest.start; // ok in this case
             if (bstr_equals0(prefix, "~")) {
-                res = mp_find_config_file(talloc_ctx, global, rest0);
+                if (global->explicit_configdir) {
+                    res = mp_path_join_bstr(talloc_ctx,
+                                            bstr0(global->explicit_configdir),
+                                            rest);
+                } else {
+                    res = mp_find_config_file(talloc_ctx, global, rest0);
+                }
                 if (!res) {
                     void *tmp = talloc_new(NULL);
                     const char *p = mp_get_platform_path(tmp, global, "home");
@@ -209,7 +223,10 @@ char *mp_get_user_path(void *talloc_ctx, struct mpv_global *global,
                 void *tmp = talloc_new(NULL);
                 char type[80];
                 snprintf(type, sizeof(type), "%.*s", BSTR_P(prefix));
-                const char *p = mp_get_platform_path(tmp, global, type);
+                const char *p =
+                    global->explicit_configdir && !strcmp(type, "home")
+                    ? global->explicit_configdir
+                    : mp_get_platform_path(tmp, global, type);
                 res = mp_path_join_bstr(talloc_ctx, bstr0(p), rest);
                 talloc_free(tmp);
             }

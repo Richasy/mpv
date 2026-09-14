@@ -1,0 +1,3 @@
+change `--config-dir` to retain an explicitly supplied root for `~~/` and
+`~~home/` expansion under `--no-config` without enabling automatic config,
+input, or script discovery; `MPV_HOME` remains ignored in this mode

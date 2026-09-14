@@ -129,4 +129,8 @@ char *whisper_translate(struct whisper_translator *tr,
 void whisper_translator_get_status(struct whisper_translator *tr,
                                    struct wt_status *out);
 
+// Process-wide count of native request/session handles deliberately retained
+// after an unproven close. The count is monotonic and contains no user data.
+int whisper_translate_retained_cleanup_count(void);
+
 #endif

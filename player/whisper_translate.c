@@ -90,6 +90,16 @@ struct whisper_translator {
     atomic_int fail_connection_close;
     atomic_int fail_session_close;
     atomic_int fail_setup;
+    atomic_bool fatal_cleanup_error;
+    atomic_int fatal_cleanup_kind;
+    atomic_ulong fatal_cleanup_native_error;
+    atomic_bool force_closing_mismatch;
+    atomic_bool test_hold_after_send;
+    atomic_bool test_send_completion_observed;
+    HANDLE test_send_submitted_event;
+    HANDLE test_send_release_event;
+    const void *test_submitted_body;
+    size_t test_submitted_body_len;
     struct wt_test_session_receipt *test_session_receipt;
 
     // Refcount: pipeline workers acquire while a translation is in flight,
@@ -432,7 +442,8 @@ static enum wt_translator_release_result
 whisper_translator_release_internal(
     struct whisper_translator **tr, DWORD *close_error);
 
-static atomic_int active_async_requests;
+static atomic_int active_async_requests = ATOMIC_VAR_INIT(0);
+static atomic_int retained_native_orphans = ATOMIC_VAR_INIT(0);
 
 enum wt_async_signal {
     WT_ASYNC_SIGNAL_NONE,
@@ -446,6 +457,7 @@ enum wt_async_signal {
 struct wt_test_finalization_receipt {
     atomic_int refs;
     HANDLE finalized_event;
+    HANDLE late_callback_event;
     atomic_int terminal;
     atomic_int finalized;
     atomic_int retained_orphan;
@@ -455,6 +467,7 @@ struct wt_test_finalization_receipt {
     atomic_int closing_handle_mismatch;
     atomic_uint closing_thread_id;
     atomic_uint finalizer_thread_id;
+    atomic_int callbacks_after_terminal;
     atomic_int request_close_count;
     atomic_int connection_close_count;
     atomic_int translator_destroy_count;
@@ -509,8 +522,6 @@ struct wt_async_cleanup_service {
     CONDITION_VARIABLE condition;
     struct wt_async_request *head;
     struct wt_async_request *tail;
-    struct wt_async_request *orphans;
-    struct whisper_translator *retained_translators;
     HANDLE test_finalize_gate;
     HANDLE test_finalize_arrived;
     atomic_int test_hold_finalizer;
@@ -519,9 +530,22 @@ struct wt_async_cleanup_service {
 static struct wt_async_cleanup_service async_cleanup_service = {
     .once = INIT_ONCE_STATIC_INIT,
 };
-static atomic_int injected_cleanup_thread_create_failures;
+static atomic_int injected_cleanup_thread_create_failures =
+    ATOMIC_VAR_INIT(0);
 static const unsigned char async_cleanup_module_anchor;
 static bool async_cleanup_ensure(void);
+static SRWLOCK retained_orphan_lock = SRWLOCK_INIT;
+static struct wt_async_request *retained_request_orphans;
+static struct whisper_translator *retained_translator_orphans;
+
+struct wt_pre_request_orphan {
+    struct whisper_translator *translator;
+    HINTERNET request;
+    HINTERNET connection;
+    struct wt_pre_request_orphan *next;
+};
+
+static struct wt_pre_request_orphan *retained_pre_request_orphans;
 
 static struct wt_test_finalization_receipt *receipt_create(void)
 {
@@ -539,11 +563,20 @@ static struct wt_test_finalization_receipt *receipt_create(void)
     atomic_init(&receipt->closing_handle_mismatch, 0);
     atomic_init(&receipt->closing_thread_id, 0);
     atomic_init(&receipt->finalizer_thread_id, 0);
+    atomic_init(&receipt->callbacks_after_terminal, 0);
     atomic_init(&receipt->request_close_count, 0);
     atomic_init(&receipt->connection_close_count, 0);
     atomic_init(&receipt->translator_destroy_count, 0);
     receipt->finalized_event = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (!receipt->finalized_event) {
+    receipt->late_callback_event =
+        CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!receipt->finalized_event ||
+        !receipt->late_callback_event)
+    {
+        if (receipt->finalized_event)
+            CloseHandle(receipt->finalized_event);
+        if (receipt->late_callback_event)
+            CloseHandle(receipt->late_callback_event);
         free(receipt);
         return NULL;
     }
@@ -635,6 +668,7 @@ void whisper_translate_test_finalization_release(
             &value->refs, 1, memory_order_acq_rel) == 1)
     {
         CloseHandle(value->finalized_event);
+        CloseHandle(value->late_callback_event);
         free(value);
     }
 }
@@ -670,6 +704,9 @@ bool whisper_translate_test_finalization_wait(
             &receipt->closing_thread_id, memory_order_acquire);
         out->finalizer_thread_id = atomic_load_explicit(
             &receipt->finalizer_thread_id, memory_order_acquire);
+        out->callbacks_after_terminal = atomic_load_explicit(
+            &receipt->callbacks_after_terminal,
+            memory_order_acquire);
         out->request_close_count = atomic_load_explicit(
             &receipt->request_close_count, memory_order_acquire);
         out->connection_close_count = atomic_load_explicit(
@@ -678,6 +715,16 @@ bool whisper_translate_test_finalization_wait(
             &receipt->translator_destroy_count, memory_order_acquire);
     }
     return true;
+}
+
+bool whisper_translate_test_finalization_wait_late_callback(
+    struct wt_test_finalization_receipt *receipt, int timeout_ms)
+{
+    if (!receipt || timeout_ms < 0)
+        return false;
+    return WaitForSingleObject(
+        receipt->late_callback_event,
+        (DWORD)timeout_ms) == WAIT_OBJECT_0;
 }
 
 static bool consume_injected_close_failure(atomic_int *counter)
@@ -729,27 +776,101 @@ static void receipt_mark_retained(
     SetEvent(receipt->finalized_event);
 }
 
+static void latch_cleanup_failure(
+    struct whisper_translator *translator,
+    enum wt_test_close_kind kind, DWORD error)
+{
+    if (!translator)
+        return;
+    atomic_store_explicit(
+        &translator->fatal_cleanup_kind, kind,
+        memory_order_release);
+    atomic_store_explicit(
+        &translator->fatal_cleanup_native_error, error,
+        memory_order_release);
+    atomic_store_explicit(
+        &translator->fatal_cleanup_error, true,
+        memory_order_release);
+}
+
 static void async_retain_orphan(
     struct wt_async_request *ctx,
     enum wt_test_close_kind kind, DWORD error)
 {
     InterlockedExchange(&ctx->cleanup_submitted, 1);
+    latch_cleanup_failure(ctx->translator, kind, error);
+    if (kind != WT_TEST_CLOSE_SESSION) {
+        atomic_fetch_add_explicit(
+            &retained_native_orphans, 1,
+            memory_order_acq_rel);
+    }
     receipt_mark_retained(ctx->receipt, kind, error);
-    EnterCriticalSection(&async_cleanup_service.lock);
-    ctx->next_cleanup = async_cleanup_service.orphans;
-    async_cleanup_service.orphans = ctx;
-    LeaveCriticalSection(&async_cleanup_service.lock);
+    AcquireSRWLockExclusive(&retained_orphan_lock);
+    ctx->next_cleanup = retained_request_orphans;
+    retained_request_orphans = ctx;
+    ReleaseSRWLockExclusive(&retained_orphan_lock);
 }
 
 static void retain_translator_orphan(struct whisper_translator *translator)
 {
-    if (!async_cleanup_ensure())
-        return;
-    EnterCriticalSection(&async_cleanup_service.lock);
+    atomic_fetch_add_explicit(
+        &retained_native_orphans, 1, memory_order_acq_rel);
+    AcquireSRWLockExclusive(&retained_orphan_lock);
     translator->next_retained =
-        async_cleanup_service.retained_translators;
-    async_cleanup_service.retained_translators = translator;
-    LeaveCriticalSection(&async_cleanup_service.lock);
+        retained_translator_orphans;
+    retained_translator_orphans = translator;
+    ReleaseSRWLockExclusive(&retained_orphan_lock);
+}
+
+static void retain_pre_request_orphan(
+    struct whisper_translator *translator,
+    HINTERNET request, HINTERNET connection,
+    enum wt_test_close_kind kind, DWORD error)
+{
+    struct wt_pre_request_orphan *orphan =
+        calloc(1, sizeof(*orphan));
+    if (!orphan)
+        abort();
+    orphan->translator = whisper_translator_acquire(translator);
+    orphan->request = request;
+    orphan->connection = connection;
+    latch_cleanup_failure(translator, kind, error);
+    atomic_fetch_add_explicit(
+        &retained_native_orphans, 1, memory_order_acq_rel);
+    AcquireSRWLockExclusive(&retained_orphan_lock);
+    orphan->next = retained_pre_request_orphans;
+    retained_pre_request_orphans = orphan;
+    ReleaseSRWLockExclusive(&retained_orphan_lock);
+}
+
+static bool close_pre_request_handles(
+    struct whisper_translator *translator,
+    HINTERNET request, HINTERNET connection,
+    struct wt_http_response *response)
+{
+    DWORD error = ERROR_SUCCESS;
+    if (request &&
+        !close_native_handle(
+            translator, WT_TEST_CLOSE_REQUEST, request, &error))
+    {
+        retain_pre_request_orphan(
+            translator, request, connection,
+            WT_TEST_CLOSE_REQUEST, error);
+        response->failure = WT_HTTP_FAILURE_CLOSE;
+        return false;
+    }
+    if (connection &&
+        !close_native_handle(
+            translator, WT_TEST_CLOSE_CONNECTION,
+            connection, &error))
+    {
+        retain_pre_request_orphan(
+            translator, NULL, connection,
+            WT_TEST_CLOSE_CONNECTION, error);
+        response->failure = WT_HTTP_FAILURE_CLOSE;
+        return false;
+    }
+    return true;
 }
 
 static void async_finalize_resources(struct wt_async_request *ctx)
@@ -1154,10 +1275,18 @@ static void CALLBACK winhttp_status_callback(
         atomic_fetch_add_explicit(
             &ctx->receipt->closing_notifications, 1,
             memory_order_acq_rel);
-        if (handle != ctx->expected_request) {
+        if (handle != ctx->expected_request ||
+            atomic_load_explicit(
+                &ctx->translator->force_closing_mismatch,
+                memory_order_acquire))
+        {
             atomic_store_explicit(
                 &ctx->receipt->closing_handle_mismatch, 1,
                 memory_order_release);
+            async_retain_orphan(
+                ctx, WT_TEST_CLOSE_REQUEST, ERROR_INVALID_HANDLE);
+            InterlockedDecrement(&ctx->callbacks_active);
+            return;
         }
         atomic_store_explicit(
             &ctx->receipt->closing_thread_id, GetCurrentThreadId(),
@@ -1172,9 +1301,17 @@ static void CALLBACK winhttp_status_callback(
     }
 
     EnterCriticalSection(&ctx->lock);
-    if (!ctx->logical_finished) {
+    if (ctx->logical_finished) {
+        atomic_fetch_add_explicit(
+            &ctx->receipt->callbacks_after_terminal, 1,
+            memory_order_acq_rel);
+        SetEvent(ctx->receipt->late_callback_event);
+    } else {
         switch (status) {
         case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE:
+            atomic_store_explicit(
+                &ctx->translator->test_send_completion_observed,
+                true, memory_order_release);
             ctx->signal = WT_ASYNC_SIGNAL_SEND_COMPLETE;
             SetEvent(ctx->operation_event);
             break;
@@ -1390,7 +1527,8 @@ static void winhttp_transport_impl(
     if (!handle) {
         mp_warn(tr->log, "translate: WinHttpOpenRequest failed (%lu)\n",
                 GetLastError());
-        WinHttpCloseHandle(connection);
+        close_pre_request_handles(
+            tr, NULL, connection, response);
         talloc_free(tmp);
         return;
     }
@@ -1398,8 +1536,8 @@ static void winhttp_transport_impl(
     struct wt_async_request *ctx = async_request_create(
         tr, connection, handle, request, deadline_ms, out_receipt);
     if (!ctx) {
-        WinHttpCloseHandle(handle);
-        WinHttpCloseHandle(connection);
+        close_pre_request_handles(
+            tr, handle, connection, response);
         talloc_free(tmp);
         return;
     }
@@ -1456,7 +1594,7 @@ static void winhttp_transport_impl(
 
     async_prepare_operation(ctx, WT_HTTP_FAILURE_SEND);
     ctx->issued = true;
-    bool complete = async_start_operation(
+    bool send_started = async_start_operation(
         ctx, WT_HTTP_FAILURE_SEND,
         WinHttpSendRequest(
             handle, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
@@ -1464,9 +1602,18 @@ static void winhttp_transport_impl(
                 ? ctx->request_body : WINHTTP_NO_REQUEST_DATA,
             (DWORD)ctx->request_body_len,
             (DWORD)ctx->request_body_len,
-            (DWORD_PTR)ctx)) &&
-        async_wait_operation(
-            ctx, WT_ASYNC_SIGNAL_SEND_COMPLETE);
+            (DWORD_PTR)ctx));
+    if (send_started &&
+        atomic_load_explicit(
+            &tr->test_hold_after_send, memory_order_acquire))
+    {
+        tr->test_submitted_body = ctx->request_body;
+        tr->test_submitted_body_len = ctx->request_body_len;
+        SetEvent(tr->test_send_submitted_event);
+        WaitForSingleObject(tr->test_send_release_event, INFINITE);
+    }
+    bool complete = send_started &&
+        async_wait_operation(ctx, WT_ASYNC_SIGNAL_SEND_COMPLETE);
 
     if (complete) {
         async_prepare_operation(ctx, WT_HTTP_FAILURE_RECEIVE);
@@ -2502,6 +2649,16 @@ static struct whisper_translator *translator_alloc(
     tr->clock_ctx = NULL;
     mp_mutex_init(&tr->state_lock);
     atomic_init(&tr->refcount, 1);
+    atomic_init(&tr->fail_request_close, 0);
+    atomic_init(&tr->fail_connection_close, 0);
+    atomic_init(&tr->fail_session_close, 0);
+    atomic_init(&tr->fail_setup, 0);
+    atomic_init(&tr->fatal_cleanup_error, false);
+    atomic_init(&tr->fatal_cleanup_kind, 0);
+    atomic_init(&tr->fatal_cleanup_native_error, ERROR_SUCCESS);
+    atomic_init(&tr->force_closing_mismatch, false);
+    atomic_init(&tr->test_hold_after_send, false);
+    atomic_init(&tr->test_send_completion_observed, false);
     return tr;
 }
 
@@ -2571,10 +2728,20 @@ struct whisper_translator *whisper_translator_create(
     {
         mp_err(log, "translate: WinHttpSetTimeouts failed (%lu)\n",
                GetLastError());
-        WinHttpCloseHandle(tr->session);
-        tr->session = NULL;
-        mp_mutex_destroy(&tr->state_lock);
-        talloc_free(tr);
+        DWORD close_error = ERROR_SUCCESS;
+        if (close_native_handle(
+                tr, WT_TEST_CLOSE_SESSION,
+                tr->session, &close_error))
+        {
+            tr->session = NULL;
+            mp_mutex_destroy(&tr->state_lock);
+            talloc_free(tr);
+        } else {
+            tr->log = NULL;
+            latch_cleanup_failure(
+                tr, WT_TEST_CLOSE_SESSION, close_error);
+            retain_translator_orphan(tr);
+        }
         return NULL;
     }
 
@@ -2629,10 +2796,20 @@ struct whisper_translator *whisper_translator_create_openai(
     {
         mp_err(log, "translate: WinHttpSetTimeouts (NO_PROXY) failed (%lu)\n",
                GetLastError());
-        WinHttpCloseHandle(tr->session_noproxy);
-        tr->session_noproxy = NULL;
-        mp_mutex_destroy(&tr->state_lock);
-        talloc_free(tr);
+        DWORD close_error = ERROR_SUCCESS;
+        if (close_native_handle(
+                tr, WT_TEST_CLOSE_SESSION,
+                tr->session_noproxy, &close_error))
+        {
+            tr->session_noproxy = NULL;
+            mp_mutex_destroy(&tr->state_lock);
+            talloc_free(tr);
+        } else {
+            tr->log = NULL;
+            latch_cleanup_failure(
+                tr, WT_TEST_CLOSE_SESSION, close_error);
+            retain_translator_orphan(tr);
+        }
         return NULL;
     }
 
@@ -2875,6 +3052,109 @@ void whisper_translate_test_winhttp_fail_next_setup(
         memory_order_acq_rel);
 }
 
+void whisper_translate_test_winhttp_force_closing_mismatch(
+    struct wt_test_winhttp_client *client)
+{
+    if (!client || !client->translator)
+        return;
+    atomic_store_explicit(
+        &client->translator->force_closing_mismatch, true,
+        memory_order_release);
+}
+
+void whisper_translate_test_winhttp_hold_after_send(
+    struct wt_test_winhttp_client *client)
+{
+    if (!client || !client->translator)
+        return;
+    struct whisper_translator *translator = client->translator;
+    if (!translator->test_send_submitted_event) {
+        translator->test_send_submitted_event =
+            CreateEventW(NULL, TRUE, FALSE, NULL);
+        translator->test_send_release_event =
+            CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!translator->test_send_submitted_event ||
+            !translator->test_send_release_event)
+        {
+            if (translator->test_send_submitted_event)
+                CloseHandle(translator->test_send_submitted_event);
+            if (translator->test_send_release_event)
+                CloseHandle(translator->test_send_release_event);
+            translator->test_send_submitted_event = NULL;
+            translator->test_send_release_event = NULL;
+            return;
+        }
+    }
+    ResetEvent(translator->test_send_submitted_event);
+    ResetEvent(translator->test_send_release_event);
+    translator->test_submitted_body = NULL;
+    translator->test_submitted_body_len = 0;
+    atomic_store_explicit(
+        &translator->test_send_completion_observed,
+        false, memory_order_release);
+    atomic_store_explicit(
+        &translator->test_hold_after_send,
+        true, memory_order_release);
+}
+
+bool whisper_translate_test_winhttp_wait_send_submitted(
+    struct wt_test_winhttp_client *client, int timeout_ms)
+{
+    if (!client || !client->translator ||
+        !client->translator->test_send_submitted_event ||
+        timeout_ms < 0)
+    {
+        return false;
+    }
+    return WaitForSingleObject(
+        client->translator->test_send_submitted_event,
+        (DWORD)timeout_ms) == WAIT_OBJECT_0;
+}
+
+bool whisper_translate_test_winhttp_send_completion_observed(
+    struct wt_test_winhttp_client *client)
+{
+    return client && client->translator &&
+        atomic_load_explicit(
+            &client->translator->test_send_completion_observed,
+            memory_order_acquire);
+}
+
+bool whisper_translate_test_winhttp_submitted_body_is_owned(
+    struct wt_test_winhttp_client *client,
+    const void *original_body, size_t body_len)
+{
+    if (!client || !client->translator || !original_body ||
+        client->translator->test_submitted_body == original_body ||
+        client->translator->test_submitted_body_len != body_len)
+    {
+        return false;
+    }
+    return memcmp(
+        client->translator->test_submitted_body,
+        original_body, body_len) == 0;
+}
+
+void whisper_translate_test_winhttp_release_send(
+    struct wt_test_winhttp_client *client)
+{
+    if (!client || !client->translator)
+        return;
+    atomic_store_explicit(
+        &client->translator->test_hold_after_send,
+        false, memory_order_release);
+    if (client->translator->test_send_release_event)
+        SetEvent(client->translator->test_send_release_event);
+}
+
+void whisper_translate_test_winhttp_status(
+    struct wt_test_winhttp_client *client,
+    struct wt_status *out)
+{
+    whisper_translator_get_status(
+        client ? client->translator : NULL, out);
+}
+
 void whisper_translate_test_winhttp_set_read_limit(
     struct wt_test_winhttp_client *client, int bytes)
 {
@@ -2886,6 +3166,12 @@ int whisper_translate_test_active_async_requests(void)
 {
     return atomic_load_explicit(
         &active_async_requests, memory_order_acquire);
+}
+
+int whisper_translate_retained_cleanup_count(void)
+{
+    return atomic_load_explicit(
+        &retained_native_orphans, memory_order_acquire);
 }
 
 struct whisper_translator *whisper_translator_acquire(
@@ -2932,6 +3218,7 @@ whisper_translator_real_destroy(
             if (close_error)
                 *close_error = error;
             t->log = NULL;
+            latch_cleanup_failure(t, WT_TEST_CLOSE_SESSION, error);
             session_receipt_mark(
                 t->test_session_receipt, false, true, error);
             retain_translator_orphan(t);
@@ -2948,6 +3235,10 @@ whisper_translator_real_destroy(
         t->test_session_receipt;
     t->test_session_receipt = NULL;
     session_receipt_mark(receipt, true, false, ERROR_SUCCESS);
+    if (t->test_send_submitted_event)
+        CloseHandle(t->test_send_submitted_event);
+    if (t->test_send_release_event)
+        CloseHandle(t->test_send_release_event);
     mp_mutex_destroy(&t->state_lock);
     talloc_free(t);
     whisper_translate_test_session_release(&receipt);
@@ -3015,6 +3306,19 @@ static bool admit_request(struct whisper_translator *tr,
                           struct wt_call_result *out,
                           struct wt_admission *admission)
 {
+    if (atomic_load_explicit(
+            &tr->fatal_cleanup_error, memory_order_acquire))
+    {
+        if (out) {
+            out->http_status = 0;
+            out->http_issued = false;
+            out->rate_limited = false;
+            out->retry_after_ms = 0;
+        }
+        set_err(out, "%s: cleanup failed",
+                provider_name(tr->provider));
+        return false;
+    }
     int64_t now = translator_monotonic_ms(tr);
     mp_mutex_lock(&tr->state_lock);
     admission->cooldown_generation = tr->cooldown_generation;
@@ -3045,6 +3349,20 @@ static bool admit_request(struct whisper_translator *tr,
     }
     mp_mutex_unlock(&tr->state_lock);
     return true;
+}
+
+bool whisper_translate_test_check_admission(
+    struct wt_test_winhttp_client *client,
+    struct wt_call_result *out)
+{
+    if (out)
+        memset(out, 0, sizeof(*out));
+    if (!client || !client->translator) {
+        set_err(out, "invalid args");
+        return false;
+    }
+    struct wt_admission admission = {0};
+    return admit_request(client->translator, out, &admission);
 }
 
 static int64_t failure_backoff_ms(int fail_count)
@@ -3227,7 +3545,13 @@ void whisper_translator_get_status(struct whisper_translator *tr,
     memset(out, 0, sizeof(*out));
     if (!tr)
         return;
-    out->enabled = true;
+    bool cleanup_failed = atomic_load_explicit(
+        &tr->fatal_cleanup_error, memory_order_acquire);
+    out->enabled = !cleanup_failed;
+    if (cleanup_failed) {
+        snprintf(out->last_error, sizeof(out->last_error),
+                 "%s: cleanup failed", provider_name(tr->provider));
+    }
     mp_mutex_lock(&tr->state_lock);
     out->fail_count = tr->fail_count;
     int64_t now = translator_monotonic_ms(tr);
@@ -3240,8 +3564,8 @@ void whisper_translator_get_status(struct whisper_translator *tr,
         out->retry_after_ms = WT_PROBE_WAIT_MS;
     }
     mp_mutex_unlock(&tr->state_lock);
-    // last_error is no longer tracked at the translator level (it is
-    // per-call). Keep the field in wt_status for ABI/JSON compat but emit
-    // an empty string.
-    out->last_error[0] = '\0';
+    // Ordinary provider failures remain per-call and redacted here. Only the
+    // fixed structural cleanup-failure reason persists at translator scope.
+    if (!cleanup_failed)
+        out->last_error[0] = '\0';
 }

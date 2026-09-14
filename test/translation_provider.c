@@ -396,7 +396,7 @@ static struct wt_test_session_status wait_for_session_finalization(
 
 static struct wt_test_finalization_status wait_for_retained_request(
     struct wt_test_finalization_receipt **receipt,
-    enum wt_test_close_kind kind)
+    enum wt_test_close_kind kind, bool mismatch)
 {
     struct wt_test_finalization_status status;
     assert_true(whisper_translate_test_finalization_wait(
@@ -407,6 +407,7 @@ static struct wt_test_finalization_status wait_for_retained_request(
     assert_true(status.retained_orphan);
     assert_int_equal(status.retained_close_kind, kind);
     assert_int_equal(status.close_error, ERROR_INVALID_HANDLE);
+    assert_int_equal(status.closing_handle_mismatch, mismatch);
     return status;
 }
 
@@ -1127,8 +1128,30 @@ static void test_production_transport_total_deadline(void)
 
 static void test_cleanup_service_init_retry(void)
 {
+    struct loopback_server server;
+    init_loopback_server(&server, LOOPBACK_STALL);
+    struct wt_test_winhttp_client *client =
+        whisper_translate_test_winhttp_create(
+            server.port, 150, true);
+    mp_require(client);
     whisper_translate_test_fail_next_cleanup_thread_create();
-    assert_false(whisper_translate_test_start_cleanup_service());
+    whisper_translate_test_winhttp_fail_next_close(
+        client, WT_TEST_CLOSE_REQUEST);
+    void *tmp = talloc_new(NULL);
+    struct wt_call_result result;
+    struct wt_test_finalization_receipt *receipt = NULL;
+    whisper_translate_test_winhttp_call(
+        client, tmp, &result, &receipt);
+    assert_false(result.http_issued);
+    assert_string_equal(result.error, "google: request close failed");
+    mp_require(!receipt);
+    assert_false(whisper_translate_test_check_admission(
+        client, &result));
+    assert_string_equal(result.error, "google: cleanup failed");
+    whisper_translate_test_winhttp_destroy(&client);
+    destroy_loopback_server(&server);
+    talloc_free(tmp);
+
     assert_true(whisper_translate_test_start_cleanup_service());
 }
 
@@ -1270,28 +1293,40 @@ static void test_production_transport_owns_post_body(void)
     mp_require(body);
     memset(body, 0x5a, body_len);
 
-    void *tmp = talloc_new(NULL);
-    struct wt_call_result result;
-    struct wt_test_finalization_receipt *receipt = NULL;
-    whisper_translate_test_winhttp_call_body(
-        client, tmp, body, body_len, &result, &receipt);
+    whisper_translate_test_winhttp_hold_after_send(client);
+    struct winhttp_call_thread call = {
+        .client = client,
+        .body = body,
+        .body_len = body_len,
+    };
+    mp_thread thread;
+    assert_int_equal(
+        mp_thread_create(&thread, call_winhttp, &call), 0);
+    assert_true(whisper_translate_test_winhttp_wait_send_submitted(
+        client, 5000));
     assert_int_equal(
         WaitForSingleObject(server.accepted_event, 5000),
         WAIT_OBJECT_0);
-    assert_true(result.http_issued);
-    assert_string_equal(result.error, "google: request timed out");
-    memset(body, 0xdd, body_len);
+    assert_false(
+        whisper_translate_test_winhttp_send_completion_observed(client));
+    assert_true(whisper_translate_test_winhttp_submitted_body_is_owned(
+        client, body, body_len));
     DWORD old_protection = 0;
     assert_true(VirtualProtect(
         body, body_len, PAGE_NOACCESS, &old_protection));
+    whisper_translate_test_winhttp_release_send(client);
+    mp_thread_join(thread);
+    assert_true(call.result.http_issued);
+    assert_string_equal(
+        call.result.error, "google: request timed out");
     whisper_translate_test_winhttp_destroy(&client);
     destroy_loopback_server(&server);
-    wait_for_finalization(&receipt);
+    wait_for_finalization(&call.receipt);
     wait_for_session_finalization(&session_receipt);
     assert_int_equal(
         whisper_translate_test_active_async_requests(), 0);
     assert_true(VirtualFree(body, 0, MEM_RELEASE));
-    talloc_free(tmp);
+    destroy_winhttp_call(&call);
 }
 
 static void test_production_transport_response_boundaries(void)
@@ -1348,6 +1383,8 @@ static void test_production_transport_response_boundaries(void)
 
 static void test_production_transport_close_failures(void)
 {
+    int retained_before =
+        whisper_translate_retained_cleanup_count();
     assert_int_equal(
         whisper_translate_test_active_async_requests(), 0);
 
@@ -1369,17 +1406,69 @@ static void test_production_transport_close_failures(void)
         request_client, tmp, &result, &receipt);
     assert_false(result.http_issued);
     assert_string_equal(result.error, "google: request close failed");
-    whisper_translate_test_winhttp_destroy(&request_client);
     destroy_loopback_server(&request_server);
     struct wt_test_finalization_status request_retained =
         wait_for_retained_request(
-            &receipt, WT_TEST_CLOSE_REQUEST);
+            &receipt, WT_TEST_CLOSE_REQUEST, false);
     assert_int_equal(request_retained.request_close_count, 0);
     assert_int_equal(request_retained.closing_notifications, 0);
+    struct wt_call_result rejected;
+    assert_false(whisper_translate_test_check_admission(
+        request_client, &rejected));
+    assert_false(rejected.http_issued);
+    assert_string_equal(rejected.error, "google: cleanup failed");
+    struct wt_status cleanup_status;
+    whisper_translate_test_winhttp_status(
+        request_client, &cleanup_status);
+    assert_false(cleanup_status.enabled);
+    assert_string_equal(
+        cleanup_status.last_error, "google: cleanup failed");
+    whisper_translate_test_winhttp_destroy(&request_client);
     struct wt_test_session_status session_pending;
     assert_false(whisper_translate_test_session_wait(
         request_session, 0, &session_pending));
     whisper_translate_test_session_release(&request_session);
+    talloc_free(tmp);
+
+    struct loopback_server bound_request_server;
+    init_loopback_server(&bound_request_server, LOOPBACK_STALL);
+    struct wt_test_winhttp_client *bound_request_client =
+        whisper_translate_test_winhttp_create(
+            bound_request_server.port, 150, true);
+    mp_require(bound_request_client);
+    struct wt_test_session_receipt *bound_request_session =
+        whisper_translate_test_winhttp_session_receipt(
+            bound_request_client);
+    whisper_translate_test_winhttp_fail_next_close(
+        bound_request_client, WT_TEST_CLOSE_REQUEST);
+    tmp = talloc_new(NULL);
+    receipt = NULL;
+    whisper_translate_test_winhttp_call(
+        bound_request_client, tmp, &result, &receipt);
+    assert_true(result.http_issued);
+    assert_string_equal(result.error, "google: request close failed");
+    assert_false(whisper_translate_test_check_admission(
+        bound_request_client, &rejected));
+    assert_false(rejected.http_issued);
+    assert_string_equal(rejected.error, "google: cleanup failed");
+    whisper_translate_test_winhttp_destroy(&bound_request_client);
+    destroy_loopback_server(&bound_request_server);
+    assert_true(
+        whisper_translate_test_finalization_wait_late_callback(
+            receipt, 5000));
+    struct wt_test_finalization_status bound_request_retained =
+        wait_for_retained_request(
+            &receipt, WT_TEST_CLOSE_REQUEST, false);
+    assert_int_equal(
+        bound_request_retained.request_close_count, 0);
+    assert_int_equal(
+        bound_request_retained.closing_notifications, 0);
+    assert_true(
+        bound_request_retained.callbacks_after_terminal > 0);
+    assert_false(whisper_translate_test_session_wait(
+        bound_request_session, 0, &session_pending));
+    whisper_translate_test_session_release(
+        &bound_request_session);
     talloc_free(tmp);
 
     struct loopback_server connection_server;
@@ -1398,14 +1487,23 @@ static void test_production_transport_close_failures(void)
     whisper_translate_test_winhttp_call(
         connection_client, tmp, &result, &receipt);
     assert_string_equal(result.error, "google: request timed out");
-    whisper_translate_test_winhttp_destroy(&connection_client);
     destroy_loopback_server(&connection_server);
     struct wt_test_finalization_status connection_retained =
         wait_for_retained_request(
-            &receipt, WT_TEST_CLOSE_CONNECTION);
+            &receipt, WT_TEST_CLOSE_CONNECTION, false);
     assert_int_equal(connection_retained.request_close_count, 1);
     assert_int_equal(connection_retained.closing_notifications, 1);
     assert_int_equal(connection_retained.connection_close_count, 0);
+    assert_false(whisper_translate_test_check_admission(
+        connection_client, &rejected));
+    assert_false(rejected.http_issued);
+    assert_string_equal(rejected.error, "google: cleanup failed");
+    whisper_translate_test_winhttp_status(
+        connection_client, &cleanup_status);
+    assert_false(cleanup_status.enabled);
+    assert_string_equal(
+        cleanup_status.last_error, "google: cleanup failed");
+    whisper_translate_test_winhttp_destroy(&connection_client);
     assert_false(whisper_translate_test_session_wait(
         connection_session, 0, &session_pending));
     whisper_translate_test_session_release(&connection_session);
@@ -1433,15 +1531,51 @@ static void test_production_transport_close_failures(void)
     destroy_loopback_server(&session_server);
     struct wt_test_finalization_status session_retained =
         wait_for_retained_request(
-            &receipt, WT_TEST_CLOSE_SESSION);
+            &receipt, WT_TEST_CLOSE_SESSION, false);
     assert_int_equal(session_retained.request_close_count, 1);
     assert_int_equal(session_retained.closing_notifications, 1);
     assert_int_equal(session_retained.connection_close_count, 1);
     wait_for_retained_session(&session_receipt);
     talloc_free(tmp);
 
+    struct loopback_server mismatch_server;
+    init_loopback_server(&mismatch_server, LOOPBACK_STALL);
+    struct wt_test_winhttp_client *mismatch_client =
+        whisper_translate_test_winhttp_create(
+            mismatch_server.port, 150, true);
+    mp_require(mismatch_client);
+    struct wt_test_session_receipt *mismatch_session =
+        whisper_translate_test_winhttp_session_receipt(
+            mismatch_client);
+    whisper_translate_test_winhttp_force_closing_mismatch(
+        mismatch_client);
+    tmp = talloc_new(NULL);
+    receipt = NULL;
+    whisper_translate_test_winhttp_call(
+        mismatch_client, tmp, &result, &receipt);
+    assert_string_equal(result.error, "google: request timed out");
+    destroy_loopback_server(&mismatch_server);
+    struct wt_test_finalization_status mismatch_retained =
+        wait_for_retained_request(
+            &receipt, WT_TEST_CLOSE_REQUEST, true);
+    assert_int_equal(mismatch_retained.request_close_count, 1);
+    assert_int_equal(mismatch_retained.closing_notifications, 1);
+    assert_int_equal(mismatch_retained.connection_close_count, 0);
+    assert_false(whisper_translate_test_check_admission(
+        mismatch_client, &rejected));
+    assert_false(rejected.http_issued);
+    assert_string_equal(rejected.error, "google: cleanup failed");
+    whisper_translate_test_winhttp_destroy(&mismatch_client);
+    assert_false(whisper_translate_test_session_wait(
+        mismatch_session, 0, &session_pending));
+    whisper_translate_test_session_release(&mismatch_session);
+    talloc_free(tmp);
+
     assert_int_equal(
-        whisper_translate_test_active_async_requests(), 3);
+        whisper_translate_test_active_async_requests(), 5);
+    assert_int_equal(
+        whisper_translate_retained_cleanup_count(),
+        retained_before + 5);
 }
 
 static const char *rate_name(enum wt_provider provider)

@@ -113,6 +113,7 @@ struct wt_test_finalization_status {
     bool closing_handle_mismatch;
     unsigned closing_thread_id;
     unsigned finalizer_thread_id;
+    int callbacks_after_terminal;
     int request_close_count;
     int connection_close_count;
     int translator_destroy_count;
@@ -148,11 +149,26 @@ void whisper_translate_test_winhttp_fail_next_close(
     enum wt_test_close_kind kind);
 void whisper_translate_test_winhttp_fail_next_setup(
     struct wt_test_winhttp_client *client);
+void whisper_translate_test_winhttp_force_closing_mismatch(
+    struct wt_test_winhttp_client *client);
+void whisper_translate_test_winhttp_hold_after_send(
+    struct wt_test_winhttp_client *client);
+bool whisper_translate_test_winhttp_wait_send_submitted(
+    struct wt_test_winhttp_client *client, int timeout_ms);
+bool whisper_translate_test_winhttp_send_completion_observed(
+    struct wt_test_winhttp_client *client);
+bool whisper_translate_test_winhttp_submitted_body_is_owned(
+    struct wt_test_winhttp_client *client,
+    const void *original_body, size_t body_len);
+void whisper_translate_test_winhttp_release_send(
+    struct wt_test_winhttp_client *client);
 void whisper_translate_test_winhttp_set_read_limit(
     struct wt_test_winhttp_client *client, int bytes);
 bool whisper_translate_test_finalization_wait(
     struct wt_test_finalization_receipt *receipt, int timeout_ms,
     struct wt_test_finalization_status *out);
+bool whisper_translate_test_finalization_wait_late_callback(
+    struct wt_test_finalization_receipt *receipt, int timeout_ms);
 void whisper_translate_test_finalization_release(
     struct wt_test_finalization_receipt **receipt);
 bool whisper_translate_test_session_wait(
@@ -160,6 +176,12 @@ bool whisper_translate_test_session_wait(
     struct wt_test_session_status *out);
 void whisper_translate_test_session_release(
     struct wt_test_session_receipt **receipt);
+bool whisper_translate_test_check_admission(
+    struct wt_test_winhttp_client *client,
+    struct wt_call_result *out);
+void whisper_translate_test_winhttp_status(
+    struct wt_test_winhttp_client *client,
+    struct wt_status *out);
 int whisper_translate_test_active_async_requests(void);
 
 #endif

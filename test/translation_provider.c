@@ -23,6 +23,7 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <werapi.h>
 
 #include "mpv_talloc.h"
 #include "misc/bstr.h"
@@ -85,9 +86,34 @@ static void configure_process_local_failure_policy(void)
         SEM_FAILCRITICALERRORS |
         SEM_NOGPFAULTERRORBOX |
         SEM_NOOPENFILEERRORBOX);
-    _set_error_mode(_OUT_TO_STDERR);
-    _set_abort_behavior(
-        0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    HMODULE crt = LoadLibraryW(L"msvcrt.dll");
+    if (crt) {
+        typedef int (__cdecl *set_error_mode_fn)(int);
+        typedef unsigned int (__cdecl *set_abort_behavior_fn)(
+            unsigned int, unsigned int);
+        set_error_mode_fn set_error_mode =
+            (set_error_mode_fn)GetProcAddress(crt, "_set_error_mode");
+        set_abort_behavior_fn set_abort_behavior =
+            (set_abort_behavior_fn)GetProcAddress(
+                crt, "_set_abort_behavior");
+        if (set_error_mode)
+            set_error_mode(_OUT_TO_STDERR);
+        if (set_abort_behavior) {
+            set_abort_behavior(
+                0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+        }
+        FreeLibrary(crt);
+    }
+
+    HMODULE wer = LoadLibraryW(L"wer.dll");
+    if (wer) {
+        typedef HRESULT (WINAPI *wer_set_flags_fn)(DWORD);
+        wer_set_flags_fn set_flags =
+            (wer_set_flags_fn)GetProcAddress(wer, "WerSetFlags");
+        if (set_flags)
+            set_flags(WER_FAULT_REPORTING_NO_UI);
+        FreeLibrary(wer);
+    }
 }
 
 enum loopback_mode {
@@ -1523,8 +1549,11 @@ static int run_live_smoke(enum wt_provider provider)
 int main(int argc, char **argv)
 {
     configure_process_local_failure_policy();
-    if (argc == 1) {
+    if (argc == 1 ||
+        (argc == 2 && strcmp(argv[1], "--selftest") == 0))
+    {
         run_offline_tests();
+        puts("MPV_TRANSLATION_PROVIDER_SELFTEST_OK_V1");
         return 0;
     }
     if (argc == 2 &&
@@ -1538,6 +1567,7 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr,
-            "usage: translation-provider [--live-google|--live-bing]\n");
+            "usage: translation-provider "
+            "[--selftest|--live-google|--live-bing]\n");
     return 2;
 }

@@ -117,7 +117,17 @@ translation_provider = executable(
     dependencies: [cc.find_library('winhttp'), cc.find_library('ws2_32')],
     link_with: test_utils,
 )
-test('translation-provider', translation_provider)
+translation_provider_lifetime_fixture = shared_library(
+    'translation-provider-lifetime-fixture',
+    'translation_provider_lifetime_fixture.c',
+    name_prefix: '',
+    include_directories: incdir,
+    objects: libmpv.extract_objects('player/whisper_translate.c'),
+    dependencies: [cc.find_library('winhttp')],
+    link_with: test_utils,
+)
+test('translation-provider', translation_provider,
+     depends: translation_provider_lifetime_fixture)
 
 subtitle_timing = executable(
     'subtitle-timing',

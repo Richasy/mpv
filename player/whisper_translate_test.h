@@ -85,6 +85,8 @@ struct whisper_translator *whisper_translator_create_for_test(
     const struct wt_test_hooks *hooks);
 
 size_t whisper_translate_test_max_response_bytes(void);
+void whisper_translate_test_fail_next_cleanup_thread_create(void);
+bool whisper_translate_test_start_cleanup_service(void);
 
 struct wt_test_winhttp_client;
 struct wt_test_finalization_receipt;

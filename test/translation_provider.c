@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -1046,6 +1047,52 @@ static void test_production_transport_total_deadline(void)
     }
 }
 
+static void test_cleanup_service_init_retry(void)
+{
+    whisper_translate_test_fail_next_cleanup_thread_create();
+    assert_false(whisper_translate_test_start_cleanup_service());
+    assert_true(whisper_translate_test_start_cleanup_service());
+}
+
+static void test_shared_library_cleanup_service_lifetime(void)
+{
+    WCHAR path[32768];
+    DWORD length = GetModuleFileNameW(NULL, path, MP_ARRAY_SIZE(path));
+    mp_require(length > 0 && length < MP_ARRAY_SIZE(path));
+    WCHAR *name = wcsrchr(path, L'\\');
+    mp_require(name);
+    name++;
+    const WCHAR fixture[] =
+        L"translation-provider-lifetime-fixture.dll";
+    mp_require(
+        (size_t)(name - path) + MP_ARRAY_SIZE(fixture) <=
+        MP_ARRAY_SIZE(path));
+    memcpy(name, fixture, sizeof(fixture));
+
+    typedef int (__cdecl *start_service_fn)(void);
+    HMODULE first_module = NULL;
+    start_service_fn first_start = NULL;
+    for (int n = 0; n < 2; n++) {
+        HMODULE module = LoadLibraryW(path);
+        mp_require(module);
+        start_service_fn start_service =
+            (start_service_fn)GetProcAddress(
+                module, "translation_provider_lifetime_start");
+        mp_require(start_service);
+        assert_int_equal(start_service(), 0);
+        if (!n) {
+            first_module = module;
+            first_start = start_service;
+        } else {
+            mp_require(module == first_module);
+        }
+        assert_true(FreeLibrary(module));
+        // The process-owned cleanup service pins its containing DLL.
+        assert_int_equal(start_service(), 0);
+    }
+    assert_int_equal(first_start(), 0);
+}
+
 static void test_production_transport_cookie_policy(void)
 {
     for (int disabled = 0; disabled <= 1; disabled++) {
@@ -1665,6 +1712,8 @@ static void run_offline_tests(void)
 static void run_vm_selftests(void)
 {
     run_offline_tests();
+    test_cleanup_service_init_retry();
+    test_shared_library_cleanup_service_lifetime();
     test_production_transport_total_deadline();
     test_production_transport_cookie_policy();
     test_production_transport_overlapping_cleanup();

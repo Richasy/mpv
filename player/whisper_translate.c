@@ -478,7 +478,6 @@ struct wt_async_cleanup_service {
     INIT_ONCE once;
     CRITICAL_SECTION lock;
     CONDITION_VARIABLE condition;
-    HANDLE thread;
     struct wt_async_request *head;
     struct wt_async_request *tail;
 };
@@ -486,6 +485,8 @@ struct wt_async_cleanup_service {
 static struct wt_async_cleanup_service async_cleanup_service = {
     .once = INIT_ONCE_STATIC_INIT,
 };
+static atomic_int injected_cleanup_thread_create_failures;
+static const unsigned char async_cleanup_module_anchor;
 
 static struct wt_test_finalization_receipt *receipt_create(void)
 {
@@ -619,18 +620,52 @@ static MP_THREAD_VOID async_cleanup_thread(void *opaque)
     MP_THREAD_RETURN();
 }
 
+static bool pin_async_cleanup_module(void)
+{
+    HMODULE module = NULL;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (const wchar_t *)&async_cleanup_module_anchor,
+            &module))
+    {
+        return false;
+    }
+    if (module == GetModuleHandleW(NULL))
+        return true;
+    return GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_PIN,
+        (const wchar_t *)&async_cleanup_module_anchor,
+        &module);
+}
+
 static BOOL CALLBACK async_cleanup_initialize(
     PINIT_ONCE once, void *parameter, void **context)
 {
     (void)once;
     (void)parameter;
     (void)context;
+    if (!pin_async_cleanup_module())
+        return FALSE;
     InitializeCriticalSection(&async_cleanup_service.lock);
     InitializeConditionVariable(&async_cleanup_service.condition);
-    async_cleanup_service.thread = (HANDLE)_beginthreadex(
+    if (atomic_exchange_explicit(
+            &injected_cleanup_thread_create_failures, 0,
+            memory_order_acq_rel) > 0)
+    {
+        DeleteCriticalSection(&async_cleanup_service.lock);
+        return FALSE;
+    }
+    HANDLE thread = (HANDLE)_beginthreadex(
         NULL, 0, async_cleanup_thread,
         &async_cleanup_service, 0, NULL);
-    return async_cleanup_service.thread != NULL;
+    if (!thread) {
+        DeleteCriticalSection(&async_cleanup_service.lock);
+        return FALSE;
+    }
+    CloseHandle(thread);
+    return TRUE;
 }
 
 static bool async_cleanup_ensure(void)
@@ -638,6 +673,18 @@ static bool async_cleanup_ensure(void)
     return InitOnceExecuteOnce(
         &async_cleanup_service.once,
         async_cleanup_initialize, NULL, NULL);
+}
+
+void whisper_translate_test_fail_next_cleanup_thread_create(void)
+{
+    atomic_store_explicit(
+        &injected_cleanup_thread_create_failures, 1,
+        memory_order_release);
+}
+
+bool whisper_translate_test_start_cleanup_service(void)
+{
+    return async_cleanup_ensure();
 }
 
 static void async_cleanup_enqueue(struct wt_async_request *ctx)

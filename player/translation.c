@@ -102,6 +102,11 @@ struct parsed_common_config {
     struct mp_translation_limits limits;
 };
 
+struct request_reservation {
+    uint64_t budget_generation;
+    bool rpm_token;
+};
+
 struct mp_translation {
     struct mp_log *log;
     mp_translation_wakeup_fn wakeup;
@@ -140,6 +145,7 @@ struct mp_translation {
     double rpm_tokens;
     int64_t rpm_last_refill_ms;
     int session_requests;
+    uint64_t budget_generation;
     int horizon_deferred;
     int cache_reused;
     int loop_skipped;
@@ -298,6 +304,9 @@ static void cache_clamp_locked(struct mp_translation *translation)
 
 static void reset_session_locked(struct mp_translation *translation)
 {
+    translation->budget_generation++;
+    if (!translation->budget_generation)
+        translation->budget_generation++;
     translation->rpm_tokens = 0;
     translation->rpm_last_refill_ms = 0;
     translation->session_requests = 0;
@@ -442,8 +451,10 @@ static void refill_tokens(struct mp_translation *translation)
 
 static bool reserve_request(
     struct mp_translation *translation,
-    enum mp_translation_result_kind *reject_kind)
+    enum mp_translation_result_kind *reject_kind,
+    struct request_reservation *reservation)
 {
+    *reservation = (struct request_reservation){0};
     if (translation->limits.session_request_limit > 0 &&
         translation->session_requests >=
             translation->limits.session_request_limit)
@@ -461,17 +472,32 @@ static bool reserve_request(
             return false;
         }
         translation->rpm_tokens -= 1.0;
+        reservation->rpm_token = true;
     }
     translation->session_requests++;
+    reservation->budget_generation = translation->budget_generation;
     return true;
 }
 
-static void rollback_request(struct mp_translation *translation)
+static void rollback_request(
+    struct mp_translation *translation,
+    const struct request_reservation *reservation)
 {
+    if (!reservation->budget_generation ||
+        reservation->budget_generation != translation->budget_generation)
+    {
+        return;
+    }
     if (translation->session_requests > 0)
         translation->session_requests--;
-    if (translation->limits.rpm_limit > 0)
+    if (reservation->rpm_token) {
         translation->rpm_tokens += 1.0;
+        if (translation->limits.rpm_limit > 0 &&
+            translation->rpm_tokens > translation->limits.rpm_limit)
+        {
+            translation->rpm_tokens = translation->limits.rpm_limit;
+        }
+    }
 }
 
 static bool task_is_current(struct mp_translation *translation,
@@ -753,11 +779,13 @@ static MP_THREAD_VOID translation_worker(void *arg)
         }
 
         bool reserved = true;
+        struct request_reservation reservation = {0};
         enum mp_translation_result_kind reject_kind =
             MP_TRANSLATION_RESULT_FALLBACK_FAILURE;
         if (limits.enabled) {
             mp_mutex_lock(&translation->limits_lock);
-            reserved = reserve_request(translation, &reject_kind);
+            reserved = reserve_request(
+                translation, &reject_kind, &reservation);
             mp_mutex_unlock(&translation->limits_lock);
         }
         if (!reserved) {
@@ -789,11 +817,11 @@ static MP_THREAD_VOID translation_worker(void *arg)
 
         bool current_backend =
             backend_is_current(translation, task->backend_epoch);
-        if (limits.enabled && current_backend) {
+        if (limits.enabled) {
             mp_mutex_lock(&translation->limits_lock);
             if (!call.http_issued)
-                rollback_request(translation);
-            if (result->translated && normalized)
+                rollback_request(translation, &reservation);
+            if (current_backend && result->translated && normalized)
                 cache_put(translation, normalized, result->translated,
                           task->backend_epoch);
             mp_mutex_unlock(&translation->limits_lock);
@@ -823,6 +851,7 @@ struct mp_translation *mp_translation_create(
     translation->wakeup_ctx = wakeup_ctx;
     translation->playback_pts = NAN;
     translation->backend_epoch = 1;
+    translation->budget_generation = 1;
     for (int n = 0; n < MP_TRANSLATION_SOURCE_COUNT; n++)
         translation->source_generation[n] = 1;
 

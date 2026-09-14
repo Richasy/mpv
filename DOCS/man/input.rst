@@ -3469,11 +3469,45 @@ Property list
     ``provider``
         Required. One of ``google``, ``azure``, or ``ai``.
 
+        ``google`` sends one fixed HTTPS form POST to Google's
+        ``translate_a/single`` endpoint. ``azure`` is retained as the settings
+        value for compatibility, but it now uses Bing's credential-free Edge
+        translation endpoint and is not the official paid Azure Translator
+        API. Neither provider performs token, cookie, consent-page, browser
+        impersonation, or endpoint fallback flows. The fixed hosts use normal
+        TLS validation, the configured system proxy, and the honest
+        ``mpv-subtitle-translation/1.0`` user agent. The ``ai`` provider retains
+        its existing no-proxy behavior and user agent for loopback-compatible
+        endpoints.
+
+        Google and Bing requests reject invalid UTF-8 and cues above 5000
+        Unicode code points. This is a defensive per-cue application bound,
+        not a documented provider limit. Input is never truncated or silently
+        split into additional billable requests. These anonymous community
+        protocols can still fail or be rate-limited by their services.
+
+        The wire contracts follow these maintained community implementations:
+
+        - `vitalets/google-translate-api at 5ad1049
+          <https://github.com/vitalets/google-translate-api/blob/5ad104993bb3f0adf952aea495b13966b7831564/src/index.ts#L6-L80>`_
+        - `AidanWelch/google-translate-api at 1917916
+          <https://github.com/AidanWelch/google-translate-api/blob/1917916bfdaea75bf8202b8661e7c25f415b9efc/lib/translation/singleTranslate.cjs#L26-L62>`_
+        - `YiiGuxing/TranslationPlugin at 2b92876
+          <https://github.com/YiiGuxing/TranslationPlugin/blob/2b92876d3b22e616f6404a77700e9e90cba0321a/src/main/kotlin/cn/yiiguxing/plugin/translate/trans/microsoft/EdgeDocumentationTranslator.kt#L30-L109>`_
+        - `plainheart/bing-translate-api PR 49 head
+          <https://github.com/plainheart/bing-translate-api/commit/46d5de35cb3f7e2a7c83cd3941bee81184d002cd>`_
+
     ``source_lang``
         Source language tag. Missing or empty values use ``auto``.
 
     ``target_lang``
         Required non-empty target language tag.
+
+        Language tags are checked using a bounded BCP-47-like syntax. ``auto``
+        is accepted only as a source. Google maps ``zh``, ``zh-CN``, and
+        ``zh-Hans`` to ``zh-CN``, and maps ``zh-TW`` and ``zh-Hant`` to
+        ``zh-TW``. Bing maps the same groups to ``zh-Hans`` and ``zh-Hant``
+        respectively. Matching is case-insensitive.
 
     ``ai``
         Required object for the ``ai`` provider and null or absent for the
@@ -3500,6 +3534,44 @@ Property list
     set, ``whisper-ai-translate``, ``whisper-translate-limits``, and the
     ``translate_provider``/``translate_to`` members of ``whisper-lookahead``
     retain their previous behavior.
+
+    HTTP response bodies are limited to 1 MiB and parsed as strict JSON;
+    duplicate object keys are rejected recursively. A ``429`` activates a
+    translator-wide cooldown before any later worker can issue another request.
+    Both delta-seconds and HTTP-date ``Retry-After`` values are honored without
+    shortening a longer active deadline; a missing or unusable value uses a
+    finite 60-second default. Repeated non-rate failures use a bounded
+    exponential cooldown, and only an actual HTTP send attempt consumes request
+    budget or increments the failure count. After a cooldown expires, one probe
+    is admitted while concurrent workers remain locally rejected. A valid zero
+    delta or non-future HTTP date skips the timed wait but still uses that
+    single serialized probe.
+
+    WinHTTP's resolve, connect, send, and receive timeouts remain configured as
+    secondary per-operation limits. Each Google or Bing request also has one
+    monotonic five-second total deadline spanning all phases and body reads;
+    ``ai`` uses its configured timeout, still capped at five seconds. Requests
+    use asynchronous WinHTTP cancellation and disable redirects. WinHTTP
+    callbacks only record operation completion or final handle closure; a
+    separate process-owned cleanup thread releases the connection, translator,
+    buffers, and context after the final callback and initiating caller have
+    both drained. The cleanup service pins its containing module for process
+    lifetime rather than leaving an unloadable idle thread. A failed native
+    handle close is reported as a terminal retained orphan and is never retried
+    or represented as successful cleanup. A translator that encounters such a
+    failure is permanently disabled: later calls fail locally with the fixed
+    ``<provider>: cleanup failed`` reason, while status exposes only that
+    structural reason. A process-wide monotonic retained-cleanup count remains
+    available to native diagnostics after the last translator owner is gone.
+    Google and Bing additionally disable WinHTTP cookies; the existing ``ai``
+    cookie behavior is unchanged.
+    See the Microsoft WinHTTP documentation for
+    `timeouts
+    <https://learn.microsoft.com/en-us/windows/win32/api/winhttp/nf-winhttp-winhttpsettimeouts>`_,
+    `concurrency
+    <https://learn.microsoft.com/en-us/windows/win32/winhttp/concurrency-in-winhttp>`_,
+    and `handle closure
+    <https://learn.microsoft.com/en-us/windows/win32/api/winhttp/nf-winhttp-winhttpclosehandle>`_.
 
 ``sub-translate`` (RW)
     Enable translation of the selected primary text subtitle. The default is

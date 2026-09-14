@@ -43,24 +43,27 @@ struct wt_openai_config {
                                 // translator stateless and safely callable
                                 // from multiple worker threads in parallel.
     int timeout_ms;             // per-request timeout; <=0 means default.
-                                // Hard-clamped to <= 5000 ms internally so
-                                // stop/seek can reliably interrupt within a
-                                // bounded delay.
+                                // Hard-clamped to <= 5000 ms and enforced as
+                                // one monotonic total request deadline.
     int max_tokens;             // 0 means: don't send max_tokens; <0 means default (128)
 };
 
 // Translator status snapshot, filled by whisper_translator_get_status().
 struct wt_status {
     bool enabled;
-    bool paused;            // backoff active: skipping requests for retry_after_ms
+    bool paused;            // shared cooldown active: requests are rejected locally
     int  fail_count;
-    int  retry_after_ms;    // remaining ms in current backoff window (0 if not paused)
+    int  retry_after_ms;    // saturated remaining cooldown in ms (0 if not paused)
     char last_error[128];   // short ascii reason; "" if none
 };
 
 struct whisper_translator;
 
-// Create a Google/Azure translator. Caller owns the returned pointer.
+// Create a Google/Bing translator. The WT_PROVIDER_AZURE value is retained for
+// settings compatibility and selects Bing's Edge translation endpoint.
+// Caller owns the returned pointer and must release it explicitly; the
+// talloc_parent argument is retained for source compatibility, while the
+// internal refcount governs asynchronous request lifetime.
 // source_lang: source language code (e.g. "auto", "en")
 // target_lang: target language code (e.g. "zh", "ja", "en")
 struct whisper_translator *whisper_translator_create(
@@ -68,8 +71,9 @@ struct whisper_translator *whisper_translator_create(
     enum wt_provider provider,
     const char *source_lang, const char *target_lang);
 
-// Create an OpenAI-compatible translator. Returns NULL on bad config
-// (missing endpoint/model/target_lang, unsupported scheme, etc.).
+// Create an OpenAI-compatible translator. Explicit release owns its lifetime
+// as above. Returns NULL on bad config (missing endpoint/model/target_lang,
+// unsupported scheme, etc.).
 struct whisper_translator *whisper_translator_create_openai(
     void *talloc_parent, struct mp_log *log,
     const struct wt_openai_config *cfg);
@@ -85,12 +89,12 @@ struct wt_call_result {
     char *translated;        // success: talloc string. failure: NULL.
     int   http_status;       // 0 if no HTTP was issued (e.g. backoff)
     bool  rate_limited;      // 429 / equivalent
-    bool  http_issued;       // true iff an HTTP request was actually sent
-                             // out the wire (used by callers to distinguish
-                             // local short-circuits like backoff / config
-                             // errors from real provider calls; only the
-                             // latter should consume cost-protection budget)
-    int   retry_after_ms;    // parsed from Retry-After header (0 if absent)
+    bool  http_issued;       // true once the HTTP send was attempted,
+                             // including send/receive/read failures; false
+                             // for local admission or setup rejection (only
+                             // attempted sends consume request budget)
+    int   retry_after_ms;    // parsed header or local cooldown remainder;
+                             // saturated to INT_MAX, 0 if absent
     char  error[256];        // short reason on failure ("" on success)
 };
 
@@ -124,5 +128,9 @@ char *whisper_translate(struct whisper_translator *tr,
 // access to the translator pointer itself).
 void whisper_translator_get_status(struct whisper_translator *tr,
                                    struct wt_status *out);
+
+// Process-wide count of native request/session handles deliberately retained
+// after an unproven close. The count is monotonic and contains no user data.
+int whisper_translate_retained_cleanup_count(void);
 
 #endif

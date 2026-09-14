@@ -1,3 +1,9 @@
 add `sub-translate-config`, `sub-translate`, and `sub-translate-status`
 properties for shared native translation of selected text subtitle tracks;
 generated output uses codec profile `translated`
+
+repair the shared Google and `azure` compatibility providers: Google now uses
+the fixed `translate_a/single` JSON form protocol and `azure` now names Bing's
+credential-free Edge JSON protocol rather than the retired Edge-auth flow;
+both use strict bounded responses, a 5000-code-point per-cue application bound,
+and translator-wide `Retry-After`/failure cooldown admission

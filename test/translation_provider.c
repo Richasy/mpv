@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "mpv_talloc.h"
+#include "misc/bstr.h"
 #include "osdep/threads.h"
 #include "player/whisper_translate_test.h"
 #include "test_utils.h"
@@ -958,7 +959,7 @@ static void test_single_probe_after_expiry(void)
     destroy_transport(&transport);
 }
 
-int main(void)
+static void run_offline_tests(void)
 {
     test_google_request_and_response();
     test_google_strict_response_validation();
@@ -974,5 +975,85 @@ int main(void)
     test_success_does_not_erase_newer_rate_limit();
     test_shorter_retry_after_cannot_reduce_deadline();
     test_single_probe_after_expiry();
-    return 0;
+}
+
+static bool contains_korean_text(const char *text)
+{
+    bstr remaining = bstr0(text);
+    while (remaining.len) {
+        bstr next;
+        int codepoint = bstr_decode_utf8(remaining, &next);
+        if (codepoint < 0)
+            return false;
+        if ((codepoint >= 0x1100 && codepoint <= 0x11ff) ||
+            (codepoint >= 0x3130 && codepoint <= 0x318f) ||
+            (codepoint >= 0xa960 && codepoint <= 0xa97f) ||
+            (codepoint >= 0xac00 && codepoint <= 0xd7a3) ||
+            (codepoint >= 0xd7b0 && codepoint <= 0xd7ff))
+        {
+            return true;
+        }
+        remaining = next;
+    }
+    return false;
+}
+
+static int run_live_smoke(enum wt_provider provider)
+{
+    static const char source[] = "Hello.\nGood morning.";
+    const char *name = provider == WT_PROVIDER_GOOGLE ? "google" : "bing";
+    struct whisper_translator *translator = whisper_translator_create(
+        NULL, NULL, provider, "auto", "ko");
+    if (!translator) {
+        printf("provider=%s status=create-failed\n", name);
+        return 1;
+    }
+
+    void *tmp = talloc_new(NULL);
+    struct wt_call_result result;
+    whisper_translate_call(translator, tmp, source, &result);
+    printf("provider=%s http_status=%d http_issued=%s rate_limited=%s "
+           "retry_after_ms=%d\n",
+           name, result.http_status,
+           result.http_issued ? "true" : "false",
+           result.rate_limited ? "true" : "false",
+           result.retry_after_ms);
+    if (result.translated) {
+        printf("output=%s\n", result.translated);
+    } else {
+        printf("output=<none> error=%s\n",
+               result.error[0] ? result.error : "translation failed");
+    }
+    fflush(stdout);
+
+    bool valid = result.http_issued &&
+                 result.http_status == 200 &&
+                 result.translated &&
+                 result.translated[0] &&
+                 strcmp(result.translated, source) != 0 &&
+                 contains_korean_text(result.translated);
+    talloc_free(tmp);
+    whisper_translator_destroy(&translator);
+    return valid ? 0 : 1;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 1) {
+        run_offline_tests();
+        return 0;
+    }
+    if (argc == 2 &&
+        (strcmp(argv[1], "--live-google") == 0 ||
+         strcmp(argv[1], "--live-bing") == 0))
+    {
+        run_offline_tests();
+        return run_live_smoke(
+            strcmp(argv[1], "--live-google") == 0
+                ? WT_PROVIDER_GOOGLE : WT_PROVIDER_AZURE);
+    }
+
+    fprintf(stderr,
+            "usage: translation-provider [--live-google|--live-bing]\n");
+    return 2;
 }

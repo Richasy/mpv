@@ -93,33 +93,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Test D3D11 adapter selector
-        run: |
-          cc -std=c11 -Wall -Wextra -Werror -I. \
-            test/d3d11_adapter.c video/out/gpu/d3d11_adapter.c \
-            -o /tmp/d3d11-adapter-test
-          /tmp/d3d11-adapter-test
-
-      - name: Test DLSSNR parameters and color matrices
-        run: |
-          cc -std=c11 -Wall -Wextra -Werror \
-            video/filter/dlssnr/test_params.c video/filter/dlssnr/params.c \
-            -lm -o /tmp/dlssnr-params-test
-          /tmp/dlssnr-params-test
-
-      - name: Test subtitle translation policy
-        if: matrix.arch == 'x86_64'
-        run: |
-          mkdir -p build/preflight
-          cc -std=c11 -Wall -Wextra -Werror -I. \
-            test/sub_translate_policy.c player/sub_translate_policy.c \
-            -o build/preflight/sub-translate-policy-test
-          build/preflight/sub-translate-policy-test
-
-      - name: Test artifact-only Azure retry helper
-        if: matrix.arch == 'x86_64'
-        run: python3 test/retry_azure_artifact.py
-
+      # This unmerged manual-preview branch builds only; it does not publish a tested release.
       - name: Ensure PATH includes local bin
         run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 

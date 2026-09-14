@@ -3271,6 +3271,27 @@ int demux_read_packet_async_until(struct sh_stream *sh, double min_pts,
     return r;
 }
 
+// Extend a lazy stream's background read boundary without changing the caller's
+// packet/readiness result or entering the synchronous thread_work fallback.
+void demux_request_read_ahead(struct sh_stream *sh, double min_pts)
+{
+    struct demux_stream *ds = sh ? sh->ds : NULL;
+    if (!ds || min_pts == MP_NOPTS_VALUE || !isfinite(min_pts))
+        return;
+
+    struct demux_internal *in = ds->in;
+    mp_mutex_lock(&in->lock);
+    if (in->threading && !in->blocked && !in->eof && !in->back_demuxing &&
+        ds->selected && !ds->eager)
+    {
+        ds->force_read_until = MP_PTS_MAX(ds->force_read_until, min_pts);
+        ds->need_wakeup |= !ds->reader_head;
+        in->reading = true;
+        mp_cond_signal(&in->wakeup);
+    }
+    mp_mutex_unlock(&in->lock);
+}
+
 // Read and return any packet we find. NULL means EOF.
 // Does not work with threading (don't call demux_start_thread()).
 struct demux_packet *demux_read_any_packet(struct demuxer *demuxer)

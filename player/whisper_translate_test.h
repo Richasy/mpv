@@ -51,6 +51,8 @@ struct wt_http_request {
     const char *body;
     size_t body_len;
     enum wt_http_proxy_mode proxy_mode;
+    bool disable_cookies;
+    int timeout_ms;
 };
 
 struct wt_http_response {

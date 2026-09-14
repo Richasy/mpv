@@ -54,6 +54,8 @@ struct captured_request {
     char *body;
     size_t body_len;
     enum wt_http_proxy_mode proxy_mode;
+    bool disable_cookies;
+    int timeout_ms;
 };
 
 struct fake_transport {
@@ -160,6 +162,8 @@ static void fake_http(void *ctx, void *talloc_ctx,
         NULL, request->body ? request->body : "", request->body_len);
     captured->body_len = request->body_len;
     captured->proxy_mode = request->proxy_mode;
+    captured->disable_cookies = request->disable_cookies;
+    captured->timeout_ms = request->timeout_ms;
     mp_cond_broadcast(&transport->condition);
 
     struct response_plan *plan = &transport->plans[index];
@@ -284,6 +288,8 @@ static void test_google_request_and_response(void)
         "sl=auto&tl=ko&q=Line+1%0A%ED%95%9C%EA%B5%AD+"
         "%F0%9F%98%80+%26%2B%2F%3F");
     assert_int_equal(request->proxy_mode, WT_HTTP_PROXY_DEFAULT);
+    assert_true(request->disable_cookies);
+    assert_int_equal(request->timeout_ms, 5000);
 
     talloc_free(tmp);
     whisper_translator_destroy(&translator);
@@ -346,6 +352,9 @@ static void test_google_strict_response_validation(void)
         "{\"sentences\":[{\"trans\":\"\"}]}",
         "{\"sentences\":[{\"trans\":\"ok\"}]} trailing",
         "{\"sentences\":[{\"trans\":\"\\udc00\"}]}",
+        "{\"sentences\":[{\"trans\":\"first\",\"trans\":\"second\"}]}",
+        "{\"sentences\":[{\"trans\":\"first\"}],"
+        "\"sentences\":[{\"trans\":\"second\"}]}",
     };
     for (int n = 0; n < MP_ARRAY_SIZE(malformed); n++)
         expect_parse_failure(WT_PROVIDER_GOOGLE, "ko", malformed[n]);
@@ -389,6 +398,8 @@ static void test_bing_request_and_response(void)
     mp_require(strstr(request->headers, "Authorization") == NULL);
     assert_string_equal(request->body, "[\"cue \\\"x\\\"\\n한국 😀\"]");
     assert_int_equal(request->proxy_mode, WT_HTTP_PROXY_DEFAULT);
+    assert_true(request->disable_cookies);
+    assert_int_equal(request->timeout_ms, 5000);
 
     talloc_free(tmp);
     whisper_translator_destroy(&translator);
@@ -411,6 +422,10 @@ static void test_bing_strict_response_validation(void)
         "[{\"translations\":[{\"text\":\"\",\"to\":\"ko\"}]}]",
         "[{\"translations\":[{\"text\":\"x\",\"to\":\"ko\"}]}] trailing",
         "[{\"translations\":[{\"text\":\"\\udc00\",\"to\":\"ko\"}]}]",
+        "[{\"translations\":[{\"text\":\"x\",\"text\":\"y\",\"to\":\"ko\"}]}]",
+        "[{\"translations\":[{\"text\":\"x\",\"to\":\"ko\",\"to\":\"fr\"}]}]",
+        "[{\"translations\":[{\"text\":\"x\",\"to\":\"ko\"}],"
+        "\"translations\":[{\"text\":\"y\",\"to\":\"ko\"}]}]",
     };
     for (int n = 0; n < MP_ARRAY_SIZE(malformed); n++)
         expect_parse_failure(WT_PROVIDER_AZURE, "ko", malformed[n]);
@@ -428,6 +443,10 @@ static void test_openai_strict_response_validation(void)
     add_text_plan(
         &transport, 200, NULL,
         "{\"choices\":[{\"message\":{\"content\":\"ignored\"}}]} trailing");
+    add_text_plan(
+        &transport, 200, NULL,
+        "{\"choices\":[{\"message\":{\"content\":\"first\","
+        "\"content\":\"second\"}}]}");
     struct whisper_translator *translator = create_translator(
         WT_PROVIDER_OPENAI, "auto", "ko", &transport, &clock);
     mp_require(translator);
@@ -438,7 +457,73 @@ static void test_openai_strict_response_validation(void)
     whisper_translate_call(translator, tmp, "cue", &result);
     mp_require(!result.translated);
     assert_string_equal(result.error, "openai: empty content");
-    assert_int_equal(transport.calls, 2);
+    whisper_translate_call(translator, tmp, "cue", &result);
+    mp_require(!result.translated);
+    assert_string_equal(result.error, "openai: empty content");
+    assert_int_equal(transport.calls, 3);
+    talloc_free(tmp);
+    whisper_translator_destroy(&translator);
+    destroy_transport(&transport);
+}
+
+static void test_openai_request_shape(void)
+{
+    struct fake_clock clock;
+    init_clock(&clock, 2600, 0);
+    struct fake_transport transport;
+    init_transport(&transport);
+    add_text_plan(
+        &transport, 200, NULL,
+        "{\"choices\":[{\"message\":{\"content\":\"안녕\"}}]}");
+    struct wt_test_hooks hooks = {
+        .transport = fake_http,
+        .transport_ctx = &transport,
+        .monotonic_ms = fake_monotonic_ms,
+        .unix_ms = fake_unix_ms,
+        .clock_ctx = &clock,
+    };
+    struct wt_openai_config config = {
+        .endpoint = "https://127.0.0.1:9443/custom?fixture=1",
+        .model = "fixture-model",
+        .api_key = "fixture-key",
+        .source_lang = "en",
+        .target_lang = "ko",
+        .system_prompt = "fixed prompt",
+        .timeout_ms = 1234,
+        .max_tokens = 64,
+    };
+    struct whisper_translator *translator =
+        whisper_translator_create_for_test(
+            NULL, WT_PROVIDER_OPENAI, NULL, NULL, &config, &hooks);
+    mp_require(translator);
+
+    void *tmp = talloc_new(NULL);
+    struct wt_call_result result;
+    whisper_translate_call(translator, tmp, "Hello.\nGood morning.", &result);
+    assert_string_equal(result.translated, "안녕");
+    assert_int_equal(transport.calls, 1);
+    struct captured_request *request = &transport.requests[0];
+    assert_string_equal(request->host, "127.0.0.1");
+    assert_int_equal(request->port, 9443);
+    assert_true(request->secure);
+    assert_string_equal(request->method, "POST");
+    assert_string_equal(request->path, "/custom?fixture=1");
+    assert_string_equal(
+        request->headers,
+        "Content-Type: application/json\r\n"
+        "Accept: application/json\r\n"
+        "Authorization: Bearer fixture-key\r\n");
+    assert_string_equal(
+        request->body,
+        "{\"model\":\"fixture-model\",\"stream\":false,\"messages\":["
+        "{\"role\":\"system\",\"content\":\"fixed prompt\"},"
+        "{\"role\":\"user\",\"content\":\"Hello.\\nGood morning.\"}],"
+        "\"temperature\":0.200000,\"max_tokens\":64,"
+        "\"thinking\":{\"type\":\"disabled\"}}");
+    assert_int_equal(request->proxy_mode, WT_HTTP_PROXY_NONE);
+    assert_false(request->disable_cookies);
+    assert_int_equal(request->timeout_ms, 1234);
+
     talloc_free(tmp);
     whisper_translator_destroy(&translator);
     destroy_transport(&transport);
@@ -561,6 +646,8 @@ static void test_transport_failures(void)
          "google: response read failed", 1},
         {WT_HTTP_FAILURE_TOO_LARGE, true, 200, NULL, 0,
          "google: response too large", 1},
+        {WT_HTTP_FAILURE_STATUS, true, 0, NULL, 0,
+         "google: invalid HTTP status", 1},
         {WT_HTTP_FAILURE_NONE, true, 0, NULL, 0,
          "google: invalid HTTP status", 1},
         {WT_HTTP_FAILURE_NONE, true, 302, NULL, 0,
@@ -724,6 +811,20 @@ static void test_retry_after_date_default_and_saturation(void)
     destroy_transport(&transport);
 
     init_transport(&transport);
+    add_text_plan(&transport, 429, "invalid", NULL);
+    translator = create_translator(
+        WT_PROVIDER_GOOGLE, "auto", "ko", &transport, &clock);
+    tmp = talloc_new(NULL);
+    whisper_translate_call(translator, tmp, "cue", &result);
+    assert_int_equal(result.retry_after_ms, 0);
+    whisper_translate_call(translator, tmp, "next", &result);
+    assert_false(result.http_issued);
+    assert_int_equal(result.retry_after_ms, 60000);
+    talloc_free(tmp);
+    whisper_translator_destroy(&translator);
+    destroy_transport(&transport);
+
+    init_transport(&transport);
     add_text_plan(&transport, 429, "3000000", NULL);
     translator = create_translator(
         WT_PROVIDER_GOOGLE, "auto", "ko", &transport, &clock);
@@ -735,6 +836,76 @@ static void test_retry_after_date_default_and_saturation(void)
     talloc_free(tmp);
     whisper_translator_destroy(&translator);
     destroy_transport(&transport);
+}
+
+static void test_zero_retry_after_serialized_probe(void)
+{
+    struct fake_clock clock;
+    init_clock(&clock, 6500, 0);
+    struct fake_transport transport;
+    init_transport(&transport);
+    add_text_plan(&transport, 429, "0", NULL);
+    add_plan(
+        &transport, WT_HTTP_FAILURE_NONE, true, 200, NULL,
+        "{\"sentences\":[{\"trans\":\"ok\"}]}",
+        strlen("{\"sentences\":[{\"trans\":\"ok\"}]}"), true);
+    struct whisper_translator *translator = create_translator(
+        WT_PROVIDER_GOOGLE, "auto", "ko", &transport, &clock);
+    void *tmp = talloc_new(NULL);
+    struct wt_call_result initial;
+    whisper_translate_call(translator, tmp, "initial", &initial);
+    assert_int_equal(initial.retry_after_ms, 0);
+
+    struct call_thread probe = {
+        .translator = translator,
+        .text = "probe",
+    };
+    mp_thread thread;
+    assert_int_equal(mp_thread_create(&thread, call_translate, &probe), 0);
+    wait_for_calls(&transport, 2);
+
+    struct wt_call_result concurrent;
+    whisper_translate_call(translator, tmp, "concurrent", &concurrent);
+    assert_false(concurrent.http_issued);
+    assert_true(concurrent.rate_limited);
+    assert_string_equal(concurrent.error, "google: rate limited");
+    assert_int_equal(transport.calls, 2);
+
+    release_call(&transport, 1);
+    mp_thread_join(thread);
+    assert_string_equal(probe.result.translated, "ok");
+
+    talloc_free(tmp);
+    destroy_call(&probe);
+    whisper_translator_destroy(&translator);
+    destroy_transport(&transport);
+
+    const struct {
+        int64_t unix_ms;
+        const char *header;
+    } dates[] = {
+        {0, "Thu, 01 Jan 1970 00:00:00 GMT"},
+        {1000, "Thu, 01 Jan 1970 00:00:00 GMT"},
+    };
+    for (int n = 0; n < MP_ARRAY_SIZE(dates); n++) {
+        init_clock(&clock, 6600, dates[n].unix_ms);
+        init_transport(&transport);
+        add_text_plan(&transport, 429, dates[n].header, NULL);
+        add_text_plan(
+            &transport, 200, NULL,
+            "{\"sentences\":[{\"trans\":\"ok\"}]}");
+        translator = create_translator(
+            WT_PROVIDER_GOOGLE, "auto", "ko", &transport, &clock);
+        tmp = talloc_new(NULL);
+        whisper_translate_call(translator, tmp, "initial", &initial);
+        assert_int_equal(initial.retry_after_ms, 0);
+        whisper_translate_call(translator, tmp, "probe", &initial);
+        assert_string_equal(initial.translated, "ok");
+        assert_int_equal(transport.calls, 2);
+        talloc_free(tmp);
+        whisper_translator_destroy(&translator);
+        destroy_transport(&transport);
+    }
 }
 
 static void test_generic_cooldown(void)
@@ -774,6 +945,69 @@ static void test_generic_cooldown(void)
     assert_int_equal(result.retry_after_ms, 9000);
     assert_int_equal(transport.calls, 1);
     talloc_free(tmp);
+    whisper_translator_destroy(&translator);
+    destroy_transport(&transport);
+}
+
+static void test_probe_owner_released_after_newer_cooldown(void)
+{
+    struct fake_clock clock;
+    init_clock(&clock, 10000, 0);
+    struct fake_transport transport;
+    init_transport(&transport);
+    add_plan(&transport, WT_HTTP_FAILURE_NONE, true, 429, "2",
+             NULL, 0, true);
+    add_text_plan(&transport, 429, "1", NULL);
+    add_plan(&transport, WT_HTTP_FAILURE_SETUP, false, 0, NULL,
+             NULL, 0, true);
+    add_text_plan(
+        &transport, 200, NULL,
+        "{\"sentences\":[{\"trans\":\"recovered\"}]}");
+    struct whisper_translator *translator = create_translator(
+        WT_PROVIDER_GOOGLE, "auto", "ko", &transport, &clock);
+
+    struct call_thread older = {
+        .translator = translator,
+        .text = "older",
+    };
+    mp_thread older_thread;
+    assert_int_equal(
+        mp_thread_create(&older_thread, call_translate, &older), 0);
+    wait_for_calls(&transport, 1);
+
+    void *tmp = talloc_new(NULL);
+    struct wt_call_result initial;
+    whisper_translate_call(translator, tmp, "initial", &initial);
+    assert_string_equal(initial.error, "google: HTTP 429");
+    set_monotonic_ms(&clock, 11001);
+
+    struct call_thread probe = {
+        .translator = translator,
+        .text = "probe",
+    };
+    mp_thread probe_thread;
+    assert_int_equal(
+        mp_thread_create(&probe_thread, call_translate, &probe), 0);
+    wait_for_calls(&transport, 3);
+
+    release_call(&transport, 0);
+    mp_thread_join(older_thread);
+    assert_string_equal(older.result.error, "google: HTTP 429");
+
+    release_call(&transport, 2);
+    mp_thread_join(probe_thread);
+    assert_false(probe.result.http_issued);
+    assert_string_equal(probe.result.error, "google: request setup failed");
+
+    set_monotonic_ms(&clock, 13002);
+    struct wt_call_result recovered;
+    whisper_translate_call(translator, tmp, "recovered", &recovered);
+    assert_string_equal(recovered.translated, "recovered");
+    assert_int_equal(transport.calls, 4);
+
+    talloc_free(tmp);
+    destroy_call(&older);
+    destroy_call(&probe);
     whisper_translator_destroy(&translator);
     destroy_transport(&transport);
 }
@@ -966,11 +1200,14 @@ static void run_offline_tests(void)
     test_bing_request_and_response();
     test_bing_strict_response_validation();
     test_openai_strict_response_validation();
+    test_openai_request_shape();
     test_input_bounds_and_languages();
     test_transport_failures();
     test_common_rate_limit();
     test_retry_after_date_default_and_saturation();
+    test_zero_retry_after_serialized_probe();
     test_generic_cooldown();
+    test_probe_owner_released_after_newer_cooldown();
     test_exponential_failure_cooldown();
     test_success_does_not_erase_newer_rate_limit();
     test_shorter_retry_after_cannot_reduce_deadline();

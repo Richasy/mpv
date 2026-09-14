@@ -100,7 +100,8 @@ struct whisper_translator {
     int64_t backoff_until_ms;   // GetTickCount64 epoch
     enum wt_cooldown_kind cooldown_kind;
     uint64_t cooldown_generation;
-    bool cooldown_probe_in_flight;
+    uint64_t next_probe_token;
+    uint64_t active_probe_token;
 };
 
 // --- Helpers ---
@@ -479,6 +480,8 @@ static void winhttp_transport(void *ctx, void *talloc_ctx,
     }
 
     DWORD disabled_features = WINHTTP_DISABLE_REDIRECTS;
+    if (request->disable_cookies)
+        disabled_features |= WINHTTP_DISABLE_COOKIES;
     if (!WinHttpSetOption(handle, WINHTTP_OPTION_DISABLE_FEATURE,
                           &disabled_features, sizeof(disabled_features)))
     {
@@ -620,18 +623,25 @@ done:
     talloc_free(tmp);
 }
 
-static int64_t parse_retry_after_ms(struct whisper_translator *tr,
-                                    const char *value)
+struct wt_retry_after {
+    bool present;
+    bool valid;
+    int64_t delay_ms;
+};
+
+static struct wt_retry_after parse_retry_after(
+    struct whisper_translator *tr, const char *value)
 {
     if (!value)
-        return 0;
+        return (struct wt_retry_after){0};
+    struct wt_retry_after parsed = {.present = true};
     while (*value == ' ' || *value == '\t')
         value++;
     size_t len = strlen(value);
     while (len && (value[len - 1] == ' ' || value[len - 1] == '\t'))
         len--;
     if (!len)
-        return 0;
+        return parsed;
 
     bool digits = true;
     int64_t seconds = 0;
@@ -649,18 +659,21 @@ static int64_t parse_retry_after_ms(struct whisper_translator *tr,
         }
     }
     if (digits) {
+        parsed.valid = true;
         if (seconds > INT64_MAX / 1000)
-            return INT64_MAX;
-        return seconds * 1000;
+            parsed.delay_ms = INT64_MAX;
+        else
+            parsed.delay_ms = seconds * 1000;
+        return parsed;
     }
 
     if (len >= 128)
-        return 0;
+        return parsed;
     WCHAR wide[128];
     for (size_t n = 0; n < len; n++) {
         unsigned char c = (unsigned char)value[n];
         if (c > 0x7f)
-            return 0;
+            return parsed;
         wide[n] = c;
     }
     wide[len] = L'\0';
@@ -670,7 +683,7 @@ static int64_t parse_retry_after_ms(struct whisper_translator *tr,
     if (!WinHttpTimeToSystemTime(wide, &system_time) ||
         !SystemTimeToFileTime(&system_time, &file_time))
     {
-        return 0;
+        return parsed;
     }
     ULARGE_INTEGER ticks = {
         .LowPart = file_time.dwLowDateTime,
@@ -679,7 +692,9 @@ static int64_t parse_retry_after_ms(struct whisper_translator *tr,
     int64_t target_ms =
         (int64_t)(ticks.QuadPart / 10000ULL) - 11644473600000LL;
     int64_t now_ms = translator_unix_ms(tr);
-    return target_ms > now_ms ? target_ms - now_ms : 0;
+    parsed.valid = true;
+    parsed.delay_ms = target_ms > now_ms ? target_ms - now_ms : 0;
+    return parsed;
 }
 
 static bool json_unicode_escapes_valid(const char *json)
@@ -730,6 +745,34 @@ static bool json_unicode_escapes_valid(const char *json)
     return !in_string;
 }
 
+static bool node_keys_unique_recursive(struct mpv_node *node)
+{
+    if (!node)
+        return false;
+    if (node->format == MPV_FORMAT_NODE_MAP) {
+        struct mpv_node_list *map = node->u.list;
+        if (!map)
+            return false;
+        for (int n = 0; n < map->num; n++) {
+            for (int k = n + 1; k < map->num; k++) {
+                if (strcmp(map->keys[n], map->keys[k]) == 0)
+                    return false;
+            }
+            if (!node_keys_unique_recursive(&map->values[n]))
+                return false;
+        }
+    } else if (node->format == MPV_FORMAT_NODE_ARRAY) {
+        struct mpv_node_list *array = node->u.list;
+        if (!array)
+            return false;
+        for (int n = 0; n < array->num; n++) {
+            if (!node_keys_unique_recursive(&array->values[n]))
+                return false;
+        }
+    }
+    return true;
+}
+
 static bool parse_json_document(void *talloc_ctx, const char *response,
                                 struct mpv_node *root)
 {
@@ -744,11 +787,11 @@ static bool parse_json_document(void *talloc_ctx, const char *response,
     if (json_parse(talloc_ctx, root, &cursor, MAX_JSON_DEPTH) < 0)
         return false;
     json_skip_whitespace(&cursor);
-    return !cursor[0];
+    return !cursor[0] && node_keys_unique_recursive(root);
 }
 
 struct wt_http_observation {
-    int64_t retry_after_ms;
+    struct wt_retry_after retry_after;
 };
 
 static bool perform_http(struct whisper_translator *tr, void *talloc_ctx,
@@ -760,8 +803,8 @@ static bool perform_http(struct whisper_translator *tr, void *talloc_ctx,
     struct wt_http_response response = {0};
     tr->transport(tr->transport_ctx, talloc_ctx, request, &response);
     if (observation)
-        observation->retry_after_ms =
-            parse_retry_after_ms(tr, response.retry_after);
+        observation->retry_after =
+            parse_retry_after(tr, response.retry_after);
     if (out) {
         out->http_issued = response.http_issued;
         out->http_status =
@@ -769,7 +812,8 @@ static bool perform_http(struct whisper_translator *tr, void *talloc_ctx,
                 ? response.http_status : 0;
         out->rate_limited = response.http_status == 429;
         out->retry_after_ms = saturated_int64_to_int(
-            observation ? observation->retry_after_ms : 0);
+            observation && observation->retry_after.valid
+                ? observation->retry_after.delay_ms : 0);
     }
 
     const char *name = provider_name(tr->provider);
@@ -959,6 +1003,8 @@ static char *translate_google(struct whisper_translator *tr,
         .body = body,
         .body_len = strlen(body),
         .proxy_mode = WT_HTTP_PROXY_DEFAULT,
+        .disable_cookies = true,
+        .timeout_ms = WT_MAX_TIMEOUT_MS,
     };
     char *response = NULL;
     if (!perform_http(tr, tmp, &request, out, observation, &response)) {
@@ -1117,6 +1163,8 @@ static char *translate_azure(struct whisper_translator *tr,
         .body = body,
         .body_len = strlen(body),
         .proxy_mode = WT_HTTP_PROXY_DEFAULT,
+        .disable_cookies = true,
+        .timeout_ms = WT_MAX_TIMEOUT_MS,
     };
     char *response = NULL;
     if (!perform_http(tr, tmp, &request, out, observation, &response)) {
@@ -1463,6 +1511,7 @@ static char *translate_openai(struct whisper_translator *tr,
         .body = body,
         .body_len = strlen(body),
         .proxy_mode = WT_HTTP_PROXY_NONE,
+        .timeout_ms = tr->oa_timeout_ms,
     };
     char *response = NULL;
     if (!perform_http(tr, tmp, &request, out, observation, &response)) {
@@ -1724,8 +1773,26 @@ void whisper_translator_destroy(struct whisper_translator **tr)
 
 struct wt_admission {
     uint64_t cooldown_generation;
-    bool probe;
+    uint64_t probe_token;
 };
+
+static uint64_t next_probe_token_locked(struct whisper_translator *tr)
+{
+    tr->next_probe_token++;
+    if (!tr->next_probe_token)
+        tr->next_probe_token++;
+    return tr->next_probe_token;
+}
+
+static void release_probe_locked(struct whisper_translator *tr,
+                                 const struct wt_admission *admission)
+{
+    if (admission->probe_token &&
+        tr->active_probe_token == admission->probe_token)
+    {
+        tr->active_probe_token = 0;
+    }
+}
 
 static bool admit_request(struct whisper_translator *tr,
                           struct wt_call_result *out,
@@ -1735,9 +1802,10 @@ static bool admit_request(struct whisper_translator *tr,
     mp_mutex_lock(&tr->state_lock);
     admission->cooldown_generation = tr->cooldown_generation;
 
+    bool has_cooldown = tr->cooldown_kind != WT_COOLDOWN_NONE;
     int64_t remaining = tr->backoff_until_ms > now
         ? tr->backoff_until_ms - now : 0;
-    if (remaining > 0 || tr->cooldown_probe_in_flight) {
+    if (remaining > 0 || tr->active_probe_token) {
         enum wt_cooldown_kind kind = tr->cooldown_kind;
         if (!remaining)
             remaining = WT_PROBE_WAIT_MS;
@@ -1754,9 +1822,9 @@ static bool admit_request(struct whisper_translator *tr,
         return false;
     }
 
-    if (tr->backoff_until_ms) {
-        tr->cooldown_probe_in_flight = true;
-        admission->probe = true;
+    if (has_cooldown) {
+        admission->probe_token = next_probe_token_locked(tr);
+        tr->active_probe_token = admission->probe_token;
     }
     mp_mutex_unlock(&tr->state_lock);
     return true;
@@ -1775,8 +1843,7 @@ static int64_t failure_backoff_ms(int fail_count)
 
 static void extend_cooldown_locked(struct whisper_translator *tr,
                                    int64_t now, int64_t delay,
-                                   enum wt_cooldown_kind kind,
-                                   bool clear_probe)
+                                   enum wt_cooldown_kind kind)
 {
     bool was_active = tr->backoff_until_ms > now;
     int64_t candidate = saturated_add_ms(now, delay);
@@ -1789,8 +1856,6 @@ static void extend_cooldown_locked(struct whisper_translator *tr,
         tr->cooldown_kind = kind;
     }
     tr->cooldown_generation++;
-    if (clear_probe)
-        tr->cooldown_probe_in_flight = false;
 }
 
 static bool immediate_generic_cooldown(int http_status)
@@ -1820,20 +1885,14 @@ static void record_outcome(struct whisper_translator *tr,
             tr->fail_count = 0;
             tr->backoff_until_ms = 0;
             tr->cooldown_kind = WT_COOLDOWN_NONE;
-            tr->cooldown_probe_in_flight = false;
-        } else if (admission->probe) {
-            tr->cooldown_probe_in_flight = false;
         }
+        release_probe_locked(tr, admission);
         mp_mutex_unlock(&tr->state_lock);
         return;
     }
 
     if (!call->http_issued) {
-        if (admission->probe &&
-            admission->cooldown_generation == tr->cooldown_generation)
-        {
-            tr->cooldown_probe_in_flight = false;
-        }
+        release_probe_locked(tr, admission);
         mp_mutex_unlock(&tr->state_lock);
         return;
     }
@@ -1842,30 +1901,30 @@ static void record_outcome(struct whisper_translator *tr,
         tr->fail_count++;
 
     if (call->http_status == 429) {
-        int64_t delay = observation->retry_after_ms > 0
-            ? observation->retry_after_ms : WT_RATE_LIMIT_BACKOFF_MS;
+        int64_t delay = observation->retry_after.valid
+            ? observation->retry_after.delay_ms
+            : WT_RATE_LIMIT_BACKOFF_MS;
         extend_cooldown_locked(
-            tr, now, delay, WT_COOLDOWN_RATE_LIMIT, admission->probe);
+            tr, now, delay, WT_COOLDOWN_RATE_LIMIT);
         log_event = WT_LOG_RATE_LIMIT;
-    } else if (observation->retry_after_ms > 0) {
+    } else if (observation->retry_after.valid) {
         extend_cooldown_locked(
-            tr, now, observation->retry_after_ms, WT_COOLDOWN_GENERIC,
-            admission->probe);
+            tr, now, observation->retry_after.delay_ms,
+            WT_COOLDOWN_GENERIC);
         log_event = WT_LOG_RETRY_AFTER;
     } else {
         int64_t delay = immediate_generic_cooldown(call->http_status)
             ? WT_CHALLENGE_BACKOFF_MS
             : failure_backoff_ms(tr->fail_count);
-        if (admission->probe && delay <= 0)
+        if (admission->probe_token && delay <= 0)
             delay = WT_BACKOFF_BASE_MS;
         if (delay > 0) {
             extend_cooldown_locked(
-                tr, now, delay, WT_COOLDOWN_GENERIC, admission->probe);
+                tr, now, delay, WT_COOLDOWN_GENERIC);
             log_event = WT_LOG_FAILURE_COOLDOWN;
-        } else if (admission->probe) {
-            tr->cooldown_probe_in_flight = false;
         }
     }
+    release_probe_locked(tr, admission);
     mp_mutex_unlock(&tr->state_lock);
 
     switch (log_event) {
@@ -1959,7 +2018,7 @@ void whisper_translator_get_status(struct whisper_translator *tr,
         out->paused = true;
         out->retry_after_ms =
             saturated_int64_to_int(tr->backoff_until_ms - now);
-    } else if (tr->cooldown_probe_in_flight) {
+    } else if (tr->active_probe_token) {
         out->paused = true;
         out->retry_after_ms = WT_PROBE_WAIT_MS;
     }

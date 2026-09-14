@@ -574,8 +574,10 @@ The following special paths/keywords are currently recognized:
 
 .. warning::
 
-    Beware that if ``--no-config`` is used, all of the "config directory"-based
-    paths (``~~/``, ``~~home/`` and ``~~global/``) will be empty strings.
+    Beware that if ``--no-config`` is used without an explicit
+    ``--config-dir``, all of the "config directory"-based paths (``~~/``,
+    ``~~home/`` and ``~~global/``) will be empty strings. Setting only
+    ``MPV_HOME`` does not provide a root in this mode.
 
     This means that ``~~home/`` would expand to an empty string, and that
     sub-paths such as ``~~home/foo/bar"`` would expand to a relative path
@@ -583,6 +585,11 @@ The following special paths/keywords are currently recognized:
 
     Furthermore, any commands that search in config directories will fail
     to find anything, since there won't be any directories to search in.
+
+    If ``--config-dir`` is explicitly supplied together with ``--no-config``,
+    ``~~/`` and ``~~home/`` expand relative to that directory. This does not
+    re-enable automatic ``mpv.conf``, ``input.conf``, or script discovery, and
+    the other platform paths retain their ``--no-config`` behavior.
 
     Be sure that your scripts can handle these "no config" scenarios.
 

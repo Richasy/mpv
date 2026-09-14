@@ -9,6 +9,7 @@ struct mpv_global {
     struct m_config_shadow *config;
     struct mp_client_api *client_api;
     char *configdir;
+    char *explicit_configdir; // explicit --config-dir retained under --no-config
     struct stats_base *stats;
     struct demux_packet_pool *packet_pool;
     struct curl_ctx *curl;

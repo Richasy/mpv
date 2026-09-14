@@ -493,6 +493,11 @@ MPV_EXPORT int64_t mpv_client_id(mpv_handle *ctx);
  *      mpv_set_option_string(mpv, "config-dir", "/my/path"); // set config root
  *      mpv_set_option_string(mpv, "config", "yes"); // enable config loading
  *      (call mpv_initialize() _after_ this)
+ *   If "config" remains disabled, an explicitly set "config-dir" does not
+ *   enable automatic config, input, or script loading. It is retained only as
+ *   the root for "~~/" and "~~home/" path expansion, including paths read from
+ *   a file passed to mpv_load_config_file(). MPV_HOME alone is not used as a
+ *   root in this mode.
  * - Idle mode is enabled, which means the playback core will enter idle mode
  *   if there are no more files to play on the internal playlist, instead of
  *   exiting. This is equivalent to the --idle option.

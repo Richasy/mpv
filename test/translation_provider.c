@@ -622,10 +622,8 @@ static void test_google_request_and_response(void)
     init_transport(&transport);
     add_text_plan(
         &transport, 200, NULL,
-        "{\"sentences\":["
-        "{\"trans\":\"  안녕\\n\",\"orig\":\"hello\"},"
-        "{\"trans\":\"\\ud55c\\uad6d \\ud83d\\ude00 &amp;  \",\"orig\":\"world\"},"
-        "{\"src_translit\":\"annyeong\"}]}");
+        "[[[\"  안녕\\n\",\"hello\"],"
+        "[\"\\ud55c\\uad6d \\ud83d\\ude00 &amp;  \",\"world\"]],null,\"en\"]");
     struct whisper_translator *translator = create_translator(
         WT_PROVIDER_GOOGLE, "AUTO", "KO", &transport, &clock);
     mp_require(translator);
@@ -641,20 +639,19 @@ static void test_google_request_and_response(void)
     assert_int_equal(transport.calls, 1);
 
     struct captured_request *request = &transport.requests[0];
-    assert_string_equal(request->host, "translate.google.com");
+    assert_string_equal(request->host, "translate.googleapis.com");
     assert_int_equal(request->port, 443);
     assert_true(request->secure);
-    assert_string_equal(request->method, "POST");
+    assert_string_equal(request->method, "GET");
     assert_string_equal(
         request->path,
-        "/translate_a/single?client=at&dt=t&dt=rm&dj=1");
+        "/translate_a/single?client=gtx&sl=auto&tl=ko&dt=t"
+        "&ie=UTF-8&oe=UTF-8&q=Line+1%0A%ED%95%9C%EA%B5%AD+"
+        "%F0%9F%98%80+%26%2B%2F%3F");
     assert_string_equal(
         request->headers,
-        "Content-Type: application/x-www-form-urlencoded;charset=utf-8\r\n");
-    assert_string_equal(
-        request->body,
-        "sl=auto&tl=ko&q=Line+1%0A%ED%95%9C%EA%B5%AD+"
-        "%F0%9F%98%80+%26%2B%2F%3F");
+        "Accept: application/json\r\n");
+    assert_int_equal(request->body_len, 0);
     assert_int_equal(request->proxy_mode, WT_HTTP_PROXY_DEFAULT);
     assert_true(request->disable_cookies);
     assert_int_equal(request->timeout_ms, 5000);
@@ -712,17 +709,16 @@ static void test_google_strict_response_validation(void)
 {
     static const char *const malformed[] = {
         "[]",
-        "{\"sentences\":{}}",
-        "{\"sentences\":[1]}",
-        "{\"sentences\":[{\"trans\":7}]}",
-        "{\"sentences\":[{\"trans\":\"ok\",\"translit\":7}]}",
-        "{\"sentences\":[{\"other\":\"value\"}]}",
-        "{\"sentences\":[{\"trans\":\"\"}]}",
-        "{\"sentences\":[{\"trans\":\"ok\"}]} trailing",
-        "{\"sentences\":[{\"trans\":\"\\udc00\"}]}",
-        "{\"sentences\":[{\"trans\":\"first\",\"trans\":\"second\"}]}",
-        "{\"sentences\":[{\"trans\":\"first\"}],"
-        "\"sentences\":[{\"trans\":\"second\"}]}",
+        "{}",
+        "[null]",
+        "[[1]]",
+        "[[[7]]]",
+        "[[[null]]]",
+        "[[{}]]",
+        "[[[\"\"]]]",
+        "[[[\"ok\"]]] trailing",
+        "[[[\"\\udc00\"]]]",
+        "[[[\"ok\",{\"value\":\"first\",\"value\":\"second\"}]]]",
     };
     for (int n = 0; n < MP_ARRAY_SIZE(malformed); n++)
         expect_parse_failure(WT_PROVIDER_GOOGLE, "ko", malformed[n]);
@@ -924,7 +920,7 @@ static void test_input_bounds_and_languages(void)
     init_transport(&transport);
     add_text_plan(
         &transport, 200, NULL,
-        "{\"sentences\":[{\"trans\":\"ok\"}]}");
+        "[[[\"ok\"]]]");
     struct whisper_translator *translator = create_translator(
         WT_PROVIDER_GOOGLE, "zh-hans", "zh-HANT", &transport, &clock);
     mp_require(translator);
@@ -1713,8 +1709,8 @@ static void test_zero_retry_after_serialized_probe(void)
     add_text_plan(&transport, 429, "0", NULL);
     add_plan(
         &transport, WT_HTTP_FAILURE_NONE, true, 200, NULL,
-        "{\"sentences\":[{\"trans\":\"ok\"}]}",
-        strlen("{\"sentences\":[{\"trans\":\"ok\"}]}"), true);
+        "[[[\"ok\"]]]",
+        strlen("[[[\"ok\"]]]"), true);
     struct whisper_translator *translator = create_translator(
         WT_PROVIDER_GOOGLE, "auto", "ko", &transport, &clock);
     void *tmp = talloc_new(NULL);
@@ -1759,7 +1755,7 @@ static void test_zero_retry_after_serialized_probe(void)
         add_text_plan(&transport, 429, dates[n].header, NULL);
         add_text_plan(
             &transport, 200, NULL,
-            "{\"sentences\":[{\"trans\":\"ok\"}]}");
+            "[[[\"ok\"]]]");
         translator = create_translator(
             WT_PROVIDER_GOOGLE, "auto", "ko", &transport, &clock);
         tmp = talloc_new(NULL);
@@ -1828,7 +1824,7 @@ static void test_probe_owner_released_after_newer_cooldown(void)
              NULL, 0, true);
     add_text_plan(
         &transport, 200, NULL,
-        "{\"sentences\":[{\"trans\":\"recovered\"}]}");
+        "[[[\"recovered\"]]]");
     struct whisper_translator *translator = create_translator(
         WT_PROVIDER_GOOGLE, "auto", "ko", &transport, &clock);
 
@@ -1918,8 +1914,8 @@ static void test_success_does_not_erase_newer_rate_limit(void)
     init_transport(&transport);
     add_plan(
         &transport, WT_HTTP_FAILURE_NONE, true, 200, NULL,
-        "{\"sentences\":[{\"trans\":\"ok\"}]}",
-        strlen("{\"sentences\":[{\"trans\":\"ok\"}]}"), true);
+        "[[[\"ok\"]]]",
+        strlen("[[[\"ok\"]]]"), true);
     add_text_plan(&transport, 429, "120", NULL);
     struct whisper_translator *translator = create_translator(
         WT_PROVIDER_GOOGLE, "auto", "ko", &transport, &clock);
@@ -2016,11 +2012,11 @@ static void test_single_probe_after_expiry(void)
     add_text_plan(&transport, 429, "1", NULL);
     add_plan(
         &transport, WT_HTTP_FAILURE_NONE, true, 200, NULL,
-        "{\"sentences\":[{\"trans\":\"ok\"}]}",
-        strlen("{\"sentences\":[{\"trans\":\"ok\"}]}"), true);
+        "[[[\"ok\"]]]",
+        strlen("[[[\"ok\"]]]"), true);
     add_text_plan(
         &transport, 200, NULL,
-        "{\"sentences\":[{\"trans\":\"next\"}]}");
+        "[[[\"next\"]]]");
     struct whisper_translator *translator = create_translator(
         WT_PROVIDER_GOOGLE, "auto", "ko", &transport, &clock);
 

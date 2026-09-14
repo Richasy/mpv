@@ -1314,6 +1314,8 @@ static void test_production_transport_owns_post_body(void)
     DWORD old_protection = 0;
     assert_true(VirtualProtect(
         body, body_len, PAGE_NOACCESS, &old_protection));
+    assert_false(
+        whisper_translate_test_winhttp_send_completion_observed(client));
     whisper_translate_test_winhttp_release_send(client);
     mp_thread_join(thread);
     assert_true(call.result.http_issued);

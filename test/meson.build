@@ -158,7 +158,11 @@ test('codepoint-width', codepoint_width)
 paths_objects = libmpv.extract_objects('options/path.c', path_source)
 paths = executable('paths', 'paths.c', include_directories: incdir,
                    objects: paths_objects, link_with: test_utils)
-test('paths', paths)
+paths_outdir = join_paths(outdir, 'paths')
+paths_home = join_paths(paths_outdir, 'environment')
+paths_env = environment()
+paths_env.set('MPV_HOME', paths_home)
+test('paths', paths, args: [paths_outdir, paths_home], env: paths_env)
 
 display_surface_objects = libmpv.extract_objects('video/out/display_surface.c')
 display_surface = executable('display-surface', 'display_surface.c',

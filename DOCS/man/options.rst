@@ -837,7 +837,13 @@ Program Behavior
     Note that the cache and state paths (``~~/cache``, ``~~/state``) are not
     considered "configuration" and keep their auto-detection logic.
 
-    Note that the ``--no-config`` option takes precedence over this option.
+    When combined with ``--no-config``, automatic config, input, and script
+    discovery remains disabled. However, an explicitly supplied
+    ``--config-dir`` is retained as the root for ``~~/`` and ``~~home/`` path
+    expansion. This allows an explicitly loaded config file to use those paths
+    without enabling ambient configuration. ``MPV_HOME`` alone is not used as
+    a root in this mode, and omitting ``--config-dir`` preserves the usual
+    ``--no-config`` behavior.
 
 ``--dump-stats=<filename>``
     Write certain statistics to the given file. The file is truncated on

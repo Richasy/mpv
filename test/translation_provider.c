@@ -20,6 +20,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include "mpv_talloc.h"
 #include "misc/bstr.h"
 #include "osdep/threads.h"
@@ -73,6 +76,173 @@ struct call_thread {
     struct wt_call_result result;
     void *tmp;
 };
+
+enum loopback_mode {
+    LOOPBACK_STALL,
+    LOOPBACK_SLOW_DRIP,
+    LOOPBACK_COOKIE,
+};
+
+struct loopback_server {
+    SOCKET listener;
+    mp_thread thread;
+    HANDLE release_event;
+    enum loopback_mode mode;
+    int port;
+    bool second_request_had_cookie;
+};
+
+static bool request_has_cookie(const char *request)
+{
+    const char *line = request;
+    while (*line) {
+        const char *end = strstr(line, "\r\n");
+        size_t length = end ? (size_t)(end - line) : strlen(line);
+        if (length >= 7 && _strnicmp(line, "Cookie:", 7) == 0)
+            return true;
+        if (!end)
+            break;
+        line = end + 2;
+    }
+    return false;
+}
+
+static bool send_all(SOCKET socket, const char *data, int length)
+{
+    while (length > 0) {
+        int sent = send(socket, data, length, 0);
+        if (sent <= 0)
+            return false;
+        data += sent;
+        length -= sent;
+    }
+    return true;
+}
+
+static bool receive_synthetic_request(SOCKET socket, char *buffer,
+                                      int capacity)
+{
+    int length = 0;
+    int expected = -1;
+    while (length + 1 < capacity) {
+        int received = recv(socket, buffer + length, capacity - length - 1, 0);
+        if (received <= 0)
+            return false;
+        length += received;
+        buffer[length] = '\0';
+        char *headers_end = strstr(buffer, "\r\n\r\n");
+        if (headers_end && expected < 0)
+            expected = (int)(headers_end + 4 - buffer) + 9;
+        if (expected >= 0 && length >= expected)
+            return true;
+    }
+    return false;
+}
+
+static MP_THREAD_VOID run_loopback_server(void *opaque)
+{
+    struct loopback_server *server = opaque;
+    int requests = server->mode == LOOPBACK_COOKIE ? 2 : 1;
+    for (int n = 0; n < requests; n++) {
+        SOCKET client = accept(server->listener, NULL, NULL);
+        if (client == INVALID_SOCKET)
+            break;
+        char request[8192] = {0};
+        bool received = receive_synthetic_request(
+            client, request, sizeof(request));
+        if (server->mode == LOOPBACK_COOKIE && n == 1)
+            server->second_request_had_cookie =
+                received && request_has_cookie(request);
+
+        if (received && server->mode == LOOPBACK_STALL) {
+            WaitForSingleObject(server->release_event, 5000);
+        } else if (received && server->mode == LOOPBACK_SLOW_DRIP) {
+            static const char headers[] =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Length: 20\r\n"
+                "Connection: close\r\n\r\n";
+            static const char body[] = "abcdefghijklmnopqrst";
+            if (send_all(client, headers, sizeof(headers) - 1)) {
+                for (int i = 0; i < 8; i++) {
+                    if (!send_all(client, &body[i], 1) ||
+                        WaitForSingleObject(
+                            server->release_event, 75) == WAIT_OBJECT_0)
+                    {
+                        break;
+                    }
+                }
+            }
+        } else if (received) {
+            const char *headers = n == 0
+                ? "HTTP/1.1 200 OK\r\n"
+                  "Content-Length: 2\r\n"
+                  "Set-Cookie: fixture=1; Path=/\r\n"
+                  "Connection: close\r\n\r\n"
+                : "HTTP/1.1 200 OK\r\n"
+                  "Content-Length: 2\r\n"
+                  "Connection: close\r\n\r\n";
+            send_all(client, headers, (int)strlen(headers));
+            send_all(client, "ok", 2);
+        }
+        shutdown(client, SD_BOTH);
+        closesocket(client);
+    }
+    MP_THREAD_RETURN();
+}
+
+static void init_loopback_server(struct loopback_server *server,
+                                 enum loopback_mode mode)
+{
+    *server = (struct loopback_server){
+        .listener = INVALID_SOCKET,
+        .mode = mode,
+    };
+    WSADATA data;
+    assert_int_equal(WSAStartup(MAKEWORD(2, 2), &data), 0);
+    server->listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    mp_require(server->listener != INVALID_SOCKET);
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = 0,
+    };
+    assert_int_equal(
+        bind(server->listener, (struct sockaddr *)&address, sizeof(address)),
+        0);
+    assert_int_equal(listen(server->listener, 2), 0);
+    int address_length = sizeof(address);
+    assert_int_equal(
+        getsockname(
+            server->listener, (struct sockaddr *)&address, &address_length),
+        0);
+    server->port = ntohs(address.sin_port);
+    server->release_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    mp_require(server->release_event);
+    assert_int_equal(
+        mp_thread_create(&server->thread, run_loopback_server, server), 0);
+}
+
+static void destroy_loopback_server(struct loopback_server *server)
+{
+    SetEvent(server->release_event);
+    shutdown(server->listener, SD_BOTH);
+    closesocket(server->listener);
+    mp_thread_join(server->thread);
+    CloseHandle(server->release_event);
+    WSACleanup();
+}
+
+static void wait_for_async_cleanup(void)
+{
+    int64_t deadline = GetTickCount64() + 2000;
+    while (whisper_translate_test_active_async_requests() != 0 &&
+           GetTickCount64() < deadline)
+    {
+        Sleep(1);
+    }
+    assert_int_equal(
+        whisper_translate_test_active_async_requests(), 0);
+}
 
 static int64_t fake_monotonic_ms(void *ctx)
 {
@@ -447,6 +617,10 @@ static void test_openai_strict_response_validation(void)
         &transport, 200, NULL,
         "{\"choices\":[{\"message\":{\"content\":\"first\","
         "\"content\":\"second\"}}]}");
+    add_text_plan(
+        &transport, 200, NULL,
+        "{\"choices\":[{\"message\":{\"content\":\"first\"}}],"
+        "\"choices\":[{\"message\":{\"content\":\"second\"}}]}");
     struct whisper_translator *translator = create_translator(
         WT_PROVIDER_OPENAI, "auto", "ko", &transport, &clock);
     mp_require(translator);
@@ -460,7 +634,10 @@ static void test_openai_strict_response_validation(void)
     whisper_translate_call(translator, tmp, "cue", &result);
     mp_require(!result.translated);
     assert_string_equal(result.error, "openai: empty content");
-    assert_int_equal(transport.calls, 3);
+    whisper_translate_call(translator, tmp, "cue", &result);
+    mp_require(!result.translated);
+    assert_string_equal(result.error, "openai: empty content");
+    assert_int_equal(transport.calls, 4);
     talloc_free(tmp);
     whisper_translator_destroy(&translator);
     destroy_transport(&transport);
@@ -712,6 +889,60 @@ static void test_transport_failures(void)
     talloc_free(tmp);
     whisper_translator_destroy(&translator);
     destroy_transport(&transport);
+}
+
+static void test_production_transport_total_deadline(void)
+{
+    enum loopback_mode modes[] = {
+        LOOPBACK_STALL,
+        LOOPBACK_SLOW_DRIP,
+    };
+    for (int n = 0; n < MP_ARRAY_SIZE(modes); n++) {
+        struct loopback_server server;
+        init_loopback_server(&server, modes[n]);
+        struct wt_test_winhttp_client *client =
+            whisper_translate_test_winhttp_create(
+                server.port, 300, true);
+        mp_require(client);
+        void *tmp = talloc_new(NULL);
+        struct wt_call_result result;
+        int64_t started = GetTickCount64();
+        whisper_translate_test_winhttp_call(client, tmp, &result);
+        int64_t elapsed = GetTickCount64() - started;
+        assert_true(result.http_issued);
+        assert_string_equal(result.error, "google: request timed out");
+        assert_true(elapsed >= 250);
+        assert_true(elapsed <= 1500);
+        whisper_translate_test_winhttp_destroy(&client);
+        talloc_free(tmp);
+        destroy_loopback_server(&server);
+        wait_for_async_cleanup();
+    }
+}
+
+static void test_production_transport_cookie_policy(void)
+{
+    for (int disabled = 0; disabled <= 1; disabled++) {
+        struct loopback_server server;
+        init_loopback_server(&server, LOOPBACK_COOKIE);
+        struct wt_test_winhttp_client *client =
+            whisper_translate_test_winhttp_create(
+                server.port, 2000, disabled);
+        mp_require(client);
+        void *tmp = talloc_new(NULL);
+        struct wt_call_result first;
+        struct wt_call_result second;
+        whisper_translate_test_winhttp_call(client, tmp, &first);
+        whisper_translate_test_winhttp_call(client, tmp, &second);
+        assert_string_equal(first.translated, "ok");
+        assert_string_equal(second.translated, "ok");
+        whisper_translate_test_winhttp_destroy(&client);
+        destroy_loopback_server(&server);
+        wait_for_async_cleanup();
+        assert_int_equal(
+            server.second_request_had_cookie, !disabled);
+        talloc_free(tmp);
+    }
 }
 
 static const char *rate_name(enum wt_provider provider)
@@ -1203,6 +1434,8 @@ static void run_offline_tests(void)
     test_openai_request_shape();
     test_input_bounds_and_languages();
     test_transport_failures();
+    test_production_transport_total_deadline();
+    test_production_transport_cookie_policy();
     test_common_rate_limit();
     test_retry_after_date_default_and_saturation();
     test_zero_retry_after_serialized_probe();

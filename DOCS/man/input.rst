@@ -3535,15 +3535,32 @@ Property list
     ``translate_provider``/``translate_to`` members of ``whisper-lookahead``
     retain their previous behavior.
 
-    HTTP response bodies are limited to 1 MiB and parsed as strict JSON. A
-    ``429`` activates a translator-wide cooldown before any later worker can
-    issue another request. Both delta-seconds and HTTP-date ``Retry-After``
-    values are honored without shortening a longer active deadline; a missing
-    or unusable value uses a finite 60-second default. Repeated non-rate
-    failures use a bounded exponential cooldown, and only an actual HTTP send
-    attempt consumes request budget or increments the failure count. After a
-    cooldown expires, one probe is admitted while concurrent workers remain
-    locally rejected.
+    HTTP response bodies are limited to 1 MiB and parsed as strict JSON;
+    duplicate object keys are rejected recursively. A ``429`` activates a
+    translator-wide cooldown before any later worker can issue another request.
+    Both delta-seconds and HTTP-date ``Retry-After`` values are honored without
+    shortening a longer active deadline; a missing or unusable value uses a
+    finite 60-second default. Repeated non-rate failures use a bounded
+    exponential cooldown, and only an actual HTTP send attempt consumes request
+    budget or increments the failure count. After a cooldown expires, one probe
+    is admitted while concurrent workers remain locally rejected. A valid zero
+    delta or non-future HTTP date skips the timed wait but still uses that
+    single serialized probe.
+
+    WinHTTP's resolve, connect, send, and receive timeouts remain configured as
+    secondary per-operation limits. Each Google or Bing request also has one
+    monotonic five-second total deadline spanning all phases and body reads;
+    ``ai`` uses its configured timeout, still capped at five seconds. Requests
+    use asynchronous WinHTTP cancellation, retain their context until the final
+    handle-closing callback, and disable redirects. Google and Bing additionally
+    disable WinHTTP cookies; the existing ``ai`` cookie behavior is unchanged.
+    See the Microsoft WinHTTP documentation for
+    `timeouts
+    <https://learn.microsoft.com/en-us/windows/win32/api/winhttp/nf-winhttp-winhttpsettimeouts>`_,
+    `concurrency
+    <https://learn.microsoft.com/en-us/windows/win32/winhttp/concurrency-in-winhttp>`_,
+    and `handle closure
+    <https://learn.microsoft.com/en-us/windows/win32/api/winhttp/nf-winhttp-winhttpclosehandle>`_.
 
 ``sub-translate`` (RW)
     Enable translation of the selected primary text subtitle. The default is

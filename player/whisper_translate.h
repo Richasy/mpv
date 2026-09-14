@@ -43,9 +43,8 @@ struct wt_openai_config {
                                 // translator stateless and safely callable
                                 // from multiple worker threads in parallel.
     int timeout_ms;             // per-request timeout; <=0 means default.
-                                // Hard-clamped to <= 5000 ms internally so
-                                // stop/seek can reliably interrupt within a
-                                // bounded delay.
+                                // Hard-clamped to <= 5000 ms and enforced as
+                                // one monotonic total request deadline.
     int max_tokens;             // 0 means: don't send max_tokens; <0 means default (128)
 };
 
@@ -62,7 +61,9 @@ struct whisper_translator;
 
 // Create a Google/Bing translator. The WT_PROVIDER_AZURE value is retained for
 // settings compatibility and selects Bing's Edge translation endpoint.
-// Caller owns the returned pointer.
+// Caller owns the returned pointer and must release it explicitly; the
+// talloc_parent argument is retained for source compatibility, while the
+// internal refcount governs asynchronous request lifetime.
 // source_lang: source language code (e.g. "auto", "en")
 // target_lang: target language code (e.g. "zh", "ja", "en")
 struct whisper_translator *whisper_translator_create(
@@ -70,8 +71,9 @@ struct whisper_translator *whisper_translator_create(
     enum wt_provider provider,
     const char *source_lang, const char *target_lang);
 
-// Create an OpenAI-compatible translator. Returns NULL on bad config
-// (missing endpoint/model/target_lang, unsupported scheme, etc.).
+// Create an OpenAI-compatible translator. Explicit release owns its lifetime
+// as above. Returns NULL on bad config (missing endpoint/model/target_lang,
+// unsupported scheme, etc.).
 struct whisper_translator *whisper_translator_create_openai(
     void *talloc_parent, struct mp_log *log,
     const struct wt_openai_config *cfg);

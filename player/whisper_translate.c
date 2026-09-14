@@ -416,33 +416,300 @@ static bool parse_endpoint_url(void *parent, const char *url,
 
 // --- HTTP request helpers ---
 
-static char *wide_to_utf8(void *talloc_ctx, const WCHAR *wide)
+static atomic_int active_async_requests;
+
+struct wt_async_request {
+    atomic_int refs;
+    struct whisper_translator *translator;
+    CRITICAL_SECTION lock;
+    HANDLE done_event;
+    HINTERNET connection;
+    HINTERNET request;
+    int64_t deadline_ms;
+    bool finished;
+    bool issued;
+    enum wt_http_failure failure;
+    enum wt_http_failure pending_failure;
+    int http_status;
+    char *retry_after;
+    unsigned char *body;
+    size_t body_len;
+    size_t pending_read;
+    bool has_content_length;
+    DWORD content_length;
+};
+
+static void async_request_release(struct wt_async_request *ctx);
+
+static void async_request_destroy(struct wt_async_request *ctx)
 {
-    if (!wide)
-        return NULL;
-    int len = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
-                                  wide, -1, NULL, 0, NULL, NULL);
-    if (len <= 0)
-        return NULL;
-    char *utf8 = talloc_array(talloc_ctx, char, len);
-    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
-                             wide, -1, utf8, len, NULL, NULL))
-    {
-        talloc_free(utf8);
-        return NULL;
-    }
-    return utf8;
+    if (ctx->connection)
+        WinHttpCloseHandle(ctx->connection);
+    if (ctx->done_event)
+        CloseHandle(ctx->done_event);
+    free(ctx->retry_after);
+    free(ctx->body);
+    DeleteCriticalSection(&ctx->lock);
+    whisper_translator_release(&ctx->translator);
+    atomic_fetch_sub_explicit(
+        &active_async_requests, 1, memory_order_acq_rel);
+    free(ctx);
 }
 
-static void winhttp_transport(void *ctx, void *talloc_ctx,
+static void async_request_addref(struct wt_async_request *ctx)
+{
+    atomic_fetch_add_explicit(&ctx->refs, 1, memory_order_acq_rel);
+}
+
+static void async_request_release(struct wt_async_request *ctx)
+{
+    if (atomic_fetch_sub_explicit(
+            &ctx->refs, 1, memory_order_acq_rel) == 1)
+    {
+        async_request_destroy(ctx);
+    }
+}
+
+static struct wt_async_request *async_request_create(
+    struct whisper_translator *tr, HINTERNET connection, HINTERNET request,
+    int64_t deadline_ms)
+{
+    struct wt_async_request *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx)
+        abort();
+    atomic_init(&ctx->refs, 1);
+    atomic_fetch_add_explicit(
+        &active_async_requests, 1, memory_order_acq_rel);
+    ctx->translator = whisper_translator_acquire(tr);
+    ctx->connection = connection;
+    ctx->request = request;
+    ctx->deadline_ms = deadline_ms;
+    ctx->failure = WT_HTTP_FAILURE_SETUP;
+    InitializeCriticalSection(&ctx->lock);
+    ctx->done_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!ctx->done_event) {
+        ctx->connection = NULL;
+        ctx->request = NULL;
+        async_request_release(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
+static void async_finish_locked(struct wt_async_request *ctx,
+                                enum wt_http_failure failure)
+{
+    if (ctx->finished)
+        return;
+    ctx->finished = true;
+    ctx->failure = failure;
+    SetEvent(ctx->done_event);
+}
+
+static void async_start_locked(struct wt_async_request *ctx,
+                               enum wt_http_failure failure, BOOL started)
+{
+    if (started)
+        return;
+    DWORD error = GetLastError();
+    if (error != ERROR_IO_PENDING)
+        async_finish_locked(ctx, failure);
+}
+
+static char *query_retry_after(HINTERNET request)
+{
+    DWORD size = 0;
+    if (WinHttpQueryHeaders(request, WINHTTP_QUERY_RETRY_AFTER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, NULL, &size,
+                            WINHTTP_NO_HEADER_INDEX) ||
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER ||
+        !size || size > WT_MAX_RESPONSE_BYTES)
+    {
+        return NULL;
+    }
+
+    WCHAR *wide = calloc(1, size);
+    if (!wide)
+        abort();
+    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_RETRY_AFTER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, wide, &size,
+                             WINHTTP_NO_HEADER_INDEX))
+    {
+        free(wide);
+        return NULL;
+    }
+    int length = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1, NULL, 0, NULL, NULL);
+    if (length <= 0) {
+        free(wide);
+        return NULL;
+    }
+    char *value = malloc(length);
+    if (!value)
+        abort();
+    if (!WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1,
+            value, length, NULL, NULL))
+    {
+        free(value);
+        value = NULL;
+    }
+    free(wide);
+    return value;
+}
+
+static void async_query_available_locked(struct wt_async_request *ctx)
+{
+    if (!ctx->request || ctx->finished)
+        return;
+    ctx->pending_failure = WT_HTTP_FAILURE_READ;
+    async_start_locked(
+        ctx, WT_HTTP_FAILURE_READ,
+        WinHttpQueryDataAvailable(ctx->request, NULL));
+}
+
+static void CALLBACK winhttp_status_callback(
+    HINTERNET handle, DWORD_PTR context, DWORD status,
+    LPVOID status_info, DWORD status_info_length)
+{
+    struct wt_async_request *ctx =
+        (struct wt_async_request *)context;
+    if (!ctx)
+        return;
+    if (status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) {
+        async_request_release(ctx);
+        return;
+    }
+
+    EnterCriticalSection(&ctx->lock);
+    if (ctx->finished) {
+        LeaveCriticalSection(&ctx->lock);
+        return;
+    }
+    if (translator_monotonic_ms(ctx->translator) >= ctx->deadline_ms) {
+        async_finish_locked(ctx, WT_HTTP_FAILURE_TIMEOUT);
+        LeaveCriticalSection(&ctx->lock);
+        return;
+    }
+
+    switch (status) {
+    case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE:
+        ctx->pending_failure = WT_HTTP_FAILURE_RECEIVE;
+        async_start_locked(
+            ctx, WT_HTTP_FAILURE_RECEIVE,
+            WinHttpReceiveResponse(handle, NULL));
+        break;
+    case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE: {
+        DWORD status_code = 0;
+        DWORD status_size = sizeof(status_code);
+        if (!WinHttpQueryHeaders(
+                handle,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &status_size,
+                WINHTTP_NO_HEADER_INDEX))
+        {
+            async_finish_locked(ctx, WT_HTTP_FAILURE_STATUS);
+            break;
+        }
+        ctx->http_status = (int)status_code;
+        ctx->retry_after = query_retry_after(handle);
+        if (status_code != 200) {
+            async_finish_locked(ctx, WT_HTTP_FAILURE_NONE);
+            break;
+        }
+
+        DWORD length_size = sizeof(ctx->content_length);
+        ctx->has_content_length = WinHttpQueryHeaders(
+            handle,
+            WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &ctx->content_length,
+            &length_size, WINHTTP_NO_HEADER_INDEX);
+        if (ctx->has_content_length &&
+            ctx->content_length > WT_MAX_RESPONSE_BYTES)
+        {
+            async_finish_locked(ctx, WT_HTTP_FAILURE_TOO_LARGE);
+            break;
+        }
+        async_query_available_locked(ctx);
+        break;
+    }
+    case WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE: {
+        if (!status_info || status_info_length != sizeof(DWORD)) {
+            async_finish_locked(ctx, WT_HTTP_FAILURE_READ);
+            break;
+        }
+        DWORD available = *(DWORD *)status_info;
+        if (!available) {
+            if (ctx->has_content_length &&
+                ctx->body_len != ctx->content_length)
+            {
+                async_finish_locked(ctx, WT_HTTP_FAILURE_READ);
+            } else {
+                async_finish_locked(ctx, WT_HTTP_FAILURE_NONE);
+            }
+            break;
+        }
+        if (available > WT_MAX_RESPONSE_BYTES - ctx->body_len) {
+            async_finish_locked(ctx, WT_HTTP_FAILURE_TOO_LARGE);
+            break;
+        }
+        unsigned char *body = realloc(
+            ctx->body, ctx->body_len + available + 1);
+        if (!body)
+            abort();
+        ctx->body = body;
+        ctx->pending_read = available;
+        ctx->pending_failure = WT_HTTP_FAILURE_READ;
+        async_start_locked(
+            ctx, WT_HTTP_FAILURE_READ,
+            WinHttpReadData(
+                handle, ctx->body + ctx->body_len, available, NULL));
+        break;
+    }
+    case WINHTTP_CALLBACK_STATUS_READ_COMPLETE:
+        if (!status_info_length ||
+            status_info_length > ctx->pending_read ||
+            ctx->body_len >
+                WT_MAX_RESPONSE_BYTES - status_info_length)
+        {
+            async_finish_locked(ctx, WT_HTTP_FAILURE_READ);
+            break;
+        }
+        ctx->body_len += status_info_length;
+        ctx->body[ctx->body_len] = '\0';
+        ctx->pending_read = 0;
+        async_query_available_locked(ctx);
+        break;
+    case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR:
+        async_finish_locked(
+            ctx, ctx->pending_failure
+                ? ctx->pending_failure : WT_HTTP_FAILURE_RECEIVE);
+        break;
+    }
+    LeaveCriticalSection(&ctx->lock);
+}
+
+static DWORD remaining_timeout_ms(int64_t deadline_ms, int64_t now_ms)
+{
+    if (deadline_ms <= now_ms)
+        return 0;
+    int64_t remaining = deadline_ms - now_ms;
+    return remaining > MAXDWORD ? MAXDWORD : (DWORD)remaining;
+}
+
+static void winhttp_transport(void *opaque, void *talloc_ctx,
                               const struct wt_http_request *request,
                               struct wt_http_response *response)
 {
-    struct whisper_translator *tr = ctx;
+    struct whisper_translator *tr = opaque;
     *response = (struct wt_http_response){
         .failure = WT_HTTP_FAILURE_SETUP,
     };
 
+    int timeout_ms = request->timeout_ms > 0
+        ? request->timeout_ms : WT_MAX_TIMEOUT_MS;
+    int64_t started_ms = translator_monotonic_ms(tr);
+    int64_t deadline_ms = saturated_add_ms(started_ms, timeout_ms);
     void *tmp = talloc_new(NULL);
     WCHAR *host = utf8_to_wide(tmp, request->host);
     WCHAR *method = utf8_to_wide(tmp, request->method);
@@ -459,14 +726,14 @@ static void winhttp_transport(void *ctx, void *talloc_ctx,
         return;
     }
 
-    HINTERNET connection = WinHttpConnect(session, host, request->port, 0);
+    HINTERNET connection = WinHttpConnect(
+        session, host, request->port, 0);
     if (!connection) {
         mp_warn(tr->log, "translate: WinHttpConnect failed (%lu)\n",
                 GetLastError());
         talloc_free(tmp);
         return;
     }
-
     DWORD flags = request->secure ? WINHTTP_FLAG_SECURE : 0;
     HINTERNET handle = WinHttpOpenRequest(
         connection, method, path, NULL, WINHTTP_NO_REFERER,
@@ -479,147 +746,112 @@ static void winhttp_transport(void *ctx, void *talloc_ctx,
         return;
     }
 
+    struct wt_async_request *ctx =
+        async_request_create(tr, connection, handle, deadline_ms);
+    if (!ctx) {
+        WinHttpCloseHandle(handle);
+        WinHttpCloseHandle(connection);
+        talloc_free(tmp);
+        return;
+    }
+
+    DWORD callback_flags =
+        WINHTTP_CALLBACK_FLAG_SENDREQUEST_COMPLETE |
+        WINHTTP_CALLBACK_FLAG_HEADERS_AVAILABLE |
+        WINHTTP_CALLBACK_FLAG_DATA_AVAILABLE |
+        WINHTTP_CALLBACK_FLAG_READ_COMPLETE |
+        WINHTTP_CALLBACK_FLAG_REQUEST_ERROR |
+        WINHTTP_CALLBACK_FLAG_HANDLES;
+    if (WinHttpSetStatusCallback(
+            handle, winhttp_status_callback, callback_flags, 0) ==
+        WINHTTP_INVALID_STATUS_CALLBACK)
+    {
+        ctx->request = NULL;
+        WinHttpCloseHandle(handle);
+        async_request_release(ctx);
+        talloc_free(tmp);
+        return;
+    }
+
+    DWORD_PTR context = (DWORD_PTR)ctx;
+    async_request_addref(ctx);
+    if (!WinHttpSetOption(handle, WINHTTP_OPTION_CONTEXT_VALUE,
+                          &context, sizeof(context)))
+    {
+        async_request_release(ctx);
+        ctx->request = NULL;
+        WinHttpCloseHandle(handle);
+        async_request_release(ctx);
+        talloc_free(tmp);
+        return;
+    }
+
     DWORD disabled_features = WINHTTP_DISABLE_REDIRECTS;
     if (request->disable_cookies)
         disabled_features |= WINHTTP_DISABLE_COOKIES;
-    if (!WinHttpSetOption(handle, WINHTTP_OPTION_DISABLE_FEATURE,
-                          &disabled_features, sizeof(disabled_features)))
-    {
-        mp_warn(tr->log, "translate: redirect policy setup failed (%lu)\n",
-                GetLastError());
-        WinHttpCloseHandle(handle);
-        WinHttpCloseHandle(connection);
-        talloc_free(tmp);
-        return;
+    bool setup_ok =
+        WinHttpSetOption(handle, WINHTTP_OPTION_DISABLE_FEATURE,
+                         &disabled_features, sizeof(disabled_features));
+    if (setup_ok && headers) {
+        setup_ok = WinHttpAddRequestHeaders(
+            handle, headers, (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
     }
 
-    if (headers &&
-        !WinHttpAddRequestHeaders(handle, headers, (DWORD)-1,
-                                  WINHTTP_ADDREQ_FLAG_ADD))
-    {
-        mp_warn(tr->log, "translate: request header setup failed (%lu)\n",
-                GetLastError());
-        WinHttpCloseHandle(handle);
-        WinHttpCloseHandle(connection);
-        talloc_free(tmp);
-        return;
+    EnterCriticalSection(&ctx->lock);
+    if (!setup_ok) {
+        async_finish_locked(ctx, WT_HTTP_FAILURE_SETUP);
+    } else if (translator_monotonic_ms(tr) >= deadline_ms) {
+        async_finish_locked(ctx, WT_HTTP_FAILURE_TIMEOUT);
+    } else {
+        ctx->issued = true;
+        ctx->pending_failure = WT_HTTP_FAILURE_SEND;
+        async_start_locked(
+            ctx, WT_HTTP_FAILURE_SEND,
+            WinHttpSendRequest(
+                handle, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                request->body_len
+                    ? (LPVOID)request->body
+                    : WINHTTP_NO_REQUEST_DATA,
+                (DWORD)request->body_len,
+                (DWORD)request->body_len, 0));
     }
+    LeaveCriticalSection(&ctx->lock);
 
-    response->http_issued = true;
-    BOOL ok = WinHttpSendRequest(
-        handle, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-        request->body_len ? (LPVOID)request->body : WINHTTP_NO_REQUEST_DATA,
-        (DWORD)request->body_len, (DWORD)request->body_len, 0);
-    if (!ok) {
-        response->failure = WT_HTTP_FAILURE_SEND;
-        mp_warn(tr->log, "translate: WinHttpSendRequest failed (%lu)\n",
-                GetLastError());
-        WinHttpCloseHandle(handle);
-        WinHttpCloseHandle(connection);
-        talloc_free(tmp);
-        return;
+    DWORD wait = remaining_timeout_ms(
+        deadline_ms, translator_monotonic_ms(tr));
+    DWORD wait_result = WaitForSingleObject(ctx->done_event, wait);
+    EnterCriticalSection(&ctx->lock);
+    if (!ctx->finished) {
+        async_finish_locked(
+            ctx, wait_result == WAIT_TIMEOUT
+                ? WT_HTTP_FAILURE_TIMEOUT
+                : WT_HTTP_FAILURE_RECEIVE);
     }
-
-    if (!WinHttpReceiveResponse(handle, NULL)) {
-        response->failure = WT_HTTP_FAILURE_RECEIVE;
-        mp_warn(tr->log, "translate: WinHttpReceiveResponse failed (%lu)\n",
-                GetLastError());
-        WinHttpCloseHandle(handle);
-        WinHttpCloseHandle(connection);
-        talloc_free(tmp);
-        return;
+    response->failure = ctx->failure;
+    response->http_issued = ctx->issued;
+    response->http_status = ctx->http_status;
+    if (ctx->retry_after)
+        response->retry_after =
+            talloc_strdup(talloc_ctx, ctx->retry_after);
+    if (ctx->body_len) {
+        response->body = talloc_memdup(
+            talloc_ctx, ctx->body, ctx->body_len);
+        response->body_len = ctx->body_len;
     }
+    HINTERNET request_handle = ctx->request;
+    ctx->request = NULL;
+    LeaveCriticalSection(&ctx->lock);
 
-    DWORD status_code = 0;
-    DWORD status_size = sizeof(status_code);
-    if (!WinHttpQueryHeaders(
-            handle, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &status_size,
-            WINHTTP_NO_HEADER_INDEX))
-    {
-        response->failure = WT_HTTP_FAILURE_STATUS;
-        mp_warn(tr->log, "translate: HTTP status query failed (%lu)\n",
-                GetLastError());
-        WinHttpCloseHandle(handle);
-        WinHttpCloseHandle(connection);
-        talloc_free(tmp);
-        return;
-    }
-    response->http_status = (int)status_code;
-
-    DWORD retry_size = 0;
-    if (!WinHttpQueryHeaders(handle, WINHTTP_QUERY_RETRY_AFTER,
-                             WINHTTP_HEADER_NAME_BY_INDEX, NULL, &retry_size,
-                             WINHTTP_NO_HEADER_INDEX) &&
-        GetLastError() == ERROR_INSUFFICIENT_BUFFER &&
-        retry_size <= 1024)
-    {
-        WCHAR *retry_wide = talloc_zero_size(tmp, retry_size);
-        if (WinHttpQueryHeaders(handle, WINHTTP_QUERY_RETRY_AFTER,
-                                WINHTTP_HEADER_NAME_BY_INDEX, retry_wide,
-                                &retry_size, WINHTTP_NO_HEADER_INDEX))
-        {
-            response->retry_after = wide_to_utf8(talloc_ctx, retry_wide);
+    // Async cancellation is requested only after publishing the NULL handle.
+    // HANDLE_CLOSING owns the callback reference and is WinHTTP's final use of
+    // the context.
+    if (request_handle) {
+        if (!WinHttpCloseHandle(request_handle)) {
+            mp_warn(tr->log, "translate: WinHttpCloseHandle failed (%lu)\n",
+                    GetLastError());
         }
     }
-
-    response->failure = WT_HTTP_FAILURE_NONE;
-    if (status_code != 200)
-        goto done;
-
-    DWORD content_length = 0;
-    DWORD length_size = sizeof(content_length);
-    bool has_content_length = WinHttpQueryHeaders(
-        handle, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
-        WINHTTP_HEADER_NAME_BY_INDEX, &content_length, &length_size,
-        WINHTTP_NO_HEADER_INDEX);
-    if (has_content_length && content_length > WT_MAX_RESPONSE_BYTES)
-    {
-        response->failure = WT_HTTP_FAILURE_TOO_LARGE;
-        goto done;
-    }
-
-    unsigned char *body = talloc_array(talloc_ctx, unsigned char, 1);
-    size_t total = 0;
-    body[0] = '\0';
-    while (true) {
-        DWORD available = 0;
-        if (!WinHttpQueryDataAvailable(handle, &available)) {
-            response->failure = WT_HTTP_FAILURE_READ;
-            talloc_free(body);
-            goto done;
-        }
-        if (!available)
-            break;
-        if (available > WT_MAX_RESPONSE_BYTES - total) {
-            response->failure = WT_HTTP_FAILURE_TOO_LARGE;
-            talloc_free(body);
-            goto done;
-        }
-        body = talloc_realloc(talloc_ctx, body, unsigned char,
-                              total + available + 1);
-        DWORD read = 0;
-        if (!WinHttpReadData(handle, body + total, available, &read) ||
-            !read || read > available)
-        {
-            response->failure = WT_HTTP_FAILURE_READ;
-            talloc_free(body);
-            goto done;
-        }
-        total += read;
-        body[total] = '\0';
-    }
-    if (has_content_length && total != content_length) {
-        response->failure = WT_HTTP_FAILURE_READ;
-        talloc_free(body);
-        goto done;
-    }
-    response->body = body;
-    response->body_len = total;
-
-done:
-    WinHttpCloseHandle(handle);
-    WinHttpCloseHandle(connection);
+    async_request_release(ctx);
     talloc_free(tmp);
 }
 
@@ -837,6 +1069,9 @@ static bool perform_http(struct whisper_translator *tr, void *talloc_ctx,
         return false;
     case WT_HTTP_FAILURE_TOO_LARGE:
         set_err(out, "%s: response too large", name);
+        return false;
+    case WT_HTTP_FAILURE_TIMEOUT:
+        set_err(out, "%s: request timed out", name);
         return false;
     }
 
@@ -1546,10 +1781,13 @@ static struct whisper_translator *translator_alloc(
     void *talloc_parent, struct mp_log *log, enum wt_provider provider,
     const char *source_lang, const char *target_lang)
 {
+    (void)talloc_parent;
     if (!target_lang || !target_lang[0])
         return NULL;
-    struct whisper_translator *tr = talloc_zero(talloc_parent,
-                                                struct whisper_translator);
+    // Lifetime is governed by the explicit refcount so an asynchronous
+    // request can safely finish closing after its owner releases the backend.
+    struct whisper_translator *tr =
+        talloc_zero(NULL, struct whisper_translator);
     tr->log = log;
     tr->provider = provider;
     tr->source_lang = talloc_strdup(
@@ -1615,7 +1853,7 @@ struct whisper_translator *whisper_translator_create(
     WCHAR *ua = utf8_to_wide(NULL, WT_EXTERNAL_USER_AGENT);
     tr->session = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS,
-                               0);
+                               WINHTTP_FLAG_ASYNC);
     talloc_free(ua);
 
     if (!tr->session) {
@@ -1625,9 +1863,18 @@ struct whisper_translator *whisper_translator_create(
         return NULL;
     }
 
-    // Hard-clamp receive timeout to WT_MAX_TIMEOUT_MS so stop/seek can
-    // interrupt any in-flight HTTP within bounded time.
-    WinHttpSetTimeouts(tr->session, 5000, 5000, WT_MAX_TIMEOUT_MS, WT_MAX_TIMEOUT_MS);
+    if (!WinHttpSetTimeouts(
+            tr->session, WT_MAX_TIMEOUT_MS, WT_MAX_TIMEOUT_MS,
+            WT_MAX_TIMEOUT_MS, WT_MAX_TIMEOUT_MS))
+    {
+        mp_err(log, "translate: WinHttpSetTimeouts failed (%lu)\n",
+               GetLastError());
+        WinHttpCloseHandle(tr->session);
+        tr->session = NULL;
+        mp_mutex_destroy(&tr->state_lock);
+        talloc_free(tr);
+        return NULL;
+    }
 
     mp_info(log, "translate: created %s translator (%s -> %s)\n",
             provider == WT_PROVIDER_GOOGLE ? "google" : "azure",
@@ -1661,7 +1908,8 @@ struct whisper_translator *whisper_translator_create_openai(
     WCHAR *ua = utf8_to_wide(NULL, WT_OPENAI_USER_AGENT);
     tr->session_noproxy = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_NO_PROXY,
                                        WINHTTP_NO_PROXY_NAME,
-                                       WINHTTP_NO_PROXY_BYPASS, 0);
+                                       WINHTTP_NO_PROXY_BYPASS,
+                                       WINHTTP_FLAG_ASYNC);
     talloc_free(ua);
 
     if (!tr->session_noproxy) {
@@ -1674,7 +1922,17 @@ struct whisper_translator *whisper_translator_create_openai(
 
     int recv_to = tr->oa_timeout_ms;
     if (recv_to < 1000) recv_to = 1000;
-    WinHttpSetTimeouts(tr->session_noproxy, 5000, 5000, recv_to, recv_to);
+    if (!WinHttpSetTimeouts(
+            tr->session_noproxy, 5000, 5000, recv_to, recv_to))
+    {
+        mp_err(log, "translate: WinHttpSetTimeouts (NO_PROXY) failed (%lu)\n",
+               GetLastError());
+        WinHttpCloseHandle(tr->session_noproxy);
+        tr->session_noproxy = NULL;
+        mp_mutex_destroy(&tr->state_lock);
+        talloc_free(tr);
+        return NULL;
+    }
 
     mp_info(log, "translate: created openai translator (model=%s, %s -> %s, "
                  "timeout=%dms, %s://%s:%d%s)\n",
@@ -1732,6 +1990,98 @@ struct whisper_translator *whisper_translator_create_for_test(
 size_t whisper_translate_test_max_response_bytes(void)
 {
     return WT_MAX_RESPONSE_BYTES;
+}
+
+struct wt_test_winhttp_client {
+    struct whisper_translator *translator;
+    int port;
+    int timeout_ms;
+    bool disable_cookies;
+};
+
+struct wt_test_winhttp_client *whisper_translate_test_winhttp_create(
+    int port, int timeout_ms, bool disable_cookies)
+{
+    if (port <= 0 || port > 65535 || timeout_ms <= 0)
+        return NULL;
+    struct wt_test_winhttp_client *client =
+        talloc_zero(NULL, struct wt_test_winhttp_client);
+    client->translator = translator_alloc(
+        client, NULL, WT_PROVIDER_GOOGLE, "auto", "ko");
+    if (!client->translator) {
+        talloc_free(client);
+        return NULL;
+    }
+
+    WCHAR *user_agent = utf8_to_wide(NULL, WT_EXTERNAL_USER_AGENT);
+    client->translator->session_noproxy = WinHttpOpen(
+        user_agent, WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS,
+        WINHTTP_FLAG_ASYNC);
+    talloc_free(user_agent);
+    int phase_timeout = timeout_ms < 1000 ? 1000 : timeout_ms;
+    if (!client->translator->session_noproxy ||
+        !WinHttpSetTimeouts(
+            client->translator->session_noproxy,
+            phase_timeout, phase_timeout, phase_timeout, phase_timeout))
+    {
+        whisper_translator_destroy(&client->translator);
+        talloc_free(client);
+        return NULL;
+    }
+    client->port = port;
+    client->timeout_ms = timeout_ms;
+    client->disable_cookies = disable_cookies;
+    return client;
+}
+
+void whisper_translate_test_winhttp_call(
+    struct wt_test_winhttp_client *client, void *talloc_ctx,
+    struct wt_call_result *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!client) {
+        set_err(out, "google: request setup failed");
+        return;
+    }
+    static const char body[] = "synthetic";
+    struct wt_http_request request = {
+        .host = "127.0.0.1",
+        .port = client->port,
+        .secure = false,
+        .method = "POST",
+        .path = "/synthetic",
+        .headers = "Content-Type: text/plain; charset=utf-8\r\n",
+        .body = body,
+        .body_len = sizeof(body) - 1,
+        .proxy_mode = WT_HTTP_PROXY_NONE,
+        .disable_cookies = client->disable_cookies,
+        .timeout_ms = client->timeout_ms,
+    };
+    struct wt_http_observation observation = {0};
+    char *response = NULL;
+    if (perform_http(
+            client->translator, talloc_ctx, &request, out,
+            &observation, &response))
+    {
+        out->translated = response;
+    }
+}
+
+void whisper_translate_test_winhttp_destroy(
+    struct wt_test_winhttp_client **client)
+{
+    if (!client || !*client)
+        return;
+    whisper_translator_destroy(&(*client)->translator);
+    talloc_free(*client);
+    *client = NULL;
+}
+
+int whisper_translate_test_active_async_requests(void)
+{
+    return atomic_load_explicit(
+        &active_async_requests, memory_order_acquire);
 }
 
 struct whisper_translator *whisper_translator_acquire(

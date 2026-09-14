@@ -114,7 +114,7 @@ translation_provider = executable(
     'translation_provider.c',
     include_directories: incdir,
     objects: libmpv.extract_objects('player/whisper_translate.c'),
-    dependencies: [cc.find_library('winhttp')],
+    dependencies: [cc.find_library('winhttp'), cc.find_library('ws2_32')],
     link_with: test_utils,
 )
 test('translation-provider', translation_provider)

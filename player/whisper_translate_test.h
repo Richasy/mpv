@@ -39,6 +39,7 @@ enum wt_http_failure {
     WT_HTTP_FAILURE_STATUS,
     WT_HTTP_FAILURE_READ,
     WT_HTTP_FAILURE_TOO_LARGE,
+    WT_HTTP_FAILURE_TIMEOUT,
 };
 
 struct wt_http_request {
@@ -84,5 +85,18 @@ struct whisper_translator *whisper_translator_create_for_test(
     const struct wt_test_hooks *hooks);
 
 size_t whisper_translate_test_max_response_bytes(void);
+
+struct wt_test_winhttp_client;
+
+// Fixed 127.0.0.1:/synthetic harness for the ordinary WinHTTP transport.
+// Only the ephemeral fixture port, total deadline, and cookie policy vary.
+struct wt_test_winhttp_client *whisper_translate_test_winhttp_create(
+    int port, int timeout_ms, bool disable_cookies);
+void whisper_translate_test_winhttp_call(
+    struct wt_test_winhttp_client *client, void *talloc_ctx,
+    struct wt_call_result *out);
+void whisper_translate_test_winhttp_destroy(
+    struct wt_test_winhttp_client **client);
+int whisper_translate_test_active_async_requests(void);
 
 #endif

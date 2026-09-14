@@ -373,23 +373,21 @@ static bool update_pkt_cache(struct dec_sub *sub, double video_pts)
 }
 
 static double subtitle_read_until(struct dec_sub *sub, double video_pts,
-                                  bool force, bool *translation_only)
+                                  bool force)
 {
-    if (translation_only)
-        *translation_only = false;
     double delay = subtitle_delay(sub);
-    double read_until =
-        delay < 0 || force ? video_pts : MP_NOPTS_VALUE;
-    if (read_until == MP_NOPTS_VALUE &&
-        sub->play_dir > 0 && sub->text_cue_callback &&
+    return delay < 0 || force ? video_pts : MP_NOPTS_VALUE;
+}
+
+static double subtitle_read_ahead_until(struct dec_sub *sub, double video_pts)
+{
+    if (sub->play_dir > 0 && sub->text_cue_callback &&
         isfinite(sub->text_cue_read_until) &&
         sub->text_cue_read_until > video_pts)
     {
-        read_until = sub->text_cue_read_until;
-        if (translation_only)
-            *translation_only = true;
+        return sub->text_cue_read_until;
     }
-    return read_until;
+    return MP_NOPTS_VALUE;
 }
 
 // Read packets from the demuxer stream passed to sub_create(). Signals if
@@ -419,21 +417,20 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
             break;
 
         // (Use this mechanism only if sub_delay matters to avoid corner cases.)
-        bool translation_only = false;
-        double min_pts = subtitle_read_until(
-            sub, video_pts, force, &translation_only);
+        double min_pts = subtitle_read_until(sub, video_pts, force);
+        double read_ahead_pts = subtitle_read_ahead_until(sub, video_pts);
 
         struct demux_packet *pkt;
         int st = demux_read_packet_async_until(sub->sh, min_pts, &pkt);
+        demux_request_read_ahead(sub->sh, read_ahead_pts);
         // Note: "wait" (st==0) happens with non-interleaved streams only, and
         // then we should stop the playloop until a new enough packet has been
         // seen (or the subtitle decoder's queue is full). This usually does not
         // happen for interleaved subtitle streams, which never return "wait"
         // when reading, unless min_pts is set.
         if (st <= 0) {
-            // Translation lookahead drives demuxing but never delays playback.
             *packets_read =
-                translation_only || st < 0 ||
+                st < 0 ||
                 (sub->last_pkt_pts != MP_NOPTS_VALUE &&
                  sub->last_pkt_pts > video_pts);
             break;
@@ -785,7 +782,7 @@ void sub_test_packet_timing(const char *codec_profile,
         .visible = visible,
         .sub_updated = advanced || sub.sub_visible != visible,
         .cached_packet_index = sub.cached_pkt_pos,
-        .read_until = subtitle_read_until(&sub, video_pts, force, NULL),
+        .read_until = subtitle_read_until(&sub, video_pts, force),
     };
 
     for (int n = 0; n < 2; n++)

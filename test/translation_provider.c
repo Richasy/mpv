@@ -18,6 +18,7 @@
 #include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <winsock2.h>
@@ -76,6 +77,18 @@ struct call_thread {
     struct wt_call_result result;
     void *tmp;
 };
+
+static void configure_process_local_failure_policy(void)
+{
+    SetErrorMode(
+        GetErrorMode() |
+        SEM_FAILCRITICALERRORS |
+        SEM_NOGPFAULTERRORBOX |
+        SEM_NOOPENFILEERRORBOX);
+    _set_error_mode(_OUT_TO_STDERR);
+    _set_abort_behavior(
+        0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+}
 
 enum loopback_mode {
     LOOPBACK_STALL,
@@ -1509,6 +1522,7 @@ static int run_live_smoke(enum wt_provider provider)
 
 int main(int argc, char **argv)
 {
+    configure_process_local_failure_policy();
     if (argc == 1) {
         run_offline_tests();
         return 0;

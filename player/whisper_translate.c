@@ -52,6 +52,8 @@
 #define WT_PROBE_WAIT_MS          1000
 #define WT_MAX_INPUT_CODEPOINTS   5000
 #define WT_MAX_RESPONSE_BYTES     (1024 * 1024)
+#define WT_EXTERNAL_USER_AGENT    "mpv-subtitle-translation/1.0"
+#define WT_OPENAI_USER_AGENT      "mpv-whisper/1.0"
 
 enum wt_cooldown_kind {
     WT_COOLDOWN_NONE,
@@ -1561,7 +1563,7 @@ struct whisper_translator *whisper_translator_create(
     if (!tr)
         return NULL;
 
-    WCHAR *ua = utf8_to_wide(NULL, "mpv-whisper/1.0");
+    WCHAR *ua = utf8_to_wide(NULL, WT_EXTERNAL_USER_AGENT);
     tr->session = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS,
                                0);
@@ -1607,7 +1609,7 @@ struct whisper_translator *whisper_translator_create_openai(
 
     // Default-proxy session is unused for openai but kept NULL-safe.
     // Use NO_PROXY for loopback / local services.
-    WCHAR *ua = utf8_to_wide(NULL, "mpv-whisper/1.0");
+    WCHAR *ua = utf8_to_wide(NULL, WT_OPENAI_USER_AGENT);
     tr->session_noproxy = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_NO_PROXY,
                                        WINHTTP_NO_PROXY_NAME,
                                        WINHTTP_NO_PROXY_BYPASS, 0);

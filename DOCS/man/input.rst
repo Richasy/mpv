@@ -3475,8 +3475,9 @@ Property list
         translation endpoint and is not the official paid Azure Translator
         API. Neither provider performs token, cookie, consent-page, browser
         impersonation, or endpoint fallback flows. The fixed hosts use normal
-        TLS validation and the configured system proxy. The ``ai`` provider
-        retains its existing no-proxy behavior for loopback-compatible
+        TLS validation, the configured system proxy, and the honest
+        ``mpv-subtitle-translation/1.0`` user agent. The ``ai`` provider retains
+        its existing no-proxy behavior and user agent for loopback-compatible
         endpoints.
 
         Google and Bing requests reject invalid UTF-8 and cues above 5000

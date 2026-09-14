@@ -81,6 +81,7 @@ struct dec_sub {
     struct sd *sd;
     sub_text_cue_fn text_cue_callback;
     void *text_cue_callback_ctx;
+    double text_cue_read_until;
 
     struct demux_packet *new_segment;
     struct demux_packet **cached_pkts;
@@ -244,6 +245,7 @@ struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
         .order = order,
         .last_pkt_pts = MP_NOPTS_VALUE,
         .last_vo_pts = MP_NOPTS_VALUE,
+        .text_cue_read_until = MP_NOPTS_VALUE,
         .start = MP_NOPTS_VALUE,
         .end = MP_NOPTS_VALUE,
     };
@@ -371,10 +373,23 @@ static bool update_pkt_cache(struct dec_sub *sub, double video_pts)
 }
 
 static double subtitle_read_until(struct dec_sub *sub, double video_pts,
-                                  bool force)
+                                  bool force, bool *translation_only)
 {
+    if (translation_only)
+        *translation_only = false;
     double delay = subtitle_delay(sub);
-    return delay < 0 || force ? video_pts : MP_NOPTS_VALUE;
+    double read_until =
+        delay < 0 || force ? video_pts : MP_NOPTS_VALUE;
+    if (read_until == MP_NOPTS_VALUE &&
+        sub->play_dir > 0 && sub->text_cue_callback &&
+        isfinite(sub->text_cue_read_until) &&
+        sub->text_cue_read_until > video_pts)
+    {
+        read_until = sub->text_cue_read_until;
+        if (translation_only)
+            *translation_only = true;
+    }
+    return read_until;
 }
 
 // Read packets from the demuxer stream passed to sub_create(). Signals if
@@ -404,7 +419,9 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
             break;
 
         // (Use this mechanism only if sub_delay matters to avoid corner cases.)
-        double min_pts = subtitle_read_until(sub, video_pts, force);
+        bool translation_only = false;
+        double min_pts = subtitle_read_until(
+            sub, video_pts, force, &translation_only);
 
         struct demux_packet *pkt;
         int st = demux_read_packet_async_until(sub->sh, min_pts, &pkt);
@@ -414,8 +431,11 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
         // happen for interleaved subtitle streams, which never return "wait"
         // when reading, unless min_pts is set.
         if (st <= 0) {
-            *packets_read = st < 0 || (sub->last_pkt_pts != MP_NOPTS_VALUE &&
-                                       sub->last_pkt_pts > video_pts);
+            // Translation lookahead drives demuxing but never delays playback.
+            *packets_read =
+                translation_only || st < 0 ||
+                (sub->last_pkt_pts != MP_NOPTS_VALUE &&
+                 sub->last_pkt_pts > video_pts);
             break;
         }
 
@@ -532,6 +552,7 @@ void sub_reset(struct dec_sub *sub)
         sub->sd->driver->reset(sub->sd);
     sub->last_pkt_pts = MP_NOPTS_VALUE;
     sub->last_vo_pts = MP_NOPTS_VALUE;
+    sub->text_cue_read_until = MP_NOPTS_VALUE;
     destroy_cached_pkts(sub);
     demux_packet_pool_push(sub->packet_pool, sub->new_segment);
     sub->new_segment = NULL;
@@ -694,6 +715,8 @@ bool sub_set_text_cue_callback(struct dec_sub *sub,
     bool supported = sub->sd && sub->sd->driver->emit_text_cues;
     sub->text_cue_callback = supported ? callback : NULL;
     sub->text_cue_callback_ctx = supported ? callback_ctx : NULL;
+    if (!sub->text_cue_callback)
+        sub->text_cue_read_until = MP_NOPTS_VALUE;
     if (sub->sd) {
         sub->sd->text_cue_callback =
             sub->text_cue_callback ? dispatch_text_cue : NULL;
@@ -762,7 +785,7 @@ void sub_test_packet_timing(const char *codec_profile,
         .visible = visible,
         .sub_updated = advanced || sub.sub_visible != visible,
         .cached_packet_index = sub.cached_pkt_pos,
-        .read_until = subtitle_read_until(&sub, video_pts, force),
+        .read_until = subtitle_read_until(&sub, video_pts, force, NULL),
     };
 
     for (int n = 0; n < 2; n++)
@@ -778,6 +801,10 @@ bool sub_emit_text_cues(struct dec_sub *sub, double start, double end)
     if (supported && sub->text_cue_callback) {
         double mapped_start = pts_to_subtitle(sub, start);
         double mapped_end = pts_to_subtitle(sub, end);
+        sub->text_cue_read_until =
+            isfinite(mapped_start) && isfinite(mapped_end)
+                ? MPMAX(mapped_start, mapped_end)
+                : MP_NOPTS_VALUE;
         sub->sd->driver->emit_text_cues(
             sub->sd, MPMIN(mapped_start, mapped_end),
             MPMAX(mapped_start, mapped_end));

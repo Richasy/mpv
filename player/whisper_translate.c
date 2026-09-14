@@ -1989,13 +1989,14 @@ static char *google_extract_translation(void *talloc_ctx,
     void *tmp = talloc_new(NULL);
     struct mpv_node root = {0};
     if (!parse_json_document(tmp, response, &root) ||
-        root.format != MPV_FORMAT_NODE_MAP)
+        root.format != MPV_FORMAT_NODE_ARRAY || !root.u.list ||
+        root.u.list->num == 0)
     {
         talloc_free(tmp);
         return NULL;
     }
-    struct mpv_node *sentences = node_map_get(&root, "sentences");
-    if (!sentences || sentences->format != MPV_FORMAT_NODE_ARRAY ||
+    struct mpv_node *sentences = &root.u.list->values[0];
+    if (sentences->format != MPV_FORMAT_NODE_ARRAY ||
         !sentences->u.list)
     {
         talloc_free(tmp);
@@ -2006,36 +2007,22 @@ static char *google_extract_translation(void *talloc_ctx,
     bool found_nonempty = false;
     for (int n = 0; n < sentences->u.list->num; n++) {
         struct mpv_node *sentence = &sentences->u.list->values[n];
-        if (sentence->format != MPV_FORMAT_NODE_MAP) {
-            talloc_free(translated);
-            talloc_free(tmp);
-            return NULL;
-        }
-        struct mpv_node *trans = node_map_get(sentence, "trans");
-        struct mpv_node *translit = node_map_get(sentence, "translit");
-        struct mpv_node *src_translit =
-            node_map_get(sentence, "src_translit");
-        if ((translit && translit->format != MPV_FORMAT_STRING) ||
-            (src_translit && src_translit->format != MPV_FORMAT_STRING))
+        if (sentence->format != MPV_FORMAT_NODE_ARRAY ||
+            !sentence->u.list || sentence->u.list->num == 0)
         {
             talloc_free(translated);
             talloc_free(tmp);
             return NULL;
         }
-        if (trans) {
-            if (trans->format != MPV_FORMAT_STRING || !trans->u.string) {
-                talloc_free(translated);
-                talloc_free(tmp);
-                return NULL;
-            }
-            translated = talloc_asprintf_append(
-                translated, "%s", trans->u.string);
-            found_nonempty |= trans->u.string[0] != '\0';
-        } else if (!translit && !src_translit) {
+        struct mpv_node *trans = &sentence->u.list->values[0];
+        if (trans->format != MPV_FORMAT_STRING || !trans->u.string) {
             talloc_free(translated);
             talloc_free(tmp);
             return NULL;
         }
+        translated = talloc_asprintf_append(
+            translated, "%s", trans->u.string);
+        found_nonempty |= trans->u.string[0] != '\0';
     }
     talloc_free(tmp);
     if (!found_nonempty) {
@@ -2074,18 +2061,17 @@ static char *translate_google(struct whisper_translator *tr,
         talloc_free(tmp);
         return NULL;
     }
-    char *body = talloc_asprintf(
-        tmp, "sl=%s&tl=%s&q=%s", encoded_sl, encoded_tl, encoded_text);
+    char *path = talloc_asprintf(
+        tmp, "/translate_a/single?client=gtx&sl=%s&tl=%s&dt=t"
+             "&ie=UTF-8&oe=UTF-8&q=%s",
+        encoded_sl, encoded_tl, encoded_text);
     struct wt_http_request request = {
-        .host = "translate.google.com",
+        .host = "translate.googleapis.com",
         .port = INTERNET_DEFAULT_HTTPS_PORT,
         .secure = true,
-        .method = "POST",
-        .path = "/translate_a/single?client=at&dt=t&dt=rm&dj=1",
-        .headers =
-            "Content-Type: application/x-www-form-urlencoded;charset=utf-8\r\n",
-        .body = body,
-        .body_len = strlen(body),
+        .method = "GET",
+        .path = path,
+        .headers = "Accept: application/json\r\n",
         .proxy_mode = WT_HTTP_PROXY_DEFAULT,
         .disable_cookies = true,
         .timeout_ms = WT_MAX_TIMEOUT_MS,

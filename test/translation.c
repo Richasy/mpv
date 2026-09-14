@@ -34,6 +34,7 @@ struct fake_backend {
     bool block;
     bool released;
     bool fail;
+    bool http_issued;
     int entered;
     int exited;
     int calls;
@@ -204,7 +205,7 @@ static void fake_call(void *ctx, void *talloc_ctx, const char *text,
     mp_cond_broadcast(&backend->condition);
     mp_mutex_unlock(&backend->lock);
 
-    out->http_issued = true;
+    out->http_issued = backend->http_issued;
     if (fail) {
         snprintf(out->error, sizeof(out->error), "fake failure");
     } else {
@@ -267,7 +268,10 @@ static void clear_collector(struct collector *collector)
 
 static void init_backend(struct fake_backend *backend, const char *prefix)
 {
-    *backend = (struct fake_backend){.prefix = prefix};
+    *backend = (struct fake_backend){
+        .prefix = prefix,
+        .http_issued = true,
+    };
     mp_mutex_init(&backend->lock);
     mp_cond_init(&backend->condition);
 }
@@ -565,6 +569,161 @@ static void test_errors_and_cancellation(void)
     mp_mutex_destroy(&wake.lock);
 }
 
+static void test_budget_rollback_survives_backend_replacement(void)
+{
+    struct wake_state wake = {0};
+    mp_mutex_init(&wake.lock);
+    mp_cond_init(&wake.condition);
+    struct fake_backend old_backend;
+    struct fake_backend new_backend;
+    init_backend(&old_backend, "old:");
+    init_backend(&new_backend, "new:");
+    old_backend.block = true;
+    old_backend.http_issued = false;
+    struct mp_translation *translation =
+        create_translation(&wake, &old_backend);
+    struct mp_translation_limits limits = {
+        .enabled = true,
+        .horizon_sec = 60,
+        .reuse_cache_capacity = 0,
+        .rpm_limit = 1,
+        .session_request_limit = 1,
+    };
+    mp_translation_set_limits(translation, &limits);
+    struct collector collector = {0};
+
+    int previous = wake.count;
+    assert_int_equal(
+        mp_translation_submit(
+            translation, MP_TRANSLATION_SOURCE_SUBTITLE,
+            20, 1, "old", 5, 2, 0),
+        MP_TRANSLATION_SUBMIT_QUEUED);
+    wait_for_backend(&old_backend, false);
+
+    mp_translation_set_backend(translation, &fake_ops, &new_backend);
+    mp_mutex_lock(&old_backend.lock);
+    old_backend.released = true;
+    mp_cond_broadcast(&old_backend.condition);
+    mp_mutex_unlock(&old_backend.lock);
+    wait_for_backend(&old_backend, true);
+    wait_for_wake(&wake, previous);
+    mp_translation_drain(
+        translation, MP_TRANSLATION_SOURCE_SUBTITLE,
+        collect_result, &collector);
+    assert_int_equal(collector.count, 0);
+
+    previous = wake.count;
+    assert_int_equal(
+        mp_translation_submit(
+            translation, MP_TRANSLATION_SOURCE_SUBTITLE,
+            21, 1, "successor", 8, 2, 0),
+        MP_TRANSLATION_SUBMIT_QUEUED);
+    wait_for_wake(&wake, previous);
+    mp_translation_drain(
+        translation, MP_TRANSLATION_SOURCE_SUBTITLE,
+        collect_result, &collector);
+    assert_int_equal(collector.count, 1);
+    assert_string_equal(collector.results[0].translated, "new:successor");
+    assert_int_equal(new_backend.calls, 1);
+    clear_collector(&collector);
+
+    mp_translation_destroy(&translation);
+    uninit_backend(&old_backend);
+    uninit_backend(&new_backend);
+    mp_cond_destroy(&wake.condition);
+    mp_mutex_destroy(&wake.lock);
+}
+
+static void test_budget_rollback_does_not_cross_session_reset(void)
+{
+    struct wake_state wake = {0};
+    mp_mutex_init(&wake.lock);
+    mp_cond_init(&wake.condition);
+    struct fake_backend old_backend;
+    struct fake_backend new_backend;
+    init_backend(&old_backend, "old:");
+    init_backend(&new_backend, "new:");
+    old_backend.block = true;
+    old_backend.http_issued = false;
+    new_backend.block = true;
+    struct mp_translation *translation =
+        create_translation(&wake, &old_backend);
+    struct mp_translation_limits limits = {
+        .enabled = true,
+        .horizon_sec = 60,
+        .reuse_cache_capacity = 0,
+        .session_request_limit = 1,
+    };
+    mp_translation_set_limits(translation, &limits);
+    struct collector collector = {0};
+
+    int previous = wake.count;
+    mp_translation_submit(
+        translation, MP_TRANSLATION_SOURCE_SUBTITLE,
+        30, 1, "old", 5, 2, 0);
+    wait_for_backend(&old_backend, false);
+
+    assert_int_equal(
+        mp_translation_configure_legacy_whisper(
+            translation, WT_PROVIDER_NONE, NULL, NULL, NULL,
+            "{\"enabled\":true,\"horizon_sec\":60,"
+            "\"seek_debounce_ms\":0,\"reuse_cache_capacity\":0,"
+            "\"session_request_limit\":1}"),
+        0);
+    mp_translation_set_backend(translation, &fake_ops, &new_backend);
+
+    mp_translation_submit(
+        translation, MP_TRANSLATION_SOURCE_SUBTITLE,
+        31, 1, "reserved", 8, 2, 0);
+    wait_for_backend(&new_backend, false);
+
+    mp_mutex_lock(&old_backend.lock);
+    old_backend.released = true;
+    mp_cond_broadcast(&old_backend.condition);
+    mp_mutex_unlock(&old_backend.lock);
+    wait_for_backend(&old_backend, true);
+    wait_for_wake(&wake, previous);
+    mp_translation_drain(
+        translation, MP_TRANSLATION_SOURCE_SUBTITLE,
+        collect_result, &collector);
+    assert_int_equal(collector.count, 0);
+
+    previous = wake.count;
+    mp_translation_submit(
+        translation, MP_TRANSLATION_SOURCE_SUBTITLE,
+        32, 1, "over-budget", 10, 2, 0);
+    wait_for_wake(&wake, previous);
+    mp_translation_drain(
+        translation, MP_TRANSLATION_SOURCE_SUBTITLE,
+        collect_result, &collector);
+    assert_int_equal(collector.count, 1);
+    assert_int_equal(
+        collector.results[0].kind,
+        MP_TRANSLATION_RESULT_FALLBACK_BUDGET);
+    assert_int_equal(new_backend.calls, 1);
+    clear_collector(&collector);
+
+    previous = wake.count;
+    mp_mutex_lock(&new_backend.lock);
+    new_backend.released = true;
+    mp_cond_broadcast(&new_backend.condition);
+    mp_mutex_unlock(&new_backend.lock);
+    wait_for_backend(&new_backend, true);
+    wait_for_wake(&wake, previous);
+    mp_translation_drain(
+        translation, MP_TRANSLATION_SOURCE_SUBTITLE,
+        collect_result, &collector);
+    assert_int_equal(collector.count, 1);
+    assert_string_equal(collector.results[0].translated, "new:reserved");
+    clear_collector(&collector);
+
+    mp_translation_destroy(&translation);
+    uninit_backend(&old_backend);
+    uninit_backend(&new_backend);
+    mp_cond_destroy(&wake.condition);
+    mp_mutex_destroy(&wake.lock);
+}
+
 static void drain_dense_results(struct mp_translation *translation,
                                 struct wake_state *wake,
                                 struct dense_collector *collector,
@@ -787,6 +946,8 @@ int main(void)
     test_producers_and_identity();
     test_source_specific_filters();
     test_errors_and_cancellation();
+    test_budget_rollback_survives_backend_replacement();
+    test_budget_rollback_does_not_cross_session_reset();
     test_dense_result_backpressure();
     test_config_and_source_policy();
     return 0;

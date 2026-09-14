@@ -40,6 +40,7 @@ enum wt_http_failure {
     WT_HTTP_FAILURE_READ,
     WT_HTTP_FAILURE_TOO_LARGE,
     WT_HTTP_FAILURE_TIMEOUT,
+    WT_HTTP_FAILURE_CLOSE,
 };
 
 struct wt_http_request {
@@ -54,6 +55,7 @@ struct wt_http_request {
     enum wt_http_proxy_mode proxy_mode;
     bool disable_cookies;
     int timeout_ms;
+    int test_read_limit;
 };
 
 struct wt_http_response {
@@ -87,18 +89,41 @@ struct whisper_translator *whisper_translator_create_for_test(
 size_t whisper_translate_test_max_response_bytes(void);
 void whisper_translate_test_fail_next_cleanup_thread_create(void);
 bool whisper_translate_test_start_cleanup_service(void);
+void whisper_translate_test_hold_finalizer(void);
+bool whisper_translate_test_wait_finalizer_held(int timeout_ms);
+void whisper_translate_test_release_finalizer(void);
 
 struct wt_test_winhttp_client;
 struct wt_test_finalization_receipt;
+struct wt_test_session_receipt;
+
+enum wt_test_close_kind {
+    WT_TEST_CLOSE_REQUEST = 1,
+    WT_TEST_CLOSE_CONNECTION,
+    WT_TEST_CLOSE_SESSION,
+};
 
 struct wt_test_finalization_status {
+    bool terminal;
     bool finalized;
+    bool retained_orphan;
+    enum wt_test_close_kind retained_close_kind;
+    unsigned long close_error;
     int closing_notifications;
     bool closing_handle_mismatch;
     unsigned closing_thread_id;
     unsigned finalizer_thread_id;
+    int request_close_count;
     int connection_close_count;
     int translator_destroy_count;
+};
+
+struct wt_test_session_status {
+    bool terminal;
+    bool closed;
+    bool retained_orphan;
+    unsigned long close_error;
+    int close_count;
 };
 
 // Fixed 127.0.0.1:/synthetic harness for the ordinary WinHTTP transport.
@@ -115,11 +140,26 @@ void whisper_translate_test_winhttp_call_body(
     struct wt_test_finalization_receipt **receipt);
 void whisper_translate_test_winhttp_destroy(
     struct wt_test_winhttp_client **client);
+struct wt_test_session_receipt *
+whisper_translate_test_winhttp_session_receipt(
+    struct wt_test_winhttp_client *client);
+void whisper_translate_test_winhttp_fail_next_close(
+    struct wt_test_winhttp_client *client,
+    enum wt_test_close_kind kind);
+void whisper_translate_test_winhttp_fail_next_setup(
+    struct wt_test_winhttp_client *client);
+void whisper_translate_test_winhttp_set_read_limit(
+    struct wt_test_winhttp_client *client, int bytes);
 bool whisper_translate_test_finalization_wait(
     struct wt_test_finalization_receipt *receipt, int timeout_ms,
     struct wt_test_finalization_status *out);
 void whisper_translate_test_finalization_release(
     struct wt_test_finalization_receipt **receipt);
+bool whisper_translate_test_session_wait(
+    struct wt_test_session_receipt *receipt, int timeout_ms,
+    struct wt_test_session_status *out);
+void whisper_translate_test_session_release(
+    struct wt_test_session_receipt **receipt);
 int whisper_translate_test_active_async_requests(void);
 
 #endif

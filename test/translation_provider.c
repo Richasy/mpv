@@ -132,6 +132,7 @@ enum loopback_mode {
     LOOPBACK_COOKIE,
     LOOPBACK_STALL_NO_READ,
     LOOPBACK_OVERLAP_STALL,
+    LOOPBACK_BODY,
 };
 
 struct loopback_server {
@@ -143,6 +144,7 @@ struct loopback_server {
     int port;
     volatile LONG accepted_count;
     bool second_request_had_cookie;
+    atomic_size_t response_size;
 };
 
 static bool request_has_cookie(const char *request)
@@ -268,6 +270,30 @@ static MP_THREAD_VOID run_loopback_server(void *opaque)
                     }
                 }
             }
+        } else if (received && server->mode == LOOPBACK_BODY) {
+            char headers[128];
+            size_t response_size = atomic_load_explicit(
+                &server->response_size, memory_order_acquire);
+            int header_length = snprintf(
+                headers, sizeof(headers),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Length: %zu\r\n"
+                "Connection: close\r\n\r\n",
+                response_size);
+            if (header_length > 0 &&
+                send_all(client, headers, header_length))
+            {
+                char chunk[16384];
+                memset(chunk, 'x', sizeof(chunk));
+                size_t remaining = response_size;
+                while (remaining) {
+                    int count = remaining < sizeof(chunk)
+                        ? (int)remaining : (int)sizeof(chunk);
+                    if (!send_all(client, chunk, count))
+                        break;
+                    remaining -= count;
+                }
+            }
         } else if (received) {
             const char *headers = n == 0
                 ? "HTTP/1.1 200 OK\r\n"
@@ -293,6 +319,7 @@ static void init_loopback_server(struct loopback_server *server,
         .listener = INVALID_SOCKET,
         .mode = mode,
     };
+    atomic_init(&server->response_size, 0);
     WSADATA data;
     assert_int_equal(WSAStartup(MAKEWORD(2, 2), &data), 0);
     server->listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -338,14 +365,63 @@ static struct wt_test_finalization_status wait_for_finalization(
     assert_true(whisper_translate_test_finalization_wait(
         *receipt, 5000, &status));
     whisper_translate_test_finalization_release(receipt);
+    assert_true(status.terminal);
     assert_true(status.finalized);
+    assert_false(status.retained_orphan);
     assert_int_equal(status.closing_notifications, 1);
     assert_false(status.closing_handle_mismatch);
     assert_true(status.closing_thread_id > 0);
     assert_true(status.finalizer_thread_id > 0);
     assert_true(
         status.closing_thread_id != status.finalizer_thread_id);
+    assert_int_equal(status.request_close_count, 1);
     assert_int_equal(status.connection_close_count, 1);
+    return status;
+}
+
+static struct wt_test_session_status wait_for_session_finalization(
+    struct wt_test_session_receipt **receipt)
+{
+    struct wt_test_session_status status;
+    assert_true(whisper_translate_test_session_wait(
+        *receipt, 5000, &status));
+    whisper_translate_test_session_release(receipt);
+    assert_true(status.terminal);
+    assert_true(status.closed);
+    assert_false(status.retained_orphan);
+    assert_int_equal(status.close_error, ERROR_SUCCESS);
+    assert_int_equal(status.close_count, 1);
+    return status;
+}
+
+static struct wt_test_finalization_status wait_for_retained_request(
+    struct wt_test_finalization_receipt **receipt,
+    enum wt_test_close_kind kind)
+{
+    struct wt_test_finalization_status status;
+    assert_true(whisper_translate_test_finalization_wait(
+        *receipt, 5000, &status));
+    whisper_translate_test_finalization_release(receipt);
+    assert_true(status.terminal);
+    assert_false(status.finalized);
+    assert_true(status.retained_orphan);
+    assert_int_equal(status.retained_close_kind, kind);
+    assert_int_equal(status.close_error, ERROR_INVALID_HANDLE);
+    return status;
+}
+
+static struct wt_test_session_status wait_for_retained_session(
+    struct wt_test_session_receipt **receipt)
+{
+    struct wt_test_session_status status;
+    assert_true(whisper_translate_test_session_wait(
+        *receipt, 5000, &status));
+    whisper_translate_test_session_release(receipt);
+    assert_true(status.terminal);
+    assert_false(status.closed);
+    assert_true(status.retained_orphan);
+    assert_int_equal(status.close_error, ERROR_INVALID_HANDLE);
+    assert_int_equal(status.close_count, 0);
     return status;
 }
 
@@ -1025,6 +1101,9 @@ static void test_production_transport_total_deadline(void)
             whisper_translate_test_winhttp_create(
                 server.port, 300, true);
         mp_require(client);
+        struct wt_test_session_receipt *session_receipt =
+            whisper_translate_test_winhttp_session_receipt(client);
+        mp_require(session_receipt);
         void *tmp = talloc_new(NULL);
         struct wt_call_result result;
         struct wt_test_finalization_receipt *receipt = NULL;
@@ -1039,9 +1118,8 @@ static void test_production_transport_total_deadline(void)
         whisper_translate_test_winhttp_destroy(&client);
         talloc_free(tmp);
         destroy_loopback_server(&server);
-        struct wt_test_finalization_status finalized =
-            wait_for_finalization(&receipt);
-        assert_int_equal(finalized.translator_destroy_count, 1);
+        wait_for_finalization(&receipt);
+        wait_for_session_finalization(&session_receipt);
         assert_int_equal(
             whisper_translate_test_active_async_requests(), 0);
     }
@@ -1102,6 +1180,9 @@ static void test_production_transport_cookie_policy(void)
             whisper_translate_test_winhttp_create(
                 server.port, 2000, disabled);
         mp_require(client);
+        struct wt_test_session_receipt *session_receipt =
+            whisper_translate_test_winhttp_session_receipt(client);
+        mp_require(session_receipt);
         void *tmp = talloc_new(NULL);
         struct wt_call_result first;
         struct wt_call_result second;
@@ -1112,15 +1193,17 @@ static void test_production_transport_cookie_policy(void)
         struct wt_test_finalization_status first_finalized =
             wait_for_finalization(&first_receipt);
         assert_int_equal(first_finalized.translator_destroy_count, 0);
+        struct wt_test_session_status pending_session;
+        assert_false(whisper_translate_test_session_wait(
+            session_receipt, 0, &pending_session));
         whisper_translate_test_winhttp_call(
             client, tmp, &second, &second_receipt);
         assert_string_equal(first.translated, "ok");
         assert_string_equal(second.translated, "ok");
         whisper_translate_test_winhttp_destroy(&client);
         destroy_loopback_server(&server);
-        struct wt_test_finalization_status second_finalized =
-            wait_for_finalization(&second_receipt);
-        assert_int_equal(second_finalized.translator_destroy_count, 1);
+        wait_for_finalization(&second_receipt);
+        wait_for_session_finalization(&session_receipt);
         assert_int_equal(
             whisper_translate_test_active_async_requests(), 0);
         assert_int_equal(
@@ -1137,6 +1220,9 @@ static void test_production_transport_overlapping_cleanup(void)
         whisper_translate_test_winhttp_create(
             server.port, 300, true);
     mp_require(client);
+    struct wt_test_session_receipt *session_receipt =
+        whisper_translate_test_winhttp_session_receipt(client);
+    mp_require(session_receipt);
     static const char body[] = "overlap";
     struct winhttp_call_thread calls[2] = {
         {.client = client, .body = body, .body_len = sizeof(body) - 1},
@@ -1155,17 +1241,14 @@ static void test_production_transport_overlapping_cleanup(void)
     whisper_translate_test_winhttp_destroy(&client);
     destroy_loopback_server(&server);
 
-    int translator_destroyed = 0;
     for (int n = 0; n < 2; n++) {
         assert_true(calls[n].result.http_issued);
         assert_string_equal(
             calls[n].result.error, "google: request timed out");
-        struct wt_test_finalization_status finalized =
-            wait_for_finalization(&calls[n].receipt);
-        translator_destroyed += finalized.translator_destroy_count;
+        wait_for_finalization(&calls[n].receipt);
         destroy_winhttp_call(&calls[n]);
     }
-    assert_int_equal(translator_destroyed, 1);
+    wait_for_session_finalization(&session_receipt);
     assert_int_equal(
         whisper_translate_test_active_async_requests(), 0);
 }
@@ -1178,6 +1261,9 @@ static void test_production_transport_owns_post_body(void)
         whisper_translate_test_winhttp_create(
             server.port, 150, true);
     mp_require(client);
+    struct wt_test_session_receipt *session_receipt =
+        whisper_translate_test_winhttp_session_receipt(client);
+    mp_require(session_receipt);
     size_t body_len = 4 * 1024 * 1024;
     unsigned char *body = VirtualAlloc(
         NULL, body_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -1200,13 +1286,162 @@ static void test_production_transport_owns_post_body(void)
         body, body_len, PAGE_NOACCESS, &old_protection));
     whisper_translate_test_winhttp_destroy(&client);
     destroy_loopback_server(&server);
-    struct wt_test_finalization_status finalized =
-        wait_for_finalization(&receipt);
-    assert_int_equal(finalized.translator_destroy_count, 1);
+    wait_for_finalization(&receipt);
+    wait_for_session_finalization(&session_receipt);
     assert_int_equal(
         whisper_translate_test_active_async_requests(), 0);
     assert_true(VirtualFree(body, 0, MEM_RELEASE));
     talloc_free(tmp);
+}
+
+static void test_production_transport_response_boundaries(void)
+{
+    const struct {
+        size_t size;
+        int read_limit;
+        bool succeeds;
+    } cases[] = {
+        {20 * 1024, 0, true},
+        {20 * 1024, 1024, true},
+        {1024 * 1024, 4096, true},
+        {1024 * 1024 + 1, 0, false},
+    };
+    for (int n = 0; n < MP_ARRAY_SIZE(cases); n++) {
+        struct loopback_server server;
+        init_loopback_server(&server, LOOPBACK_BODY);
+        atomic_store_explicit(
+            &server.response_size, cases[n].size,
+            memory_order_release);
+        struct wt_test_winhttp_client *client =
+            whisper_translate_test_winhttp_create(
+                server.port, 5000, true);
+        mp_require(client);
+        whisper_translate_test_winhttp_set_read_limit(
+            client, cases[n].read_limit);
+        struct wt_test_session_receipt *session_receipt =
+            whisper_translate_test_winhttp_session_receipt(client);
+        void *tmp = talloc_new(NULL);
+        struct wt_call_result result;
+        struct wt_test_finalization_receipt *receipt = NULL;
+        whisper_translate_test_winhttp_call(
+            client, tmp, &result, &receipt);
+        if (cases[n].succeeds) {
+            mp_require(result.translated);
+            assert_int_equal(strlen(result.translated), cases[n].size);
+            assert_int_equal(result.translated[0], 'x');
+            assert_int_equal(
+                result.translated[cases[n].size - 1], 'x');
+        } else {
+            mp_require(!result.translated);
+            assert_string_equal(
+                result.error, "google: response too large");
+        }
+        whisper_translate_test_winhttp_destroy(&client);
+        destroy_loopback_server(&server);
+        wait_for_finalization(&receipt);
+        wait_for_session_finalization(&session_receipt);
+        assert_int_equal(
+            whisper_translate_test_active_async_requests(), 0);
+        talloc_free(tmp);
+    }
+}
+
+static void test_production_transport_close_failures(void)
+{
+    assert_int_equal(
+        whisper_translate_test_active_async_requests(), 0);
+
+    struct loopback_server request_server;
+    init_loopback_server(&request_server, LOOPBACK_STALL);
+    struct wt_test_winhttp_client *request_client =
+        whisper_translate_test_winhttp_create(
+            request_server.port, 150, true);
+    mp_require(request_client);
+    struct wt_test_session_receipt *request_session =
+        whisper_translate_test_winhttp_session_receipt(request_client);
+    whisper_translate_test_winhttp_fail_next_setup(request_client);
+    whisper_translate_test_winhttp_fail_next_close(
+        request_client, WT_TEST_CLOSE_REQUEST);
+    void *tmp = talloc_new(NULL);
+    struct wt_call_result result;
+    struct wt_test_finalization_receipt *receipt = NULL;
+    whisper_translate_test_winhttp_call(
+        request_client, tmp, &result, &receipt);
+    assert_false(result.http_issued);
+    assert_string_equal(result.error, "google: request close failed");
+    whisper_translate_test_winhttp_destroy(&request_client);
+    destroy_loopback_server(&request_server);
+    struct wt_test_finalization_status request_retained =
+        wait_for_retained_request(
+            &receipt, WT_TEST_CLOSE_REQUEST);
+    assert_int_equal(request_retained.request_close_count, 0);
+    assert_int_equal(request_retained.closing_notifications, 0);
+    struct wt_test_session_status session_pending;
+    assert_false(whisper_translate_test_session_wait(
+        request_session, 0, &session_pending));
+    whisper_translate_test_session_release(&request_session);
+    talloc_free(tmp);
+
+    struct loopback_server connection_server;
+    init_loopback_server(&connection_server, LOOPBACK_STALL);
+    struct wt_test_winhttp_client *connection_client =
+        whisper_translate_test_winhttp_create(
+            connection_server.port, 150, true);
+    mp_require(connection_client);
+    struct wt_test_session_receipt *connection_session =
+        whisper_translate_test_winhttp_session_receipt(
+            connection_client);
+    whisper_translate_test_winhttp_fail_next_close(
+        connection_client, WT_TEST_CLOSE_CONNECTION);
+    tmp = talloc_new(NULL);
+    receipt = NULL;
+    whisper_translate_test_winhttp_call(
+        connection_client, tmp, &result, &receipt);
+    assert_string_equal(result.error, "google: request timed out");
+    whisper_translate_test_winhttp_destroy(&connection_client);
+    destroy_loopback_server(&connection_server);
+    struct wt_test_finalization_status connection_retained =
+        wait_for_retained_request(
+            &receipt, WT_TEST_CLOSE_CONNECTION);
+    assert_int_equal(connection_retained.request_close_count, 1);
+    assert_int_equal(connection_retained.closing_notifications, 1);
+    assert_int_equal(connection_retained.connection_close_count, 0);
+    assert_false(whisper_translate_test_session_wait(
+        connection_session, 0, &session_pending));
+    whisper_translate_test_session_release(&connection_session);
+    talloc_free(tmp);
+
+    struct loopback_server session_server;
+    init_loopback_server(&session_server, LOOPBACK_STALL);
+    struct wt_test_winhttp_client *session_client =
+        whisper_translate_test_winhttp_create(
+            session_server.port, 150, true);
+    mp_require(session_client);
+    struct wt_test_session_receipt *session_receipt =
+        whisper_translate_test_winhttp_session_receipt(session_client);
+    whisper_translate_test_winhttp_fail_next_close(
+        session_client, WT_TEST_CLOSE_SESSION);
+    whisper_translate_test_hold_finalizer();
+    tmp = talloc_new(NULL);
+    receipt = NULL;
+    whisper_translate_test_winhttp_call(
+        session_client, tmp, &result, &receipt);
+    assert_string_equal(result.error, "google: request timed out");
+    assert_true(whisper_translate_test_wait_finalizer_held(5000));
+    whisper_translate_test_winhttp_destroy(&session_client);
+    whisper_translate_test_release_finalizer();
+    destroy_loopback_server(&session_server);
+    struct wt_test_finalization_status session_retained =
+        wait_for_retained_request(
+            &receipt, WT_TEST_CLOSE_SESSION);
+    assert_int_equal(session_retained.request_close_count, 1);
+    assert_int_equal(session_retained.closing_notifications, 1);
+    assert_int_equal(session_retained.connection_close_count, 1);
+    wait_for_retained_session(&session_receipt);
+    talloc_free(tmp);
+
+    assert_int_equal(
+        whisper_translate_test_active_async_requests(), 3);
 }
 
 static const char *rate_name(enum wt_provider provider)
@@ -1718,6 +1953,8 @@ static void run_vm_selftests(void)
     test_production_transport_cookie_policy();
     test_production_transport_overlapping_cleanup();
     test_production_transport_owns_post_body();
+    test_production_transport_response_boundaries();
+    test_production_transport_close_failures();
 }
 
 static bool contains_korean_text(const char *text)

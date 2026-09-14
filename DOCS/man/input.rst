@@ -3555,8 +3555,11 @@ Property list
     callbacks only record operation completion or final handle closure; a
     separate process-owned cleanup thread releases the connection, translator,
     buffers, and context after the final callback and initiating caller have
-    both drained. Google and Bing additionally disable WinHTTP cookies; the
-    existing ``ai`` cookie behavior is unchanged.
+    both drained. The cleanup service pins its containing module for process
+    lifetime rather than leaving an unloadable idle thread. A failed native
+    handle close is reported as a terminal retained orphan and is never retried
+    or represented as successful cleanup. Google and Bing additionally disable
+    WinHTTP cookies; the existing ``ai`` cookie behavior is unchanged.
     See the Microsoft WinHTTP documentation for
     `timeouts
     <https://learn.microsoft.com/en-us/windows/win32/api/winhttp/nf-winhttp-winhttpsettimeouts>`_,

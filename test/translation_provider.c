@@ -1651,10 +1651,6 @@ static void run_offline_tests(void)
     test_openai_request_shape();
     test_input_bounds_and_languages();
     test_transport_failures();
-    test_production_transport_total_deadline();
-    test_production_transport_cookie_policy();
-    test_production_transport_overlapping_cleanup();
-    test_production_transport_owns_post_body();
     test_common_rate_limit();
     test_retry_after_date_default_and_saturation();
     test_zero_retry_after_serialized_probe();
@@ -1664,6 +1660,15 @@ static void run_offline_tests(void)
     test_success_does_not_erase_newer_rate_limit();
     test_shorter_retry_after_cannot_reduce_deadline();
     test_single_probe_after_expiry();
+}
+
+static void run_vm_selftests(void)
+{
+    run_offline_tests();
+    test_production_transport_total_deadline();
+    test_production_transport_cookie_policy();
+    test_production_transport_overlapping_cleanup();
+    test_production_transport_owns_post_body();
 }
 
 static bool contains_korean_text(const char *text)
@@ -1729,10 +1734,12 @@ static int run_live_smoke(enum wt_provider provider)
 int main(int argc, char **argv)
 {
     configure_process_local_failure_policy();
-    if (argc == 1 ||
-        (argc == 2 && strcmp(argv[1], "--selftest") == 0))
-    {
+    if (argc == 1) {
         run_offline_tests();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--selftest") == 0) {
+        run_vm_selftests();
         puts("MPV_TRANSLATION_PROVIDER_SELFTEST_OK_V1");
         return 0;
     }

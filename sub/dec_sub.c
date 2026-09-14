@@ -81,6 +81,7 @@ struct dec_sub {
     struct sd *sd;
     sub_text_cue_fn text_cue_callback;
     void *text_cue_callback_ctx;
+    double text_cue_read_until;
 
     struct demux_packet *new_segment;
     struct demux_packet **cached_pkts;
@@ -244,6 +245,7 @@ struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
         .order = order,
         .last_pkt_pts = MP_NOPTS_VALUE,
         .last_vo_pts = MP_NOPTS_VALUE,
+        .text_cue_read_until = MP_NOPTS_VALUE,
         .start = MP_NOPTS_VALUE,
         .end = MP_NOPTS_VALUE,
     };
@@ -377,6 +379,17 @@ static double subtitle_read_until(struct dec_sub *sub, double video_pts,
     return delay < 0 || force ? video_pts : MP_NOPTS_VALUE;
 }
 
+static double subtitle_read_ahead_until(struct dec_sub *sub, double video_pts)
+{
+    if (sub->play_dir > 0 && sub->text_cue_callback &&
+        isfinite(sub->text_cue_read_until) &&
+        sub->text_cue_read_until > video_pts)
+    {
+        return sub->text_cue_read_until;
+    }
+    return MP_NOPTS_VALUE;
+}
+
 // Read packets from the demuxer stream passed to sub_create(). Signals if
 // enough packets were read and if the subtitle state updated in anyway. If
 // packets_read is false, the player should wait until the demuxer signals new
@@ -414,8 +427,10 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
         // happen for interleaved subtitle streams, which never return "wait"
         // when reading, unless min_pts is set.
         if (st <= 0) {
-            *packets_read = st < 0 || (sub->last_pkt_pts != MP_NOPTS_VALUE &&
-                                       sub->last_pkt_pts > video_pts);
+            *packets_read =
+                st < 0 ||
+                (sub->last_pkt_pts != MP_NOPTS_VALUE &&
+                 sub->last_pkt_pts > video_pts);
             break;
         }
 
@@ -435,6 +450,10 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
         if (!(sub->preload_attempted && sub->sd->preload_ok))
             sub->sd->driver->decode(sub->sd, pkt);
     }
+    // Keep the playback wakeup boundary until its required read has settled.
+    if (*packets_read)
+        demux_request_read_ahead(sub->sh, subtitle_read_ahead_until(sub, video_pts));
+
     if (sub->cached_pkts && sub->num_cached_pkts) {
         bool visible = is_packet_visible(sub->cached_pkts[sub->cached_pkt_pos], video_pts);
         *sub_updated = update_pkt_cache(sub, video_pts) || sub->sub_visible != visible;
@@ -532,6 +551,7 @@ void sub_reset(struct dec_sub *sub)
         sub->sd->driver->reset(sub->sd);
     sub->last_pkt_pts = MP_NOPTS_VALUE;
     sub->last_vo_pts = MP_NOPTS_VALUE;
+    sub->text_cue_read_until = MP_NOPTS_VALUE;
     destroy_cached_pkts(sub);
     demux_packet_pool_push(sub->packet_pool, sub->new_segment);
     sub->new_segment = NULL;
@@ -694,6 +714,8 @@ bool sub_set_text_cue_callback(struct dec_sub *sub,
     bool supported = sub->sd && sub->sd->driver->emit_text_cues;
     sub->text_cue_callback = supported ? callback : NULL;
     sub->text_cue_callback_ctx = supported ? callback_ctx : NULL;
+    if (!sub->text_cue_callback)
+        sub->text_cue_read_until = MP_NOPTS_VALUE;
     if (sub->sd) {
         sub->sd->text_cue_callback =
             sub->text_cue_callback ? dispatch_text_cue : NULL;
@@ -778,6 +800,10 @@ bool sub_emit_text_cues(struct dec_sub *sub, double start, double end)
     if (supported && sub->text_cue_callback) {
         double mapped_start = pts_to_subtitle(sub, start);
         double mapped_end = pts_to_subtitle(sub, end);
+        sub->text_cue_read_until =
+            isfinite(mapped_start) && isfinite(mapped_end)
+                ? MPMAX(mapped_start, mapped_end)
+                : MP_NOPTS_VALUE;
         sub->sd->driver->emit_text_cues(
             sub->sd, MPMIN(mapped_start, mapped_end),
             MPMAX(mapped_start, mapped_end));

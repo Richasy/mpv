@@ -45,6 +45,7 @@ enum cue_state {
     CUE_DEFERRED,
     CUE_PENDING,
     CUE_TRANSLATED,
+    CUE_EXPIRED,
 };
 
 struct translated_cue {
@@ -239,6 +240,16 @@ static bool cue_in_window(struct sub_translate_state *state,
            end >= playback - SUB_TRANSLATE_PAST_WINDOW;
 }
 
+static bool cue_already_ended(struct sub_translate_state *state,
+                              const struct sub_text_cue *cue)
+{
+    double playback = state->mpctx->playback_pts;
+    double end = cue->start + cue->duration;
+    return isfinite(playback) && isfinite(cue->start) &&
+           isfinite(cue->duration) && cue->duration >= 0 &&
+           isfinite(end) && end < playback;
+}
+
 static enum mp_translation_submit_result submit_cue(
     struct sub_translate_state *state, struct translated_cue *cue)
 {
@@ -252,12 +263,15 @@ static enum mp_translation_submit_result submit_cue(
         cue->state = CUE_PENDING;
         return result;
     }
-    cue->state = result == MP_TRANSLATION_SUBMIT_BACKPRESSURE
-        ? CUE_DEFERRED : CUE_WAITING;
+    if (result == MP_TRANSLATION_SUBMIT_BACKPRESSURE)
+        cue->state = CUE_DEFERRED;
+    else if (result == MP_TRANSLATION_SUBMIT_TOO_LATE)
+        cue->state = CUE_EXPIRED;
+    else
+        cue->state = CUE_WAITING;
     if (result == MP_TRANSLATION_SUBMIT_NO_BACKEND) {
         set_error(state, "sub-translate-config is disabled");
     } else if (result == MP_TRANSLATION_SUBMIT_TOO_LATE) {
-        cue->state = CUE_WAITING;
         set_error(state, "translation skipped because the cue is too late");
     } else if (result == MP_TRANSLATION_SUBMIT_INACTIVE) {
         set_error(state, "subtitle translation source is inactive");
@@ -270,7 +284,8 @@ static void on_text_cue(void *ctx, const struct sub_text_cue *source)
     struct sub_translate_state *state = ctx;
     if (!state->enabled || !state->source_decoder ||
         state->secondary_blocked ||
-        !cue_in_window(state, source))
+        !cue_in_window(state, source) ||
+        cue_already_ended(state, source))
     {
         return;
     }
@@ -392,8 +407,10 @@ static void accept_result(
                  result->kind == MP_TRANSLATION_RESULT_FALLBACK_BUDGET ||
                  result->kind == MP_TRANSLATION_RESULT_FALLBACK_QUEUE)
             set_error(state, "translation request skipped by limits");
-        else if (result->kind == MP_TRANSLATION_RESULT_FALLBACK_LATE)
+        else if (result->kind == MP_TRANSLATION_RESULT_FALLBACK_LATE) {
+            cue->state = CUE_EXPIRED;
             set_error(state, "translation arrived after cue end");
+        }
         return;
     }
 

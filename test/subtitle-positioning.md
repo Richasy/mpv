@@ -25,6 +25,8 @@ transitions within one scenario stay on that client, while independent shape
 references use a separate client. The synthetic video uses full-resolution
 4:4:4 chroma so a subtitle's placement cannot change the shape oracle through
 chroma subsampling.
+Software color conversion uses swscale rather than zimg's default random
+dithering, keeping exact pixel comparisons independent of absolute placement.
 The relative gate uses the default LIBASS software compositor, including its
 source/destination clipping. The legacy comparison forces RGBA subtitle
 conversion because older direct LIBASS compositors cannot safely consume

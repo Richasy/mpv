@@ -152,10 +152,16 @@ enum sub_stack_order {
     SUB_STACK_ORDER_SECONDARY_TOP,      // secondary subtitle is always above primary
 };
 
+enum sub_position_mode {
+    SUB_POSITION_AUTO = 0,
+    SUB_POSITION_RELATIVE,
+};
+
 // Options for both primary and secondary subs.
 struct mp_subtitle_shared_opts {
     double sub_delay[2];
     float sub_pos[2];
+    int sub_pos_mode[2];
     float sub_scale[2];
     bool sub_visibility[2];
     int ass_style_override[2];

@@ -776,7 +776,8 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
         set_use_margins = opts->ass_use_margins;
     }
     if (converted || shared_opts->ass_style_override[sd->order]) {
-        set_sub_pos = 100.0f - shared_opts->sub_pos[sd->order];
+        if (shared_opts->sub_pos_mode[sd->order] != SUB_POSITION_RELATIVE)
+            set_sub_pos = 100.0f - shared_opts->sub_pos[sd->order];
         set_line_spacing = opts->sub_line_spacing;
         set_hinting = opts->sub_hinting;
     }

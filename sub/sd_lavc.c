@@ -551,7 +551,8 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
         h = MPMAX(priv->video_params.h, current->src_h);
     }
 
-    if (shared_opts->sub_pos[sd->order] != 100.0f && shared_opts->ass_style_override[sd->order]) {
+    if (shared_opts->sub_pos_mode[sd->order] != SUB_POSITION_RELATIVE &&
+        shared_opts->sub_pos[sd->order] != 100.0f && shared_opts->ass_style_override[sd->order]) {
         float offset = (100.0f - shared_opts->sub_pos[sd->order]) / 100.0f * h;
 
         for (int n = 0; n < res->num_parts; n++) {

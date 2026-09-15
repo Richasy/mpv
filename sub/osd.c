@@ -379,13 +379,19 @@ static void get_sub_bbox_y(struct sub_bitmaps *imgs, int *out_top, int *out_bott
     *out_bottom = bottom;
 }
 
+static float subtitle_layout_position(struct mp_subtitle_shared_opts *opts,
+                                      int order)
+{
+    return opts->sub_pos_mode[order] == SUB_POSITION_RELATIVE
+        ? 100.0f : opts->sub_pos[order];
+}
+
 // Apply subtitle stacking layout to reposition primary and secondary subtitle
 // bitmaps so they don't overlap and are arranged according to the chosen layout.
 static void apply_sub_stack_layout(struct osd_state *osd,
                                    struct sub_bitmap_list *list,
                                    struct mp_osd_res res)
 {
-    m_config_cache_update(osd->sub_shared_opts_cache);
     struct mp_subtitle_shared_opts *shared = osd->sub_shared_opts;
 
     int layout = shared->sub_stack_layout;
@@ -422,8 +428,8 @@ static void apply_sub_stack_layout(struct osd_state *osd,
             if (solo == secondary) {
                 // Secondary is rendered at sub_pos[1] (default 0 = top).
                 // Move it to primary's sub_pos[0] position (default 100 = bottom).
-                float pri_pos = shared->sub_pos[0];
-                float sec_pos = shared->sub_pos[1];
+                float pri_pos = subtitle_layout_position(shared, 0);
+                float sec_pos = subtitle_layout_position(shared, 1);
                 int dy = (int)((pri_pos - sec_pos) / 100.0f * res.h);
                 for (int i = 0; i < solo->num_parts; i++)
                     solo->parts[i].y += dy;
@@ -432,7 +438,7 @@ static void apply_sub_stack_layout(struct osd_state *osd,
         } else if (layout == SUB_STACK_TOP) {
             int solo_top, solo_bottom;
             get_sub_bbox_y(solo, &solo_top, &solo_bottom);
-            float sub_pos = shared->sub_pos[0];
+            float sub_pos = subtitle_layout_position(shared, 0);
             int mirror_offset = (int)((100.0f - sub_pos) / 100.0f * res.h);
             int target_top = res.mt + mirror_offset;
             int dy = target_top - solo_top;
@@ -442,7 +448,7 @@ static void apply_sub_stack_layout(struct osd_state *osd,
             // Split: secondary alone goes to top, mirroring primary's sub-pos.
             // sub_pos 100 = default bottom edge, so top mirror offset = (100 - sub_pos) / 100 * h
             if (solo == secondary) {
-                float sub_pos = shared->sub_pos[0];
+                float sub_pos = subtitle_layout_position(shared, 0);
                 int solo_top, solo_bottom;
                 get_sub_bbox_y(solo, &solo_top, &solo_bottom);
                 int mirror_offset = (int)((100.0f - sub_pos) / 100.0f * res.h);
@@ -503,7 +509,7 @@ static void apply_sub_stack_layout(struct osd_state *osd,
         // Top stacking: edge sub at top, inner sub placed below it.
         // Mirror the primary sub-pos to position at top.
         // sub_pos 100 = default bottom, so mirror offset = (100 - sub_pos) / 100 * h
-        float sub_pos = shared->sub_pos[0];
+        float sub_pos = subtitle_layout_position(shared, 0);
         int mirror_offset = (int)((100.0f - sub_pos) / 100.0f * res.h);
 
         // Position edge subtitle at the top area.
@@ -524,7 +530,7 @@ static void apply_sub_stack_layout(struct osd_state *osd,
         // Split: primary stays at its sub-pos position (already rendered),
         // secondary moves to top, mirroring primary's distance from bottom.
         // sub_pos 100 = default bottom edge, so mirror offset = (100 - sub_pos) / 100 * h
-        float sub_pos = shared->sub_pos[0];
+        float sub_pos = subtitle_layout_position(shared, 0);
         int mirror_offset = (int)((100.0f - sub_pos) / 100.0f * res.h);
 
         int sec_top, sec_bottom;
@@ -533,6 +539,23 @@ static void apply_sub_stack_layout(struct osd_state *osd,
         int dy = target_top - sec_top;
         for (int i = 0; i < secondary->num_parts; i++)
             secondary->parts[i].y += dy;
+    }
+}
+
+static void apply_sub_position(struct mp_subtitle_shared_opts *opts,
+                               struct sub_bitmap_list *list,
+                               struct mp_osd_res res)
+{
+    for (int n = 0; n < list->num_items; n++) {
+        struct sub_bitmaps *imgs = list->items[n];
+        int order = imgs->render_index - OSDTYPE_SUB;
+        if (order < 0 || order >= 2 ||
+            opts->sub_pos_mode[order] != SUB_POSITION_RELATIVE)
+            continue;
+
+        int offset = lrint((opts->sub_pos[order] - 100.0) * res.h / 100.0);
+        for (int i = 0; i < imgs->num_parts; i++)
+            imgs->parts[i].y += offset;
     }
 }
 
@@ -653,6 +676,13 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
 
     int64_t start_time = mp_time_ns();
 
+    if (m_config_cache_update(osd->sub_shared_opts_cache)) {
+        // Post-render positioning must invalidate cached bitmaps even when
+        // libass renders exactly the same glyphs at their original positions.
+        osd->objs[OSDTYPE_SUB]->vo_change_id++;
+        osd->objs[OSDTYPE_SUB2]->vo_change_id++;
+    }
+
     struct sub_bitmap_list *list = talloc_zero(NULL, struct sub_bitmap_list);
     list->change_id = 1;
     list->w = res.w;
@@ -702,9 +732,9 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
     }
 
     apply_sub_stack_layout(osd, list, res);
+    apply_sub_position(osd->sub_shared_opts, list, res);
 
     m_config_cache_update(osd->sub_avoid_opts_cache);
-    m_config_cache_update(osd->sub_shared_opts_cache);
     apply_sub_avoid_bottom(list, res,
                            osd->sub_avoid_opts->sub_avoid_bottom_px,
                            osd->sub_shared_opts->sub_stack_layout);

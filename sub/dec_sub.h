@@ -25,6 +25,7 @@ enum sd_ctrl {
     SD_CTRL_UPDATE_OPTS,
     SD_CTRL_APPLY_DVDNAV,   // const struct stream_nav_state *
     SD_CTRL_SET_TEXT_REPLACEMENT, // struct sub_text_replacement *; NULL clears all
+    SD_CTRL_SET_BITMAP_REPLACEMENT, // uint64_t *; NULL clears all
 };
 
 enum sd_text_type {
@@ -72,6 +73,23 @@ struct sub_text_replacement {
 typedef void (*sub_text_cue_fn)(void *ctx,
                                 const struct sub_text_cue *cue);
 
+struct sub_bitmap_part {
+    const uint8_t *indices;
+    const uint32_t *palette;
+    int x, y, w, h, stride, num_colors;
+};
+
+struct sub_bitmap_cue {
+    uint64_t id;
+    double start, duration;
+    bool end_known;
+    const struct sub_bitmap_part *parts;
+    int num_parts;
+};
+
+// Bitmap storage is borrowed only for the callback; asynchronous consumers copy it.
+typedef void (*sub_bitmap_cue_fn)(void *ctx, const struct sub_bitmap_cue *cue);
+
 struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
                            struct attachment_list *attachments, int order);
 void sub_destroy(struct dec_sub *sub);
@@ -93,6 +111,9 @@ bool sub_set_text_cue_callback(struct dec_sub *sub,
 // Re-emit decoded text cues overlapping [start, end]. This is a decoder tap,
 // not an OSD text snapshot, and can include overlapping or future cues.
 bool sub_emit_text_cues(struct dec_sub *sub, double start, double end);
+bool sub_set_bitmap_cue_callback(struct dec_sub *sub,
+                                 sub_bitmap_cue_fn callback, void *callback_ctx);
+bool sub_emit_bitmap_cues(struct dec_sub *sub, double start, double end);
 bool sub_map_player_cue_to_subtitle(struct dec_sub *sub,
                                     double player_start,
                                     double player_duration,

@@ -81,6 +81,8 @@ struct dec_sub {
     struct sd *sd;
     sub_text_cue_fn text_cue_callback;
     void *text_cue_callback_ctx;
+    sub_bitmap_cue_fn bitmap_cue_callback;
+    void *bitmap_cue_callback_ctx;
     double text_cue_read_until;
 
     struct demux_packet *new_segment;
@@ -156,6 +158,19 @@ static void dispatch_text_cue(void *ctx, const struct sub_text_cue *cue)
     sub->text_cue_callback(sub->text_cue_callback_ctx, &mapped);
 }
 
+static void dispatch_bitmap_cue(void *ctx, const struct sub_bitmap_cue *cue)
+{
+    struct dec_sub *sub = ctx;
+    if (!sub->bitmap_cue_callback)
+        return;
+    double start = pts_from_subtitle(sub, cue->start);
+    double end = pts_from_subtitle(sub, cue->start + cue->duration);
+    struct sub_bitmap_cue mapped = *cue;
+    mapped.start = MPMIN(start, end);
+    mapped.duration = fabs(end - start);
+    sub->bitmap_cue_callback(sub->bitmap_cue_callback_ctx, &mapped);
+}
+
 static void wakeup_demux(void *ctx)
 {
     struct mp_dispatch_queue *q = ctx;
@@ -206,6 +221,9 @@ static struct sd *init_decoder(struct dec_sub *sub)
             .text_cue_callback =
                 sub->text_cue_callback ? dispatch_text_cue : NULL,
             .text_cue_callback_ctx = sub,
+            .bitmap_cue_callback =
+                sub->bitmap_cue_callback ? dispatch_bitmap_cue : NULL,
+            .bitmap_cue_callback_ctx = sub,
             .preload_ok = true,
         };
 
@@ -381,7 +399,8 @@ static double subtitle_read_until(struct dec_sub *sub, double video_pts,
 
 static double subtitle_read_ahead_until(struct dec_sub *sub, double video_pts)
 {
-    if (sub->play_dir > 0 && sub->text_cue_callback &&
+    if (sub->play_dir > 0 &&
+        (sub->text_cue_callback || sub->bitmap_cue_callback) &&
         isfinite(sub->text_cue_read_until) &&
         sub->text_cue_read_until > video_pts)
     {
@@ -807,6 +826,43 @@ bool sub_emit_text_cues(struct dec_sub *sub, double start, double end)
         sub->sd->driver->emit_text_cues(
             sub->sd, MPMIN(mapped_start, mapped_end),
             MPMAX(mapped_start, mapped_end));
+    }
+    mp_mutex_unlock(&sub->lock);
+    return supported;
+}
+
+bool sub_set_bitmap_cue_callback(struct dec_sub *sub,
+                                 sub_bitmap_cue_fn callback, void *callback_ctx)
+{
+    if (!sub)
+        return false;
+    mp_mutex_lock(&sub->lock);
+    bool supported = sub->sd && sub->sd->driver->emit_bitmap_cues;
+    sub->bitmap_cue_callback = supported ? callback : NULL;
+    sub->bitmap_cue_callback_ctx = sub->bitmap_cue_callback ? callback_ctx : NULL;
+    if (!sub->bitmap_cue_callback && !sub->text_cue_callback)
+        sub->text_cue_read_until = MP_NOPTS_VALUE;
+    if (sub->sd) {
+        sub->sd->bitmap_cue_callback =
+            sub->bitmap_cue_callback ? dispatch_bitmap_cue : NULL;
+        sub->sd->bitmap_cue_callback_ctx = sub;
+    }
+    mp_mutex_unlock(&sub->lock);
+    return supported;
+}
+
+bool sub_emit_bitmap_cues(struct dec_sub *sub, double start, double end)
+{
+    if (!sub)
+        return false;
+    mp_mutex_lock(&sub->lock);
+    bool supported = sub->sd && sub->sd->driver->emit_bitmap_cues;
+    if (supported && sub->bitmap_cue_callback) {
+        double a = pts_to_subtitle(sub, start);
+        double b = pts_to_subtitle(sub, end);
+        sub->text_cue_read_until = isfinite(a) && isfinite(b)
+            ? MPMAX(a, b) : MP_NOPTS_VALUE;
+        sub->sd->driver->emit_bitmap_cues(sub->sd, MPMIN(a, b), MPMAX(a, b));
     }
     mp_mutex_unlock(&sub->lock);
     return supported;

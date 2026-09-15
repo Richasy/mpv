@@ -39,6 +39,7 @@
 
 struct sub {
     bool valid;
+    bool replaced;
     AVSubtitle avsub;
     struct sub_bitmap *inbitmaps;
     int count;
@@ -156,6 +157,7 @@ error_probe:
 
 static void clear_sub(struct sub *sub)
 {
+    sub->replaced = false;
     sub->count = 0;
     sub->pts = MP_NOPTS_VALUE;
     sub->endpts = MP_NOPTS_VALUE;
@@ -361,7 +363,51 @@ static void rerender_queued_subs(struct sd *sd)
         sub->src_w = 0;
         sub->src_h = 0;
         sub->id = priv->new_id++;
+        sub->replaced = false;
         read_sub_bitmaps(sd, sub);
+    }
+}
+
+static void emit_bitmap_cues(struct sd *sd, double start, double end)
+{
+    struct sd_lavc_priv *priv = sd->priv;
+    if (!sd->bitmap_cue_callback || priv->menu_active)
+        return;
+    for (int n = MAX_QUEUE - 1; n >= 0; n--) {
+        struct sub *sub = &priv->subs[n];
+        if (!sub->valid || sub->pts == MP_NOPTS_VALUE)
+            continue;
+        double until = sub->endpts == MP_NOPTS_VALUE
+            ? sub->pts + 60 : sub->endpts;
+        if (until < start || sub->pts > end || until <= sub->pts)
+            continue;
+        if (sub->avsub.num_rects > 64) {
+            MP_WARN(sd, "Bitmap OCR skipped an event with too many objects.\n");
+            continue;
+        }
+        struct sub_bitmap_part parts[64];
+        int count = 0;
+        for (unsigned i = 0; i < sub->avsub.num_rects; i++) {
+            AVSubtitleRect *r = sub->avsub.rects[i];
+            if (r->type != SUBTITLE_BITMAP || r->w <= 0 || r->h <= 0 ||
+                (!(r->flags & AV_SUBTITLE_FLAG_FORCED) &&
+                 sd->opts->sub_forced_events_only))
+                continue;
+            parts[count++] = (struct sub_bitmap_part){
+                .indices = r->data[0], .palette = (const uint32_t *)r->data[1],
+                .x = r->x, .y = r->y, .w = r->w, .h = r->h,
+                .stride = r->linesize[0], .num_colors = r->nb_colors,
+            };
+        }
+        if (count) {
+            struct sub_bitmap_cue cue = {
+                .id = sub->id, .start = sub->pts,
+                .duration = until - sub->pts,
+                .end_known = sub->endpts != MP_NOPTS_VALUE,
+                .parts = parts, .num_parts = count,
+            };
+            sd->bitmap_cue_callback(sd->bitmap_cue_callback_ctx, &cue);
+        }
     }
 }
 
@@ -431,6 +477,7 @@ static void decode(struct sd *sd, struct demux_packet *packet)
         // This subtitle packet only signals the end of subtitle display.
         if (!sub.num_rects) {
             avsubtitle_free(&sub);
+            emit_bitmap_cues(sd, -INFINITY, INFINITY);
             return;
         }
     }
@@ -457,6 +504,7 @@ static void decode(struct sd *sd, struct demux_packet *packet)
                          (struct seekpoint){.pts = pts, .endpts = endpts});
         skip: ;
     }
+    emit_bitmap_cues(sd, -INFINITY, INFINITY);
 }
 
 static struct sub *get_current(struct sd_lavc_priv *priv, double pts)
@@ -491,7 +539,7 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
 
     struct sub *current = get_current(priv, pts);
 
-    if (!current)
+    if (!current || current->replaced)
         return NULL;
 
     MP_TARRAY_GROW(priv, priv->outbitmaps, current->count);
@@ -748,6 +796,14 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
 {
     struct sd_lavc_priv *priv = sd->priv;
     switch (cmd) {
+    case SD_CTRL_SET_BITMAP_REPLACEMENT:
+        for (int n = 0; n < MAX_QUEUE; n++) {
+            if (!arg)
+                priv->subs[n].replaced = false;
+            else if ((uint64_t)priv->subs[n].id == *(uint64_t *)arg)
+                priv->subs[n].replaced = true;
+        }
+        return CONTROL_OK;
     case SD_CTRL_SUB_STEP: {
         double *a = arg;
         double res = step_sub(sd, a[0], a[1]);
@@ -791,4 +847,5 @@ const struct sd_functions sd_lavc = {
     .control = control,
     .reset = reset,
     .uninit = uninit,
+    .emit_bitmap_cues = emit_bitmap_cues,
 };

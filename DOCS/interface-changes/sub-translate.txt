@@ -2,6 +2,12 @@ add `sub-translate-config`, `sub-translate`, and `sub-translate-status`
 properties for shared native translation of selected text subtitle tracks;
 generated output uses codec profile `translated`
 
+add optional Windows bitmap-subtitle OCR through `sub-ocr-config`, using a
+locally supplied PP-OCRv6 medium ONNX model and ordered CTC dictionary; expose
+OCR availability, recognized-event count, ambiguity, and selection reason in
+`sub-translate-status`; recognized bitmap events use ordinary generated text
+with source-bitmap fallback until output is available
+
 repair the shared Google and `azure` compatibility providers: Google now uses
 the fixed `translate_a/single` JSON form protocol and `azure` now names Bing's
 credential-free Edge JSON protocol rather than the retired Edge-auth flow;

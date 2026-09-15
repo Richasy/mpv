@@ -1518,6 +1518,31 @@ if rife_found
     sources += files('video/filter/vf_rife.c')
 endif
 
+sub_ocr_opt = get_option('sub-ocr').require(
+    win32, error_message: 'subtitle OCR requires Windows',
+)
+sub_ocr_inc = []
+if sub_ocr_opt.allowed() and ort_path != ''
+    sub_ocr_inc = [include_directories(ort_path / 'include')]
+endif
+sub_ocr_header = false
+if sub_ocr_opt.allowed()
+    sub_ocr_header = cc.compiles(
+        '#include <onnxruntime_c_api.h>\n' +
+        '#if ORT_API_VERSION < 24\n#error OCR requires ORT API 24\n#endif\n' +
+        'int main(void) { return 0; }',
+        name: 'ONNX Runtime API 24 headers',
+        include_directories: sub_ocr_inc)
+endif
+sub_ocr_opt = sub_ocr_opt.require(
+    sub_ocr_header, error_message: 'subtitle OCR requires ONNX Runtime API 24 SDK headers',
+)
+features += {'sub-ocr': sub_ocr_opt.allowed()}
+if features['sub-ocr']
+    dependencies += declare_dependency(include_directories: sub_ocr_inc)
+    sources += files('sub/ocr_engine.c', 'sub/ocr_policy.c', 'player/sub_ocr.c')
+endif
+
 if features['d3d-hwaccel'] and features['egl-angle']
     sources += files('video/out/opengl/hwdec_d3d11egl.c')
 endif

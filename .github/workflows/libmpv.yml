@@ -82,7 +82,7 @@ jobs:
       CLANG_ROOT: /home/richasy/programs/clang_root
       SRC_PACKAGES: /home/richasy/programs/src_packages
       RUSTUP_LOC: /home/richasy/programs/clang_root/install_rustup
-      OUTPUT_DIR: /home/richasy/programs/libmpv-output
+      OUTPUT_DIR: ${{ runner.temp }}/libmpv-output-${{ github.run_id }}-${{ github.run_attempt }}
       BUILD_DIR: /home/richasy/programs/build_${{ matrix.arch }}
       TARGET_ARCH: ${{ matrix.arch }}
       MPV_REPO: https://github.com/Richasy/mpv.git

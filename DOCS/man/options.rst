@@ -2633,6 +2633,32 @@ Subtitles
     Specify the position of secondary subtitles on the screen. This is similar
     to ``--sub-pos`` but for secondary subtitles.
 
+``--sub-pos-mode=<auto|relative>``
+    Select how ``--sub-pos`` changes subtitle position (default: auto).
+
+    ``auto``
+        Use the subtitle renderer's native positioning behavior. Authored ASS
+        positions, top/center alignment, and some image subtitles can ignore
+        ``--sub-pos``.
+
+    ``relative``
+        Render at the original position, then translate the complete subtitle
+        by ``(sub-pos - 100)`` percent of the output height. 100 preserves the
+        original layout, smaller values move up, and larger values move down.
+        This also moves ASS positioning tags, drawings, and image subtitles
+        without stripping their styles. Content moved outside the output is
+        clipped.
+
+        This translation happens after ``--sub-stack-layout`` and before
+        ``--sub-avoid-bottom-px``. Use the same relative position for both tracks
+        to move a bilingual stack as one group. This explicit positioning mode
+        is independent of ``--sub-ass-override``.
+
+``--secondary-sub-pos-mode=<auto|relative>``
+    Select the positioning mode for secondary subtitles (default: auto).
+    In relative mode, set ``--secondary-sub-pos=100`` to retain the original
+    layout; its ordinary default of 0 translates it up by one output height.
+
 ``--sub-stack-layout=<none|bottom|top|split>``
     Control how primary and secondary subtitles are arranged when both are
     visible. By default, mpv renders primary subtitles at the bottom and

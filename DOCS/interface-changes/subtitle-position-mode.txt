@@ -1,0 +1,4 @@
+Add sub-pos-mode and secondary-sub-pos-mode. The opt-in relative mode moves
+complete rendered subtitle tracks after stacking, including authored ASS
+positions and image subtitles, without changing their styles. Both modes
+default to auto, preserving the existing renderer-specific behavior.

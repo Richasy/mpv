@@ -67,6 +67,9 @@ ExternalProject_Add(mpv
         ${mpv_gl}
         -Dc_args='-Wno-error=int-conversion'
         -Drife=auto
+        # Shipping builds must fail rather than silently omit subtitle OCR when
+        # the runner does not provide ONNX Runtime API 24 SDK headers.
+        -Dsub-ocr=enabled
         -Donnxruntime-path=/home/richasy/programs/microsoft.ml.onnxruntime.directml/build/native
     BUILD_COMMAND ${EXEC} LTO_JOB=1 PDB=1 ninja -C <BINARY_DIR>
     INSTALL_COMMAND ""

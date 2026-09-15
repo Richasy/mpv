@@ -226,6 +226,12 @@ endif
 if get_option('libmpv')
     file = join_paths(source_root, 'etc', 'mpv-icon-8bit-16x16.png')
 
+    if win32
+        executable('libmpv-test-subtitle-positioning',
+                   'libmpv_test_subtitle_positioning.c',
+                   include_directories: incdir_public)
+    endif
+
     exe = executable('libmpv-test-file-loading', 'libmpv_test_file_loading.c',
                      include_directories: incdir, dependencies: libmpv_dep)
     test('libmpv-test-file-loading', exe, args: file, suite: 'libmpv')

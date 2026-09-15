@@ -329,11 +329,22 @@ static void render_ass(struct mp_draw_sub_cache *p, struct sub_bitmaps *sb)
     for (int i = 0; i < sb->num_parts; i++) {
         struct sub_bitmap *s = &sb->parts[i];
 
-        draw_ass_rgba(mp_image_pixel_ptr(p->rgba_overlay, 0, s->x, s->y),
-                      p->rgba_overlay->stride[0], s->bitmap, s->stride,
-                      s->w, s->h, s->libass.color);
+        int x0 = MPCLAMP(s->x, 0, p->w);
+        int y0 = MPCLAMP(s->y, 0, p->h);
+        int x1 = MPCLAMP(s->x + s->w, 0, p->w);
+        int y1 = MPCLAMP(s->y + s->h, 0, p->h);
+        if (x0 >= x1 || y0 >= y1)
+            continue;
 
-        mark_rect(p, s->x, s->y, s->x + s->w, s->y + s->h);
+        // Stacking and position offsets can move otherwise clipped libass
+        // images outside the output. Preserve the corresponding source crop.
+        uint8_t *src = (uint8_t *)s->bitmap +
+            (y0 - s->y) * s->stride + (x0 - s->x);
+        draw_ass_rgba(mp_image_pixel_ptr(p->rgba_overlay, 0, x0, y0),
+                      p->rgba_overlay->stride[0], src, s->stride,
+                      x1 - x0, y1 - y0, s->libass.color);
+
+        mark_rect(p, x0, y0, x1, y1);
     }
 }
 

@@ -2,10 +2,14 @@
 ScriptType: v4.00+
 PlayResX: 640
 PlayResY: 360
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+YCbCr Matrix: TV.709
 
 [V4+ Styles]
 Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
 Style: Default,Arial,24,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1
+Style: Sign,Arial,32,&H0000FFFF,&H00FF0000,&H00223344,&H80445566,-1,0,0,0,95,110,2,15,1,2,1,7,21,22,23,1
 
 [Events]
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
@@ -13,3 +17,8 @@ Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,{\i1}Hello\Nworld{\i0}
 Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,I
 Dialogue: 1,0:00:01.00,0:00:03.00,Default,,0,0,0,,Repeat
 Dialogue: 2,0:00:01.00,0:00:03.00,Default,,0,0,0,,Repeat
+Dialogue: 3,0:00:00.00,0:00:03.00,Sign,actor,12,13,14,Banner;20;0;10,{\an7\pos(42,64)\fad(100,200)\t(0,500,\fscx125)\clip(0,0,600,300)} Positioned {\rDefault}
+Dialogue: 4,0:00:00.00,0:00:03.00,Sign,decoration,0,0,0,,{\an7\pos(10,20)\p1}m 0 0 l 30 0 30 30 0 30{\p0}
+Dialogue: 5,0:00:00.00,0:00:03.00,Sign,mixed,0,0,0,,{\p1}m 0 0 l 10 10{\p0} Caption {\p1}m 20 20 l 30 30{\p0}
+Dialogue: 6,0:00:00.00,0:00:03.00,Sign,karaoke,0,0,0,,{\k20}ka{\kf30}ra\h{\ko40}oke
+Dialogue: 7,0:00:00.00,0:00:03.00,Sign,escape,0,0,0,,{\i1}Escaping{\i0}

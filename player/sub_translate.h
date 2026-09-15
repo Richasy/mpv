@@ -53,4 +53,14 @@ size_t sub_translate_escape_ass_buffer(char *buffer, size_t size,
                                        const char *text);
 char *sub_translate_escape_ass(void *talloc_parent, const char *text);
 
+struct sub_translate_span {
+    size_t start;
+    size_t length;
+};
+
+// Enumerate byte ranges of visible text, excluding tags, drawings and escapes.
+// A NULL spans array counts the required entries. Returns -1 for malformed ASS.
+int sub_translate_ass_spans(const char *text, struct sub_translate_span *spans,
+                            int capacity);
+
 #endif

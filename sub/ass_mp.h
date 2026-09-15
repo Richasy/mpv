@@ -21,6 +21,7 @@
 #define MPLAYER_ASS_MP_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include <ass/ass.h>
 #include <ass/ass_types.h>
@@ -42,6 +43,14 @@ struct mpv_global;
 struct mp_osd_res;
 struct osd_style_opts;
 struct mp_log;
+struct sub_text_replacement;
+
+uint64_t mp_ass_event_id(const ASS_Event *event);
+// Caller holds the decoder lock. Canonical events are restored before pruning.
+ASS_Image *mp_ass_render_replacements(
+    ASS_Renderer *renderer, ASS_Track *track, long long ts, int *changed,
+    const struct sub_text_replacement *replacements, int num_replacements,
+    long long prune_delay);
 
 void mp_ass_flush_old_events(ASS_Track *track, long long ts);
 void mp_ass_set_style(ASS_Style *style, double res_y,

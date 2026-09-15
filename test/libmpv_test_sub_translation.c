@@ -97,7 +97,10 @@ static void wait_for_translated_count_timeout(int count, int attempts)
     char expected[64];
     snprintf(expected, sizeof(expected), "\"translated\":%d", count);
     for (int attempt = 0; attempt < attempts; attempt++) {
-        if (strstr(observed_status, expected))
+        char *status = get_string("sub-translate-status");
+        bool ready = strstr(status, expected);
+        mpv_free(status);
+        if (ready)
             return;
         record_status_event(mpv_wait_event(ctx, 0.05));
     }
@@ -208,7 +211,7 @@ static void configure(const char *endpoint)
         "\"model\":\"fixture\",\"api_key\":\"fixture-secret\","
         "\"source_lang\":\"auto\",\"target_lang\":\"zh\","
         "\"system_prompt\":\"translate\",\"context_size\":0,"
-        "\"max_tokens\":64,\"timeout_ms\":2000},"
+        "\"max_tokens\":64,\"timeout_ms\":10000},"
         "\"limits\":{\"enabled\":true,\"horizon_sec\":60,"
         "\"seek_debounce_ms\":0,\"min_text_chars\":2,"
         "\"reuse_cache_capacity\":32,"
@@ -379,20 +382,95 @@ static int count_occurrences(const char *text, const char *needle)
     return count;
 }
 
-static void test_ass_dialogue(const char *video, const char *subtitle)
+static void verify_ass_snapshot(const char *source, bool translated)
+{
+    char *actual = get_string("sub-text/ass-full");
+    if (translated) {
+        if (!strstr(actual, "translated:Hello"))
+            fail("ASS snapshot has no translated replacement: %s\n", actual);
+        char *read = actual;
+        char *write = actual;
+        while (*read) {
+            if (!strncmp(read, "translated:", 11)) {
+                read += 11;
+            } else {
+                *write++ = *read++;
+            }
+        }
+        *write = 0;
+    }
+    if (strcmp(actual, source))
+        fail("ASS event metadata, tags, drawings or text changed: %s\n", actual);
+    mpv_free(actual);
+}
+
+static void configure_mode(const char *endpoint, const char *mode)
+{
+    char url[1024];
+    snprintf(url, sizeof(url), "%s?mode=%s", endpoint, mode);
+    reset_status_observation();
+    configure(url);
+}
+
+static void fixture_barrier(const char *name)
+{
+    printf("fixture:%s\n", name);
+    fflush(stdout);
+    char response[16];
+    if (!fgets(response, sizeof(response), stdin) || strcmp(response, "ok\n"))
+        fail("Translation fixture barrier failed: %s\n", name);
+}
+
+static void wait_for_settled(void)
+{
+    for (int attempt = 0; attempt < 200; attempt++) {
+        char *status = get_string("sub-translate-status");
+        bool settled = strstr(status, "\"pending\":0");
+        mpv_free(status);
+        if (settled)
+            return;
+        record_status_event(mpv_wait_event(ctx, 0.05));
+    }
+    fail("Translation did not settle.\n");
+}
+
+static void test_ass_dialogue(const char *video, const char *subtitle,
+                              const char *srt, const char *endpoint)
 {
     load_file(video);
     command(((const char *[]){"sub-add", subtitle, "select", NULL}));
+    int64_t primary = get_int64("sid");
+    command(((const char *[]){"sub-add", srt, "select", NULL}));
+    int64_t secondary = get_int64("sid");
+    set_track_id("sid", primary);
+    set_track_id("secondary-sid", secondary);
+    advance_to(1.2);
+    char *source = get_string("sub-text/ass-full");
+    char *metadata = get_string("sub-ass-extradata");
+    int64_t tracks = get_int64("track-list/count");
+    char *override = get_string("sub-ass-override");
+    char *scale = get_string("sub-scale");
+
     int enabled = 1;
     reset_status_observation();
     mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
-    int paused = 0;
-    mpv_set_property(ctx, "pause", MPV_FORMAT_FLAG, &paused);
-    wait_for_translated_count(4);
-    advance_to(1.2);
+    wait_for_translated_count(8);
+    char *status = wait_for_status("active");
+    if (!strstr(status, "\"presentation\":\"replace\"") ||
+        !strstr(status, "\"output_sid\":null"))
+        fail("Styled source did not use replacement: %s\n", status);
+    mpv_free(status);
+    if (get_int64("sid") != primary ||
+        get_int64("secondary-sid") != secondary ||
+        get_int64("track-list/count") != tracks)
+        fail("Styled replacement created a track or changed ownership.\n");
+    check_string("sub-ass-extradata", metadata);
+    check_string("sub-ass-override", override);
+    check_string("sub-scale", scale);
+    verify_ass_snapshot(source, true);
 
-    char *text = get_string("secondary-sub-text");
-    if (!strstr(text, "translated:Hello\nworld") ||
+    char *text = get_string("sub-text");
+    if (!strstr(text, "translated:Hello\ntranslated:world") ||
         !strstr(text, "translated:I") ||
         count_occurrences(text, "translated:Repeat") != 2 ||
         strstr(text, "{\\i"))
@@ -403,16 +481,111 @@ static void test_ass_dialogue(const char *video, const char *subtitle)
     mpv_free(text);
     double start;
     double end;
-    get_property("secondary-sub-start", MPV_FORMAT_DOUBLE, &start);
-    get_property("secondary-sub-end", MPV_FORMAT_DOUBLE, &end);
+    get_property("sub-start", MPV_FORMAT_DOUBLE, &start);
+    get_property("sub-end", MPV_FORMAT_DOUBLE, &end);
     if (start != 0.0 || end != 3.0)
         fail("Overlapping ASS cue times changed.\n");
 
+    configure_mode(endpoint, "partial");
+    wait_for_translated_count(7);
+    wait_for_settled();
+    text = get_string("sub-text/ass");
+    if (!strstr(text, "{\\i1}Hello\\Nworld{\\i0}") ||
+        strstr(text, "translated:Hello"))
+        fail("Failed span exposed a partially translated ASS event: %s\n", text);
+    mpv_free(text);
+
+    configure_mode(endpoint, "hold");
+    status = wait_for_status("translating");
+    mpv_free(status);
+    fixture_barrier("hold-started");
+    verify_ass_snapshot(source, false);
     enabled = 0;
     reset_status_observation();
     mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
-    char *status = wait_for_status("disabled");
+    status = wait_for_status("disabled");
     mpv_free(status);
+    verify_ass_snapshot(source, false);
+    fixture_barrier("hold-release");
+    configure_mode(endpoint, "after-hold");
+    enabled = 1;
+    reset_status_observation();
+    mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    wait_for_translated_count(8);
+    verify_ass_snapshot(source, true);
+
+    configure_mode(endpoint, "escape");
+    wait_for_translated_count(8);
+    text = get_string("sub-text/ass");
+    if (!strstr(text, "{\\i1}\\{\\\xe2\x81\xa0p1}"
+                     "\\\xe2\x81\xa0N\\N你好{\\i0}"))
+        fail("Provider ASS syntax was not escaped: %s\n", text);
+    mpv_free(text);
+
+    configure(endpoint);
+    seek_to_start();
+    wait_for_translated_count(8);
+    advance_to(1.2);
+    verify_ass_snapshot(source, true);
+    set_property_string("sub-translate-config", "");
+    verify_ass_snapshot(source, false);
+    configure(endpoint);
+    wait_for_translated_count(8);
+    verify_ass_snapshot(source, true);
+
+    // Transition both ways within one file, including an old owned companion.
+    set_property_string("secondary-sid", "no");
+    set_track_id("sid", secondary);
+    seek_to_start();
+    wait_for_translated_count(2);
+    status = get_string("sub-translate-status");
+    if (!strstr(status, "\"presentation\":\"companion\"") ||
+        get_int64("secondary-sid") < 1)
+        fail("ASS to SRT transition did not restore companion mode.\n");
+    mpv_free(status);
+    set_track_id("sid", primary);
+    wait_for_translated_count(8);
+    if (get_int64("secondary-sid") != -2)
+        fail("SRT companion remained selected in replacement mode.\n");
+    enabled = 0;
+    reset_status_observation();
+    mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    status = wait_for_status("disabled");
+    mpv_free(status);
+    advance_to(1.2);
+    verify_ass_snapshot(source, false);
+    mpv_free(source);
+    mpv_free(metadata);
+    mpv_free(override);
+    mpv_free(scale);
+}
+
+static void test_ssa_dialogue(const char *video, const char *subtitle)
+{
+    load_file(video);
+    command(((const char *[]){"sub-add", subtitle, "select", NULL}));
+    advance_to(0.5);
+    char *source = get_string("sub-text/ass-full");
+    char *metadata = get_string("sub-ass-extradata");
+    int64_t tracks = get_int64("track-list/count");
+    int enabled = 1;
+    reset_status_observation();
+    mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    wait_for_translated_count(1);
+    char *status = get_string("sub-translate-status");
+    if (!strstr(status, "\"presentation\":\"replace\"") ||
+        !strstr(status, "\"output_sid\":null") ||
+        get_int64("track-list/count") != tracks ||
+        get_int64("secondary-sid") != -2)
+        fail("SSA created an extra track: %s\n", status);
+    mpv_free(status);
+    verify_ass_snapshot(source, true);
+    check_string("sub-ass-extradata", metadata);
+    enabled = 0;
+    mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    verify_ass_snapshot(source, false);
+    mpv_free(source);
+    mpv_free(metadata);
 }
 
 static void find_two_subtitles(int64_t *first, int64_t *second)
@@ -493,7 +666,7 @@ static void test_dense_preload(const char *video, const char *subtitle)
 
 int main(int argc, char **argv)
 {
-    if (argc != 9)
+    if (argc != 10)
         return 1;
     ctx = mpv_create();
     if (!ctx)
@@ -519,7 +692,8 @@ int main(int argc, char **argv)
     test_external(argv[3], argv[4]);
     test_bitmap(argv[3], argv[5]);
     test_secondary_conflict(argv[6]);
-    test_ass_dialogue(argv[3], argv[7]);
+    test_ass_dialogue(argv[3], argv[7], argv[4], argv[1]);
+    test_ssa_dialogue(argv[3], argv[9]);
     test_dense_preload(argv[3], argv[8]);
     command_string("quit");
     while (wrap_wait_event()->event_id != MPV_EVENT_SHUTDOWN) {}

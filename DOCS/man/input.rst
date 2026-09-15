@@ -3578,11 +3578,14 @@ Property list
     ``no``. This flag is independent from ``whisper-lookahead`` and does not
     load a Whisper model, create an audio filter, or require an audio track.
 
-    The selected source remains the primary subtitle. mpv creates an owned
+    The selected source remains the primary subtitle. For unstyled formats
+    such as ordinary SRT, mpv creates an owned
     companion subtitle track with codec profile ``translated`` and selects it
     as the secondary subtitle. If a different secondary subtitle is already
     selected, translation reports an error and leaves both user selections
-    unchanged. Generated ``whisper`` and ``translated`` tracks are never used
+    unchanged. ASS/SSA instead uses styled text replacement in the primary
+    decoder; it creates no companion track and does not require, select, or
+    displace a secondary subtitle. Generated ``whisper`` and ``translated`` tracks are never used
     as input.
 
     Text formats decoded by mpv's ASS subtitle decoder are supported, including
@@ -3597,9 +3600,26 @@ Property list
     Short and
     repeated source cues are not subjected to Whisper's ASR-specific filters.
 
+    Styled replacement retains the original libass track, including script
+    resolution, styles, attachments, event layer, actor, margins, effect,
+    timing, positioning, and drawing-only events. Only visible text spans are
+    translated. Override blocks, drawing payloads, escapes and whitespace
+    separators remain byte-for-byte in their original order; providers never
+    receive the override syntax. Each complete event is replaced atomically
+    after all its spans succeed. Pending, failed, or malformed events retain
+    their original text. Translation does not change subtitle layout options;
+    explicit user overrides still apply.
+
+    Spans bounded by formatting and karaoke tags are translated separately,
+    without proportional tag reinsertion. This conservatively preserves
+    effects and timing tokens, but cannot guarantee sentence-level translation
+    quality across spans, the original text width, or semantic syllable
+    alignment for translated karaoke.
+
     Disabling the property, seeking, changing the primary subtitle, unloading
     the file, or replacing the common configuration invalidates queued work and
-    clears only the owned generated output. A bounded look-ahead window is used,
+    clears the owned generated output or restores canonical styled text.
+    Source files are never modified. A bounded look-ahead window is used,
     so a slow provider can legitimately miss a cue rather than delaying or
     retiming it. Admission is bounded; cues deferred by backpressure are
     retried after completed results are drained.
@@ -3611,12 +3631,20 @@ Property list
 
         {
             "state": "disabled|idle|translating|active|unsupported|error",
+            "presentation": "companion|replace",
             "source_sid": 1,
             "output_sid": 2,
             "translated": 12,
             "pending": 3,
             "error": null
         }
+
+    ``presentation`` is ``replace`` for an attached ASS/SSA source and
+    ``companion`` otherwise. In replacement mode, ``source_sid`` remains the
+    original primary ID, ``output_sid`` is always null, and ``active`` does not
+    require an output track. ``translated`` counts complete translated events
+    retained in the look-ahead window, not individual spans; ``pending``
+    includes admitted and deferred span requests.
 
     ``source_sid`` and ``output_sid`` are null when unavailable. The status
     never contains subtitle text, provider URLs, or credentials. Property

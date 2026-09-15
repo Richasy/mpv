@@ -62,6 +62,8 @@ struct sd_ass_priv {
     struct seen_packet *seen_packets;
     int num_seen_packets;
     bool check_animated;
+    struct sub_text_replacement *replacements;
+    int num_replacements;
 };
 
 struct seen_packet {
@@ -486,7 +488,7 @@ static uint64_t cue_hash_value(uint64_t hash, uint64_t value)
     return hash;
 }
 
-static uint64_t cue_identity(const ASS_Event *event)
+uint64_t mp_ass_event_id(const ASS_Event *event)
 {
     uint64_t hash = UINT64_C(1469598103934665603);
     hash = cue_hash_value(hash, (uint64_t)(uint32_t)event->ReadOrder);
@@ -503,8 +505,74 @@ static uint64_t cue_identity(const ASS_Event *event)
     return hash;
 }
 
+static char *replacement_text(const struct sub_text_replacement *replacements,
+                              int num_replacements, ASS_Event *event)
+{
+    if (num_replacements && event->Text) {
+        uint64_t id = mp_ass_event_id(event);
+        for (int n = 0; n < num_replacements; n++) {
+            const struct sub_text_replacement *r = &replacements[n];
+            if (r->id == id && strcmp(r->source, event->Text) == 0)
+                return (char *)r->text;
+        }
+    }
+    return event->Text;
+}
+
+static char *event_text(struct sd_ass_priv *ctx, ASS_Event *event)
+{
+    return replacement_text(ctx->replacements, ctx->num_replacements, event);
+}
+
+ASS_Image *mp_ass_render_replacements(
+    ASS_Renderer *renderer, ASS_Track *track, long long ts, int *changed,
+    const struct sub_text_replacement *replacements, int num_replacements,
+    long long prune_delay)
+{
+#if LIBASS_VERSION < 0x01703010
+    (void)prune_delay;
+#endif
+    // No packet parsing or decoder callbacks can run while the caller holds
+    // its lock. Only Text is substituted; the original libass track is used.
+    char **original = NULL;
+    if (num_replacements && track->n_events) {
+#if LIBASS_VERSION >= 0x01703010
+        // libass may compact/free events during rendering. Delay that until
+        // canonical pointers are restored, preserving the user's prune policy.
+        ass_configure_prune(track, -1);
+#endif
+        original = talloc_array(NULL, char *, track->n_events);
+        for (int n = 0; n < track->n_events; n++) {
+            ASS_Event *event = &track->events[n];
+            original[n] = event->Text;
+            if (ts >= event->Start && ts < event->Start + event->Duration)
+                event->Text = replacement_text(replacements, num_replacements,
+                                               event);
+        }
+    }
+    ASS_Image *images = ass_render_frame(renderer, track, ts, changed);
+    if (original) {
+        for (int n = 0; n < track->n_events; n++)
+            track->events[n].Text = original[n];
+        talloc_free(original);
+#if LIBASS_VERSION >= 0x01703010
+        ass_configure_prune(track, prune_delay);
+        if (prune_delay >= 0)
+            ass_prune_events(track, ts - prune_delay);
+#endif
+    }
+    return images;
+}
+
+static void clear_replacements(struct sd_ass_priv *ctx)
+{
+    TA_FREEP(&ctx->replacements);
+    ctx->num_replacements = 0;
+}
+
 static void emit_text_event(struct sd *sd, ASS_Event *event)
 {
+    struct sd_ass_priv *ctx = sd->priv;
     if (!sd->text_cue_callback || !event->Text)
         return;
 
@@ -521,10 +589,12 @@ static void emit_text_event(struct sd *sd, ASS_Event *event)
     }
     if (visible) {
         struct sub_text_cue cue = {
-            .id = cue_identity(event),
+            .id = mp_ass_event_id(event),
             .start = event->Start / 1000.0,
             .duration = event->Duration / 1000.0,
             .text = plain,
+            .ass = !ctx->is_converted || lavc_conv_is_styled(ctx->converter)
+                ? event->Text : NULL,
         };
         sd->text_cue_callback(sd->text_cue_callback_ctx, &cue);
     }
@@ -876,7 +946,9 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
         fill_plaintext(sd, pts);
 
     int changed;
-    ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
+    ASS_Image *imgs = mp_ass_render_replacements(
+        renderer, track, ts, &changed, ctx->replacements,
+        no_ass ? 0 : ctx->num_replacements, opts->ass_prune_delay * 1000.0);
     mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
 
 done:
@@ -971,10 +1043,11 @@ static bstr get_text_buf(struct sd *sd, double pts, enum sd_text_type type)
     for (int i = 0; i < track->n_events; ++i) {
         ASS_Event *event = track->events + i;
         if (ipts >= event->Start && ipts < event->Start + event->Duration) {
-            if (event->Text) {
+            const char *text = event_text(ctx, event);
+            if (text) {
                 int start = b->len;
                 if (type == SD_TEXT_TYPE_PLAIN) {
-                    ass_to_plaintext(b, event->Text);
+                    ass_to_plaintext(b, text);
                 } else if (type == SD_TEXT_TYPE_ASS_FULL) {
                     long long s = event->Start;
                     long long e = s + event->Duration;
@@ -996,9 +1069,9 @@ static bstr get_text_buf(struct sd *sd, double pts, enum sd_text_type type)
                         eh, em, es, ec,
                         (style && style->Name) ? style->Name : "", event->Name,
                         event->MarginL, event->MarginR, event->MarginV,
-                        event->Effect, event->Text);
+                        event->Effect, text);
                 } else {
-                    bstr_xappend(NULL, b, bstr0(event->Text));
+                    bstr_xappend(NULL, b, bstr0(text));
                 }
                 if (is_whitespace_only(bstr_cut(*b, start))) {
                     b->len = start;
@@ -1093,6 +1166,7 @@ static void fill_plaintext(struct sd *sd, double pts)
 static void reset(struct sd *sd)
 {
     struct sd_ass_priv *ctx = sd->priv;
+    clear_replacements(ctx);
     if (sd->opts->sub_clear_on_seek || ctx->clear_once) {
         ass_flush_events(ctx->ass_track);
         ctx->num_seen_packets = 0;
@@ -1126,7 +1200,7 @@ static struct sub_lines *get_lines(struct sd *sd)
             continue;
 
         char *plain = NULL;
-        bstr result = sd_ass_to_plaintext(&plain, event->Text);
+        bstr result = sd_ass_to_plaintext(&plain, event_text(ctx, event));
 
         // ASS subtitle lines can have many empty lines after stripping tags,
         // but empty lines are useful in LRC.
@@ -1172,6 +1246,31 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
 {
     struct sd_ass_priv *ctx = sd->priv;
     switch (cmd) {
+    case SD_CTRL_SET_TEXT_REPLACEMENT: {
+        struct sub_text_replacement *replacement = arg;
+        if (!replacement) {
+            clear_replacements(ctx);
+            return CONTROL_OK;
+        }
+        for (int n = 0; n < ctx->num_replacements; n++) {
+            struct sub_text_replacement *r = &ctx->replacements[n];
+            if (r->id != replacement->id)
+                continue;
+            talloc_free((char *)r->source);
+            talloc_free((char *)r->text);
+            MP_TARRAY_REMOVE_AT(ctx->replacements, ctx->num_replacements, n);
+            break;
+        }
+        if (replacement->text) {
+            struct sub_text_replacement r = *replacement;
+            MP_TARRAY_APPEND(ctx, ctx->replacements, ctx->num_replacements, r);
+            struct sub_text_replacement *stored =
+                &ctx->replacements[ctx->num_replacements - 1];
+            stored->source = talloc_strdup(ctx->replacements, r.source);
+            stored->text = talloc_strdup(ctx->replacements, r.text);
+        }
+        return CONTROL_OK;
+    }
     case SD_CTRL_SUB_STEP: {
         double *a = arg;
         long long ts = floor(a[0] * 1000.0 + 1e-6);

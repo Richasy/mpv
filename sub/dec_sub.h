@@ -23,6 +23,7 @@ enum sd_ctrl {
     SD_CTRL_RESET_SOFT,
     SD_CTRL_UPDATE_OPTS,
     SD_CTRL_APPLY_DVDNAV,   // const struct stream_nav_state *
+    SD_CTRL_SET_TEXT_REPLACEMENT, // struct sub_text_replacement *; NULL clears all
 };
 
 enum sd_text_type {
@@ -57,6 +58,13 @@ struct sub_text_cue {
     double start;
     double duration;
     const char *text; // valid only for the duration of the callback
+    const char *ass; // canonical ASS Text for styled input, otherwise NULL
+};
+
+struct sub_text_replacement {
+    uint64_t id;
+    const char *source;
+    const char *text; // NULL removes this replacement
 };
 
 typedef void (*sub_text_cue_fn)(void *ctx,

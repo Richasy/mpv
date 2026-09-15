@@ -138,6 +138,18 @@ subtitle_timing = executable(
 )
 test('subtitle-timing', subtitle_timing)
 
+if features['libass']
+    subtitle_ass_translation = executable(
+        'subtitle-ass-translation',
+        'subtitle_ass_translation.c',
+        include_directories: incdir,
+        objects: libmpv.extract_all_objects(recursive: true),
+        dependencies: dependencies,
+    )
+    test('subtitle-ass-translation', subtitle_ass_translation,
+         args: files('samples/sub_translate.ass'))
+endif
+
 linked_list = executable('linked-list', files('linked_list.c'), include_directories: incdir)
 test('linked-list', linked_list)
 

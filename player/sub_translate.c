@@ -46,6 +46,7 @@ enum cue_state {
     CUE_PENDING,
     CUE_TRANSLATED,
     CUE_EXPIRED,
+    CUE_FAILED,
 };
 
 struct translated_cue {
@@ -56,6 +57,12 @@ struct translated_cue {
     double duration;
     char *text;
     char *translated;
+    uint64_t request_id;
+    struct sub_translate_span *spans;
+    int num_spans;
+    int next_span;
+    char *assembled;
+    char *request_text;
     enum cue_state state;
 };
 
@@ -67,11 +74,13 @@ struct sub_translate_state {
     struct dec_sub *source_decoder;
     bool source_attached;
     bool secondary_blocked;
+    bool replace;
     struct sh_stream *output_stream;
     struct track *output_track;
     struct translated_cue **cues;
     int num_cues;
     int next_read_order;
+    uint64_t next_request_id;
     int translated_count;
     double scan_until;
     bool needs_scan;
@@ -167,6 +176,8 @@ static struct track *find_output_track(struct sub_translate_state *state)
 
 static bool secondary_conflict(struct sub_translate_state *state)
 {
+    if (state->replace)
+        return false;
     struct track *secondary =
         state->mpctx->current_track[1][STREAM_SUB];
     return secondary && !owns_secondary(state, secondary);
@@ -184,14 +195,26 @@ static void clear_output(struct sub_translate_state *state, bool deselect)
         mp_switch_track_n(state->mpctx, 1, STREAM_SUB, NULL, 0);
 }
 
+static void redraw_replacement(struct sub_translate_state *state)
+{
+    if (state->replace && state->source_track) {
+        state->source_track->redraw_subs = true;
+        osd_changed(state->mpctx->osd);
+    }
+}
+
 static void detach_source(struct sub_translate_state *state)
 {
     if (state->source_decoder) {
+        sub_control(state->source_decoder, SD_CTRL_SET_TEXT_REPLACEMENT, NULL);
+        redraw_replacement(state);
         sub_set_text_cue_callback(state->source_decoder, NULL, NULL);
     }
     state->source_track = NULL;
     state->source_decoder = NULL;
     state->source_attached = false;
+    state->replace = false;
+    state->secondary_blocked = false;
     state->scan_until = -INFINITY;
     state->needs_scan = false;
     if (state->mpctx->translation) {
@@ -204,6 +227,10 @@ static void detach_source(struct sub_translate_state *state)
 static void reset_source_work(struct sub_translate_state *state,
                               bool deselect_output)
 {
+    if (state->source_decoder) {
+        sub_control(state->source_decoder, SD_CTRL_SET_TEXT_REPLACEMENT, NULL);
+        redraw_replacement(state);
+    }
     if (state->mpctx->translation) {
         mp_translation_invalidate_source(
             state->mpctx->translation,
@@ -257,7 +284,8 @@ static enum mp_translation_submit_result submit_cue(
         mp_translation_submit(
             state->mpctx->translation,
             MP_TRANSLATION_SOURCE_SUBTITLE,
-            cue->id, cue->revision, cue->text,
+            cue->request_id, cue->revision,
+            state->replace ? cue->request_text : cue->text,
             cue->start, cue->duration, 0);
     if (result == MP_TRANSLATION_SUBMIT_QUEUED) {
         cue->state = CUE_PENDING;
@@ -279,6 +307,15 @@ static enum mp_translation_submit_result submit_cue(
     return result;
 }
 
+static void prepare_span(struct sub_translate_state *state,
+                         struct translated_cue *cue)
+{
+    struct sub_translate_span span = cue->spans[cue->next_span];
+    talloc_free(cue->request_text);
+    cue->request_text = talloc_strndup(cue, cue->text + span.start, span.length);
+    cue->request_id = ++state->next_request_id;
+}
+
 static void on_text_cue(void *ctx, const struct sub_text_cue *source)
 {
     struct sub_translate_state *state = ctx;
@@ -290,6 +327,9 @@ static void on_text_cue(void *ctx, const struct sub_text_cue *source)
         return;
     }
 
+    const char *text = state->replace ? source->ass : source->text;
+    if (!text)
+        return;
     struct translated_cue *cue = find_cue(state, source->id);
     if (!cue) {
         cue = talloc_zero(NULL, struct translated_cue);
@@ -299,16 +339,20 @@ static void on_text_cue(void *ctx, const struct sub_text_cue *source)
         MP_TARRAY_APPEND(state, state->cues, state->num_cues, cue);
     } else if (cue->start == source->start &&
                cue->duration == source->duration &&
-               strcmp(cue->text, source->text) == 0)
+               strcmp(cue->text, text) == 0)
     {
         if (cue->state == CUE_WAITING)
             submit_cue(state, cue);
+        if (state->replace && cue->state == CUE_TRANSLATED)
+            state->needs_rebuild = true;
         notify_status_if_changed(state);
         return;
     } else {
         cue->revision++;
-        if (cue->state == CUE_TRANSLATED)
+        if (cue->state == CUE_TRANSLATED) {
             state->needs_rebuild = true;
+            state->translated_count--;
+        }
         talloc_free(cue->translated);
         cue->translated = NULL;
     }
@@ -316,7 +360,22 @@ static void on_text_cue(void *ctx, const struct sub_text_cue *source)
     cue->start = source->start;
     cue->duration = source->duration;
     talloc_free(cue->text);
-    cue->text = talloc_strdup(cue, source->text);
+    cue->text = talloc_strdup(cue, text);
+    cue->request_id = ++state->next_request_id;
+    if (state->replace) {
+        TA_FREEP(&cue->spans);
+        TA_FREEP(&cue->assembled);
+        cue->num_spans = sub_translate_ass_spans(text, NULL, 0);
+        cue->next_span = 0;
+        if (cue->num_spans <= 0) {
+            cue->state = CUE_FAILED;
+            return;
+        }
+        cue->spans = talloc_array(cue, struct sub_translate_span, cue->num_spans);
+        sub_translate_ass_spans(text, cue->spans, cue->num_spans);
+        cue->assembled = talloc_strdup(cue, "");
+        prepare_span(state, cue);
+    }
     cue->state = CUE_WAITING;
     submit_cue(state, cue);
     notify_status_if_changed(state);
@@ -368,6 +427,24 @@ static void feed_cue(struct sub_translate_state *state,
 
 static void rebuild_output(struct sub_translate_state *state)
 {
+    if (state->replace) {
+        sub_control(state->source_decoder, SD_CTRL_SET_TEXT_REPLACEMENT, NULL);
+        for (int n = 0; n < state->num_cues; n++) {
+            struct translated_cue *cue = state->cues[n];
+            if (cue->state != CUE_TRANSLATED)
+                continue;
+            struct sub_text_replacement replacement = {
+                .id = cue->id,
+                .source = cue->text,
+                .text = cue->translated,
+            };
+            sub_control(state->source_decoder, SD_CTRL_SET_TEXT_REPLACEMENT,
+                        &replacement);
+        }
+        redraw_replacement(state);
+        state->needs_rebuild = false;
+        return;
+    }
     if (!state->output_stream && state->mpctx->demuxer) {
         state->output_stream =
             demuxer_ensure_translated_sub(state->mpctx->demuxer);
@@ -395,11 +472,19 @@ static void accept_result(
     void *ctx, const struct mp_translation_result *result)
 {
     struct sub_translate_state *state = ctx;
-    struct translated_cue *cue = find_cue(state, result->cue_id);
+    struct translated_cue *cue = NULL;
+    for (int n = 0; n < state->num_cues; n++) {
+        if (state->cues[n]->request_id == result->cue_id) {
+            cue = state->cues[n];
+            break;
+        }
+    }
     if (!cue || cue->revision != result->revision)
         return;
     cue->state = CUE_WAITING;
     if (!result->translated) {
+        if (state->replace)
+            cue->state = CUE_FAILED;
         if (result->kind == MP_TRANSLATION_RESULT_FALLBACK_FAILURE)
             set_error(state, result->error
                 ? result->error : "translation provider failed");
@@ -414,8 +499,32 @@ static void accept_result(
         return;
     }
 
+    if (state->replace) {
+        if (!result->translated[0]) {
+            cue->state = CUE_FAILED;
+            set_error(state, "translation provider returned empty text");
+            return;
+        }
+        struct sub_translate_span span = cue->spans[cue->next_span];
+        size_t previous_end = cue->next_span
+            ? cue->spans[cue->next_span - 1].start +
+              cue->spans[cue->next_span - 1].length : 0;
+        cue->assembled = talloc_strndup_append(
+            cue->assembled, cue->text + previous_end, span.start - previous_end);
+        char *escaped = sub_translate_escape_ass(NULL, result->translated);
+        cue->assembled = talloc_strdup_append(cue->assembled, escaped);
+        talloc_free(escaped);
+        if (++cue->next_span < cue->num_spans) {
+            prepare_span(state, cue);
+            submit_cue(state, cue);
+            return;
+        }
+        cue->assembled = talloc_strdup_append(
+            cue->assembled, cue->text + span.start + span.length);
+    }
     talloc_free(cue->translated);
-    cue->translated = talloc_strdup(cue, result->translated);
+    cue->translated = talloc_strdup(
+        cue, state->replace ? cue->assembled : result->translated);
     cue->state = CUE_TRANSLATED;
     state->translated_count++;
     replace_message(&state->error, state, NULL);
@@ -429,6 +538,13 @@ static void prune_cues(struct sub_translate_state *state, double playback)
         if (cue->start + cue->duration <
             playback - SUB_TRANSLATE_PAST_WINDOW)
         {
+            if (state->replace) {
+                struct sub_text_replacement replacement = {.id = cue->id};
+                sub_control(state->source_decoder, SD_CTRL_SET_TEXT_REPLACEMENT,
+                            &replacement);
+                if (cue->state == CUE_TRANSLATED)
+                    state->translated_count--;
+            }
             talloc_free(cue);
             MP_TARRAY_REMOVE_AT(state->cues, state->num_cues, n);
         } else {
@@ -490,7 +606,7 @@ static void attach_current_source(struct sub_translate_state *state)
     }
 
     detach_source(state);
-    reset_source_work(state, false);
+    reset_source_work(state, true);
     replace_message(&state->error, state, NULL);
     replace_message(&state->unsupported, state, NULL);
     if (!state->enabled)
@@ -499,6 +615,10 @@ static void attach_current_source(struct sub_translate_state *state)
     if (track && track->d_sub) {
         state->source_track = track;
         state->source_decoder = track->d_sub;
+        const char *codec = track->stream && track->stream->codec
+            ? track->stream->codec->codec : NULL;
+        state->replace = codec &&
+            (!strcmp(codec, "ass") || !strcmp(codec, "ssa"));
         const char *profile =
             track->stream && track->stream->codec
                 ? track->stream->codec->codec_profile : NULL;
@@ -606,7 +726,7 @@ void sub_translate_update(struct MPContext *mpctx)
     attach_current_source(state);
     if (state->output_stream && !state->output_track)
         state->output_track = find_output_track(state);
-    if (state->output_track) {
+    if (state->output_track && !state->replace) {
         struct track *secondary = mpctx->current_track[1][STREAM_SUB];
         if (!secondary)
             mp_switch_track_n(mpctx, 1, STREAM_SUB,
@@ -736,7 +856,7 @@ char *sub_translate_get_status(struct MPContext *mpctx, void *talloc_parent)
         if (state->source_track &&
             !sub_translate_is_generated_profile(profile))
             source_sid = state->source_track->user_tid;
-        if (state->output_track)
+        if (state->output_track && !state->replace)
             output_sid = state->output_track->user_tid;
         translated = state->translated_count;
         if (mpctx->translation) {
@@ -755,7 +875,7 @@ char *sub_translate_get_status(struct MPContext *mpctx, void *talloc_parent)
             name = "error";
         } else if (pending > 0) {
             name = translated > 0 ? "active" : "translating";
-        } else if (translated > 0 && state->output_track) {
+        } else if (translated > 0 && (state->replace || state->output_track)) {
             name = "active";
         } else {
             name = "idle";
@@ -767,6 +887,8 @@ char *sub_translate_get_status(struct MPContext *mpctx, void *talloc_parent)
     node_init(&root, MPV_FORMAT_NODE_MAP, NULL);
     talloc_steal(tmp, root.u.list);
     node_map_add_string(&root, "state", name);
+    node_map_add_string(&root, "presentation",
+                        state && state->replace ? "replace" : "companion");
     if (source_sid >= 0)
         node_map_add_int64(&root, "source_sid", source_sid);
     else
@@ -790,7 +912,7 @@ char *sub_translate_get_status(struct MPContext *mpctx, void *talloc_parent)
     talloc_free(tmp);
     return result ? result : talloc_strdup(
         talloc_parent,
-        "{\"state\":\"error\",\"source_sid\":null,"
+        "{\"state\":\"error\",\"presentation\":\"companion\",\"source_sid\":null,"
         "\"output_sid\":null,\"translated\":0,\"pending\":0,"
         "\"error\":\"status serialization failed\"}");
 }

@@ -597,6 +597,7 @@ static bool start_player(struct suite *suite)
         {"ao", "null"},
         {"hwdec", "no"},
         {"screenshot-sw", "yes"},
+        {"sws-allow-zimg", "no"},
         {"force-rgba-osd-rendering", suite->relative_mode ? "no" : "yes"},
         {"pause", "yes"},
         {"keep-open", "yes"},

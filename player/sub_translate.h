@@ -35,6 +35,9 @@ void sub_translate_set_enabled(struct MPContext *mpctx, bool enabled);
 int sub_translate_set_config(struct MPContext *mpctx, const char *json,
                              char **error);
 char *sub_translate_get_config(struct MPContext *mpctx, void *talloc_parent);
+int sub_translate_set_ocr_config(struct MPContext *mpctx, const char *json,
+                                 char **error);
+char *sub_translate_get_ocr_config(struct MPContext *mpctx, void *talloc_parent);
 char *sub_translate_get_status(struct MPContext *mpctx, void *talloc_parent);
 
 void sub_translate_update(struct MPContext *mpctx);

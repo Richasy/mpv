@@ -32,6 +32,8 @@ struct sd {
     const char *lang;
     sub_text_cue_fn text_cue_callback;
     void *text_cue_callback_ctx;
+    sub_bitmap_cue_fn bitmap_cue_callback;
+    void *bitmap_cue_callback_ctx;
 
     // Set to false as soon as the decoder discards old subtitle events.
     // (only needed if sd_functions.accept_packets_in_advance == false)
@@ -56,6 +58,7 @@ struct sd_functions {
     struct sd_times (*get_times)(struct sd *sd, double pts);
     struct sub_lines *(*get_lines)(struct sd *sd);
     void (*emit_text_cues)(struct sd *sd, double start, double end);
+    void (*emit_bitmap_cues)(struct sd *sd, double start, double end);
 };
 
 // lavc_conv.c

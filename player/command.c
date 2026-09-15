@@ -1780,6 +1780,30 @@ static int mp_property_sub_translate(void *ctx, struct m_property *prop,
     return M_PROPERTY_NOT_IMPLEMENTED;
 }
 
+static int mp_property_sub_ocr_config(void *ctx, struct m_property *prop,
+                                      int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    switch (action) {
+    case M_PROPERTY_GET_TYPE:
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_STRING};
+        return M_PROPERTY_OK;
+    case M_PROPERTY_GET:
+        *(char **)arg = sub_translate_get_ocr_config(mpctx, NULL);
+        return M_PROPERTY_OK;
+    case M_PROPERTY_SET: {
+        char *error = NULL;
+        int result = sub_translate_set_ocr_config(mpctx, *(char **)arg, &error);
+        if (result < 0)
+            MP_WARN(mpctx, "sub-ocr-config rejected: %s\n",
+                    error ? error : "invalid configuration");
+        talloc_free(error);
+        return result < 0 ? M_PROPERTY_ERROR : M_PROPERTY_OK;
+    }
+    }
+    return M_PROPERTY_NOT_IMPLEMENTED;
+}
+
 static int mp_property_sub_translate_status(void *ctx,
                                             struct m_property *prop,
                                             int action, void *arg)
@@ -4996,6 +5020,7 @@ static const struct m_property mp_properties_base[] = {
     {"whisper-ai-translate-status", mp_property_whisper_ai_translate_status},
     {"whisper-translate-limits", mp_property_whisper_translate_limits},
     {"sub-translate-config", mp_property_sub_translate_config},
+    {"sub-ocr-config", mp_property_sub_ocr_config},
     {"sub-translate", mp_property_sub_translate},
     {"sub-translate-status", mp_property_sub_translate_status},
     {"playback-abort", mp_property_playback_abort},

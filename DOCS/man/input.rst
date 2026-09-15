@@ -3573,8 +3573,74 @@ Property list
     and `handle closure
     <https://learn.microsoft.com/en-us/windows/win32/api/winhttp/nf-winhttp-winhttpclosehandle>`_.
 
+``sub-ocr-config`` (RW)
+    Configure optional local bitmap-subtitle OCR. This is a JSON string, not a
+    translation-provider configuration. The default ``{}`` disables OCR.
+    An empty string also disables it. Unknown fields, duplicate fields and
+    invalid modes are rejected without replacing the previous configuration.
+
+    ``model`` and ``dictionary`` are required nonempty paths when enabled.
+    ``runtime`` optionally selects an explicit ``onnxruntime.dll``. Paths
+    support mpv's user-path expansion. Without ``runtime``, the backend uses
+    the already loaded runtime or the runtime next to the mpv library.
+    The dictionary is a UTF-8 JSON string array in model output order, including
+    the CTC blank at index zero and the final space entry.
+
+    ``mode`` is ``auto`` (default), ``source`` or ``full``. ``source_lang``
+    optionally supplies an OCR selection hint and defaults to ``auto``.
+    ``source`` mode requires an explicit ``source_lang``. The translation
+    target and, otherwise, the source hint come from ``sub-translate-config``.
+    Set the translation provider's source language to ``auto`` or the language
+    actually selected for translation.
+
+    ``full`` retains all recognized lines. ``auto`` requires three distinct,
+    time-ordered, nonoverlapping events with the same centered two-block
+    convention before selecting one block. It reuses a matching target block,
+    or translates only the source when the companion uses a clearly disjoint
+    non-target script. ``source`` requests an explicitly
+    selected source block. Ambiguous language or layout evidence retains the
+    full recognized text rather than silently discarding a block. Same-language
+    wrapped lines remain together. Script detection is not a general language
+    detector: short text, Han-only Japanese/Chinese, and unsupported language
+    combinations can remain ambiguous. Merely containing target-language text
+    does not establish that an unrelated sign and dialogue are translations.
+    Existing target text is reused only within the recognized bilingual
+    authoring convention; that convention is not semantic proof of equivalence.
+
+    The Windows build requires ``-Dsub-ocr=enabled`` and compatible ONNX Runtime
+    SDK headers supplied through ``-Donnxruntime-path``. The runtime is loaded
+    dynamically and OCR uses the CPU execution provider; it does not require
+    DirectML, a GPU, an NPU, Python or PaddlePaddle during playback.
+    ``TOOLS/prepare-sub-ocr.py <directory>`` downloads the pinned Apache-2.0
+    PP-OCRv6 medium model, verifies its hashes, and prepares its dictionary.
+    That optional preparation helper requires Python and PyYAML. Model weights
+    are not bundled in the source tree or downloaded implicitly during playback.
+
+    Model loading and recognition run on a dedicated worker. Admission is
+    bounded to 32 outstanding events and 32 MiB of copied bitmap pixels.
+    Disabling translation, seeking or changing tracks invalidates queued and
+    in-flight results. Configuration replacement additionally releases the old
+    model session. Decoder-owned image memory never escapes into the worker.
+    The normal bitmap decoder still retains its four-event display queue:
+    demuxer read-ahead does not make it an unlimited decoded-image cache.
+    A subtitle whose end is not known yet uses the decoder's one-minute
+    ceiling and is revised when a following display/clear event closes it.
+    This provisional interval does not advance bilingual-layout observations.
+
+    ``sub-translate-status`` includes ``ocr_available``, ``ocr_recognized``,
+    ``ocr_ambiguous`` and ``ocr_selection``. Selection reasons distinguish
+    ``bilingual-target-reused``, ``bilingual-source-selected``,
+    ``manual-source-selected``, ``full-requested`` and conservative fallback
+    reasons. Bitmap output reports presentation ``bitmap-text``.
+
+    Example configuration::
+
+        {"model":"C:\\Models\\ocr\\inference.onnx",
+         "dictionary":"C:\\Models\\ocr\\dictionary.json",
+         "mode":"auto","source_lang":"en"}
+
 ``sub-translate`` (RW)
-    Enable translation of the selected primary text subtitle. The default is
+    Enable translation of the selected primary subtitle. The default is
     ``no``. This flag is independent from ``whisper-lookahead`` and does not
     load a Whisper model, create an audio filter, or require an audio track.
 
@@ -3590,8 +3656,13 @@ Property list
 
     Text formats decoded by mpv's ASS subtitle decoder are supported, including
     external subtitle files and text subtitle streams embedded in containers.
-    Bitmap subtitles are reported as unsupported; OCR and hard-subtitle
-    recognition are not performed. Translation consumes decoded dialogue text,
+    Bitmap subtitles require the optional OCR build and ``sub-ocr-config``.
+    OCR reads decoded palette subtitle objects, not video frames. It produces
+    ordinary text in the owned companion track and hides a source bitmap event
+    only after its text output has been supplied. Pending or failed events
+    retain their original bitmap. Bitmap fonts, colors and effects are not
+    reconstructed. Hard-subtitle recognition is not performed.
+    Translation consumes decoded dialogue text,
     preserves each cue's player-timeline timing and identity (including
     overlaps), compensates independently for primary and secondary subtitle
     delay/speed transforms, and escapes translated text before placing it in

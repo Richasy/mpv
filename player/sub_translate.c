@@ -22,6 +22,7 @@
 
 #include <mpv/client.h>
 
+#include "config.h"
 #include "mpv_talloc.h"
 
 #include "common/common.h"
@@ -30,11 +31,15 @@
 #include "demux/packet.h"
 #include "misc/json.h"
 #include "misc/node.h"
+#include "options/path.h"
 #include "sub/dec_sub.h"
+#include "sub/ocr_engine.h"
+#include "sub/ocr_policy.h"
 
 #include "command.h"
 #include "core.h"
 #include "sub_translate.h"
+#include "sub_ocr.h"
 #include "translation.h"
 
 #define SUB_TRANSLATE_PAST_WINDOW 30.0
@@ -65,6 +70,14 @@ struct translated_cue {
     char *assembled;
     char *request_text;
     enum cue_state state;
+    bool already_target;
+};
+
+struct ocr_source_cue {
+    uint64_t id;
+    double start, duration;
+    bool submitted, failed, end_known, policy_observed;
+    struct mp_ocr_result *recognized;
 };
 
 struct sub_translate_state {
@@ -76,6 +89,7 @@ struct sub_translate_state {
     bool source_attached;
     bool secondary_blocked;
     bool replace;
+    bool bitmap;
     struct sh_stream *output_stream;
     struct track *output_track;
     struct translated_cue **cues;
@@ -89,7 +103,29 @@ struct sub_translate_state {
     char *error;
     char *unsupported;
     char *last_status;
+    char *ocr_config;
+    char *ocr_model, *ocr_dictionary, *ocr_runtime;
+    char *ocr_mode, *ocr_source_lang;
+    char *ocr_effective_source, *ocr_target_lang;
+    char *ocr_selection;
+    bool ocr_ambiguous;
+    int ocr_recognized;
+    struct sub_ocr_worker *ocr_worker;
+    struct ocr_source_cue **ocr_cues;
+    int num_ocr_cues;
+    bool ocr_reselect;
+    struct mp_ocr_policy_context ocr_policy;
 };
+
+static void reset_ocr_work(struct sub_translate_state *state);
+static void process_ocr(struct sub_translate_state *state);
+static void redraw_replacement(struct sub_translate_state *state);
+#if HAVE_SUB_OCR
+static void on_bitmap_cue(void *ctx, const struct sub_bitmap_cue *source);
+static bool select_bitmap_text(struct sub_translate_state *state,
+                               struct ocr_source_cue *cue, char **text,
+                               bool *already_target);
+#endif
 
 static struct sub_translate_state *get_state(struct MPContext *mpctx,
                                              bool create)
@@ -186,6 +222,10 @@ static bool secondary_conflict(struct sub_translate_state *state)
 
 static void clear_output(struct sub_translate_state *state, bool deselect)
 {
+    if (state->bitmap && state->source_decoder) {
+        sub_control(state->source_decoder, SD_CTRL_SET_BITMAP_REPLACEMENT, NULL);
+        redraw_replacement(state);
+    }
     if (state->mpctx->demuxer)
         demux_clear_translated_sub_queue(state->mpctx->demuxer);
     reset_translated_subtitle_track(state->mpctx);
@@ -198,7 +238,7 @@ static void clear_output(struct sub_translate_state *state, bool deselect)
 
 static void redraw_replacement(struct sub_translate_state *state)
 {
-    if (state->replace && state->source_track) {
+    if ((state->replace || state->bitmap) && state->source_track) {
         state->source_track->redraw_subs = true;
         osd_changed(state->mpctx->osd);
     }
@@ -208,13 +248,16 @@ static void detach_source(struct sub_translate_state *state)
 {
     if (state->source_decoder) {
         sub_control(state->source_decoder, SD_CTRL_SET_TEXT_REPLACEMENT, NULL);
+        sub_control(state->source_decoder, SD_CTRL_SET_BITMAP_REPLACEMENT, NULL);
         redraw_replacement(state);
         sub_set_text_cue_callback(state->source_decoder, NULL, NULL);
+        sub_set_bitmap_cue_callback(state->source_decoder, NULL, NULL);
     }
     state->source_track = NULL;
     state->source_decoder = NULL;
     state->source_attached = false;
     state->replace = false;
+    state->bitmap = false;
     state->secondary_blocked = false;
     state->scan_until = -INFINITY;
     state->needs_scan = false;
@@ -230,8 +273,10 @@ static void reset_source_work(struct sub_translate_state *state,
 {
     if (state->source_decoder) {
         sub_control(state->source_decoder, SD_CTRL_SET_TEXT_REPLACEMENT, NULL);
+        sub_control(state->source_decoder, SD_CTRL_SET_BITMAP_REPLACEMENT, NULL);
         redraw_replacement(state);
     }
+    reset_ocr_work(state);
     if (state->mpctx->translation) {
         mp_translation_invalidate_source(
             state->mpctx->translation,
@@ -281,6 +326,8 @@ static bool cue_already_ended(struct sub_translate_state *state,
 static enum mp_translation_submit_result submit_cue(
     struct sub_translate_state *state, struct translated_cue *cue)
 {
+    if (cue->already_target)
+        return MP_TRANSLATION_SUBMIT_QUEUED;
     enum mp_translation_submit_result result =
         mp_translation_submit(
             state->mpctx->translation,
@@ -317,7 +364,8 @@ static void prepare_span(struct sub_translate_state *state,
     cue->request_id = ++state->next_request_id;
 }
 
-static void on_text_cue(void *ctx, const struct sub_text_cue *source)
+static void accept_source_cue(void *ctx, const struct sub_text_cue *source,
+                              bool already_target)
 {
     struct sub_translate_state *state = ctx;
     if (!state->enabled || !state->source_decoder ||
@@ -341,7 +389,8 @@ static void on_text_cue(void *ctx, const struct sub_text_cue *source)
     } else if (cue->start == source->start &&
                cue->duration == source->duration &&
                cue->ass_primary_end == source->ass_primary_end &&
-               strcmp(cue->text, text) == 0)
+               strcmp(cue->text, text) == 0 &&
+               cue->already_target == already_target)
     {
         if (cue->state == CUE_WAITING)
             submit_cue(state, cue);
@@ -362,9 +411,18 @@ static void on_text_cue(void *ctx, const struct sub_text_cue *source)
     cue->start = source->start;
     cue->duration = source->duration;
     cue->ass_primary_end = source->ass_primary_end;
+    cue->already_target = already_target;
     talloc_free(cue->text);
     cue->text = talloc_strdup(cue, text);
     cue->request_id = ++state->next_request_id;
+    if (already_target) {
+        cue->translated = talloc_strdup(cue, text);
+        cue->state = CUE_TRANSLATED;
+        state->translated_count++;
+        state->needs_rebuild = true;
+        notify_status_if_changed(state);
+        return;
+    }
     if (state->replace) {
         TA_FREEP(&cue->spans);
         TA_FREEP(&cue->assembled);
@@ -396,17 +454,22 @@ static void on_text_cue(void *ctx, const struct sub_text_cue *source)
     notify_status_if_changed(state);
 }
 
-static void feed_cue(struct sub_translate_state *state,
+static void on_text_cue(void *ctx, const struct sub_text_cue *source)
+{
+    accept_source_cue(ctx, source, false);
+}
+
+static bool feed_cue(struct sub_translate_state *state,
                      struct translated_cue *cue)
 {
     if (!state->mpctx->demuxer || !cue->translated ||
         !state->output_track || !state->output_track->d_sub)
     {
-        return;
+        return false;
     }
     if (secondary_conflict(state)) {
         set_error(state, "secondary subtitle track is already selected");
-        return;
+        return false;
     }
 
     double pts;
@@ -416,7 +479,7 @@ static void feed_cue(struct sub_translate_state *state,
             &pts, &duration))
     {
         set_error(state, "translated subtitle timing is unavailable");
-        return;
+        return false;
     }
 
     char *escaped = sub_translate_escape_ass(NULL, cue->translated);
@@ -430,7 +493,7 @@ static void feed_cue(struct sub_translate_state *state,
     if (!packet) {
         talloc_free(line);
         set_error(state, "translated subtitle packet allocation failed");
-        return;
+        return false;
     }
     packet->pts = pts;
     packet->dts = pts;
@@ -438,6 +501,7 @@ static void feed_cue(struct sub_translate_state *state,
     packet->sub_duration = duration;
     demuxer_feed_translated_sub(state->mpctx->demuxer, packet);
     talloc_free(line);
+    return true;
 }
 
 static void rebuild_output(struct sub_translate_state *state)
@@ -476,10 +540,17 @@ static void rebuild_output(struct sub_translate_state *state)
         return;
     }
     clear_output(state, false);
+    if (state->bitmap)
+        sub_control(state->source_decoder, SD_CTRL_SET_BITMAP_REPLACEMENT, NULL);
     for (int n = 0; n < state->num_cues; n++) {
-        if (state->cues[n]->state == CUE_TRANSLATED)
-            feed_cue(state, state->cues[n]);
+        if (state->cues[n]->state == CUE_TRANSLATED) {
+            bool fed = feed_cue(state, state->cues[n]);
+            if (fed && state->bitmap)
+                sub_control(state->source_decoder, SD_CTRL_SET_BITMAP_REPLACEMENT,
+                            &state->cues[n]->id);
+        }
     }
+    redraw_replacement(state);
     state->needs_rebuild = false;
 }
 
@@ -496,6 +567,12 @@ static void accept_result(
     }
     if (!cue || cue->revision != result->revision)
         return;
+    if (state->bitmap && isfinite(state->mpctx->playback_pts) &&
+        cue->start + cue->duration < state->mpctx->playback_pts)
+    {
+        cue->state = CUE_EXPIRED;
+        return;
+    }
     cue->state = CUE_WAITING;
     if (!result->translated) {
         if (state->replace)
@@ -589,6 +666,260 @@ static bool source_ready(struct sub_translate_state *state)
            !state->secondary_blocked && !state->unsupported;
 }
 
+static void reset_ocr_work(struct sub_translate_state *state)
+{
+#if HAVE_SUB_OCR
+    sub_ocr_worker_invalidate(state->ocr_worker);
+#endif
+    for (int n = 0; n < state->num_ocr_cues; n++)
+        talloc_free(state->ocr_cues[n]);
+    TA_FREEP(&state->ocr_cues);
+    state->num_ocr_cues = 0;
+    state->ocr_recognized = 0;
+    state->ocr_ambiguous = false;
+    state->ocr_reselect = false;
+    state->ocr_policy = (struct mp_ocr_policy_context){0};
+    replace_message(&state->ocr_selection, state, NULL);
+}
+
+#if HAVE_SUB_OCR
+static struct ocr_source_cue *find_ocr_cue(struct sub_translate_state *state,
+                                         uint64_t id)
+{
+    for (int n = 0; n < state->num_ocr_cues; n++) {
+        if (state->ocr_cues[n]->id == id)
+            return state->ocr_cues[n];
+    }
+    return NULL;
+}
+
+static void on_bitmap_cue(void *ctx, const struct sub_bitmap_cue *source)
+{
+    struct sub_translate_state *state = ctx;
+    if (!source_ready(state) || !state->bitmap || !state->ocr_worker)
+        return;
+    struct sub_text_cue timing = {
+        .id = source->id, .start = source->start, .duration = source->duration,
+    };
+    struct ocr_source_cue *cue = find_ocr_cue(state, source->id);
+    if (!cue && (!cue_in_window(state, &timing) ||
+                 cue_already_ended(state, &timing)))
+        return;
+    if (!cue) {
+        if (state->num_ocr_cues >= 256) {
+            set_error(state, "bitmap OCR event cache is full");
+            return;
+        }
+        cue = talloc_zero(NULL, struct ocr_source_cue);
+        cue->id = source->id;
+        MP_TARRAY_APPEND(state, state->ocr_cues, state->num_ocr_cues, cue);
+    }
+    if (cue->start != source->start || cue->duration != source->duration ||
+        cue->end_known != source->end_known)
+    {
+        state->ocr_reselect = true;
+        struct translated_cue *output = find_cue(state, cue->id);
+        if (output) {
+            output->start = source->start;
+            output->duration = source->duration;
+            state->needs_rebuild = true;
+        }
+    }
+    cue->start = source->start;
+    cue->duration = source->duration;
+    cue->end_known = source->end_known;
+    if (!cue->submitted && !cue->failed && !cue->recognized &&
+        !cue_already_ended(state, &timing))
+    {
+        enum sub_ocr_submit_result result =
+            sub_ocr_worker_submit(state->ocr_worker, source);
+        cue->submitted = result == SUB_OCR_QUEUED;
+        if (result == SUB_OCR_INVALID) {
+            cue->failed = true;
+            set_error(state, "bitmap OCR rejected an invalid or oversized event");
+        }
+    }
+}
+#endif
+
+static void process_ocr(struct sub_translate_state *state)
+{
+#if HAVE_SUB_OCR
+    if (!state->bitmap || !state->ocr_worker || !source_ready(state))
+        return;
+    double playback = state->mpctx->playback_pts;
+    if (!isfinite(playback))
+        playback = 0;
+    for (int n = 0; n < state->num_ocr_cues; ) {
+        struct ocr_source_cue *cue = state->ocr_cues[n];
+        if (cue->start + cue->duration < playback - SUB_TRANSLATE_PAST_WINDOW) {
+            talloc_free(cue);
+            MP_TARRAY_REMOVE_AT(state->ocr_cues, state->num_ocr_cues, n);
+        } else {
+            n++;
+        }
+    }
+    struct mp_translation_limits limits;
+    mp_translation_get_limits(state->mpctx->translation, &limits);
+    sub_emit_bitmap_cues(state->source_decoder,
+        playback - SUB_TRANSLATE_PAST_WINDOW,
+        playback + (limits.horizon_sec > 0 ? limits.horizon_sec : 60));
+    bool changed = state->ocr_reselect;
+    state->ocr_reselect = false;
+    struct sub_ocr_completion *completion;
+    while ((completion = sub_ocr_worker_poll(state->ocr_worker))) {
+        struct ocr_source_cue *cue = find_ocr_cue(state, completion->id);
+        if (cue) {
+            cue->submitted = false;
+            if (completion->result->error || !completion->result->num_lines) {
+                cue->failed = true;
+                set_error(state, completion->result->error
+                    ? completion->result->error : "bitmap OCR found no text");
+            } else {
+                cue->recognized = talloc_steal(cue, completion->result);
+                state->ocr_recognized++;
+                changed = true;
+            }
+        }
+        talloc_free(completion);
+    }
+    if (changed) {
+        for (int n = 0; n < state->num_ocr_cues; n++) {
+            struct ocr_source_cue *cue = state->ocr_cues[n];
+            if (cue->recognized && !cue->policy_observed && cue->end_known) {
+                char *text = NULL;
+                bool already_target = false;
+                select_bitmap_text(state, cue, &text, &already_target);
+                talloc_free(text);
+            }
+        }
+        state->ocr_ambiguous = false;
+        for (int n = 0; n < state->num_ocr_cues; n++) {
+            struct ocr_source_cue *cue = state->ocr_cues[n];
+            if (!cue->recognized)
+                continue;
+            char *text = NULL;
+            bool already_target = false;
+            if (select_bitmap_text(state, cue, &text, &already_target) &&
+                cue->start + cue->duration >= playback)
+            {
+                struct sub_text_cue source = {
+                    .id = cue->id, .start = cue->start,
+                    .duration = cue->duration, .text = text,
+                };
+                accept_source_cue(state, &source, already_target);
+            }
+            talloc_free(text);
+        }
+    }
+#endif
+}
+
+#if HAVE_SUB_OCR
+static bool select_bitmap_text(struct sub_translate_state *state,
+                               struct ocr_source_cue *cue, char **text,
+                               bool *already_target)
+{
+    if (cue->recognized->num_lines > MP_OCR_POLICY_MAX_LINES) {
+        set_error(state, "bitmap OCR returned too many text lines");
+        return false;
+    }
+    struct mp_ocr_policy_line lines[MP_OCR_POLICY_MAX_LINES];
+    size_t capacity = 1;
+    for (int n = 0; n < cue->recognized->num_lines; n++) {
+        const struct mp_ocr_line *line = &cue->recognized->lines[n];
+        size_t length = strlen(line->text);
+        if (capacity >= 65536 || length >= 65536 - capacity) {
+            set_error(state, "bitmap OCR text exceeds the event limit");
+            return false;
+        }
+        capacity += length + 1;
+        lines[n] = (struct mp_ocr_policy_line){
+            .text = line->text, .x = line->x, .y = line->y,
+            .w = line->w, .h = line->h, .region = line->region,
+            .confidence = line->confidence,
+        };
+    }
+    enum mp_ocr_selection_mode mode = MP_OCR_SELECT_AUTO;
+    if (state->ocr_mode && !strcmp(state->ocr_mode, "source"))
+        mode = MP_OCR_SELECT_SOURCE;
+    else if (state->ocr_mode && !strcmp(state->ocr_mode, "full"))
+        mode = MP_OCR_SELECT_FULL;
+    struct mp_ocr_policy_input input = {
+        .lines = lines, .num_lines = cue->recognized->num_lines,
+        .cue_id = cue->id, .revision = 1,
+        .start = cue->start, .duration = cue->duration,
+        .mode = mode, .source_lang = state->ocr_effective_source,
+        .target_lang = state->ocr_target_lang,
+        .track_lang = state->source_track ? state->source_track->lang : NULL,
+    };
+    struct mp_ocr_policy_context query = state->ocr_policy;
+    bool observe = !cue->policy_observed && cue->end_known;
+    input.reevaluate = !observe;
+    struct mp_ocr_policy_context *context = observe ? &state->ocr_policy : &query;
+    struct mp_ocr_policy_result selection;
+    *text = talloc_size(NULL, capacity);
+    if (!mp_ocr_policy_select(context, &input, *text, capacity,
+                              NULL, 0, &selection))
+    {
+        set_error(state, mp_ocr_policy_reason_string(selection.reason));
+        TA_FREEP(text);
+        return false;
+    }
+    cue->policy_observed |= observe;
+    if (!(*text)[0]) {
+        set_error(state, "bitmap OCR selected empty text");
+        TA_FREEP(text);
+        return false;
+    }
+    *already_target = selection.already_target;
+    double playback = state->mpctx->playback_pts;
+    if (!isfinite(playback) || cue->start + cue->duration >= playback) {
+        state->ocr_ambiguous |= selection.ambiguous;
+        replace_message(&state->ocr_selection, state,
+                        mp_ocr_policy_reason_string(selection.reason));
+    }
+    return true;
+}
+
+static void refresh_ocr_languages(struct sub_translate_state *state)
+{
+    void *tmp = talloc_new(NULL);
+    char *json = sub_translate_get_config(state->mpctx, tmp);
+    char *cursor = json;
+    struct mpv_node root = {0};
+    const char *source = "auto", *target = "";
+    if (json && json_parse(tmp, &root, &cursor, MAX_JSON_DEPTH) >= 0 &&
+        root.format == MPV_FORMAT_NODE_MAP)
+    {
+        struct mpv_node *s = node_map_get(&root, "source_lang");
+        struct mpv_node *t = node_map_get(&root, "target_lang");
+        if (s && s->format == MPV_FORMAT_STRING)
+            source = s->u.string;
+        if (t && t->format == MPV_FORMAT_STRING)
+            target = t->u.string;
+        struct mpv_node *provider = node_map_get(&root, "provider");
+        struct mpv_node *ai = node_map_get(&root, "ai");
+        if (provider && provider->format == MPV_FORMAT_STRING &&
+            !strcmp(provider->u.string, "ai") && ai &&
+            ai->format == MPV_FORMAT_NODE_MAP)
+        {
+            s = node_map_get(ai, "source_lang");
+            t = node_map_get(ai, "target_lang");
+            if (s && s->format == MPV_FORMAT_STRING && s->u.string[0])
+                source = s->u.string;
+            if (t && t->format == MPV_FORMAT_STRING && t->u.string[0])
+                target = t->u.string;
+        }
+    }
+    if (state->ocr_source_lang && strcmp(state->ocr_source_lang, "auto"))
+        source = state->ocr_source_lang;
+    replace_message(&state->ocr_effective_source, state, source);
+    replace_message(&state->ocr_target_lang, state, target);
+    talloc_free(tmp);
+}
+#endif
+
 static void attach_current_source(struct sub_translate_state *state)
 {
     struct MPContext *mpctx = state->mpctx;
@@ -661,9 +992,33 @@ static void attach_current_source(struct sub_translate_state *state)
         return;
     }
     if (!sub_set_text_cue_callback(track->d_sub, on_text_cue, state)) {
+#if HAVE_SUB_OCR
+        if (!state->ocr_model || !state->ocr_dictionary) {
+            replace_message(&state->unsupported, state,
+                            "selected subtitle track is bitmap-based; configure sub-ocr-config");
+            return;
+        }
+        if (!sub_set_bitmap_cue_callback(track->d_sub, on_bitmap_cue, state)) {
+            replace_message(&state->unsupported, state,
+                            "selected subtitle decoder has no bitmap OCR tap");
+            return;
+        }
+        if (!state->ocr_worker)
+            state->ocr_worker = sub_ocr_worker_create(
+                state->log, state->ocr_model, state->ocr_dictionary,
+                state->ocr_runtime, mp_wakeup_core_cb, mpctx);
+        if (!state->ocr_worker) {
+            sub_set_bitmap_cue_callback(track->d_sub, NULL, NULL);
+            set_error(state, "could not start bitmap OCR worker");
+            return;
+        }
+        state->bitmap = true;
+        refresh_ocr_languages(state);
+#else
         replace_message(&state->unsupported, state,
-                        "selected subtitle track is bitmap-based");
+                        "selected subtitle track is bitmap-based; OCR is unavailable in this build");
         return;
+#endif
     }
 
     mp_translation_register_source(
@@ -728,6 +1083,126 @@ char *sub_translate_get_config(struct MPContext *mpctx, void *talloc_parent)
         mpctx ? mpctx->translation : NULL, talloc_parent);
 }
 
+int sub_translate_set_ocr_config(struct MPContext *mpctx, const char *json,
+                                 char **error)
+{
+    if (!json || strlen(json) > 16384) {
+        *error = talloc_strdup(NULL, "OCR configuration exceeds 16384 bytes");
+        return -1;
+    }
+    void *tmp = talloc_new(NULL);
+    struct mpv_node root = {0};
+    char *cursor = (char *)json;
+    const char *message = NULL;
+    const char *model = NULL, *dictionary = NULL, *runtime = NULL;
+    const char *mode = "auto", *language = "auto";
+    bool enabled = json[0] != '\0';
+    if (enabled) {
+        if (!json_validate_strict(json, MAX_JSON_DEPTH) ||
+            json_parse(tmp, &root, &cursor, MAX_JSON_DEPTH) < 0 ||
+            root.format != MPV_FORMAT_NODE_MAP)
+        {
+            message = "OCR configuration must be a JSON object";
+            goto invalid;
+        }
+        for (int n = 0; n < root.u.list->num; n++) {
+            const char *key = root.u.list->keys[n];
+            struct mpv_node *value = &root.u.list->values[n];
+            for (int i = 0; i < n; i++) {
+                if (!strcmp(key, root.u.list->keys[i])) {
+                    message = "duplicate OCR configuration field";
+                    goto invalid;
+                }
+            }
+            if (value->format != MPV_FORMAT_STRING || !value->u.string[0]) {
+                message = "OCR configuration values must be nonempty strings";
+                goto invalid;
+            }
+            if (!strcmp(key, "model"))
+                model = value->u.string;
+            else if (!strcmp(key, "dictionary"))
+                dictionary = value->u.string;
+            else if (!strcmp(key, "runtime"))
+                runtime = value->u.string;
+            else if (!strcmp(key, "mode"))
+                mode = value->u.string;
+            else if (!strcmp(key, "source_lang"))
+                language = value->u.string;
+            else {
+                message = "unknown OCR configuration field";
+                goto invalid;
+            }
+        }
+        enabled = root.u.list->num > 0;
+        if (enabled && (!model || !dictionary)) {
+            message = "OCR model and dictionary are required";
+            goto invalid;
+        }
+        if (strcmp(mode, "auto") && strcmp(mode, "source") &&
+            strcmp(mode, "full"))
+        {
+            message = "OCR mode must be auto, source or full";
+            goto invalid;
+        }
+        if (!strcmp(mode, "source") && !strcmp(language, "auto")) {
+            message = "source mode requires an explicit OCR source_lang";
+            goto invalid;
+        }
+        if (strlen(language) > 63) {
+            message = "OCR source language is too long";
+            goto invalid;
+        }
+    }
+#if !HAVE_SUB_OCR
+    if (enabled) {
+        message = "bitmap OCR is unavailable in this build";
+        goto invalid;
+    }
+#endif
+    struct sub_translate_state *state = get_state(mpctx, true);
+    detach_source(state);
+    reset_source_work(state, true);
+#if HAVE_SUB_OCR
+    sub_ocr_worker_destroy(state->ocr_worker);
+    state->ocr_worker = NULL;
+#endif
+    TA_FREEP(&state->ocr_model);
+    TA_FREEP(&state->ocr_dictionary);
+    TA_FREEP(&state->ocr_runtime);
+    if (enabled) {
+        state->ocr_model = mp_normalize_user_path(state, mpctx->global, model);
+        state->ocr_dictionary = mp_normalize_user_path(
+            state, mpctx->global, dictionary);
+        if (runtime)
+            state->ocr_runtime = mp_normalize_user_path(
+                state, mpctx->global, runtime);
+    }
+    replace_message(&state->ocr_mode, state, mode);
+    replace_message(&state->ocr_source_lang, state, language);
+    replace_message(&state->ocr_config, state, enabled ? json : "{}");
+    replace_message(&state->error, state, NULL);
+    replace_message(&state->unsupported, state, NULL);
+    if (state->enabled)
+        attach_current_source(state);
+    notify_status_if_changed(state);
+    mp_notify_property(mpctx, "sub-ocr-config");
+    mp_wakeup_core(mpctx);
+    talloc_free(tmp);
+    return 0;
+
+invalid:
+    *error = talloc_strdup(NULL, message);
+    talloc_free(tmp);
+    return -1;
+}
+
+char *sub_translate_get_ocr_config(struct MPContext *mpctx, void *talloc_parent)
+{
+    struct sub_translate_state *state = get_state(mpctx, false);
+    return talloc_strdup(talloc_parent,
+        state && state->ocr_config ? state->ocr_config : "{}");
+}
+
 void sub_translate_update(struct MPContext *mpctx)
 {
     struct sub_translate_state *state = get_state(mpctx, false);
@@ -772,6 +1247,7 @@ void sub_translate_update(struct MPContext *mpctx)
     mp_translation_drain(mpctx->translation,
                          MP_TRANSLATION_SOURCE_SUBTITLE,
                          accept_result, state);
+    process_ocr(state);
     retry_deferred_cues(state);
     if (state->needs_rebuild)
         rebuild_output(state);
@@ -786,9 +1262,9 @@ void sub_translate_update(struct MPContext *mpctx)
     double horizon = limits.horizon_sec > 0
         ? limits.horizon_sec : 60;
     double wanted_end = playback + horizon;
-    if (state->needs_scan ||
+    if (!state->bitmap && (state->needs_scan ||
         wanted_end > state->scan_until - SUB_TRANSLATE_SCAN_MARGIN)
-    {
+    ) {
         state->needs_scan = false;
         state->scan_until = wanted_end;
         sub_emit_text_cues(state->source_decoder,
@@ -849,6 +1325,9 @@ void sub_translate_destroy(struct MPContext *mpctx)
     if (!mpctx || !mpctx->sub_translate)
         return;
     sub_translate_stop_file(mpctx);
+#if HAVE_SUB_OCR
+    sub_ocr_worker_destroy(mpctx->sub_translate->ocr_worker);
+#endif
     talloc_free(mpctx->sub_translate);
     mpctx->sub_translate = NULL;
 }
@@ -881,6 +1360,9 @@ char *sub_translate_get_status(struct MPContext *mpctx, void *talloc_parent)
         }
         for (int n = 0; n < state->num_cues; n++)
             pending += state->cues[n]->state == CUE_DEFERRED;
+#if HAVE_SUB_OCR
+        pending += sub_ocr_worker_pending(state->ocr_worker);
+#endif
         error = state->error ? state->error : state->unsupported;
         if (!state->enabled) {
             name = "disabled";
@@ -903,7 +1385,15 @@ char *sub_translate_get_status(struct MPContext *mpctx, void *talloc_parent)
     talloc_steal(tmp, root.u.list);
     node_map_add_string(&root, "state", name);
     node_map_add_string(&root, "presentation",
+                        state && state->bitmap ? "bitmap-text" :
                         state && state->replace ? "replace" : "companion");
+    node_map_add_flag(&root, "ocr_available", HAVE_SUB_OCR);
+    node_map_add_int64(&root, "ocr_recognized", state ? state->ocr_recognized : 0);
+    node_map_add_flag(&root, "ocr_ambiguous", state && state->ocr_ambiguous);
+    if (state && state->ocr_selection)
+        node_map_add_string(&root, "ocr_selection", state->ocr_selection);
+    else
+        node_map_add(&root, "ocr_selection", MPV_FORMAT_NONE);
     if (source_sid >= 0)
         node_map_add_int64(&root, "source_sid", source_sid);
     else

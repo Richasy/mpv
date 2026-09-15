@@ -62,6 +62,7 @@ option('wasapi', type: 'feature', value: 'auto', description: 'WASAPI audio outp
 option('amf', type: 'feature', value: 'auto', description: 'AMD AMF')
 option('dlssnr', type: 'feature', value: 'auto', description: 'Experimental NVIDIA DLSS neural rendering (Windows x64, external runtime)')
 option('rife', type: 'feature', value: 'auto', description: 'RIFE frame interpolation (DirectML via ONNX Runtime)')
+option('sub-ocr', type: 'feature', value: 'auto', description: 'Bitmap subtitle OCR (Windows, ONNX Runtime CPU)')
 option('onnxruntime-path', type: 'string', value: '', description: 'Path to ONNX Runtime SDK root directory (containing include/onnxruntime_c_api.h)')
 option('caca', type: 'feature', value: 'auto', description: 'CACA')
 option('cocoa', type: 'feature', value: 'auto', description: 'Cocoa')

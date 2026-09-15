@@ -109,6 +109,30 @@ translation_test = executable(
 )
 test('translation', translation_test)
 
+if features['sub-ocr']
+    ocr_policy_test = executable(
+        'ocr-policy', 'ocr_policy.c',
+        objects: libmpv.extract_objects('sub/ocr_policy.c'),
+        include_directories: incdir,
+    )
+    test('ocr-policy', ocr_policy_test)
+    ocr_engine_test = executable(
+        'ocr-engine', 'ocr_engine.c',
+        include_directories: incdir,
+        dependencies: dependencies,
+        link_with: test_utils,
+    )
+    test('ocr-engine', ocr_engine_test)
+    sub_ocr_worker_test = executable(
+        'sub-ocr-worker', 'sub_ocr_worker.c',
+        objects: libmpv.extract_objects('player/sub_ocr.c'),
+        include_directories: incdir,
+        dependencies: dependencies,
+        link_with: test_utils,
+    )
+    test('sub-ocr-worker', sub_ocr_worker_test, timeout: 15)
+endif
+
 translation_provider = executable(
     'translation-provider',
     'translation_provider.c',

@@ -63,4 +63,21 @@ struct sub_translate_span {
 int sub_translate_ass_spans(const char *text, struct sub_translate_span *spans,
                             int capacity);
 
+#define SUB_TRANSLATE_ASS_LAYOUT_SAMPLES 32
+
+struct sub_translate_ass_sample {
+    const char *text;
+    double start;
+    double duration;
+    double font_size;
+    int style;
+    bool normal_layout;
+};
+
+// A recurring same-event, smaller-italic lower block is a conventional bilingual
+// layout, not proof of language equivalence. Zero means translate the whole cue.
+size_t sub_translate_ass_primary_end(
+    const struct sub_translate_ass_sample *samples, int num_samples,
+    const struct sub_translate_ass_sample *cue);
+
 #endif

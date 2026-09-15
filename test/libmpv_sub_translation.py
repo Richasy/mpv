@@ -71,12 +71,12 @@ class TranslationHandler(http.server.BaseHTTPRequestHandler):
             pass  # Cancellation is expected for deliberately held old work.
 
 
-def run_test(dense_path, ssa_path):
+def run_test(dense_path, ssa_path, bilingual_path):
     server = TranslationServer()
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
     originals = {Path(path): Path(path).read_bytes()
-                 for path in [*sys.argv[2:], dense_path, ssa_path]}
+                 for path in [*sys.argv[2:], dense_path, ssa_path, bilingual_path]}
     try:
         process = subprocess.Popen(
             [
@@ -85,6 +85,7 @@ def run_test(dense_path, ssa_path):
                 *sys.argv[2:],
                 str(dense_path),
                 str(ssa_path),
+                str(bilingual_path),
             ],
             text=True,
             encoding="utf-8",
@@ -139,7 +140,10 @@ def run_test(dense_path, ssa_path):
         with server.lock:
             requests = list(server.requests)
         expected = {"foo", "bar", "Hello", "world", "I", "Repeat",
-                    "Positioned", "Caption", "ka", "ra", "oke", "Escaping"}
+                    "Positioned", "Caption", "ka", "ra", "oke", "Escaping",
+                    "Upper one", "Upper two", "Upper speaker", "Lower speaker",
+                    "Plain first", "Plain second", "Normal", "emphasis"}
+        expected.update(f"Upper block {index}" for index in range(1, 5))
         expected.update(f"dense-{index:03d}" for index in range(160))
         if not expected.issubset(requests) or any(
             text not in expected for text in requests
@@ -196,7 +200,43 @@ def main():
             "{\\a6\\pos(20,30)}Hello\n",
             encoding="utf-8",
         )
-        run_test(dense_path, ssa_path)
+        bilingual_path = Path(directory) / "bilingual-blocks.ass"
+        style_format = (
+            "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,"
+            "OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,"
+            "ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,"
+            "MarginL,MarginR,MarginV,Encoding\n"
+        )
+        style_fields = (
+            ",Arial,18,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,"
+            "0,0,0,0,100,100,0,0,1,1,1,2,5,5,2,1\n"
+        )
+        bilingual_path.write_text(
+            "[Script Info]\nScriptType: v4.00+\nPlayResX: 384\nPlayResY: 288\n"
+            "[V4+ Styles]\n" + style_format
+            + "".join("Style: " + name + style_fields
+                      for name in ("Body", "Speaker", "Plain"))
+            + "[Events]\n"
+            "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
+            + "".join(
+                f"Dialogue: 0,0:00:{index * 3:02d}.00,"
+                f"0:00:{index * 3 + 3:02d}.00,Body,,0,0,0,,"
+                + ("Upper one\\NUpper two" if index == 0
+                   else f"Upper block {index}")
+                + "\\N{\\fs12\\Arial\\i1}Lower unchanged\n"
+                for index in range(5)
+            )
+            + "Dialogue: 0,0:00:00.00,0:00:03.00,Speaker,,0,0,0,,"
+            "{\\pos(160,160)}Lower speaker\n"
+            + "Dialogue: 0,0:00:00.00,0:00:03.00,Speaker,,0,0,0,,"
+            "{\\pos(160,40)}Upper speaker\n"
+            + "Dialogue: 0,0:00:00.00,0:00:03.00,Plain,,0,0,0,,"
+            "Plain first\\NPlain second\n"
+            + "Dialogue: 0,0:00:00.00,0:00:03.00,Plain,,0,0,0,,"
+            "Normal\\N{\\i1}emphasis{\\i0}\n",
+            encoding="utf-8",
+        )
+        run_test(dense_path, ssa_path, bilingual_path)
 
 
 if __name__ == "__main__":

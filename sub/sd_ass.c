@@ -35,6 +35,7 @@
 #include "common/msg.h"
 #include "demux/demux.h"
 #include "demux/packet_pool.h"
+#include "player/sub_translate.h"
 #include "video/csputils.h"
 #include "video/mp_image.h"
 #include "dec_sub.h"
@@ -64,6 +65,7 @@ struct sd_ass_priv {
     bool check_animated;
     struct sub_text_replacement *replacements;
     int num_replacements;
+    uint64_t layout_sample_hash;
 };
 
 struct seen_packet {
@@ -570,7 +572,52 @@ static void clear_replacements(struct sd_ass_priv *ctx)
     ctx->num_replacements = 0;
 }
 
-static void emit_text_event(struct sd *sd, ASS_Event *event)
+static struct sub_translate_ass_sample layout_sample(
+    struct sd_ass_priv *ctx, ASS_Event *event)
+{
+    ASS_Track *track = ctx->ass_track;
+    ASS_Style *style = event->Style >= 0 && event->Style < track->n_styles
+        ? &track->styles[event->Style] : NULL;
+    return (struct sub_translate_ass_sample){
+        .text = event->Text,
+        .style = event->Style,
+        .font_size = style ? style->FontSize : 0,
+        .start = event->Start / 1000.0,
+        .duration = event->Duration / 1000.0,
+        .normal_layout = !ctx->is_converted && style &&
+            style->Alignment == 2 && !style->Italic && style->Angle == 0 &&
+            style->ScaleX == 1 && style->ScaleY == 1 &&
+            !event->Layer && !event->MarginL && !event->MarginR &&
+            !event->MarginV && (!event->Name || !event->Name[0]) &&
+            (!event->Effect || !event->Effect[0]),
+    };
+}
+
+static int layout_samples(struct sd *sd,
+                          struct sub_translate_ass_sample *samples,
+                          bool *changed)
+{
+    struct sd_ass_priv *ctx = sd->priv;
+    if (ctx->is_converted) {
+        *changed = false;
+        return 0;
+    }
+    int count = MPMIN(ctx->ass_track->n_events, SUB_TRANSLATE_ASS_LAYOUT_SAMPLES);
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (int n = 0; n < count; n++) {
+        ASS_Event *event = &ctx->ass_track->events[n];
+        samples[n] = layout_sample(ctx, event);
+        hash = cue_hash_value(hash, mp_ass_event_id(event));
+        hash = cue_hash_value(hash, event->Duration);
+    }
+    *changed = ctx->layout_sample_hash != hash;
+    ctx->layout_sample_hash = hash;
+    return count;
+}
+
+static void emit_text_event(struct sd *sd, ASS_Event *event,
+                            const struct sub_translate_ass_sample *samples,
+                            int num_samples)
 {
     struct sd_ass_priv *ctx = sd->priv;
     if (!sd->text_cue_callback || !event->Text)
@@ -588,6 +635,7 @@ static void emit_text_event(struct sd *sd, ASS_Event *event)
         }
     }
     if (visible) {
+        struct sub_translate_ass_sample sample = layout_sample(ctx, event);
         struct sub_text_cue cue = {
             .id = mp_ass_event_id(event),
             .start = event->Start / 1000.0,
@@ -595,6 +643,8 @@ static void emit_text_event(struct sd *sd, ASS_Event *event)
             .text = plain,
             .ass = !ctx->is_converted || lavc_conv_is_styled(ctx->converter)
                 ? event->Text : NULL,
+            .ass_primary_end =
+                sub_translate_ass_primary_end(samples, num_samples, &sample),
         };
         sd->text_cue_callback(sd->text_cue_callback_ctx, &cue);
     }
@@ -606,9 +656,16 @@ static void emit_text_events_from(struct sd *sd, int first)
     struct sd_ass_priv *ctx = sd->priv;
     if (!sd->text_cue_callback)
         return;
+    struct sub_translate_ass_sample samples[SUB_TRANSLATE_ASS_LAYOUT_SAMPLES];
+    bool changed;
+    int num_samples = layout_samples(sd, samples, &changed);
+    // Newly decoded evidence can change an earlier cue's translation scope.
+    // Re-emission bumps its controller revision, rejecting old full-cue work.
+    if (changed)
+        first = 0;
     first = MPCLAMP(first, 0, ctx->ass_track->n_events);
     for (int n = first; n < ctx->ass_track->n_events; n++)
-        emit_text_event(sd, &ctx->ass_track->events[n]);
+        emit_text_event(sd, &ctx->ass_track->events[n], samples, num_samples);
 }
 
 static void decode(struct sd *sd, struct demux_packet *packet)
@@ -1166,6 +1223,7 @@ static void fill_plaintext(struct sd *sd, double pts)
 static void reset(struct sd *sd)
 {
     struct sd_ass_priv *ctx = sd->priv;
+    ctx->layout_sample_hash = 0;
     clear_replacements(ctx);
     if (sd->opts->sub_clear_on_seek || ctx->clear_once) {
         ass_flush_events(ctx->ass_track);
@@ -1230,6 +1288,13 @@ static void emit_text_cues(struct sd *sd, double start, double end)
 {
     struct sd_ass_priv *ctx = sd->priv;
     ASS_Track *track = ctx->ass_track;
+    struct sub_translate_ass_sample samples[SUB_TRANSLATE_ASS_LAYOUT_SAMPLES];
+    bool changed;
+    int num_samples = layout_samples(sd, samples, &changed);
+    if (changed) {
+        start = -INFINITY;
+        end = INFINITY;
+    }
     for (int n = 0; n < track->n_events; n++) {
         ASS_Event *event = &track->events[n];
         double cue_start = event->Start / 1000.0;
@@ -1238,7 +1303,7 @@ static void emit_text_cues(struct sd *sd, double start, double end)
             continue;
         if (isfinite(end) && cue_start > end)
             continue;
-        emit_text_event(sd, event);
+        emit_text_event(sd, event, samples, num_samples);
     }
 }
 

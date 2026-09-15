@@ -56,6 +56,7 @@ struct translated_cue {
     double start;
     double duration;
     char *text;
+    size_t ass_primary_end;
     char *translated;
     uint64_t request_id;
     struct sub_translate_span *spans;
@@ -339,6 +340,7 @@ static void on_text_cue(void *ctx, const struct sub_text_cue *source)
         MP_TARRAY_APPEND(state, state->cues, state->num_cues, cue);
     } else if (cue->start == source->start &&
                cue->duration == source->duration &&
+               cue->ass_primary_end == source->ass_primary_end &&
                strcmp(cue->text, text) == 0)
     {
         if (cue->state == CUE_WAITING)
@@ -359,6 +361,7 @@ static void on_text_cue(void *ctx, const struct sub_text_cue *source)
 
     cue->start = source->start;
     cue->duration = source->duration;
+    cue->ass_primary_end = source->ass_primary_end;
     talloc_free(cue->text);
     cue->text = talloc_strdup(cue, text);
     cue->request_id = ++state->next_request_id;
@@ -373,6 +376,18 @@ static void on_text_cue(void *ctx, const struct sub_text_cue *source)
         }
         cue->spans = talloc_array(cue, struct sub_translate_span, cue->num_spans);
         sub_translate_ass_spans(text, cue->spans, cue->num_spans);
+        if (cue->ass_primary_end) {
+            int count = 0;
+            while (count < cue->num_spans &&
+                   cue->spans[count].start + cue->spans[count].length <=
+                       cue->ass_primary_end)
+                count++;
+            cue->num_spans = count;
+            if (!count) {
+                cue->state = CUE_FAILED;
+                return;
+            }
+        }
         cue->assembled = talloc_strdup(cue, "");
         prepare_span(state, cue);
     }

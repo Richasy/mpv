@@ -3616,6 +3616,31 @@ Property list
     quality across spans, the original text width, or semantic syllable
     alignment for translated karaoke.
 
+    A conservative same-event bilingual convention is recognized from decoded
+    ASS structure, without language detection. The event must use a normal,
+    unrotated, unscaled, non-italic bottom-center style, layer zero, no actor,
+    effect or event-margin overrides. A hard line break followed immediately
+    by an override block must switch normal base-size text to italic text at
+    most 80% of the base font size. That smaller italic presentation must cover
+    all remaining visible text; relative (signed) font sizes are excluded.
+    Positioning, drawing, transforms, style resets
+    and font-geometry overrides exclude this recognition.
+
+    Among the first 32 currently decoded events, at least three non-overlapping
+    events of that style, and at least 80% of that style's sampled events, must
+    share the exact lower-block override. Once recognized, only the entire
+    upper block is translated; the boundary and lower text/tags remain
+    byte-for-byte original. Earlier hard breaks and natural wrapping inside
+    the upper block do not truncate it. New decoded evidence revises affected
+    cues, invalidating pending results from their previous translation scope.
+
+    This is an authoring convention, not semantic proof of bilingual content.
+    Monolingual subtitles deliberately using the same repeated convention can
+    be indistinguishable. Unmarked SRT, ordinary multiline/emphasized ASS,
+    different-event bilingual layouts and other unrecognized conventions retain
+    whole-cue translation. Coincident speaker/sign events are not paired, and
+    file event order is never used to select an upper event.
+
     Disabling the property, seeking, changing the primary subtitle, unloading
     the file, or replacing the common configuration invalidates queued work and
     clears the owned generated output or restores canonical styled text.

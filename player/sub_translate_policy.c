@@ -18,6 +18,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <math.h>
 
 #include "sub_translate.h"
 
@@ -123,6 +124,167 @@ int sub_translate_ass_spans(const char *text, struct sub_translate_span *spans,
         }
     }
     return count;
+}
+
+struct block_style {
+    double size;
+    bool italic;
+};
+
+struct block_boundary {
+    size_t offset;
+    const char *tag;
+    size_t tag_length;
+};
+
+static bool block_override(const char *start, const char *end,
+                           struct block_style *style)
+{
+    for (const char *p = start; p < end; p++) {
+        if (*p != '\\')
+            continue;
+        const char *tag = ++p;
+        while (tag < end && span_space(*tag))
+            tag++;
+        const char *next = tag;
+        while (next < end && *next != '\\')
+            next++;
+        // Do not infer top-to-bottom block order through positioning, drawings,
+        // transforms, style resets or font geometry overrides.
+        if (tag < end && (*tag == 'p' || *tag == 'a' || *tag == 'r' ||
+                         *tag == 't' || !strncmp(tag, "move", 4) ||
+                         !strncmp(tag, "org", 3) || !strncmp(tag, "fr", 2) ||
+                         !strncmp(tag, "fa", 2) || !strncmp(tag, "fsc", 3) ||
+                         !strncmp(tag, "clip", 4) || !strncmp(tag, "iclip", 5)))
+            return false;
+        int prefix = 0;
+        bool size = next - tag >= 2 && !strncmp(tag, "fs", 2) &&
+                    (next - tag == 2 || tag[2] != 'p');
+        if (size)
+            prefix = 2;
+        else if (tag < next && *tag == 'i')
+            prefix = 1;
+        if (prefix) {
+            const char *number = tag + prefix;
+            while (number < next && span_space(*number))
+                number++;
+            // libass interprets signed fs values relatively, not as points.
+            if (size && number < next && (*number == '+' || *number == '-'))
+                return false;
+            char *tail;
+            double value = strtod(number, &tail);
+            if (tail == number || !isfinite(value))
+                return false;
+            while (tail < next && span_space(*tail))
+                tail++;
+            if (tail != next)
+                return false;
+            if (size) {
+                if (value <= 0)
+                    return false;
+                style->size = value;
+            } else {
+                if (value != 0 && value != 1)
+                    return false;
+                style->italic = value != 0;
+            }
+        }
+        p = next - 1;
+    }
+    return true;
+}
+
+static struct block_boundary block_boundary(
+    const struct sub_translate_ass_sample *cue)
+{
+    struct block_boundary result = {0};
+    if (!cue->normal_layout || !cue->text || !isfinite(cue->font_size) ||
+        cue->font_size <= 0 || !isfinite(cue->start) ||
+        !isfinite(cue->duration) || cue->duration <= 0)
+        return result;
+
+    struct block_style style = {.size = cue->font_size};
+    double lower_size = 0;
+    bool upper_text = false;
+    bool lower_text = false;
+    const char *p = cue->text;
+    while (*p) {
+        if (*p == '{') {
+            const char *end = strchr(p, '}');
+            if (!end || !block_override(p + 1, end, &style))
+                return (struct block_boundary){0};
+            p = end + 1;
+        } else if (p[0] == '\\' && p[1] == 'N' && p[2] == '{' &&
+                   !result.offset && upper_text &&
+                   style.size == cue->font_size && !style.italic) {
+            const char *end = strchr(p + 2, '}');
+            struct block_style lower = style;
+            if (!end || !block_override(p + 3, end, &lower))
+                return (struct block_boundary){0};
+            if (lower.italic && lower.size <= cue->font_size * 0.8) {
+                result = (struct block_boundary){
+                    .offset = p - cue->text,
+                    .tag = p + 2,
+                    .tag_length = end - (p + 2) + 1,
+                };
+                lower_size = lower.size;
+            }
+            style = lower;
+            p = end + 1;
+        } else if (*p == '\\') {
+            p++;
+            if (*p && (unsigned char)*p < 0x80)
+                p++;
+        } else {
+            if (!span_space(*p)) {
+                if (result.offset) {
+                    if (!style.italic || style.size != lower_size)
+                        return (struct block_boundary){0};
+                    lower_text = true;
+                } else {
+                    upper_text = true;
+                }
+            }
+            p++;
+        }
+    }
+    return lower_text ? result : (struct block_boundary){0};
+}
+
+size_t sub_translate_ass_primary_end(
+    const struct sub_translate_ass_sample *samples, int num_samples,
+    const struct sub_translate_ass_sample *cue)
+{
+    struct block_boundary boundary = block_boundary(cue);
+    if (!boundary.offset)
+        return 0;
+    if (num_samples > SUB_TRANSLATE_ASS_LAYOUT_SAMPLES)
+        num_samples = SUB_TRANSLATE_ASS_LAYOUT_SAMPLES;
+
+    int total = 0;
+    int matches = 0;
+    for (int n = 0; n < num_samples; n++) {
+        const struct sub_translate_ass_sample *sample = &samples[n];
+        if (sample->style != cue->style)
+            continue;
+        total++;
+        struct block_boundary candidate = block_boundary(sample);
+        if (!candidate.offset || sample->font_size != cue->font_size ||
+            candidate.tag_length != boundary.tag_length ||
+            memcmp(candidate.tag, boundary.tag, boundary.tag_length))
+            continue;
+        bool overlaps = false;
+        for (int k = 0; k < num_samples; k++) {
+            const struct sub_translate_ass_sample *other = &samples[k];
+            if (k != n && other->style == sample->style &&
+                sample->start < other->start + other->duration &&
+                other->start < sample->start + sample->duration)
+                overlaps = true;
+        }
+        if (!overlaps)
+            matches++;
+    }
+    return matches >= 3 && matches * 5 >= total * 4 ? boundary.offset : 0;
 }
 
 static void append_byte(char *buffer, size_t size, size_t *length,

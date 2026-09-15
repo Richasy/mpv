@@ -588,6 +588,55 @@ static void test_ssa_dialogue(const char *video, const char *subtitle)
     mpv_free(metadata);
 }
 
+static void verify_primary_block(void)
+{
+    char *text = get_string("sub-text/ass");
+    if (!strstr(text, "translated:Upper one\\Ntranslated:Upper two"
+                      "\\N{\\fs12\\Arial\\i1}Lower unchanged") ||
+        strstr(text, "translated:Lower unchanged") ||
+        !strstr(text, "{\\pos(160,160)}translated:Lower speaker") ||
+        !strstr(text, "{\\pos(160,40)}translated:Upper speaker") ||
+        !strstr(text, "translated:Plain first\\Ntranslated:Plain second") ||
+        !strstr(text, "translated:Normal\\N{\\i1}translated:emphasis{\\i0}"))
+        fail("Upper block selection changed lower text or unrelated cues: %s\n",
+             text);
+    mpv_free(text);
+}
+
+static void test_bilingual_blocks(const char *video, const char *subtitle)
+{
+    load_file(video);
+    command(((const char *[]){"sub-add", subtitle, "select", NULL}));
+    advance_to(0.5);
+    char *source = get_string("sub-text/ass-full");
+    char *metadata = get_string("sub-ass-extradata");
+    int64_t tracks = get_int64("track-list/count");
+    int enabled = 1;
+    reset_status_observation();
+    mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    wait_for_translated_count(9);
+    verify_primary_block();
+    check_string("sub-ass-extradata", metadata);
+    if (get_int64("track-list/count") != tracks || get_int64("secondary-sid") != -2)
+        fail("Bilingual ASS created or selected a companion.\n");
+    seek_to_start();
+    wait_for_translated_count(9);
+    advance_to(0.5);
+    verify_primary_block();
+    enabled = 0;
+    mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    verify_ass_snapshot(source, false);
+    enabled = 1;
+    reset_status_observation();
+    mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    wait_for_translated_count(9);
+    verify_primary_block();
+    enabled = 0;
+    mpv_set_property(ctx, "sub-translate", MPV_FORMAT_FLAG, &enabled);
+    mpv_free(source);
+    mpv_free(metadata);
+}
+
 static void find_two_subtitles(int64_t *first, int64_t *second)
 {
     struct mpv_node tracks = {0};
@@ -666,7 +715,7 @@ static void test_dense_preload(const char *video, const char *subtitle)
 
 int main(int argc, char **argv)
 {
-    if (argc != 10)
+    if (argc != 11)
         return 1;
     ctx = mpv_create();
     if (!ctx)
@@ -694,6 +743,7 @@ int main(int argc, char **argv)
     test_secondary_conflict(argv[6]);
     test_ass_dialogue(argv[3], argv[7], argv[4], argv[1]);
     test_ssa_dialogue(argv[3], argv[9]);
+    test_bilingual_blocks(argv[3], argv[10]);
     test_dense_preload(argv[3], argv[8]);
     command_string("quit");
     while (wrap_wait_event()->event_id != MPV_EVENT_SHUTDOWN) {}

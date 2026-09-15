@@ -2,6 +2,7 @@
 #define MPLAYER_DEC_SUB_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "player/core.h"
@@ -59,6 +60,7 @@ struct sub_text_cue {
     double duration;
     const char *text; // valid only for the duration of the callback
     const char *ass; // canonical ASS Text for styled input, otherwise NULL
+    size_t ass_primary_end; // exclusive upper block boundary; 0 means whole cue
 };
 
 struct sub_text_replacement {

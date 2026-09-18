@@ -131,6 +131,19 @@ runtime validation must use a caller-owned or otherwise rights-controlled
 fixture. Each artifact includes exact source and patch provenance plus the
 applicable license notices.
 
+On Windows, `test/libmpv_avs_decode.py` checks an exact DLL against a local
+fixture without opening a window. It disables audio and hardware decoding,
+disallows decoder fallback, and requires an observed decoded video frame with
+the expected dimensions and pixel format under a bounded child process:
+
+```text
+python test\libmpv_avs_decode.py <libmpv-2.dll> <fixture.mkv> --decoder libdavs2 --width 3840 --height 2160 --pixel-format yuv420p10
+```
+
+Use `libuavs3d` for AVS3. The probe explicitly selects the AVS3 demuxer for a
+raw `.avs3` fixture; that case proves decoding, not automatic raw-stream
+detection. It reports hashes and frame metadata, not real-time performance.
+
 ## Upstream integration: 2026-09-07
 
 This integration merges mpv-player/mpv through `989d32716e` and coordinates

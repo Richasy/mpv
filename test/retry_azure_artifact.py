@@ -13,33 +13,96 @@ import zipfile
 REPOSITORY = "Richasy/mpv"
 RUN_ID = 34752654492
 SOURCE_SHA = "8b898bb5fac0d2df8de1451be13e57a130a100cd"
-FFMPEG_SHA = "df21143bf252528f45d7ae56cc1d317ff00d4449"
+FFMPEG_SHA = "026ddd08e6f80db6251cbb32d011c23c49470713"
 LIBPLACEBO_SHA = "3330a515d62139259c26239014f286e233bd3a5c"
+DAVS2_SHA = "21d64c8f8e36af71fc7a488cd6f789c86cdd1200"
+UAVS3D_SHA = "0e20d2c291853f196c68922a264bcd8471d75b68"
+AVS_PATCH_SHA = "6788d317a3a67c44f799d02c4ff83f95d6b10165"
 TOOL_SHA = "a" * 40
 ARTIFACT_ID = 10316414903
 ARM64_ARTIFACT_ID = 10316392721
+NOTICE_ROOT = Path(__file__).parents[1] / "ci" / "winbuild" / "notices"
+EXPECTED_AVS_NOTICES = {
+    "AVS-THIRD-PARTY-NOTICES.txt": (
+        "21bfffd34ee6644dd7acbeffc65a68afd449e3ec4427f1a67afe46c0fb38517d"
+    ),
+    "GPL-2.0.txt": (
+        "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6"
+    ),
+    "GPL-3.0.txt": (
+        "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+    ),
+    "UAVS3D-BSD-3-Clause.txt": (
+        "5a8dcb7da222df8a81b6e334000f859248196335e2d28e1db9f3c552827d7cdf"
+    ),
+}
+AVS_NOTICES = tuple(EXPECTED_AVS_NOTICES)
 
 
 def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def write_zip(path, build_info=None, target_arch="x86_64"):
-    info = build_info or (
-        f"mpv_commit={SOURCE_SHA}\n"
-        f"ffmpeg_commit={FFMPEG_SHA}\n"
-        f"libplacebo_commit={LIBPLACEBO_SHA}\n"
-        f"target_arch={target_arch}\n"
-        "build_type=release\n"
-        "compiler=clang version 21.1.8\n"
-        "pdb_guid=fixture\n"
+def build_info_text(
+    ffmpeg=FFMPEG_SHA,
+    libplacebo=LIBPLACEBO_SHA,
+    target_arch="x86_64",
+    include_libplacebo=True,
+):
+    davs2_cpu_path = (
+        "aarch64-neon-intrinsics-no-asm"
+        if target_arch == "aarch64"
+        else "x86_64-nasm"
     )
+    uavs3d_cpu_path = (
+        "portable-c" if target_arch == "aarch64" else "x86_64-simd"
+    )
+    lines = [
+        f"mpv_commit={SOURCE_SHA}\n",
+        f"ffmpeg_commit={ffmpeg}\n",
+    ]
+    if include_libplacebo:
+        lines.append(f"libplacebo_commit={libplacebo}\n")
+    lines.extend(
+        [
+            f"davs2_commit={DAVS2_SHA}\n",
+            f"uavs3d_commit={UAVS3D_SHA}\n",
+            f"avs_patch_commit={AVS_PATCH_SHA}\n",
+            "davs2_build=static-bit-depth-10\n",
+            "uavs3d_build=static-8-and-10-bit\n",
+            f"davs2_cpu_path={davs2_cpu_path}\n",
+            f"uavs3d_cpu_path={uavs3d_cpu_path}\n",
+            "avs_registration_proof=config-and-static-archive-symbols\n",
+            f"target_arch={target_arch}\n",
+            "build_type=release\n",
+            "compiler=clang version 21.1.8\n",
+            "pdb_guid=fixture\n",
+        ],
+    )
+    return "".join(lines)
+
+
+def write_zip(
+    path,
+    build_info=None,
+    target_arch="x86_64",
+    omit_notice=None,
+    tamper_notice=None,
+):
+    info = build_info or build_info_text(target_arch=target_arch)
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("libmpv-2.dll", b"dll-bytes")
         archive.writestr("libmpv-2.pdb", b"pdb-bytes")
         archive.writestr("ggml-base.dll", b"ggml-bytes")
         archive.writestr("DirectML.dll", b"directml-bytes")
         archive.writestr("build-info.txt", info.encode("utf-8"))
+        for name in AVS_NOTICES:
+            if name == omit_notice:
+                continue
+            data = (NOTICE_ROOT / name).read_bytes()
+            if name == tamper_notice:
+                data += b"\ntampered\n"
+            archive.writestr(name, data)
 
 
 def base_state(root, archive, architecture="x64"):
@@ -191,6 +254,9 @@ def verify_success(root, archive):
     assert receipt["build_info"]["mpv_commit"] == SOURCE_SHA
     assert receipt["build_info"]["ffmpeg_commit"] == FFMPEG_SHA
     assert receipt["build_info"]["libplacebo_commit"] == LIBPLACEBO_SHA
+    assert receipt["build_info"]["davs2_commit"] == DAVS2_SHA
+    assert receipt["build_info"]["uavs3d_commit"] == UAVS3D_SHA
+    assert receipt["build_info"]["avs_patch_commit"] == AVS_PATCH_SHA
     assert (
         receipt["provenance_policy"]["expected_libplacebo_commit"] ==
         LIBPLACEBO_SHA
@@ -204,6 +270,16 @@ def verify_success(root, archive):
         uploaded = root / "azure" / "native" / "x64" / name
         assert uploaded.is_file()
         assert receipt["files"][name]["sha256"] == sha256(uploaded)
+    for name, expected_sha256 in EXPECTED_AVS_NOTICES.items():
+        uploaded = root / "azure" / "native" / "x64" / name
+        assert uploaded.is_file()
+        assert sha256(uploaded) == expected_sha256
+        assert receipt["files"][name]["sha256"] == expected_sha256
+        upload = next(
+            item for item in receipt["uploads"]
+            if item["blob"] == f"native/x64/{name}"
+        )
+        assert upload["attempts"] == 1
     for name in ("libmpv-2.dll", "libmpv-2.pdb", "build-info.txt"):
         uploaded = root / "azure" / "symbols" / SOURCE_SHA / "x64" / name
         assert uploaded.is_file()
@@ -221,6 +297,16 @@ def verify_arm64_success(root, archive):
     assert receipt["artifact"]["id"] == ARM64_ARTIFACT_ID
     assert receipt["build_info"]["target_arch"] == "aarch64"
     assert final_state["upload_attempts"]["native/arm64/libmpv-2.dll"] == 1
+    for name, expected_sha256 in EXPECTED_AVS_NOTICES.items():
+        stable = root / "azure" / "native" / "arm64" / name
+        assert stable.is_file()
+        assert sha256(stable) == expected_sha256
+        assert receipt["files"][name]["sha256"] == expected_sha256
+        upload = next(
+            item for item in receipt["uploads"]
+            if item["blob"] == f"native/arm64/{name}"
+        )
+        assert upload["attempts"] == 1
     for name in ("libmpv-2.dll", "libmpv-2.pdb", "build-info.txt"):
         stable = root / "azure" / "native" / "arm64" / name
         symbol = root / "azure" / "symbols" / SOURCE_SHA / "arm64" / name
@@ -258,6 +344,15 @@ def verify_nontransient_upload_failure(root, archive):
     assert final_state["upload_attempts"]["native/x64/DirectML.dll"] == 1
 
 
+def artifact_digest_mutation(archive):
+    def mutate(state):
+        state["artifacts"]["artifacts"][0].update({
+            "digest": f"sha256:{sha256(archive)}",
+        })
+
+    return mutate
+
+
 def main():
     root = Path.cwd() / f"build-artifact-retry-test-{os.getpid()}"
     if root.exists():
@@ -266,6 +361,8 @@ def main():
     archive = root / "artifact.zip"
     arm64_archive = root / "artifact-arm64.zip"
     try:
+        for name, expected_sha256 in EXPECTED_AVS_NOTICES.items():
+            assert sha256(NOTICE_ROOT / name) == expected_sha256
         write_zip(archive)
         write_zip(arm64_archive, target_arch="aarch64")
         verify_success(root, archive)
@@ -322,11 +419,7 @@ def main():
         malformed = root / "malformed.zip"
         write_zip(
             malformed,
-            f"mpv_commit={SOURCE_SHA}\n"
-            f"ffmpeg_commit={FFMPEG_SHA}\n"
-            "target_arch=x86_64\n"
-            "build_type=release\n"
-            "compiler=clang version 21.1.8\n",
+            build_info_text(include_libplacebo=False),
         )
         verify_failure(
             root, malformed, "provenance",
@@ -338,12 +431,7 @@ def main():
         wrong_ffmpeg = root / "wrong-ffmpeg.zip"
         write_zip(
             wrong_ffmpeg,
-            f"mpv_commit={SOURCE_SHA}\n"
-            f"ffmpeg_commit={'1' * 40}\n"
-            f"libplacebo_commit={LIBPLACEBO_SHA}\n"
-            "target_arch=x86_64\n"
-            "build_type=release\n"
-            "compiler=clang version 21.1.8\n",
+            build_info_text(ffmpeg="1" * 40),
         )
         verify_failure(
             root, wrong_ffmpeg, "wrong-ffmpeg",
@@ -355,12 +443,7 @@ def main():
         wrong_libplacebo = root / "wrong-libplacebo.zip"
         write_zip(
             wrong_libplacebo,
-            f"mpv_commit={SOURCE_SHA}\n"
-            f"ffmpeg_commit={FFMPEG_SHA}\n"
-            f"libplacebo_commit={'2' * 40}\n"
-            "target_arch=x86_64\n"
-            "build_type=release\n"
-            "compiler=clang version 21.1.8\n",
+            build_info_text(libplacebo="2" * 40),
         )
         wrong_libplacebo_receipt = verify_failure(
             root, wrong_libplacebo, "wrong-libplacebo",
@@ -372,6 +455,29 @@ def main():
             wrong_libplacebo_receipt["error"] ==
             "build-info libplacebo_commit does not match"
         )
+
+        for index, name in enumerate(AVS_NOTICES):
+            missing_notice = root / f"missing-notice-{index}.zip"
+            write_zip(missing_notice, omit_notice=name)
+            missing_receipt = verify_failure(
+                root, missing_notice, f"missing-notice-{index}",
+                artifact_digest_mutation(missing_notice),
+            )
+            assert (
+                missing_receipt["error"] ==
+                f"artifact is missing required file {name}"
+            )
+
+            tampered_notice = root / f"tampered-notice-{index}.zip"
+            write_zip(tampered_notice, tamper_notice=name)
+            tampered_receipt = verify_failure(
+                root, tampered_notice, f"tampered-notice-{index}",
+                artifact_digest_mutation(tampered_notice),
+            )
+            assert (
+                tampered_receipt["error"] ==
+                f"artifact notice SHA256 does not match: {name}"
+            )
 
         wrong_arch = root / "wrong-arch.zip"
         write_zip(wrong_arch, target_arch="aarch64")

@@ -12,26 +12,25 @@ published. `upload_target` must be `azure` or `both`; both values perform only
 the Azure retry because the source GitHub artifact is reused in place rather
 than repackaged.
 
-For the x64 retry from run `34752654492`:
+For an x64 retry from a build using the current Player FFmpeg pin:
 
 ```sh
 gh workflow run libmpv.yml \
   --repo Richasy/mpv \
-  --ref richasy/subtitle-translation \
-  -f source_run_id=34752654492 \
-  -f expected_source_sha=8b898bb5fac0d2df8de1451be13e57a130a100cd \
-  -f expected_libplacebo_sha=3330a515d62139259c26239014f286e233bd3a5c \
+  --ref SOURCE_REF \
+  -f source_run_id=SOURCE_RUN_ID \
+  -f expected_source_sha=FULL_MPV_SHA \
+  -f expected_libplacebo_sha=FULL_LIBPLACEBO_SHA \
   -f build_x64=true \
   -f build_arm64=false \
   -f upload_target=azure \
   -f build_type=release \
-  -f ffmpeg_ref=df21143bf252528f45d7ae56cc1d317ff00d4449
+  -f ffmpeg_ref=026ddd08e6f80db6251cbb32d011c23c49470713
 ```
 
-That source run's x64 artifact is ID `10316414903` with metadata digest
-`sha256:03c9cfa6728323197db16eb371c9b87c56b5bd97ecf3c8e235c4458c90fc20ab`.
-The helper discovers it by exact name within the explicit run and verifies the
-downloaded archive against that digest before extraction.
+The helper discovers the artifact by exact name within the explicit run and
+verifies the downloaded archive against its GitHub metadata digest before
+extraction.
 
 The retry helper verifies:
 
@@ -42,8 +41,10 @@ The retry helper verifies:
 - exactly one non-expired artifact with the expected architecture/build name;
 - the downloaded archive SHA-256 against GitHub artifact metadata;
 - exact `build-info.txt` values for mpv, FFmpeg, libplacebo, target
-  architecture, and build type, plus a Clang compiler identity;
-- required `libmpv-2.dll`, `libmpv-2.pdb`, and `build-info.txt` files.
+  architecture, build type, pinned AVS sources, patch provenance, architecture
+  paths, and registration proof, plus a Clang compiler identity;
+- required `libmpv-2.dll`, `libmpv-2.pdb`, and `build-info.txt` files, plus
+  exact SHA-256 values for all AVS license and source notices.
 
 Uploads use the existing `AZURE_STORAGE_CONNECTION_STRING` secret implicitly
 through the Azure CLI environment. Each upload is limited to 180 seconds and

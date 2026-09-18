@@ -187,6 +187,55 @@ def base_state(root, archive, architecture="x64"):
     }
 
 
+def mark_github_only_success(state):
+    state["run"]["conclusion"] = "success"
+    for job in state["jobs"]["jobs"]:
+        if not job["name"].startswith("build ("):
+            continue
+        job["conclusion"] = "success"
+        for step in job["steps"]:
+            if step["name"] == "Upload libmpv-2.dll to Azure Blob":
+                step["conclusion"] = "skipped"
+
+
+def github_only_required_step_mutation(name, conclusion):
+    def mutate(state):
+        mark_github_only_success(state)
+        job = state["jobs"]["jobs"][0]
+        step = next(item for item in job["steps"] if item["name"] == name)
+        step["conclusion"] = conclusion
+        if conclusion == "failure":
+            job["conclusion"] = "failure"
+            state["run"]["conclusion"] = "failure"
+
+    return mutate
+
+
+def failed_github_only_mutation(state):
+    mark_github_only_success(state)
+    state["run"]["conclusion"] = "failure"
+
+
+def remove_azure_step(state):
+    job = state["jobs"]["jobs"][0]
+    job["steps"] = [
+        step for step in job["steps"]
+        if step["name"] != "Upload libmpv-2.dll to Azure Blob"
+    ]
+
+
+def azure_step_conclusion_mutation(conclusion):
+    def mutate(state):
+        job = state["jobs"]["jobs"][0]
+        step = next(
+            item for item in job["steps"]
+            if item["name"] == "Upload libmpv-2.dll to Azure Blob"
+        )
+        step["conclusion"] = conclusion
+
+    return mutate
+
+
 def run_helper(root, state, case, expect_success, architecture="x64"):
     state_path = root / f"{case}-state.json"
     state_path.write_text(json.dumps(state), encoding="utf-8")
@@ -248,6 +297,7 @@ def verify_success(root, archive):
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["status"] == "success"
     assert receipt["source_run_conclusion"] == "failure"
+    assert receipt["source_azure_publication_conclusion"] == "failure"
     assert receipt["publication"]["tool_sha"] == TOOL_SHA
     assert receipt["artifact"]["id"] == ARTIFACT_ID
     assert receipt["artifact"]["archive_sha256"] == sha256(archive)
@@ -286,14 +336,42 @@ def verify_success(root, archive):
         assert receipt["files"][name]["sha256"] == sha256(uploaded)
 
 
+def verify_github_only_success(root, archive):
+    state = base_state(root, archive)
+    mark_github_only_success(state)
+    receipt_path, final_state = run_helper(
+        root, state, "github-only-success", True)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "success"
+    assert receipt["source_run_conclusion"] == "success"
+    assert receipt["source_azure_publication_conclusion"] == "skipped"
+    assert receipt["artifact"]["archive_sha256"] == sha256(archive)
+    assert final_state["upload_attempts"]["native/x64/libmpv-2.dll"] == 1
+    for name, expected_sha256 in EXPECTED_AVS_NOTICES.items():
+        stable = root / "azure" / "native" / "x64" / name
+        assert stable.is_file()
+        assert sha256(stable) == expected_sha256
+        assert receipt["files"][name]["sha256"] == expected_sha256
+
+
 def verify_arm64_success(root, archive):
     state = base_state(root, archive, "arm64")
     state["transient_blob"] = ""
+    x64_job, arm64_job = state["jobs"]["jobs"]
+    x64_job["conclusion"] = "success"
+    arm64_job["conclusion"] = "failure"
+    for job, conclusion in ((x64_job, "success"), (arm64_job, "failure")):
+        azure_step = next(
+            step for step in job["steps"]
+            if step["name"] == "Upload libmpv-2.dll to Azure Blob"
+        )
+        azure_step["conclusion"] = conclusion
     receipt_path, final_state = run_helper(
         root, state, "arm64-success", True, "arm64")
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["status"] == "success"
     assert receipt["source_run_conclusion"] == "failure"
+    assert receipt["source_azure_publication_conclusion"] == "failure"
     assert receipt["artifact"]["id"] == ARM64_ARTIFACT_ID
     assert receipt["build_info"]["target_arch"] == "aarch64"
     assert final_state["upload_attempts"]["native/arm64/libmpv-2.dll"] == 1
@@ -366,6 +444,7 @@ def main():
         write_zip(archive)
         write_zip(arm64_archive, target_arch="aarch64")
         verify_success(root, archive)
+        verify_github_only_success(root, archive)
         verify_arm64_success(root, arm64_archive)
         verify_nontransient_upload_failure(root, archive)
         verify_failure(
@@ -415,6 +494,40 @@ def main():
             lambda state: state["jobs"]["jobs"][1].update(
                 {"conclusion": "failure"}),
         )
+        for step_name in (
+            "Build libmpv for x64",
+            "Upload to GitHub Artifacts",
+        ):
+            case_name = step_name.lower().replace(" ", "-")
+            for conclusion in ("failure", "skipped"):
+                receipt = verify_failure(
+                    root,
+                    archive,
+                    f"github-only-{case_name}-{conclusion}",
+                    github_only_required_step_mutation(
+                        step_name, conclusion),
+                )
+                assert receipt["error"] == (
+                    f"required source step did not succeed: {step_name}")
+
+        failed_skipped_azure = verify_failure(
+            root,
+            archive,
+            "failed-skipped-azure",
+            failed_github_only_mutation,
+        )
+        assert failed_skipped_azure["error"] == (
+            "skipped source Azure publication requires a successful workflow")
+
+        for case_name, mutation in (
+            ("missing-azure-step", remove_azure_step),
+            ("cancelled-azure-step",
+             azure_step_conclusion_mutation("cancelled")),
+        ):
+            receipt = verify_failure(
+                root, archive, case_name, mutation)
+            assert receipt["error"] == (
+                "source Azure publication step was not requested")
 
         malformed = root / "malformed.zip"
         write_zip(

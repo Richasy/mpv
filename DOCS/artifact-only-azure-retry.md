@@ -36,7 +36,10 @@ The retry helper verifies:
 
 - repository, workflow ID, run ID, event, completion state, and exact source
   SHA;
-- that any source-run failure came only from the Azure publication step;
+- a successful GitHub-only source may have its Azure publication step
+  explicitly skipped;
+- any failed source run must contain actual Azure publication failures only;
+  a skipped Azure step never makes a failed run eligible;
 - successful architecture build and GitHub artifact-upload steps;
 - exactly one non-expired artifact with the expected architecture/build name;
 - the downloaded archive SHA-256 against GitHub artifact metadata;
@@ -60,9 +63,9 @@ Successful uploads retain the existing paths:
   `build-info.txt`.
 
 Each architecture emits a nonsecret receipt artifact containing the source
-run conclusion, GitHub artifact ID and archive digest, build provenance,
-per-file SHA-256 values, destinations, retry counts, and the separate commit
-that supplied the publication tooling. A failed source workflow is never
-relabeled as successful; it is accepted only when all failures are confined
-to Azure publication and the reusable artifact passed every verification
-above.
+run and source Azure-step conclusions, GitHub artifact ID and archive digest,
+build provenance, per-file SHA-256 values, destinations, retry counts, and the
+separate commit that supplied the publication tooling. A failed source workflow
+is never relabeled as successful; it is accepted only when all failures are
+confined to Azure publication and the reusable artifact passed every
+verification above.

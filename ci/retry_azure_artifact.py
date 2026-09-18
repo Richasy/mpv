@@ -167,10 +167,17 @@ def validate_run(gh, repository, run_id, expected_sha, architecture):
         step for step in steps
         if step.get("name") == "Upload libmpv-2.dll to Azure Blob"
     ]
-    if len(azure_steps) != 1 or azure_steps[0].get("conclusion") not in (
-        "success", "failure",
-    ):
+    if len(azure_steps) != 1:
         raise RetryError("source Azure publication step was not requested")
+    azure_conclusion = azure_steps[0].get("conclusion")
+    if azure_conclusion not in ("success", "failure", "skipped"):
+        raise RetryError("source Azure publication step was not requested")
+    if azure_conclusion == "skipped" and (
+        run.get("conclusion") != "success"
+        or selected[0].get("conclusion") != "success"
+    ):
+        raise RetryError(
+            "skipped source Azure publication requires a successful workflow")
 
     failed_steps = []
     for job in jobs:
@@ -194,7 +201,7 @@ def validate_run(gh, repository, run_id, expected_sha, architecture):
         raise RetryError("failed source workflow has no Azure publication failure")
     if run.get("conclusion") == "success" and failed_steps:
         raise RetryError("successful source workflow contains a failed step")
-    return run
+    return run, azure_conclusion
 
 
 def find_artifact(gh, repository, run_id, artifact_name, expected_sha):
@@ -543,7 +550,7 @@ def main():
 
         gh = command_from_env("LIBMPV_RETRY_GH_COMMAND", "gh")
         az = command_from_env("LIBMPV_RETRY_AZ_COMMAND", "az")
-        run = validate_run(
+        run, source_azure_conclusion = validate_run(
             gh, args.repository, args.source_run_id,
             args.expected_source_sha.lower(), args.architecture)
 
@@ -573,6 +580,8 @@ def main():
         )
         receipt.update({
             "source_run_conclusion": run["conclusion"],
+            "source_azure_publication_conclusion":
+                source_azure_conclusion,
             "artifact": {
                 "id": artifact["id"],
                 "name": artifact["name"],

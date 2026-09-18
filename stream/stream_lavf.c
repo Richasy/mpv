@@ -400,7 +400,8 @@ void mp_setup_av_network_options(AVDictionary **dict, const char *target_fmt,
             av_dict_set(dict, "timeout", buf, 0);
         }
     }
-    if (opts->http_proxy && opts->http_proxy[0])
+    // An explicitly empty proxy disables the backend's environment fallback.
+    if (opts->http_proxy)
         av_dict_set(dict, "http_proxy", opts->http_proxy, 0);
 
     struct stream_lavf_opts *lavf_opts =

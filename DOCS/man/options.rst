@@ -5871,11 +5871,16 @@ Network
             Connection: close
 
 ``--http-proxy=<proxy>``
-    URL of the HTTP/HTTPS proxy. If this is set, the ``http_proxy`` environment
-    is ignored. The ``no_proxy`` environment variable is still respected. This
-    option is silently ignored if it does not start with ``http://``. Proxies
-    are not used for https URLs. Setting this option does not try to make the
-    ytdl script use the proxy.
+    URL of the proxy used for HTTP and HTTPS requests. When unset, the network
+    backend may use its proxy environment variables. An explicitly empty value
+    (``--http-proxy=``) disables that fallback and requests a direct connection
+    in both the FFmpeg and libcurl backends. This does not bypass an operating
+    system VPN or transparent network proxy.
+
+    A nonempty value overrides the backend's proxy environment variables;
+    ``no_proxy`` is still respected. FFmpeg requires an ``http://`` proxy and
+    uses CONNECT for HTTPS destinations. Setting this option does not try to
+    make the ytdl script use the proxy.
 
 ``--tls-ca-file=<filename>``
     Certificate authority database file for use with TLS. (Silently fails with

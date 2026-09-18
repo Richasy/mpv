@@ -821,7 +821,8 @@ static void setup_curl(struct priv *p)
         ua = p->net_opts->default_useragent;
     if (ua && ua[0])
         curl_easy_setopt(c, CURLOPT_USERAGENT, ua);
-    if (p->net_opts->http_proxy && p->net_opts->http_proxy[0])
+    // An explicitly empty proxy disables the backend's environment fallback.
+    if (p->net_opts->http_proxy)
         curl_easy_setopt(c, CURLOPT_PROXY, p->net_opts->http_proxy);
 
     curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);

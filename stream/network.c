@@ -45,7 +45,8 @@ const struct m_sub_options mp_network_conf = {
         {"tls-cert-file", OPT_STRING(tls_cert_file), .flags = M_OPT_FILE},
         {"tls-key-file", OPT_STRING(tls_key_file), .flags = M_OPT_FILE},
         {"network-timeout", OPT_DOUBLE(timeout), M_RANGE(0, DBL_MAX)},
-        {"http-proxy", OPT_STRING(http_proxy)},
+        // String equality folds NULL into ""; proxy inheritance must not.
+        {"http-proxy", OPT_STRING(http_proxy), .force_update = true},
         {0}
     },
     .size = sizeof(struct mp_network_opts),

@@ -32,6 +32,15 @@ class EndFile(ctypes.Structure):
     _fields_ = [("reason", ctypes.c_int), ("error", ctypes.c_int)]
 
 
+class LogMessage(ctypes.Structure):
+    _fields_ = [
+        ("prefix", ctypes.c_char_p),
+        ("level", ctypes.c_char_p),
+        ("text", ctypes.c_char_p),
+        ("log_level", ctypes.c_int),
+    ]
+
+
 def run_client(library, url, backend, mode, proxy):
     with contextlib.ExitStack() as stack:
         if os.name == "nt":
@@ -42,6 +51,7 @@ def run_client(library, url, backend, mode, proxy):
             ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
         ]
         mpv.mpv_initialize.argtypes = [ctypes.c_void_p]
+        mpv.mpv_request_log_messages.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         mpv.mpv_command.argtypes = [
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
         ]
@@ -53,6 +63,8 @@ def run_client(library, url, backend, mode, proxy):
         if not client:
             raise RuntimeError("Could not create the native client")
         stack.callback(mpv.mpv_terminate_destroy, client)
+        if mpv.mpv_request_log_messages(client, b"warn") < 0:
+            raise RuntimeError("Native diagnostic subscription failed")
         options = {
             "config": "no",
             "load-scripts": "no",
@@ -60,13 +72,18 @@ def run_client(library, url, backend, mode, proxy):
             "vo": "null",
             "ao": "null",
             "pause": "yes",
+            "ytdl": "no",
             "tls-verify": "no",
             "network-timeout": "5",
             "curl-enabled": "yes" if backend == "curl" else "no",
             "stream-lavf-o": "reconnect=0,reconnect_on_network_error=0",
         }
+        direct = mode in ("direct", "clear")
+        if mode == "clear":
+            if mpv.mpv_set_option_string(client, b"http-proxy", proxy.encode()) < 0:
+                raise RuntimeError("Initial explicit proxy was rejected")
         if mode != "inherit":
-            options["http-proxy"] = "" if mode == "direct" else proxy
+            options["http-proxy"] = "" if direct else proxy
         for name, value in options.items():
             if mpv.mpv_set_option_string(client, name.encode(), value.encode()) < 0:
                 raise RuntimeError(f"Native option rejected: {name}")
@@ -76,17 +93,23 @@ def run_client(library, url, backend, mode, proxy):
         if mpv.mpv_command(client, command) < 0:
             raise RuntimeError("Native load command failed")
         deadline = time.monotonic() + 10
+        messages = []
         while time.monotonic() < deadline:
             event = mpv.mpv_wait_event(client, 0.25).contents
+            if event.event_id == 2:  # MPV_EVENT_LOG_MESSAGE
+                message = ctypes.cast(event.data, ctypes.POINTER(LogMessage)).contents
+                messages.append(message.text.decode("utf-8", errors="replace")[:500])
+                messages = messages[-12:]
             if event.event_id == 8:  # MPV_EVENT_FILE_LOADED
-                if mode != "direct":
+                if not direct:
                     raise RuntimeError("The rejecting proxy was bypassed")
                 return
             if event.event_id == 7:  # MPV_EVENT_END_FILE
                 end = ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents
-                if mode == "direct" or end.reason != 4 or end.error != -13:
+                if direct or end.reason != 4 or end.error != -13:
                     raise RuntimeError(
                         f"Unexpected end-file: reason={end.reason}, error={end.error}"
+                        + "\n" + "".join(messages)
                     )
                 return
         raise TimeoutError("Native media opening did not finish")
@@ -192,7 +215,7 @@ def main(library):
                 environment[name] = inherited_url
             for backend in ("lavf", "curl"):
                 for scheme, server in (("http", http), ("https", https)):
-                    for mode in ("inherit", "direct", "explicit"):
+                    for mode in ("inherit", "clear", "direct", "explicit"):
                         before = (inherited.requests, explicit.requests, server.requests)
                         result = subprocess.run(
                             [sys.executable, str(Path(__file__).resolve()), "--child",
@@ -203,13 +226,16 @@ def main(library):
                         if result.returncode:
                             raise RuntimeError(
                                 f"{backend}/{scheme}/{mode}: {result.stdout}{result.stderr}"
+                                f"\nRequests: inherited={inherited.requests - before[0]},"
+                                f" explicit={explicit.requests - before[1]},"
+                                f" media={server.requests - before[2]}"
                             )
                         observed = (
                             inherited.requests > before[0],
                             explicit.requests > before[1],
                             server.requests > before[2],
                         )
-                        expected = (mode == "inherit", mode == "explicit", mode == "direct")
+                        expected = (mode == "inherit", mode == "explicit", mode in ("direct", "clear"))
                         if observed != expected:
                             raise RuntimeError(
                                 f"{backend}/{scheme}/{mode}: {observed} != {expected}"

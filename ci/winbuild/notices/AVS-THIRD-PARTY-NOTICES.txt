@@ -1,0 +1,87 @@
+AVS decoder components in the Windows libmpv build
+==================================================
+
+davs2
+-----
+
+Source: https://github.com/xatabhk/davs2-10bit.git
+Revision: 21d64c8f8e36af71fc7a488cd6f789c86cdd1200
+License: GNU General Public License version 2 or later.
+
+The build selects a static, position-independent, CLI-free bit-depth-10
+configuration. This configuration supports the AVS2 8-bit and 10-bit paths
+consumed by FFmpeg's libdavs2 wrapper.
+
+The patches below are byte-for-byte copies from
+https://github.com/DanielZhang17/ffmpeg-mmt-avs.git at revision
+6788d317a3a67c44f799d02c4ff83f95d6b10165. That repository declares the
+GNU General Public License version 3 in its top-level LICENSE file.
+
+The x86_64 build applies patches 0001 and 0010 and retains the NASM path.
+The Windows ARM64 build applies patches 0001 through 0010 plus 0012. It
+disables handwritten assembly that is not available for this fork while
+retaining the patched AArch64 NEON intrinsics and Windows-safe setjmp path.
+The corresponding patch files are distributed in `ci/winbuild/packages` at
+the mpv source revision recorded in `build-info.txt`.
+
+SHA-256:
+
+2e83a0f00092c58a4d5a3350ca6f48b1f411dbe088b9dd5c8812dcd2e5986f65
+  davs2-0001-enable-10bit-build-and-propagate-frame-packet-position.patch
+6d0c31f67bdefaa44f5bd2b5b59cd2ef6b97cd05adde9fe0e70f0be5bfe28129
+  davs2-0002-enable-arm64-neon-detect-and-keep-vectorization.patch
+9e063173a7c70041c8fa31c00afa03d126e2aa8f25dcd025d428dccaaed30054
+  davs2-0003-add-aarch64-neon-primitives-for-copy-add-avg.patch
+ba4ce478ef69efe635f8b1582e4f69b6ed60b50ab334e8625e54f720d4b9a84d
+  davs2-0004-add-aarch64-neon-mc-interpolation.patch
+51d7c75911fe5c76cb3d6355c154b35318d2a409d9a7a58b3caf626e2e64187c
+  davs2-0005-add-aarch64-neon-mc-ext-primitives.patch
+176575848ab314cc8787edd573c80cb56f6163a77b264bb2b2a2993a2c2e337a
+  davs2-0006-add-aarch64-neon-deblock-luma.patch
+5363aa7714b23ee697ae5c275d8277b95f5365b966c26b0f4e8b4da021543571
+  davs2-0007-add-aarch64-neon-deblock-chroma.patch
+c3ab52931da7b5110579c933da0ca2045cea21a0260a8316168442525cef86fe
+  davs2-0008-add-aarch64-neon-intra-basic-10bit.patch
+e83616b399e164252255887290948480a2238095280597bdcc2bf5ad899fc28a
+  davs2-0009-add-aarch64-neon-intra-bilinear-10bit.patch
+64aa309b9217269c83ccd7183aad3b7980da76515a9700bbce9499cb85d58460
+  davs2-0010-export-sequence-display-color-description.patch
+ce90d09171067c5d84e31cf070c9bee7634d48d4a8cef2b26dd70801779085c5
+  davs2-0012-use-standard-setjmp-on-windows-arm64.patch
+
+uavs3d
+-------
+
+Source: https://github.com/uavs3/uavs3d.git
+Revision: 0e20d2c291853f196c68922a264bcd8471d75b68
+License: BSD 3-Clause. See UAVS3D-BSD-3-Clause.txt.
+
+The static build uses COMPILE_10BIT=ON, which includes both 8-bit and 10-bit
+AVS3 decoding paths. The x86_64 build retains its SIMD sources. The Windows
+ARM64 build selects the portable C path because the upstream AArch64 assembly
+uses ELF directives that are incompatible with Windows COFF objects. ARM64
+portable-C UHD throughput has not been established.
+
+The Windows ARM64 portability patch is copied from the same
+DanielZhang17/ffmpeg-mmt-avs revision:
+
+06e999884317732470a1598b9a875c98aafe202f2220ea7dce3ba25f7365d053
+  uavs3d-0001-use-portable-c-functions-on-windows-arm64.patch
+
+Combined build and verification scope
+-------------------------------------
+
+FFmpeg source: https://github.com/Richasy/FFmpeg.git
+FFmpeg revision: 026ddd08e6f80db6251cbb32d011c23c49470713
+
+FFmpeg is configured with --enable-gpl, --enable-version3,
+--enable-libdavs2, and --enable-libuavs3d. GPL-2.0.txt and GPL-3.0.txt
+contain the applicable license texts.
+
+The build fails unless FFmpeg reports both decoder registrations and the
+static libavcodec archive defines both wrapper symbols. Those checks prove
+configuration, compilation, and registration only. They do not prove that a
+particular stream decodes correctly or establish decoder performance.
+
+No AVS sample stream is redistributed. Runtime checks must use a caller-owned
+or otherwise rights-controlled sample supplied outside the build artifacts.

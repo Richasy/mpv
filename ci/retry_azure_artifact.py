@@ -18,6 +18,24 @@ import zipfile
 
 WORKFLOW_ID = 235091400
 EXPECTED_REPOSITORY = "Richasy/mpv"
+EXPECTED_DAVS2_COMMIT = "21d64c8f8e36af71fc7a488cd6f789c86cdd1200"
+EXPECTED_UAVS3D_COMMIT = "0e20d2c291853f196c68922a264bcd8471d75b68"
+EXPECTED_AVS_PATCH_COMMIT = "6788d317a3a67c44f799d02c4ff83f95d6b10165"
+EXPECTED_AVS_NOTICES = {
+    "AVS-THIRD-PARTY-NOTICES.txt": (
+        "21bfffd34ee6644dd7acbeffc65a68afd449e3ec4427f1a67afe46c0fb38517d"
+    ),
+    "GPL-2.0.txt": (
+        "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6"
+    ),
+    "GPL-3.0.txt": (
+        "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+    ),
+    "UAVS3D-BSD-3-Clause.txt": (
+        "5a8dcb7da222df8a81b6e334000f859248196335e2d28e1db9f3c552827d7cdf"
+    ),
+}
+REQUIRED_AVS_NOTICES = tuple(EXPECTED_AVS_NOTICES)
 TRANSIENT_UPLOAD_ERRORS = (
     "unexpected_eof",
     "eof occurred in violation",
@@ -149,10 +167,17 @@ def validate_run(gh, repository, run_id, expected_sha, architecture):
         step for step in steps
         if step.get("name") == "Upload libmpv-2.dll to Azure Blob"
     ]
-    if len(azure_steps) != 1 or azure_steps[0].get("conclusion") not in (
-        "success", "failure",
-    ):
+    if len(azure_steps) != 1:
         raise RetryError("source Azure publication step was not requested")
+    azure_conclusion = azure_steps[0].get("conclusion")
+    if azure_conclusion not in ("success", "failure", "skipped"):
+        raise RetryError("source Azure publication step was not requested")
+    if azure_conclusion == "skipped" and (
+        run.get("conclusion") != "success"
+        or selected[0].get("conclusion") != "success"
+    ):
+        raise RetryError(
+            "skipped source Azure publication requires a successful workflow")
 
     failed_steps = []
     for job in jobs:
@@ -176,7 +201,7 @@ def validate_run(gh, repository, run_id, expected_sha, architecture):
         raise RetryError("failed source workflow has no Azure publication failure")
     if run.get("conclusion") == "success" and failed_steps:
         raise RetryError("successful source workflow contains a failed step")
-    return run
+    return run, azure_conclusion
 
 
 def find_artifact(gh, repository, run_id, artifact_name, expected_sha):
@@ -286,14 +311,26 @@ def validate_payload(payload, expected_sha, expected_ffmpeg,
     if len(build_infos) != 1:
         raise RetryError("artifact must contain exactly one build-info.txt")
     root = build_infos[0].parent
-    required = ["libmpv-2.dll", "libmpv-2.pdb", "build-info.txt"]
+    required = [
+        "libmpv-2.dll",
+        "libmpv-2.pdb",
+        "build-info.txt",
+        *REQUIRED_AVS_NOTICES,
+    ]
     for name in required:
         if not (root / name).is_file():
             raise RetryError(f"artifact is missing required file {name}")
+    for name, expected_sha256 in EXPECTED_AVS_NOTICES.items():
+        if sha256_file(root / name) != expected_sha256:
+            raise RetryError(
+                f"artifact notice SHA256 does not match: {name}")
 
     info = parse_build_info(root / "build-info.txt")
     required_keys = (
         "mpv_commit", "ffmpeg_commit", "libplacebo_commit",
+        "davs2_commit", "uavs3d_commit", "avs_patch_commit",
+        "davs2_build", "uavs3d_build", "davs2_cpu_path",
+        "uavs3d_cpu_path", "avs_registration_proof",
         "target_arch", "build_type", "compiler",
     )
     if any(not info.get(key) for key in required_keys):
@@ -306,8 +343,28 @@ def validate_payload(payload, expected_sha, expected_ffmpeg,
         raise RetryError("build-info libplacebo_commit is not a full SHA")
     if info["libplacebo_commit"].lower() != expected_libplacebo:
         raise RetryError("build-info libplacebo_commit does not match")
+    expected_avs = {
+        "davs2_commit": EXPECTED_DAVS2_COMMIT,
+        "uavs3d_commit": EXPECTED_UAVS3D_COMMIT,
+        "avs_patch_commit": EXPECTED_AVS_PATCH_COMMIT,
+        "davs2_build": "static-bit-depth-10",
+        "uavs3d_build": "static-8-and-10-bit",
+        "avs_registration_proof": "config-and-static-archive-symbols",
+    }
+    for key, expected in expected_avs.items():
+        if info[key].lower() != expected.lower():
+            raise RetryError(f"build-info {key} does not match")
     if info["target_arch"] != target_arch:
         raise RetryError("build-info target_arch does not match")
+    expected_cpu_paths = {
+        "x86_64": ("x86_64-nasm", "x86_64-simd"),
+        "aarch64": ("aarch64-neon-intrinsics-no-asm", "portable-c"),
+    }
+    davs2_cpu_path, uavs3d_cpu_path = expected_cpu_paths[target_arch]
+    if info["davs2_cpu_path"] != davs2_cpu_path:
+        raise RetryError("build-info davs2_cpu_path does not match")
+    if info["uavs3d_cpu_path"] != uavs3d_cpu_path:
+        raise RetryError("build-info uavs3d_cpu_path does not match")
     if info["build_type"] != build_type:
         raise RetryError("build-info build_type does not match")
     if "clang" not in info.get("compiler", "").lower():
@@ -493,7 +550,7 @@ def main():
 
         gh = command_from_env("LIBMPV_RETRY_GH_COMMAND", "gh")
         az = command_from_env("LIBMPV_RETRY_AZ_COMMAND", "az")
-        run = validate_run(
+        run, source_azure_conclusion = validate_run(
             gh, args.repository, args.source_run_id,
             args.expected_source_sha.lower(), args.architecture)
 
@@ -523,6 +580,8 @@ def main():
         )
         receipt.update({
             "source_run_conclusion": run["conclusion"],
+            "source_azure_publication_conclusion":
+                source_azure_conclusion,
             "artifact": {
                 "id": artifact["id"],
                 "name": artifact["name"],

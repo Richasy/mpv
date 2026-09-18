@@ -17,7 +17,7 @@ set -e
 #   MPV_REPO      - mpv git repository URL (default: https://github.com/Richasy/mpv.git)
 #   MPV_COMMIT    - mpv git commit/branch/tag (default: master)
 #   FFMPEG_COMMIT - Richasy/FFmpeg git commit/branch/tag
-#                   (default: df21143bf252528f45d7ae56cc1d317ff00d4449)
+#                   (default: 026ddd08e6f80db6251cbb32d011c23c49470713)
 #   MPV_SRC_DIR   - path to mpv source (for copying headers)
 #   BUILD_TYPE    - 'release' (default) or 'debug'. Debug switches mpv meson
 #                   options to -Doptimization=0 -Db_lto=false -Db_ndebug=false
@@ -38,6 +38,11 @@ log() { echo -e "${GREEN}[BUILD]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
+readonly DEFAULT_FFMPEG_COMMIT=026ddd08e6f80db6251cbb32d011c23c49470713
+readonly DAVS2_COMMIT=21d64c8f8e36af71fc7a488cd6f789c86cdd1200
+readonly UAVS3D_COMMIT=0e20d2c291853f196c68922a264bcd8471d75b68
+readonly AVS_PATCH_COMMIT=6788d317a3a67c44f799d02c4ff83f95d6b10165
+
 # Validate required env vars
 : "${BUILD_DIR:?BUILD_DIR is required}"
 : "${CLANG_ROOT:?CLANG_ROOT is required}"
@@ -45,13 +50,17 @@ err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 : "${RUSTUP_LOC:?RUSTUP_LOC is required}"
 : "${OUTPUT_DIR:?OUTPUT_DIR is required}"
 : "${TARGET_ARCH:?TARGET_ARCH is required (x86_64 or aarch64)}"
+case "$TARGET_ARCH" in
+    x86_64|aarch64) ;;
+    *) err "TARGET_ARCH must be x86_64 or aarch64, got: $TARGET_ARCH" ;;
+esac
 
 # Auto-detect WINBUILD_DIR from script location
 WINBUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/winbuild"
 
 MPV_REPO="${MPV_REPO:-https://github.com/Richasy/mpv.git}"
 MPV_COMMIT="${MPV_COMMIT:-master}"
-export FFMPEG_COMMIT="${FFMPEG_COMMIT:-df21143bf252528f45d7ae56cc1d317ff00d4449}"
+export FFMPEG_COMMIT="${FFMPEG_COMMIT:-$DEFAULT_FFMPEG_COMMIT}"
 # Keep the default synchronized with the Player native dependency pin.
 BUILD_TYPE="${BUILD_TYPE:-release}"
 case "$BUILD_TYPE" in
@@ -153,6 +162,20 @@ build() {
     rm -rf "$SRC_PACKAGES/ffmpeg" 2>/dev/null || true
     rm -rf "$BUILD_DIR/packages/ffmpeg-prefix/src/ffmpeg-stamp" 2>/dev/null || true
     rm -rf "$BUILD_DIR/packages/ffmpeg-prefix/src/ffmpeg-build" 2>/dev/null || true
+
+    # AVS sources and patches are pinned. Remove shared source and package
+    # caches so a prior checkout cannot bypass the exact repository, revision,
+    # or architecture-specific patch selection.
+    log "Removing AVS decoder caches to force exact re-clones..."
+    rm -rf "$SRC_PACKAGES/davs2" "$SRC_PACKAGES/uavs3d" 2>/dev/null || true
+    rm -rf "$BUILD_DIR/packages/davs2-prefix" 2>/dev/null || true
+    rm -rf "$BUILD_DIR/packages/uavs3d-prefix" 2>/dev/null || true
+    rm -f "$MINGW_PREFIX/lib/libdavs2.a" 2>/dev/null || true
+    rm -f "$MINGW_PREFIX/lib/libuavs3d.a" 2>/dev/null || true
+    rm -f "$MINGW_PREFIX/lib/pkgconfig/davs2.pc" 2>/dev/null || true
+    rm -f "$MINGW_PREFIX/lib/pkgconfig/uavs3d.pc" 2>/dev/null || true
+    rm -f "$MINGW_PREFIX/include/davs2.h" 2>/dev/null || true
+    rm -f "$MINGW_PREFIX/include/uavs3d.h" 2>/dev/null || true
 
     # Force amf-headers re-clone + re-install so the freshly-cloned ffmpeg's
     # newer AMF code builds against up-to-date AMF SDK headers. ffmpeg is
@@ -339,8 +362,12 @@ collect() {
     local MPV_BUILD_COMMIT="${MPV_COMMIT:-unknown}"
     local FFMPEG_BUILD_COMMIT="unknown"
     local LIBPLACEBO_BUILD_COMMIT="unknown"
+    local DAVS2_BUILD_COMMIT="unknown"
+    local UAVS3D_BUILD_COMMIT="unknown"
     local COMPILER_VERSION="unknown"
     local PDB_GUID="unknown"
+    local DAVS2_CPU_PATH="unknown"
+    local UAVS3D_CPU_PATH="unknown"
     if [ -n "${MPV_SRC_DIR:-}" ] && git -C "$MPV_SRC_DIR" rev-parse HEAD >/dev/null 2>&1; then
         MPV_BUILD_COMMIT=$(git -C "$MPV_SRC_DIR" rev-parse HEAD)
     fi
@@ -349,6 +376,25 @@ collect() {
     fi
     if git -C "$SRC_PACKAGES/libplacebo" rev-parse HEAD >/dev/null 2>&1; then
         LIBPLACEBO_BUILD_COMMIT=$(git -C "$SRC_PACKAGES/libplacebo" rev-parse HEAD)
+    fi
+    if git -C "$SRC_PACKAGES/davs2" rev-parse HEAD >/dev/null 2>&1; then
+        DAVS2_BUILD_COMMIT=$(git -C "$SRC_PACKAGES/davs2" rev-parse HEAD)
+    fi
+    if git -C "$SRC_PACKAGES/uavs3d" rev-parse HEAD >/dev/null 2>&1; then
+        UAVS3D_BUILD_COMMIT=$(git -C "$SRC_PACKAGES/uavs3d" rev-parse HEAD)
+    fi
+    if [ "$DAVS2_BUILD_COMMIT" != "$DAVS2_COMMIT" ]; then
+        err "davs2 source mismatch: expected $DAVS2_COMMIT, got $DAVS2_BUILD_COMMIT"
+    fi
+    if [ "$UAVS3D_BUILD_COMMIT" != "$UAVS3D_COMMIT" ]; then
+        err "uavs3d source mismatch: expected $UAVS3D_COMMIT, got $UAVS3D_BUILD_COMMIT"
+    fi
+    if [ "$ARCH" = "aarch64" ]; then
+        DAVS2_CPU_PATH="aarch64-neon-intrinsics-no-asm"
+        UAVS3D_CPU_PATH="portable-c"
+    else
+        DAVS2_CPU_PATH="x86_64-nasm"
+        UAVS3D_CPU_PATH="x86_64-simd"
     fi
     if [ -x "$CLANG_ROOT/bin/clang" ]; then
         COMPILER_VERSION=$("$CLANG_ROOT/bin/clang" --version | head -n1)
@@ -363,12 +409,32 @@ collect() {
 mpv_commit=$MPV_BUILD_COMMIT
 ffmpeg_commit=$FFMPEG_BUILD_COMMIT
 libplacebo_commit=$LIBPLACEBO_BUILD_COMMIT
+davs2_commit=$DAVS2_BUILD_COMMIT
+uavs3d_commit=$UAVS3D_BUILD_COMMIT
+avs_patch_commit=$AVS_PATCH_COMMIT
+davs2_build=static-bit-depth-10
+uavs3d_build=static-8-and-10-bit
+davs2_cpu_path=$DAVS2_CPU_PATH
+uavs3d_cpu_path=$UAVS3D_CPU_PATH
+avs_registration_proof=config-and-static-archive-symbols
 target_arch=$TARGET_ARCH
 build_type=$BUILD_TYPE
 compiler=$COMPILER_VERSION
 pdb_guid=$PDB_GUID
 EOF
     log "Build metadata written to $ARCH_OUTPUT/build-info.txt"
+
+    for notice in \
+        AVS-THIRD-PARTY-NOTICES.txt \
+        GPL-2.0.txt \
+        GPL-3.0.txt \
+        UAVS3D-BSD-3-Clause.txt; do
+        if [ ! -f "$WINBUILD_DIR/notices/$notice" ]; then
+            err "Required distribution notice is missing: $notice"
+        fi
+        cp "$WINBUILD_DIR/notices/$notice" "$ARCH_OUTPUT/"
+    done
+    log "AVS source and license notices copied"
 
     # Copy ggml/whisper shared libraries. whisper.cpp is now built as
     # BUILD_SHARED_LIBS=ON so af_whisper (static-linked into libmpv-2.dll)

@@ -99,7 +99,7 @@ does not invoke the native build.
 Use the workflow's `ffmpeg_ref` input (or `FFMPEG_COMMIT` for the build script)
 to build an exact companion FFmpeg revision without changing the default branch.
 It defaults to the Player-pinned
-`df21143bf252528f45d7ae56cc1d317ff00d4449` commit. For a coordinated upgrade,
+`026ddd08e6f80db6251cbb32d011c23c49470713` commit. For a coordinated upgrade,
 select the committed FFmpeg SHA and use `upload_target=github` until the
 artifact set is ready to publish. GitHub-only runs omit ARM64. The
 `build_arm64` input is honored only when `upload_target` is `azure` or `both`;
@@ -107,6 +107,42 @@ ordinary artifact builds use x64.
 
 To retry only Azure publication from the exact bytes of a prior GitHub Actions
 artifact, see [Artifact-only Azure retry](DOCS/artifact-only-azure-retry.md).
+
+### AVS2 and AVS3 decoding
+
+The Windows x64 and ARM64 builds statically link AVS2 and AVS3 decoders into
+FFmpeg:
+
+- `davs2` is pinned to
+  `xatabhk/davs2-10bit@21d64c8f8e36af71fc7a488cd6f789c86cdd1200` and
+  built for the 8-bit and 10-bit AVS2 paths. x64 retains NASM; ARM64 uses the
+  public AArch64 NEON patch set while disabling unavailable handwritten
+  assembly.
+- `uavs3d` is pinned to
+  `uavs3/uavs3d@0e20d2c291853f196c68922a264bcd8471d75b68` with
+  `COMPILE_10BIT=ON`, which includes its 8-bit and 10-bit AVS3 paths. Windows
+  ARM64 uses the portable C path because upstream AArch64 assembly targets ELF,
+  not COFF. UHD throughput on that portable path remains unverified.
+
+FFmpeg configuration and static archive symbols are checked fail-closed for
+both wrappers. This is compilation and registration evidence, not stream
+decode or performance evidence. No public AVS sample stream is redistributed;
+runtime validation must use a caller-owned or otherwise rights-controlled
+fixture. Each artifact includes exact source and patch provenance plus the
+applicable license notices.
+
+On Windows, `test/libmpv_avs_decode.py` checks an exact DLL against a local
+fixture without opening a window. It disables audio and hardware decoding,
+disallows decoder fallback, and requires an observed decoded video frame with
+the expected dimensions and pixel format under a bounded child process:
+
+```text
+python test\libmpv_avs_decode.py <libmpv-2.dll> <fixture.mkv> --decoder libdavs2 --width 3840 --height 2160 --pixel-format yuv420p10
+```
+
+Use `libuavs3d` for AVS3. The probe explicitly selects the AVS3 demuxer for a
+raw `.avs3` fixture; that case proves decoding, not automatic raw-stream
+detection. It reports hashes and frame metadata, not real-time performance.
 
 ## Upstream integration: 2026-09-07
 

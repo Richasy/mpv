@@ -1,0 +1,23 @@
+diff --git a/source/common/cpu.cc b/source/common/cpu.cc
+index 490b2b3..95ca00c 100644
+--- a/source/common/cpu.cc
++++ b/source/common/cpu.cc
+@@ -50,7 +50,7 @@
+ #include <machine/cpu.h>
+ #endif
+ 
+-#if ARCH_ARM || ARCH_AARCH64
++#if (ARCH_ARM || ARCH_AARCH64) && !defined(_WIN32)
+ #include <signal.h>
+ #include <setjmp.h>
+ static sigjmp_buf jmpbuf;
+@@ -68,7 +68,7 @@ static void sigill_handler(int sig)
+     siglongjmp(jmpbuf, 1);
+ }
+ 
+-#endif // if ARCH_ARM || ARCH_AARCH64
++#endif // if (ARCH_ARM || ARCH_AARCH64) && !defined(_WIN32)
+ 
+ #ifdef __cplusplus
+ extern "C" {
+

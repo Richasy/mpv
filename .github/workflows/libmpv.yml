@@ -29,7 +29,7 @@ on:
       ffmpeg_ref:
         description: 'Richasy/FFmpeg commit, branch, or tag'
         type: string
-        default: df21143bf252528f45d7ae56cc1d317ff00d4449
+        default: 026ddd08e6f80db6251cbb32d011c23c49470713
       source_run_id:
         description: 'Prior libmpv workflow run ID for artifact-only Azure retry'
         type: string
@@ -89,7 +89,7 @@ jobs:
       TARGET_ARCH: ${{ matrix.arch }}
       MPV_REPO: https://github.com/Richasy/mpv.git
       MPV_COMMIT: ${{ github.sha }}
-      FFMPEG_COMMIT: ${{ inputs.ffmpeg_ref || 'df21143bf252528f45d7ae56cc1d317ff00d4449' }}
+      FFMPEG_COMMIT: ${{ inputs.ffmpeg_ref || '026ddd08e6f80db6251cbb32d011c23c49470713' }}
       BUILD_TYPE: ${{ inputs.build_type }}
       BUILD_SUFFIX: ${{ inputs.build_type == 'debug' && '-debug' || '' }}
     steps:
@@ -193,6 +193,8 @@ jobs:
             ${{ env.BUILD_DIR }}/packages/mpv-prefix/src/mpv-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/mpv-prefix/src/mpv-build/meson-logs/*.txt
             ${{ env.BUILD_DIR }}/packages/ffmpeg-prefix/src/ffmpeg-stamp/*.log
+            ${{ env.BUILD_DIR }}/packages/davs2-prefix/src/davs2-stamp/*.log
+            ${{ env.BUILD_DIR }}/packages/uavs3d-prefix/src/uavs3d-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/curl-prefix/src/curl-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/mbedtls-prefix/src/mbedtls-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-stamp/*.log
@@ -229,7 +231,7 @@ jobs:
             echo "::error::expected_libplacebo_sha must be a full commit SHA."
             exit 1
           fi
-          if [ "$FFMPEG_REF" != "df21143bf252528f45d7ae56cc1d317ff00d4449" ]; then
+          if [ "$FFMPEG_REF" != "026ddd08e6f80db6251cbb32d011c23c49470713" ]; then
             echo "::error::Artifact retry requires the pinned Player FFmpeg commit."
             exit 1
           fi

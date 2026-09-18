@@ -34,7 +34,9 @@ ExternalProject_Add(ffmpeg
         shaderc
         libplacebo
         libaribcaption
+        davs2
         dav1d
+        uavs3d
         rubberband
         openal-soft
         whisper
@@ -71,7 +73,9 @@ ExternalProject_Add(ffmpeg
         --enable-librubberband
         --enable-libvpx
         --enable-libwebp
+        --enable-libdavs2
         --enable-libdav1d
+        --enable-libuavs3d
         --enable-libzimg
         --enable-openssl
         --enable-libxml2
@@ -95,7 +99,15 @@ ExternalProject_Add(ffmpeg
         ${ffmpeg_lto}
         --extra-cflags='-Wno-error=int-conversion'
         "--extra-libs='${ffmpeg_extra_libs}'" # -lstdc++ / -lc++ needed by libjxl
+    COMMAND ${CMAKE_COMMAND}
+        -DFFMPEG_CONFIG_MAK=<BINARY_DIR>/ffbuild/config.mak
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/../verify-ffmpeg-avs.cmake
     BUILD_COMMAND ${MAKE}
+    COMMAND ${CMAKE_COMMAND}
+        -DFFMPEG_CONFIG_MAK=<BINARY_DIR>/ffbuild/config.mak
+        -DFFMPEG_ARCHIVE=<BINARY_DIR>/libavcodec/libavcodec.a
+        -DLLVM_NM=${CMAKE_INSTALL_PREFIX}/bin/${TARGET_ARCH}-nm
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/../verify-ffmpeg-avs.cmake
     INSTALL_COMMAND ${MAKE} install
     LOG_DOWNLOAD 1 LOG_UPDATE 1 LOG_CONFIGURE 1 LOG_BUILD 1 LOG_INSTALL 1
 )

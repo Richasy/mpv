@@ -1,0 +1,4 @@
+ci/winbuild/notices/*.txt text eol=lf
+# Keep exact imported patch bytes, including their original whitespace.
+ci/winbuild/packages/davs2-*.patch text eol=lf -whitespace
+ci/winbuild/packages/uavs3d-*.patch text eol=lf -whitespace

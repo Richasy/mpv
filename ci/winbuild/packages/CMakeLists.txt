@@ -1,5 +1,6 @@
 set_property(DIRECTORY PROPERTY EP_STEP_TARGETS download)
 include(${PROJECT_SOURCE_DIR}/cmake/packages_check.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/avs_provenance.cmake)
 list(APPEND ep
     gmp
     xz
@@ -46,7 +47,9 @@ list(APPEND ep
     nvcodec-headers
     libmysofa
     xxhash
+    davs2
     dav1d
+    uavs3d
     libwebp
     libbs2b
     openssl

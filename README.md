@@ -91,22 +91,16 @@ The script will patch `mpv.cmake` to point to this fork, build the LLVM toolchai
 ### CI
 
 The GitHub Actions workflow (`.github/workflows/libmpv.yml`) is configured for
-manual dispatch only (`workflow_dispatch`). Normal builds run on the
-self-hosted Linux runner and output artifacts to a local directory; the
-artifact-only Azure retry runs on a bounded GitHub-hosted publication job and
-does not invoke the native build.
+manual dispatch only (`workflow_dispatch`). It exposes only the x64 and ARM64
+architecture switches plus the upload target. Builds run on the self-hosted
+Linux runner in release mode using the FFmpeg revision pinned by
+`ci/build-libmpv.sh`.
 
-Use the workflow's `ffmpeg_ref` input (or `FFMPEG_COMMIT` for the build script)
-to build an exact companion FFmpeg revision without changing the default branch.
-It defaults to the Player-pinned
-`026ddd08e6f80db6251cbb32d011c23c49470713` commit. For a coordinated upgrade,
-select the committed FFmpeg SHA and use `upload_target=github` until the
-artifact set is ready to publish. GitHub-only runs omit ARM64. The
-`build_arm64` input is honored only when `upload_target` is `azure` or `both`;
-ordinary artifact builds use x64.
-
-To retry only Azure publication from the exact bytes of a prior GitHub Actions
-artifact, see [Artifact-only Azure retry](DOCS/artifact-only-azure-retry.md).
+Each selected architecture replaces its stable local output directory and
+archive (`x86_64`/`libmpv-x64.7z` or
+`aarch64`/`libmpv-arm64.7z`). GitHub-only runs omit ARM64; `build_arm64` is
+honored only when `upload_target` is `azure` or `both`. Azure uploads retry
+each file up to three times with bounded backoff.
 
 ### AVS2 and AVS3 decoding
 

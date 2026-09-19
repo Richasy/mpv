@@ -19,29 +19,6 @@ on:
           - azure
           - both
         default: github
-      build_type:
-        description: 'Build type (release = -O3 LTO + PDB; debug = -O0 no-LTO, asserts on, PDB)'
-        type: choice
-        options:
-          - release
-          - debug
-        default: release
-      ffmpeg_ref:
-        description: 'Richasy/FFmpeg commit, branch, or tag'
-        type: string
-        default: 026ddd08e6f80db6251cbb32d011c23c49470713
-      source_run_id:
-        description: 'Prior libmpv workflow run ID for artifact-only Azure retry'
-        type: string
-        default: ''
-      expected_source_sha:
-        description: 'Required full mpv commit SHA when source_run_id is set'
-        type: string
-        default: ''
-      expected_libplacebo_sha:
-        description: 'Required full libplacebo commit SHA when source_run_id is set'
-        type: string
-        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-shared-native-build
@@ -49,7 +26,6 @@ concurrency:
 
 jobs:
   prepare:
-    if: inputs.source_run_id == ''
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
@@ -73,7 +49,7 @@ jobs:
 
   build:
     needs: prepare
-    if: inputs.source_run_id == '' && needs.prepare.outputs.matrix != '{"include":[]}'
+    if: needs.prepare.outputs.matrix != '{"include":[]}'
     runs-on: [self-hosted, Linux, X64]
     strategy:
       fail-fast: false
@@ -84,14 +60,11 @@ jobs:
       CLANG_ROOT: /home/richasy/programs/clang_root
       SRC_PACKAGES: /home/richasy/programs/src_packages
       RUSTUP_LOC: /home/richasy/programs/clang_root/install_rustup
-      OUTPUT_DIR: /home/richasy/programs/libmpv-output/${{ github.run_id }}/${{ github.run_attempt }}
+      OUTPUT_DIR: /home/richasy/programs/libmpv-output
       BUILD_DIR: /home/richasy/programs/build_${{ matrix.arch }}
       TARGET_ARCH: ${{ matrix.arch }}
       MPV_REPO: https://github.com/Richasy/mpv.git
       MPV_COMMIT: ${{ github.sha }}
-      FFMPEG_COMMIT: ${{ inputs.ffmpeg_ref || '026ddd08e6f80db6251cbb32d011c23c49470713' }}
-      BUILD_TYPE: ${{ inputs.build_type }}
-      BUILD_SUFFIX: ${{ inputs.build_type == 'debug' && '-debug' || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -118,10 +91,6 @@ jobs:
             -o build/preflight/sub-translate-policy-test
           build/preflight/sub-translate-policy-test
 
-      - name: Test artifact-only Azure retry helper
-        if: matrix.arch == 'x86_64'
-        run: python3 test/retry_azure_artifact.py
-
       - name: Ensure PATH includes local bin
         run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 
@@ -130,14 +99,24 @@ jobs:
           export MPV_SRC_DIR="$GITHUB_WORKSPACE"
           bash ci/build-libmpv.sh all
 
+      - name: Package artifacts as 7z
+        run: |
+          archive="$OUTPUT_DIR/libmpv-${{ matrix.name }}.7z"
+          staging="${archive}.new"
+          rm -f "$staging"
+          cd "$OUTPUT_DIR/${{ matrix.arch }}"
+          7z a -t7z -mx=9 "$staging" .
+          mv -f "$staging" "$archive"
+          ls -lh "$archive"
+
       - name: Upload to GitHub Artifacts
         if: inputs.upload_target == 'github' || inputs.upload_target == 'both'
         uses: actions/upload-artifact@v4
         with:
-          name: libmpv-${{ matrix.name }}${{ env.BUILD_SUFFIX }}
-          path: ${{ env.OUTPUT_DIR }}/${{ matrix.arch }}/
+          name: libmpv-${{ matrix.name }}
+          path: ${{ env.OUTPUT_DIR }}/libmpv-${{ matrix.name }}.7z
           retention-days: 30
-          compression-level: 6
+          compression-level: 0
 
       - name: Upload libmpv-2.dll to Azure Blob
         if: inputs.upload_target == 'azure' || inputs.upload_target == 'both'
@@ -145,8 +124,8 @@ jobs:
           AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
         run: |
           ARCH_OUT="$OUTPUT_DIR/${{ matrix.arch }}"
-          AZ_DIR="native/${{ matrix.name }}${BUILD_SUFFIX}"
-          SYMBOL_DIR="symbols/${{ github.sha }}/${{ matrix.name }}${BUILD_SUFFIX}"
+          AZ_DIR="native/${{ matrix.name }}"
+          SYMBOL_DIR="symbols/${{ github.sha }}/${{ matrix.name }}"
           DLL_PATH="$ARCH_OUT/libmpv-2.dll"
           if [ ! -f "$DLL_PATH" ]; then
             echo "ERROR: libmpv-2.dll not found at $DLL_PATH"
@@ -155,16 +134,27 @@ jobs:
           upload() {
             local file="$1"
             local blob_dir="${2:-$AZ_DIR}"
-            local name
+            local name attempt delay
             name=$(basename "$file")
-            echo "Uploading $name to $blob_dir..."
-            az storage blob upload \
-              --container-name rodel-player-deps \
-              --name "$blob_dir/$name" \
-              --file "$file" \
-              --overwrite \
-              --connection-string "$AZURE_STORAGE_CONNECTION_STRING"
-            echo "Uploaded: $blob_dir/$name"
+            for attempt in 1 2 3; do
+              echo "Uploading $name to $blob_dir (attempt $attempt/3)..."
+              if az storage blob upload \
+                --container-name rodel-player-deps \
+                --name "$blob_dir/$name" \
+                --file "$file" \
+                --overwrite \
+                --connection-string "$AZURE_STORAGE_CONNECTION_STRING"; then
+                echo "Uploaded: $blob_dir/$name"
+                return 0
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "::error::Failed to upload $blob_dir/$name after 3 attempts."
+                return 1
+              fi
+              delay=$((attempt * 30))
+              echo "::warning::Upload failed; retrying in ${delay}s."
+              sleep "$delay"
+            done
           }
           # Upload runtime artifacts and current symbols to the stable paths.
           # shared libraries (BUILD_SHARED_LIBS=ON + GGML_BACKEND_DL=ON). The
@@ -201,105 +191,3 @@ jobs:
             ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-build/CMakeFiles/CMakeOutput.log
             ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-build/CMakeFiles/CMakeError.log
           retention-days: 7
-
-  prepare-artifact-retry:
-    if: inputs.source_run_id != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-    steps:
-      - id: set-matrix
-        env:
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
-          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
-          EXPECTED_LIBPLACEBO_SHA: ${{ inputs.expected_libplacebo_sha }}
-          FFMPEG_REF: ${{ inputs.ffmpeg_ref }}
-          UPLOAD_TARGET: ${{ inputs.upload_target }}
-          BUILD_X64: ${{ inputs.build_x64 }}
-          BUILD_ARM64: ${{ inputs.build_arm64 }}
-        run: |
-          if ! [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]; then
-            echo "::error::source_run_id must be a numeric workflow run ID."
-            exit 1
-          fi
-          if ! [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "::error::expected_source_sha must be a full commit SHA."
-            exit 1
-          fi
-          if ! [[ "$EXPECTED_LIBPLACEBO_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "::error::expected_libplacebo_sha must be a full commit SHA."
-            exit 1
-          fi
-          if [ "$FFMPEG_REF" != "026ddd08e6f80db6251cbb32d011c23c49470713" ]; then
-            echo "::error::Artifact retry requires the pinned Player FFmpeg commit."
-            exit 1
-          fi
-          if [ "$UPLOAD_TARGET" != "azure" ] && [ "$UPLOAD_TARGET" != "both" ]; then
-            echo "::error::Artifact retry publishes only to Azure; select azure or both."
-            exit 1
-          fi
-          entries=()
-          if [ "$BUILD_X64" = "true" ]; then
-            entries+=('{"arch":"x86_64","name":"x64"}')
-          fi
-          if [ "$BUILD_ARM64" = "true" ]; then
-            entries+=('{"arch":"aarch64","name":"arm64"}')
-          fi
-          if [ "${#entries[@]}" -eq 0 ]; then
-            echo "::error::Select at least one architecture to republish."
-            exit 1
-          fi
-          matrix="{\"include\":[$(IFS=,; echo "${entries[*]}")]}"
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-
-  retry-azure-publication:
-    needs: prepare-artifact-retry
-    if: inputs.source_run_id != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      actions: read
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare-artifact-retry.outputs.matrix) }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Verify artifact and retry Azure publication
-        env:
-          GH_TOKEN: ${{ github.token }}
-          AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
-          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
-          EXPECTED_FFMPEG_SHA: ${{ inputs.ffmpeg_ref }}
-          EXPECTED_LIBPLACEBO_SHA: ${{ inputs.expected_libplacebo_sha }}
-          RETRY_ARCHITECTURE: ${{ matrix.name }}
-          RETRY_BUILD_TYPE: ${{ inputs.build_type }}
-        run: |
-          suffix=""
-          if [ "$RETRY_BUILD_TYPE" = "debug" ]; then
-            suffix="-debug"
-          fi
-          python3 ci/retry_azure_artifact.py \
-            --repository "$GITHUB_REPOSITORY" \
-            --source-run-id "$SOURCE_RUN_ID" \
-            --expected-source-sha "$EXPECTED_SOURCE_SHA" \
-            --expected-ffmpeg-sha "$EXPECTED_FFMPEG_SHA" \
-            --expected-libplacebo-sha "$EXPECTED_LIBPLACEBO_SHA" \
-            --architecture "$RETRY_ARCHITECTURE" \
-            --build-type "$RETRY_BUILD_TYPE" \
-            --artifact-name "libmpv-${RETRY_ARCHITECTURE}${suffix}" \
-            --workspace "$GITHUB_WORKSPACE" \
-            --staging-directory "$GITHUB_WORKSPACE/.artifact-retry/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$RETRY_ARCHITECTURE" \
-            --receipt "$GITHUB_WORKSPACE/artifact-retry-receipts/$SOURCE_RUN_ID/$RETRY_ARCHITECTURE.json"
-
-      - name: Upload publication receipt
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: azure-retry-receipt-${{ inputs.source_run_id }}-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifact-retry-receipts/${{ inputs.source_run_id }}/${{ matrix.name }}.json
-          if-no-files-found: warn
-          retention-days: 30

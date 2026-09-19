@@ -86,6 +86,8 @@ DEFINE_GUID(MPV_IID_IDMLDevice, 0x6dbd6437, 0x96fd, 0x423f,
 #include "video/img_format.h"
 #include "video/mp_image.h"
 #include "video/mp_image_pool.h"
+#include "video/filter/rife_model.h"
+#include "video/filter/rife_sync.h"
 
 #include "video/filter/rife_shaders/cs_pack_rgb0.dxil.h"
 #include "video/filter/rife_shaders/cs_fill_meta.dxil.h"
@@ -126,40 +128,56 @@ static struct {
     wchar_t       resolved_path[MAX_PATH];
 } g_ort = {0};
 
+static HMODULE load_sibling_library(struct mp_log *log, const wchar_t *name,
+                                    wchar_t *resolved_path)
+{
+    HMODULE self = NULL;
+    wchar_t path[MAX_PATH] = {0};
+    if (GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCWSTR)load_sibling_library, &self) && self)
+    {
+        DWORD len = GetModuleFileNameW(self, path, MAX_PATH);
+        if (len > 0 && len < MAX_PATH) {
+            wchar_t *slash = wcsrchr(path, L'\\');
+            if (slash) {
+                wchar_t dir[MAX_PATH] = {0};
+                wcsncpy(dir, path, slash - path + 1);
+                AddDllDirectory(dir);
+                *(slash + 1) = 0;
+                if (wcslen(path) + wcslen(name) < MAX_PATH) {
+                    wcscat(path, name);
+                    HMODULE dll = LoadLibraryExW(
+                            path, NULL,
+                            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                            LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+                    if (dll) {
+                        if (resolved_path)
+                            wcsncpy(resolved_path, path, MAX_PATH - 1);
+                        return dll;
+                    }
+                    mp_verbose(log, "could not load sibling runtime %ls\n",
+                               path);
+                }
+            }
+        }
+    }
+
+    HMODULE dll = LoadLibraryExW(
+            name, NULL, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (dll && resolved_path)
+        GetModuleFileNameW(dll, resolved_path, MAX_PATH);
+    return dll;
+}
+
 static bool ort_load(struct mp_log *log)
 {
     if (g_ort.dll)
         return g_ort.api != NULL;
 
-    HMODULE dll = LoadLibraryW(L"onnxruntime.dll");
-    if (!dll) {
-        // Fallback: try the directory holding the loaded copy of mpv/libmpv.
-        HMODULE self = NULL;
-        if (GetModuleHandleExW(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                (LPCWSTR)ort_load, &self) && self)
-        {
-            wchar_t path[MAX_PATH] = {0};
-            DWORD len = GetModuleFileNameW(self, path, MAX_PATH);
-            if (len > 0 && len < MAX_PATH) {
-                wchar_t *slash = wcsrchr(path, L'\\');
-                if (slash) {
-                    wchar_t dir[MAX_PATH] = {0};
-                    wcsncpy(dir, path, slash - path + 1);
-                    // Add directory so transitive deps (DirectML.dll,
-                    // onnxruntime_providers_shared.dll) load too.
-                    AddDllDirectory(dir);
-                    *(slash + 1) = 0;
-                    wcscat(path, L"onnxruntime.dll");
-                    mp_verbose(log, "trying %ls\n", path);
-                    dll = LoadLibraryExW(path, NULL,
-                        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-                        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-                }
-            }
-        }
-    }
+    HMODULE dll = load_sibling_library(
+            log, L"onnxruntime.dll", g_ort.resolved_path);
     if (!dll) {
         mp_warn(log, "onnxruntime.dll not found; RIFE disabled.\n");
         return false;
@@ -175,10 +193,10 @@ static bool ort_load(struct mp_log *log)
     }
     const OrtApiBase *base = get_api_base();
     const OrtApi *api = base->GetApi(ORT_API_VERSION);
-    if (!api)
-        api = base->GetApi(1);
     if (!api) {
-        mp_warn(log, "ORT GetApi returned NULL\n");
+        mp_warn(log, "onnxruntime does not provide required API v%d "
+                     "(runtime %s)\n",
+                ORT_API_VERSION, base->GetVersionString());
         FreeLibrary(dll);
         return false;
     }
@@ -198,14 +216,11 @@ static bool ort_load(struct mp_log *log)
         g_ort.dml_api = (const OrtDmlApi *)dml_api_v;
     }
 
-    // Capture the actual loaded path so we can log it (rubber-duck note:
-    // wrong onnxruntime.dll on PATH is a real footgun).
-    GetModuleFileNameW(dll, g_ort.resolved_path, MAX_PATH);
-
     g_ort.dll = dll;
     g_ort.api = api;
-    mp_verbose(log, "onnxruntime.dll loaded (API v%d): %ls\n",
-               ORT_API_VERSION, g_ort.resolved_path);
+    mp_verbose(log, "onnxruntime %s loaded (API v%d): %ls\n",
+               base->GetVersionString(), ORT_API_VERSION,
+               g_ort.resolved_path);
     if (g_ort.dml_api)
         mp_verbose(log, "OrtDmlApi available (DML1 EP supported)\n");
 
@@ -213,7 +228,8 @@ static bool ort_load(struct mp_log *log)
     // non-fatal: callers fall back to the legacy DML(gpu_id) path.
     g_ort.d3d12_dll = LoadLibraryW(L"d3d12.dll");
     g_ort.dxgi_dll  = LoadLibraryW(L"dxgi.dll");
-    g_ort.dml_dll   = LoadLibraryW(L"DirectML.dll");
+    g_ort.dml_dll   = load_sibling_library(
+            log, L"DirectML.dll", NULL);
     if (g_ort.d3d12_dll) {
         g_ort.d3d12_create_device = (PFN_D3D12CreateDevice)
             GetProcAddress(g_ort.d3d12_dll, "D3D12CreateDevice");
@@ -238,6 +254,8 @@ static bool ort_load(struct mp_log *log)
 struct rife_opts {
     bool  enabled;
     char *model_path;
+    char *model_profile;
+    int   model_padding;
     int   multiplier;
     int   gpu_id;
     char *gpu_luid;
@@ -367,6 +385,10 @@ struct priv {
     ID3D11Fence               *zc_xfence_d3d11;
     HANDLE                     zc_xfence_handle;  // closed after both opens
     _Atomic uint64_t           zc_xfence_value;   // monotonic frame counter
+    ID3D12Fence               *zc_consumer_fence_d3d12;
+    ID3D11Fence               *zc_consumer_fence_d3d11;
+    HANDLE                     zc_consumer_fence_event;
+    _Atomic uint64_t           zc_consumer_fence_value;
     ID3D11Device5             *zc_d3d11_dev5;     // for OpenSharedFence/-Resource1
     ID3D11DeviceContext4      *zc_d3d11_ctx4;     // for Wait()
     ID3D12DescriptorHeap      *zc_rtv_heap;
@@ -479,6 +501,8 @@ struct priv {
     uint64_t                   stats_total_pairs;
     uint64_t                   stats_skipped_static;
     uint64_t                   stats_skipped_scene;
+    uint64_t                   stats_bypassed_hdr;
+    uint64_t                   stats_bypassed_size;
 
     // Sliding-window FPS tracking. Tick once per source pair. source_fps =
     // pairs/sec, output_fps = source_fps * multiplier (every pair emits
@@ -535,6 +559,7 @@ struct priv {
 struct rife_zc_slot {
     int                idx;
     _Atomic int        in_flight;        // 1 = held by an mp_image, 0 = free
+    _Atomic uint64_t   consumer_fence_value;
     ID3D12Resource    *d3d12_tex;        // BGRA, SHARED, RT|UAV
     ID3D11Texture2D   *d3d11_tex;        // opened wrapper on mpv's D3D11
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_cpu;
@@ -561,6 +586,90 @@ static bool ort_check(struct mp_filter *vf, OrtStatus *st, const char *op)
     MP_ERR(vf, "ORT %s failed: %s\n", op, msg ? msg : "(unknown)");
     g_ort.api->ReleaseStatus(st);
     return false;
+}
+
+static bool validate_model_tensor(struct mp_filter *vf, bool input,
+                                  int expected_channels)
+{
+    struct priv *p = vf->priv;
+    const OrtApi *api = g_ort.api;
+    OrtTypeInfo *type_info = NULL;
+    const OrtTensorTypeAndShapeInfo *tensor_info = NULL;
+    ONNXTensorElementDataType element_type;
+    size_t rank = 0;
+    int64_t dims[4] = {0};
+    bool ok = false;
+
+    OrtStatus *st = input
+        ? api->SessionGetInputTypeInfo(p->session, 0, &type_info)
+        : api->SessionGetOutputTypeInfo(p->session, 0, &type_info);
+    if (!ort_check(vf, st, input ? "SessionGetInputTypeInfo"
+                                 : "SessionGetOutputTypeInfo"))
+        goto done;
+
+    st = api->CastTypeInfoToTensorInfo(type_info, &tensor_info);
+    if (!ort_check(vf, st, "CastTypeInfoToTensorInfo") || !tensor_info)
+        goto done;
+    st = api->GetTensorElementType(tensor_info, &element_type);
+    if (!ort_check(vf, st, "GetTensorElementType"))
+        goto done;
+    st = api->GetDimensionsCount(tensor_info, &rank);
+    if (!ort_check(vf, st, "GetDimensionsCount"))
+        goto done;
+    if (rank != MP_ARRAY_SIZE(dims)) {
+        MP_ERR(vf, "RIFE model %s rank must be 4 (got %zu)\n",
+               input ? "input" : "output", rank);
+        goto done;
+    }
+    st = api->GetDimensions(tensor_info, dims, rank);
+    if (!ort_check(vf, st, "GetDimensions"))
+        goto done;
+    if (element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+        MP_ERR(vf, "RIFE model %s must use float32 tensors (got %d)\n",
+               input ? "input" : "output", (int)element_type);
+        goto done;
+    }
+    if (!mp_rife_tensor_shape_matches(dims, rank, expected_channels,
+                                      p->pad_h, p->pad_w))
+    {
+        MP_ERR(vf, "RIFE model %s shape is incompatible: "
+                   "[%lld,%lld,%lld,%lld], expected [1,%d,%d,%d] "
+                   "or dynamic spatial dimensions\n",
+               input ? "input" : "output",
+               (long long)dims[0], (long long)dims[1],
+               (long long)dims[2], (long long)dims[3],
+               expected_channels, p->pad_h, p->pad_w);
+        goto done;
+    }
+    ok = true;
+
+done:
+    if (type_info)
+        api->ReleaseTypeInfo(type_info);
+    return ok;
+}
+
+static bool validate_model_contract(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    const OrtApi *api = g_ort.api;
+    size_t inputs = 0;
+    size_t outputs = 0;
+
+    if (!ort_check(vf, api->SessionGetInputCount(p->session, &inputs),
+                   "SessionGetInputCount") ||
+        !ort_check(vf, api->SessionGetOutputCount(p->session, &outputs),
+                   "SessionGetOutputCount"))
+    {
+        return false;
+    }
+    if (inputs != 1 || outputs != 1) {
+        MP_ERR(vf, "RIFE model requires exactly one input and one output "
+                   "(got %zu input(s), %zu output(s))\n", inputs, outputs);
+        return false;
+    }
+    return validate_model_tensor(vf, true, 11) &&
+           validate_model_tensor(vf, false, 3);
 }
 
 // Pack one RGB0 plane (R,G,B,X) into channels [base..base+2] of the input
@@ -898,9 +1007,6 @@ static bool d3d12_alloc_tensors(struct mp_filter *vf,
     p->zc_out_bytes = out_bytes;
 
     D3D12_HEAP_PROPERTIES default_heap = { .Type = D3D12_HEAP_TYPE_DEFAULT };
-    D3D12_HEAP_PROPERTIES upload_heap  = { .Type = D3D12_HEAP_TYPE_UPLOAD };
-    D3D12_HEAP_PROPERTIES rb_heap      = { .Type = D3D12_HEAP_TYPE_READBACK };
-
     D3D12_RESOURCE_DESC rd = {
         .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
         .Alignment = 0,
@@ -923,23 +1029,6 @@ static bool d3d12_alloc_tensors(struct mp_filter *vf,
         return false;
     }
 
-    rd.Flags = D3D12_RESOURCE_FLAG_NONE;
-    hr = ID3D12Device_CreateCommittedResource(p->zc_d3d12, &upload_heap,
-            D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
-            NULL, &IID_ID3D12Resource, (void **)&p->zc_in_upload);
-    if (FAILED(hr)) {
-        MP_ERR(vf, "RIFE zc: create in_upload hr=0x%08lx\n",
-               (unsigned long)hr);
-        return false;
-    }
-    D3D12_RANGE no_read = {0, 0};
-    hr = ID3D12Resource_Map(p->zc_in_upload, 0, &no_read,
-                            &p->zc_in_upload_ptr);
-    if (FAILED(hr)) {
-        MP_ERR(vf, "RIFE zc: map in_upload hr=0x%08lx\n", (unsigned long)hr);
-        return false;
-    }
-
     rd.Width = out_bytes;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     hr = ID3D12Device_CreateCommittedResource(p->zc_d3d12, &default_heap,
@@ -947,16 +1036,6 @@ static bool d3d12_alloc_tensors(struct mp_filter *vf,
             &IID_ID3D12Resource, (void **)&p->zc_out_default);
     if (FAILED(hr)) {
         MP_ERR(vf, "RIFE zc: create out_default hr=0x%08lx\n",
-               (unsigned long)hr);
-        return false;
-    }
-
-    rd.Flags = D3D12_RESOURCE_FLAG_NONE;
-    hr = ID3D12Device_CreateCommittedResource(p->zc_d3d12, &rb_heap,
-            D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-            &IID_ID3D12Resource, (void **)&p->zc_out_readback);
-    if (FAILED(hr)) {
-        MP_ERR(vf, "RIFE zc: create out_readback hr=0x%08lx\n",
                (unsigned long)hr);
         return false;
     }
@@ -990,6 +1069,98 @@ static bool d3d12_alloc_tensors(struct mp_filter *vf,
 
     MP_INFO(vf, "RIFE zc: D3D12 buffers + tensors ready "
                 "(in=%zu B, out=%zu B)\n", in_bytes, out_bytes);
+    return true;
+}
+
+static bool ensure_zc_input_fallback(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    if (p->in_buf && p->zc_in_upload && p->zc_in_upload_ptr)
+        return true;
+
+    if (!p->in_buf) {
+        size_t floats = p->zc_in_bytes / sizeof(float);
+        p->in_buf = calloc(floats, sizeof(float));
+        if (!p->in_buf) {
+            MP_ERR(vf, "RIFE zc: failed to allocate input fallback buffer\n");
+            return false;
+        }
+    }
+
+    D3D12_HEAP_PROPERTIES heap = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+    D3D12_RESOURCE_DESC rd = {
+        .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+        .Width = p->zc_in_bytes,
+        .Height = 1,
+        .DepthOrArraySize = 1,
+        .MipLevels = 1,
+        .Format = DXGI_FORMAT_UNKNOWN,
+        .SampleDesc = { .Count = 1 },
+        .Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+    };
+    HRESULT hr;
+    if (!p->zc_in_upload) {
+        hr = ID3D12Device_CreateCommittedResource(
+                p->zc_d3d12, &heap, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource,
+                (void **)&p->zc_in_upload);
+        if (FAILED(hr)) {
+            MP_ERR(vf, "RIFE zc: create input fallback upload hr=0x%08lx\n",
+                   (unsigned long)hr);
+            return false;
+        }
+    }
+    D3D12_RANGE no_read = {0, 0};
+    hr = ID3D12Resource_Map(p->zc_in_upload, 0, &no_read,
+                            &p->zc_in_upload_ptr);
+    if (FAILED(hr)) {
+        MP_ERR(vf, "RIFE zc: map input fallback upload hr=0x%08lx\n",
+               (unsigned long)hr);
+        SAFE_RELEASE(p->zc_in_upload);
+        return false;
+    }
+    MP_VERBOSE(vf, "RIFE zc: allocated CPU input fallback lazily\n");
+    return true;
+}
+
+static bool ensure_zc_output_fallback(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    if (p->out_buf && p->zc_out_readback)
+        return true;
+
+    if (!p->out_buf) {
+        size_t floats = p->zc_out_bytes / sizeof(float);
+        p->out_buf = calloc(floats, sizeof(float));
+        if (!p->out_buf) {
+            MP_ERR(vf, "RIFE zc: failed to allocate output fallback buffer\n");
+            return false;
+        }
+    }
+
+    D3D12_HEAP_PROPERTIES heap = { .Type = D3D12_HEAP_TYPE_READBACK };
+    D3D12_RESOURCE_DESC rd = {
+        .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+        .Width = p->zc_out_bytes,
+        .Height = 1,
+        .DepthOrArraySize = 1,
+        .MipLevels = 1,
+        .Format = DXGI_FORMAT_UNKNOWN,
+        .SampleDesc = { .Count = 1 },
+        .Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+    };
+    if (!p->zc_out_readback) {
+        HRESULT hr = ID3D12Device_CreateCommittedResource(
+                p->zc_d3d12, &heap, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource,
+                (void **)&p->zc_out_readback);
+        if (FAILED(hr)) {
+            MP_ERR(vf, "RIFE zc: create output fallback readback hr=0x%08lx\n",
+                   (unsigned long)hr);
+            return false;
+        }
+    }
+    MP_VERBOSE(vf, "RIFE zc: allocated CPU output fallback lazily\n");
     return true;
 }
 
@@ -2662,22 +2833,23 @@ static bool cur_only_to_slot(struct mp_filter *vf,
 
 static void zc_out_release(struct priv *p)
 {
-    // The ring backs live mp_images via custom AVBufferRef destructors that
-    // dereference p->zc_ring. We MUST NOT free the ring while any slot is
-    // still in_flight; the filter destroy path drains pending images before
-    // calling release_session, so by here all slots should be free. Assert
-    // and leak gracefully if not.
+    uint64_t consumer_value = atomic_load(&p->zc_consumer_fence_value);
+    if (consumer_value && p->zc_consumer_fence_d3d12 &&
+        p->zc_consumer_fence_event &&
+        ID3D12Fence_GetCompletedValue(p->zc_consumer_fence_d3d12) <
+            consumer_value)
+    {
+        if (SUCCEEDED(ID3D12Fence_SetEventOnCompletion(
+                p->zc_consumer_fence_d3d12, consumer_value,
+                p->zc_consumer_fence_event)))
+        {
+            WaitForSingleObject(p->zc_consumer_fence_event, 2000);
+        }
+    }
+
     if (p->zc_ring) {
         for (int i = 0; i < p->zc_ring_n; i++) {
             struct rife_zc_slot *s = &p->zc_ring[i];
-            if (atomic_load(&s->in_flight)) {
-                // A downstream consumer still holds a ref. Detach the slot
-                // from the ring (set owner to NULL) so the destructor knows
-                // not to touch ring memory; let the OS reclaim the textures
-                // when refcount drops. This prevents a UAF but does leak.
-                s->owner = NULL;
-                continue;
-            }
             if (s->d3d11_tex) {
                 ID3D11Texture2D_Release(s->d3d11_tex);
                 s->d3d11_tex = NULL;
@@ -2687,15 +2859,8 @@ static void zc_out_release(struct priv *p)
                 s->d3d12_tex = NULL;
             }
         }
-        // Only free if no slot leaked. (talloc would simplify; use plain
-        // free for symmetry with the rest of the file.)
-        bool any_leaked = false;
-        for (int i = 0; i < p->zc_ring_n; i++)
-            if (p->zc_ring[i].owner == NULL) any_leaked = true;
-        if (!any_leaked) {
-            free(p->zc_ring);
-            p->zc_ring = NULL;
-        }
+        free(p->zc_ring);
+        p->zc_ring = NULL;
     }
     p->zc_ring_n = 0;
     p->zc_ring_w = p->zc_ring_h = 0;
@@ -2714,11 +2879,21 @@ static void zc_out_release(struct priv *p)
         p->zc_xfence_d3d11 = NULL;
     }
     SAFE_RELEASE(p->zc_xfence_d3d12);
+    if (p->zc_consumer_fence_d3d11) {
+        ID3D11Fence_Release(p->zc_consumer_fence_d3d11);
+        p->zc_consumer_fence_d3d11 = NULL;
+    }
+    SAFE_RELEASE(p->zc_consumer_fence_d3d12);
+    if (p->zc_consumer_fence_event) {
+        CloseHandle(p->zc_consumer_fence_event);
+        p->zc_consumer_fence_event = NULL;
+    }
     if (p->zc_xfence_handle) {
         CloseHandle(p->zc_xfence_handle);
         p->zc_xfence_handle = NULL;
     }
     atomic_store(&p->zc_xfence_value, 0);
+    atomic_store(&p->zc_consumer_fence_value, 0);
     p->use_zc_out = false;
 }
 
@@ -2838,6 +3013,38 @@ static bool zc_out_init(struct mp_filter *vf, int w, int h)
     p->zc_xfence_handle = NULL;
     atomic_store(&p->zc_xfence_value, 0);
 
+    HANDLE consumer_handle = NULL;
+    hr = ID3D12Device_CreateFence(p->zc_d3d12, 0,
+            D3D12_FENCE_FLAG_SHARED, &IID_ID3D12Fence,
+            (void **)&p->zc_consumer_fence_d3d12);
+    if (FAILED(hr)) {
+        MP_ERR(vf, "RIFE zc-out: CreateFence(consumer) hr=0x%08lx\n",
+               (unsigned long)hr);
+        return false;
+    }
+    hr = ID3D12Device_CreateSharedHandle(p->zc_d3d12,
+            (ID3D12DeviceChild *)p->zc_consumer_fence_d3d12, NULL,
+            GENERIC_ALL, NULL, &consumer_handle);
+    if (FAILED(hr)) {
+        MP_ERR(vf, "RIFE zc-out: CreateSharedHandle(consumer) hr=0x%08lx\n",
+               (unsigned long)hr);
+        return false;
+    }
+    hr = ID3D11Device5_OpenSharedFence(p->zc_d3d11_dev5, consumer_handle,
+            &IID_ID3D11Fence, (void **)&p->zc_consumer_fence_d3d11);
+    CloseHandle(consumer_handle);
+    if (FAILED(hr)) {
+        MP_ERR(vf, "RIFE zc-out: OpenSharedFence(consumer) hr=0x%08lx\n",
+               (unsigned long)hr);
+        return false;
+    }
+    p->zc_consumer_fence_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!p->zc_consumer_fence_event) {
+        MP_ERR(vf, "RIFE zc-out: CreateEventW(consumer) failed\n");
+        return false;
+    }
+    atomic_store(&p->zc_consumer_fence_value, 0);
+
     // Allocate ring + a small RTV descriptor heap (one descriptor per slot).
     p->zc_ring_n = ZC_RING_N;
     p->zc_ring_w = w;
@@ -2885,6 +3092,7 @@ static bool zc_out_init(struct mp_filter *vf, int w, int h)
         s->idx = i;
         s->owner = p;
         atomic_store(&s->in_flight, 0);
+        atomic_store(&s->consumer_fence_value, 0);
 
         hr = ID3D12Device_CreateCommittedResource(p->zc_d3d12, &default_heap,
                 D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
@@ -2932,11 +3140,23 @@ static struct rife_zc_slot *zc_out_acquire(struct priv *p)
 {
     if (!p->zc_ring)
         return NULL;
+    uint64_t completed = p->zc_consumer_fence_d3d12
+        ? ID3D12Fence_GetCompletedValue(p->zc_consumer_fence_d3d12)
+        : UINT64_MAX;
     for (int i = 0; i < p->zc_ring_n; i++) {
+        if (!mp_rife_slot_ready(
+                atomic_load(&p->zc_ring[i].in_flight),
+                atomic_load(&p->zc_ring[i].consumer_fence_value),
+                completed))
+        {
+            continue;
+        }
         int expected = 0;
         if (atomic_compare_exchange_strong(&p->zc_ring[i].in_flight,
-                                           &expected, 1))
+                                           &expected, 1)) {
+            atomic_store(&p->zc_ring[i].consumer_fence_value, 0);
             return &p->zc_ring[i];
+        }
     }
     return NULL;  // ring exhausted; caller falls back
 }
@@ -3015,13 +3235,9 @@ static uint64_t zc_out_paint_placeholder(struct mp_filter *vf,
 // Promote a freshly-filled ring slot into an emit-ready mp_image. The slot's
 // shared D3D11 texture has SHARED+SHARED_NTHANDLE+SIMULTANEOUS_ACCESS misc
 // flags; that combination prevents ra_d3d11 (vo_gpu_next side) from creating
-// a SRV on it (E_INVALIDARG). To stay compatible with the d3d11va hwdec
-// mapper, we copy the slot into a normal mp_image_pool BGRA texture (which
-// has plain BindFlags=RT|SR, no shared-misc) and emit that. The ring slot is
-// recycled immediately after queuing the GPU copy. The cross-fence Wait()
-// issued by run_inference() guarantees D3D11 will execute the copy AFTER
-// the D3D12 producer is done; the natural ring depth (8) provides slack so
-// D3D12 does not reuse the slot before D3D11 has consumed it.
+// a SRV on it (E_INVALIDARG). Copy into a normal mp_image_pool BGRA texture,
+// then signal the separate consumer fence. zc_out_acquire() will not recycle
+// this slot until the D3D11 copy has actually completed.
 static struct mp_image *zc_out_make_mpi(struct mp_filter *vf,
                                         struct rife_zc_slot *s,
                                         struct mp_image *src)
@@ -3066,9 +3282,21 @@ static struct mp_image *zc_out_make_mpi(struct mp_filter *vf,
             (ID3D11Resource *)dst_tex, dst_sub, 0, 0, 0,
             (ID3D11Resource *)s->d3d11_tex, 0, &box);
 
-    // Slot is logically consumed (queued in D3D11 cmd stream). Free it for
-    // the next round; ring depth + FIFO ordering keep this safe.
-    zc_slot_release(s);
+    uint64_t consumer_value =
+        atomic_fetch_add(&p->zc_consumer_fence_value, 1) + 1;
+    HRESULT hr = ID3D11DeviceContext4_Signal(
+            p->zc_d3d11_ctx4, p->zc_consumer_fence_d3d11,
+            consumer_value);
+    if (FAILED(hr)) {
+        MP_ERR(vf, "RIFE zc-out: consumer signal hr=0x%08lx\n",
+               (unsigned long)hr);
+        atomic_store(&s->consumer_fence_value, UINT64_MAX);
+        mp_image_unrefp(&out);
+        return NULL;
+    }
+    ID3D11DeviceContext_Flush(p->d3d11_ctx);
+    atomic_store(&s->consumer_fence_value, consumer_value);
+    atomic_store(&s->in_flight, 0);
 
     mp_image_copy_attributes(out, src);
     out->params.hw_subfmt = IMGFMT_BGRA;
@@ -3151,8 +3379,13 @@ static bool init_session(struct mp_filter *vf, int orig_w, int orig_h)
     if (p->proc_w < 32) p->proc_w = 32;
     if (p->proc_h < 32) p->proc_h = 32;
     p->inv_scale = (float)orig_w / (float)p->proc_w;  // also ~ 1/scale
-    p->pad_w  = (p->proc_w + 31) & ~31;
-    p->pad_h  = (p->proc_h + 31) & ~31;
+    if (!mp_rife_valid_padding(p->opts->model_padding)) {
+        MP_ERR(vf, "RIFE model-padding must be 32, 64, or 128 (got %d)\n",
+               p->opts->model_padding);
+        return false;
+    }
+    p->pad_w = mp_rife_pad_dimension(p->proc_w, p->opts->model_padding);
+    p->pad_h = mp_rife_pad_dimension(p->proc_h, p->opts->model_padding);
     p->channels = 11;
 
     OrtStatus *st;
@@ -3207,6 +3440,8 @@ static bool init_session(struct mp_filter *vf, int orig_w, int orig_h)
     }
     st = api->CreateSession(p->env, wpath, p->session_opts, &p->session);
     if (!ort_check(vf, st, "CreateSession")) goto fail;
+    if (!validate_model_contract(vf))
+        goto fail;
 
     st = api->GetAllocatorWithDefaultOptions(&p->allocator);
     if (!ort_check(vf, st, "GetAllocatorWithDefaultOptions")) goto fail;
@@ -3216,19 +3451,8 @@ static bool init_session(struct mp_filter *vf, int orig_w, int orig_h)
     st = api->SessionGetOutputName(p->session, 0, p->allocator, &p->output_name);
     if (!ort_check(vf, st, "SessionGetOutputName")) goto fail;
 
-    st = api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault,
-                                  &p->mem_info);
-    if (!ort_check(vf, st, "CreateCpuMemoryInfo")) goto fail;
-
     size_t in_n  = (size_t)1 * p->channels * p->pad_h * p->pad_w;
     size_t out_n = (size_t)1 *           3 * p->pad_h * p->pad_w;
-    p->in_buf  = calloc(in_n,  sizeof(float));
-    p->out_buf = calloc(out_n, sizeof(float));
-    if (!p->in_buf || !p->out_buf) {
-        MP_ERR(vf, "RIFE: failed to allocate %.1f MiB host buffers\n",
-               (in_n + out_n) * sizeof(float) / (1024.0 * 1024.0));
-        goto fail;
-    }
 
     if (zc_wanted) {
         if (!d3d12_alloc_tensors(vf, in_n * sizeof(float),
@@ -3241,9 +3465,13 @@ static bool init_session(struct mp_filter *vf, int orig_w, int orig_h)
         st = api->BindOutput(p->zc_io_binding, p->output_name, p->zc_out_tensor);
         if (!ort_check(vf, st, "BindOutput")) goto fail;
         p->use_zc = true;
-        MP_INFO(vf, "RIFE session ready (zerocopy/DML1): src=%dx%d proc=%dx%d "
-                    "(padded %dx%d) scale=%.3f, gpu=%d\n",
+        MP_INFO(vf, "RIFE session ready (zerocopy/DML1): model=%s "
+                    "src=%dx%d proc=%dx%d (padded %dx%d, mod%d) "
+                    "scale=%.3f, gpu=%d\n",
+                p->opts->model_profile && p->opts->model_profile[0]
+                    ? p->opts->model_profile : "custom",
                 orig_w, orig_h, p->proc_w, p->proc_h, p->pad_w, p->pad_h,
+                p->opts->model_padding,
                 (float)p->proc_w / orig_w, p->gpu_dxgi_ordinal);
 
         if (p->opts->pack_shader) {
@@ -3255,6 +3483,16 @@ static bool init_session(struct mp_filter *vf, int orig_w, int orig_h)
         // Note: unpack_shader_init() requires the zc-out ring (created on
         // the first IMGFMT_D3D11 frame), so it's deferred to that path.
     } else {
+        st = api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault,
+                                      &p->mem_info);
+        if (!ort_check(vf, st, "CreateCpuMemoryInfo")) goto fail;
+        p->in_buf  = calloc(in_n,  sizeof(float));
+        p->out_buf = calloc(out_n, sizeof(float));
+        if (!p->in_buf || !p->out_buf) {
+            MP_ERR(vf, "RIFE: failed to allocate %.1f MiB host buffers\n",
+                   (in_n + out_n) * sizeof(float) / (1024.0 * 1024.0));
+            goto fail;
+        }
         int64_t in_shape[]  = {1, p->channels, p->pad_h, p->pad_w};
         int64_t out_shape[] = {1,           3, p->pad_h, p->pad_w};
         st = api->CreateTensorWithDataAsOrtValue(p->mem_info,
@@ -3266,9 +3504,12 @@ static bool init_session(struct mp_filter *vf, int orig_w, int orig_h)
                 out_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &p->out_tensor);
         if (!ort_check(vf, st, "CreateTensor(out)")) goto fail;
 
-        MP_INFO(vf, "RIFE session ready: src=%dx%d proc=%dx%d (padded %dx%d) "
-                    "scale=%.3f, DirectML gpu=%d\n",
+        MP_INFO(vf, "RIFE session ready: model=%s src=%dx%d proc=%dx%d "
+                    "(padded %dx%d, mod%d) scale=%.3f, DirectML gpu=%d\n",
+                p->opts->model_profile && p->opts->model_profile[0]
+                    ? p->opts->model_profile : "custom",
                 orig_w, orig_h, p->proc_w, p->proc_h, p->pad_w, p->pad_h,
+                p->opts->model_padding,
                 (float)p->proc_w / orig_w, p->gpu_dxgi_ordinal);
     }
     p->gpu_session_active = true;
@@ -3288,7 +3529,7 @@ static bool run_inference(struct mp_filter *vf,
                           float t, struct rife_zc_slot *out_slot,
                           struct rife_zc_slot *cur_slot,
                           uint64_t *out_xfence_v,
-                          bool force_skip)
+                          bool force_skip, bool reuse_pair)
 {
     struct priv *p = vf->priv;
     const OrtApi *api = g_ort.api;
@@ -3315,9 +3556,17 @@ static bool run_inference(struct mp_filter *vf,
 
     bool need_cpu_pack = (!p->use_pack_shader || p->opts->pack_shader_debug)
                          && !nv12_path;
+    if (need_cpu_pack && p->use_zc && !ensure_zc_input_fallback(vf))
+        return false;
+    bool need_cpu_output = p->use_zc &&
+                           !(out_slot && p->use_unpack_shader);
+    if (need_cpu_output && !ensure_zc_output_fallback(vf))
+        return false;
     if (need_cpu_pack) {
-        pack_rgb0(p, prev->planes[0], prev->stride[0], CH_R0);
-        pack_rgb0(p, cur->planes[0],  cur->stride[0],  CH_R1);
+        if (!reuse_pair) {
+            pack_rgb0(p, prev->planes[0], prev->stride[0], CH_R0);
+            pack_rgb0(p, cur->planes[0],  cur->stride[0],  CH_R1);
+        }
         fill_meta_channels(p, t);
     }
 
@@ -3342,7 +3591,7 @@ static bool run_inference(struct mp_filter *vf,
             // Stage RGB0 into both upload buffers (CPU writes, no GPU work yet).
             // Skipped for NV12 input — the GPU NV12->RGBA dispatch fills the
             // RGBA inputs directly.
-            if (!nv12_path) {
+            if (!reuse_pair && !nv12_path) {
                 pack_shader_stage(p->zc_pack_upload_prev_ptr,
                                   p->zc_pack_upload_row_pitch,
                                   prev->planes[0], prev->stride[0],
@@ -3356,22 +3605,14 @@ static bool run_inference(struct mp_filter *vf,
             // zc_in_default COMMON -> UAV (shader writes).
             ID3D12GraphicsCommandList_ResourceBarrier(p->zc_cmd_list, 1, &b);
 
-            // For NV12 input we must run cs_nv12_to_rgba BEFORE pack_shader,
-            // because pack_shader_record_one transitions in_tex_*
-            // COPY_DEST -> NPSR -> COPY_DEST and reads it as SRV. Our dispatch
-            // ends with in_tex_* in COPY_DEST too, matching the expected entry
-            // state.
-            if (nv12_path)
+            if (!reuse_pair && nv12_path)
                 nv12_input_record_dispatch(p, cur);
 
-            // Common compute setup.
             ID3D12DescriptorHeap *heaps[] = { p->zc_pack_heap };
             ID3D12GraphicsCommandList_SetDescriptorHeaps(p->zc_cmd_list,
                     1, heaps);
             ID3D12GraphicsCommandList_SetComputeRootSignature(p->zc_cmd_list,
                     p->zc_pack_root_sig);
-            ID3D12GraphicsCommandList_SetPipelineState(p->zc_cmd_list,
-                    p->zc_pack_pso);
 
             D3D12_GPU_DESCRIPTOR_HANDLE heap_gpu;
             p->zc_pack_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(
@@ -3382,16 +3623,20 @@ static bool run_inference(struct mp_filter *vf,
             D3D12_GPU_DESCRIPTOR_HANDLE uav_in_gpu   = heap_gpu;
             uav_in_gpu.ptr  += (UINT64)p->zc_pack_heap_stride * 2u;
 
-            // prev: copy upload -> in_tex, dispatch base=0.
-            pack_shader_record_one(p, p->zc_pack_in_tex_prev,
-                    nv12_path ? NULL : p->zc_pack_upload_prev,
-                    srv_prev_gpu, uav_in_gpu, CH_R0);
-            // cur: copy upload -> in_tex, dispatch base=3.
-            pack_shader_record_one(p, p->zc_pack_in_tex_cur,
-                    nv12_path ? NULL : p->zc_pack_upload_cur,
-                    srv_cur_gpu, uav_in_gpu, CH_R1);
+            if (!reuse_pair) {
+                ID3D12GraphicsCommandList_SetPipelineState(p->zc_cmd_list,
+                        p->zc_pack_pso);
+                pack_shader_record_one(p, p->zc_pack_in_tex_prev,
+                        nv12_path ? NULL : p->zc_pack_upload_prev,
+                        srv_prev_gpu, uav_in_gpu, CH_R0);
+                pack_shader_record_one(p, p->zc_pack_in_tex_cur,
+                        nv12_path ? NULL : p->zc_pack_upload_cur,
+                        srv_cur_gpu, uav_in_gpu, CH_R1);
+            }
 
             // meta: dispatch only (no SRV needed; UAV table is already set).
+            ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(
+                    p->zc_cmd_list, 1, uav_in_gpu);
             ID3D12GraphicsCommandList_SetPipelineState(p->zc_cmd_list,
                     p->zc_meta_pso);
             UINT meta_params[8] = {0};
@@ -3456,7 +3701,7 @@ static bool run_inference(struct mp_filter *vf,
         // shader-pack path active (which keeps zc_pack_in_tex_prev/cur as
         // RGBA8 we can read). The CPU-pack fallback doesn't have these.
         bool diff_dispatched = false;
-        if (!force_skip && p->use_pack_shader &&
+        if (!reuse_pair && !force_skip && p->use_pack_shader &&
             (p->opts->static_threshold > 0.0f || p->opts->scene_threshold > 0.0f))
         {
             if (!p->use_frame_diff)
@@ -3479,7 +3724,7 @@ static bool run_inference(struct mp_filter *vf,
         // fence, and queue a Wait on the D3D12 queue so the dispatch sees
         // completed copies. Failure here aborts this run; the next frame
         // can retry.
-        if (nv12_path) {
+        if (nv12_path && !reuse_pair) {
             uint64_t v_in = nv12_input_copy_and_signal(vf, prev, cur);
             if (!v_in)
                 return false;
@@ -3796,6 +4041,30 @@ static bool can_process(struct mp_image *img)
          img->params.hw_subfmt == IMGFMT_P010))
         return true;
     return false;
+}
+
+enum rife_bypass_reason {
+    RIFE_BYPASS_NONE,
+    RIFE_BYPASS_HDR,
+    RIFE_BYPASS_SIZE,
+};
+
+static enum rife_bypass_reason rife_bypass_reason(struct priv *p,
+                                                  struct mp_image *img)
+{
+    if (p->opts->hdr_passthrough &&
+        (img->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION ||
+         img->params.color.transfer == PL_COLOR_TRC_PQ ||
+         img->params.color.transfer == PL_COLOR_TRC_HLG))
+    {
+        return RIFE_BYPASS_HDR;
+    }
+    if ((p->opts->max_width > 0 && img->w > p->opts->max_width) ||
+        (p->opts->max_height > 0 && img->h > p->opts->max_height))
+    {
+        return RIFE_BYPASS_SIZE;
+    }
+    return RIFE_BYPASS_NONE;
 }
 
 // Unpack the network output ([1,3,pad_h,pad_w] float RGB planar) into the
@@ -4182,6 +4451,26 @@ static void vf_rife_process(struct mp_filter *vf)
     }
 
     struct mp_image *cur = frame.data;
+    enum rife_bypass_reason bypass = rife_bypass_reason(
+            p, raw ? raw : cur);
+    if (bypass != RIFE_BYPASS_NONE) {
+        if (bypass == RIFE_BYPASS_HDR)
+            p->stats_bypassed_hdr++;
+        else
+            p->stats_bypassed_size++;
+        mp_image_unrefp(&p->prev);
+        pending_q_clear(p);
+        mp_image_unrefp(&p->raw_pending);
+        if (raw) {
+            mp_frame_unref(&frame);
+            mp_pin_in_write(vf->ppins[1],
+                            MAKE_FRAME(MP_FRAME_VIDEO, raw));
+            raw = NULL;
+        } else {
+            mp_pin_in_write(vf->ppins[1], frame);
+        }
+        return;
+    }
 
     // ---- Step 5c.1 cross-API output ----
     // When --rife=enabled=yes:zerocopy-output=yes is set AND we receive a
@@ -4560,7 +4849,7 @@ static void vf_rife_process(struct mp_filter *vf)
             if (!run_inference(vf, p->prev, cur, ti,
                                mid_slots[i - 1],
                                last ? cur_slot : NULL,
-                               &xfv, force_skip))
+                               &xfv, force_skip, i > 1))
             {
                 any_inference_failed = true;
                 break;
@@ -4616,7 +4905,8 @@ static void vf_rife_process(struct mp_filter *vf)
         if (run_inference(vf, p->prev, cur, 0.5f,
                           mid_slot, cur_slot,
                           (mid_slot || cur_slot) ? &xfv : NULL,
-                          /*force_skip=*/false))
+                          /*force_skip=*/false,
+                          /*reuse_pair=*/false))
         {
             if (cur_slot) {
                 cur_mp = zc_out_make_mpi(vf, cur_slot, raw ? raw : cur);
@@ -4809,6 +5099,10 @@ static bool vf_rife_command(struct mp_filter *vf, struct mp_filter_command *cmd)
         mp_tags_set_str(t, "multiplier",
                         mp_tprintf(16, "%dx", p->opts->multiplier));
         mp_tags_set_str(t, "model", p->opts->model_path ? p->opts->model_path : "");
+        mp_tags_set_str(t, "model-profile",
+                        p->opts->model_profile ? p->opts->model_profile : "");
+        mp_tags_set_str(t, "model-padding",
+                        mp_tprintf(16, "%d", p->opts->model_padding));
         mp_tags_set_str(t, "gpu-name", p->gpu_name ? p->gpu_name : "");
         mp_tags_set_str(t, "gpu-selected", p->gpu_selected ? "yes" : "no");
         mp_tags_set_str(t, "gpu-session-active",
@@ -4867,6 +5161,12 @@ static bool vf_rife_command(struct mp_filter *vf, struct mp_filter_command *cmd)
         mp_tags_set_str(t, "skipped-scene",
                         mp_tprintf(32, "%llu",
                                    (unsigned long long)p->stats_skipped_scene));
+        mp_tags_set_str(t, "bypassed-hdr",
+                        mp_tprintf(32, "%llu",
+                                   (unsigned long long)p->stats_bypassed_hdr));
+        mp_tags_set_str(t, "bypassed-size",
+                        mp_tprintf(32, "%llu",
+                                   (unsigned long long)p->stats_bypassed_size));
         mp_tags_set_str(t, "source-fps",
                         mp_tprintf(32, "%.2f", p->fps_source_pps));
         mp_tags_set_str(t, "output-fps",
@@ -4935,6 +5235,8 @@ static struct mp_filter *vf_rife_create(struct mp_filter *parent, void *options)
 static const m_option_t rife_opts_fields[] = {
     {"enabled",          OPT_BOOL(enabled)},
     {"model-path",       OPT_STRING(model_path)},
+    {"model-profile",    OPT_STRING(model_profile)},
+    {"model-padding",    OPT_INT(model_padding), M_RANGE(32, 128)},
     {"multiplier",       OPT_INT(multiplier),   M_RANGE(2, 8)},
     {"gpu",              OPT_INT(gpu_id),       M_RANGE(0, 15)},
     {"gpu-luid",         OPT_STRING(gpu_luid)},
@@ -4962,6 +5264,8 @@ const struct mp_user_filter_entry vf_rife = {
         .priv_defaults = &(const OPT_BASE_STRUCT) {
             .enabled = false,
             .model_path = NULL,
+            .model_profile = NULL,
+            .model_padding = 32,
             .multiplier = 2,
             .gpu_id = 0,
             .gpu_luid = NULL,

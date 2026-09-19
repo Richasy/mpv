@@ -272,7 +272,6 @@ participate in the code review process with human-written responses, and
 confirming that the code can be submitted under the same license as the
 relevant files (usually LGPLv2 or GPLv2).
 
-AI/LLM must not be used to write commit messages or pull request descriptions.
 Clearly vibe-coded patches will not be considered.
 
 Code of Conduct

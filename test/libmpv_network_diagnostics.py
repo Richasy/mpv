@@ -87,6 +87,8 @@ class FixtureServer(http.server.ThreadingHTTPServer):
         self.release_cancel = threading.Event()
         self.cancel_entered = threading.Event()
         self.expired = threading.Event()
+        self.reuse_lock = threading.Lock()
+        self.reuse_original_requests = 0
 
 
 class FixtureHandler(http.server.BaseHTTPRequestHandler):
@@ -101,6 +103,19 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
+        if path == "/reuse-original":
+            with self.server.reuse_lock:
+                self.server.reuse_original_requests += 1
+                request = self.server.reuse_original_requests
+            self.send_response(302 if request == 1 else 403)
+            if request == 1:
+                self.send_header("Location", "/reuse-media")
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            return
+
         if path == "/denied":
             self.send_response(403)
             self.send_header("Content-Length", "0")
@@ -123,6 +138,13 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
             if start > end:
                 self.send_error(416)
                 return
+        if path == "/reuse-media" and requested and start > 0:
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            return
         self.send_response(206 if requested else 200)
         self.send_header("Content-Type", "video/x-matroska")
         self.send_header("Accept-Ranges", "bytes")

@@ -13,6 +13,7 @@ struct diagnostics {
     bool pending;
     bool cancelled;
     bool failed;
+    bool reopen_failed;
     bool numeric_redacted;
     bool stop_requested;
     int pending_count;
@@ -59,6 +60,11 @@ static void observe(mpv_event_log_message *msg, struct diagnostics *d,
                     const char *mode)
 {
     const char *text = msg->text;
+    if (strstr(text, "reopen failed; marking stream broken")) {
+        d->reopen_failed = true;
+        fputs(text, stdout);
+        return;
+    }
     if (strncmp(text, "network_io ", 11))
         return;
     if (strstr(text, "test-secret") || strstr(text, "http://") ||
@@ -119,6 +125,57 @@ static void observe(mpv_event_log_message *msg, struct diagnostics *d,
             command_string("stop");
         }
     }
+}
+
+static void wait_for_failed_file(const char *url, const char *mode,
+                                 struct diagnostics *d)
+{
+    command(((const char *[]){"loadfile", url, NULL}));
+
+    bool loaded = false;
+    bool ended = false;
+    while (!ended) {
+        mpv_event *event = mpv_wait_event(ctx, 1);
+        if (event->event_id == MPV_EVENT_LOG_MESSAGE)
+            observe(event->data, d, mode);
+        if (event->event_id == MPV_EVENT_FILE_LOADED)
+            loaded = true;
+        if (event->event_id == MPV_EVENT_END_FILE)
+            ended = true;
+    }
+    while (true) {
+        mpv_event *event = mpv_wait_event(ctx, 0);
+        if (event->event_id == MPV_EVENT_NONE)
+            break;
+        if (event->event_id == MPV_EVENT_LOG_MESSAGE)
+            observe(event->data, d, mode);
+    }
+    if (loaded)
+        fail("Failed fixture unexpectedly loaded (%s).\n", mode);
+    if (!d->failed)
+        fail("Missing native HTTP failure result (%s).\n", mode);
+}
+
+static void run_failed_reuse_case(const char *base)
+{
+    char original[1024];
+    char denied[1024];
+    snprintf(original, sizeof(original), "%s/reuse-original?api_key=test-secret",
+             base);
+    snprintf(denied, sizeof(denied), "%s/denied?api_key=test-secret", base);
+
+    struct diagnostics first = {0};
+    wait_for_failed_file(original, "reuse-original", &first);
+    if (!first.reopen_failed)
+        fail("The redirected range failure did not exhaust the original URL reopen.\n");
+
+    struct diagnostics second = {0};
+    wait_for_failed_file(denied, "reuse-denied", &second);
+    exit_cleanup();
+    printf("PASS failed-reuse: first_http_error=%d reopen_failed=%d "
+           "second_http_error=%d\n",
+           first.failed, first.reopen_failed, second.failed);
+    fflush(stdout);
 }
 
 static void run_case(const char *base, const char *mode)
@@ -201,5 +258,7 @@ int main(int argc, char **argv)
         create_client();
         run_case(argv[1], modes[n]);
     }
+    create_client();
+    run_failed_reuse_case(argv[1]);
     return 0;
 }

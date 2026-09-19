@@ -177,6 +177,7 @@ struct demux_internal {
     // structs; the real demuxer can access the shadow struct only.
     struct demuxer *d_thread;   // accessed by demuxer impl. (producer)
     struct demuxer *d_user;     // accessed by player (consumer)
+    bool desc_open_called;
 
     // The lock protects the packet queues (struct demux_stream),
     // and the fields below.
@@ -1150,7 +1151,7 @@ static void demux_shutdown(struct demux_internal *in)
 
     dumper_close(in);
 
-    if (demuxer->desc->close)
+    if (in->desc_open_called && demuxer->desc->close)
         demuxer->desc->close(in->d_thread);
     demuxer->priv = NULL;
     in->d_thread->priv = NULL;
@@ -3886,6 +3887,7 @@ static struct demuxer *open_given_type(struct mpv_global *global,
     }
 
     in->d_thread->params = params; // temporary during open()
+    in->desc_open_called = true;
     int ret = demuxer->desc->open(in->d_thread, check);
     if (ret >= 0) {
         in->d_thread->params = NULL;

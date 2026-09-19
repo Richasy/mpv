@@ -825,6 +825,84 @@ Available mpv-only filters are:
         ``--vf=@hdr:d3d11vpp=nvidia-true-hdr=yes`` together with
         ``mpv_observe_property(ctx, 0, "vf-metadata/hdr/nvidia-true-hdr-status", MPV_FORMAT_STRING)``.
 
+``rife``
+    Windows DirectML frame interpolation for a caller-supplied RIFE ONNX
+    model. The filter is intended for embedded ``libmpv`` consumers using
+    D3D11 decoding and ``gpu-next`` output. mpv does not bundle a model.
+
+    The accepted model contract is deliberately strict: one float32 input
+    named arbitrarily with shape ``[1,11,H,W]`` and one float32 output with
+    shape ``[1,3,H,W]``. Spatial dimensions may be dynamic or must match the
+    padded processing size. Unknown multi-input and mixed-schema models fail
+    instead of being interpreted as this layout.
+
+    The 11 input channels are both RGB frames, timestep, horizontal/vertical
+    grids, and two grid-scale channels. Models exported in the vs-mlrt
+    ``rife/`` (v1/external preprocessing) layout use this contract; models in
+    ``rife_v2/`` do not.
+
+    Example::
+
+        --vf=@rife:rife=enabled=yes:model-path=C\:\\models\\rife.onnx:\
+            model-profile=rife-v4.25-lite:model-padding=128:\
+            multiplier=2:scale=0.5:gpu-luid=luid\:0000000000000001:\
+            zerocopy=yes:zerocopy-output=yes:pack-shader=yes:\
+            unpack-shader=yes:nv12-input=yes
+
+    ``enabled=<yes|no>``
+        Runtime processing switch. A disabled labeled filter remains installed
+        so it can be enabled with ``vf-command``.
+
+    ``model-path=<path>``
+        Absolute path to the ONNX model.
+
+    ``model-profile=<name>``
+        Non-secret diagnostic identifier reported through
+        ``vf-metadata/<label>``. It does not alter the graph.
+
+    ``model-padding=<32|64|128>``
+        Required spatial multiple for the selected model (default: 32).
+        RIFE v4.25-lite requires 128; v4.25 standard requires 32.
+
+    ``multiplier=<2-8>``
+        Integer output frame-rate multiplier. Higher multipliers run multiple
+        timesteps for each source pair. Consumers should avoid requesting an
+        output rate above the active display refresh.
+
+    ``scale=<0.25-1.0>``
+        Whole-frame inference-resolution scale. This is not the model's
+        internal optical-flow scale. The result is bilinearly restored to the
+        source size.
+
+    ``gpu=<0-15>``, ``gpu-luid=<selector>``
+        DirectML adapter selection. The stable LUID selector takes precedence
+        when supplied.
+
+    ``max-width=<pixels>``, ``max-height=<pixels>``
+        Bypass interpolation above either non-zero limit.
+
+    ``hdr-passthrough=<yes|no>``
+        Forward PQ, HLG, and Dolby Vision frames unchanged (default: yes).
+        The current interpolation output is SDR BGRA8.
+
+    ``zerocopy=<yes|no>``, ``zerocopy-output=<yes|no>``
+        Use DML1 with caller-owned D3D12 tensors and shared D3D11 output
+        resources. ``pack-shader`` and ``unpack-shader`` keep tensor
+        conversion on the GPU. The output ring uses a reverse consumer fence;
+        a slot is not reused until its queued D3D11 copy completes.
+
+    ``nv12-input=<yes|no>``
+        Import D3D11 NV12/P010 frames through shared textures instead of a CPU
+        download. Adapter LUIDs must match.
+
+    ``scene-threshold=<0-1>``, ``static-threshold=<0-1>``
+        GPU frame-difference thresholds. A static pair or hard scene cut is
+        copied rather than interpolated.
+
+    Runtime metadata includes the selected model profile/padding, exact
+    adapter identity, active GPU paths, processing geometry, inference time,
+    source/output cadence, skip counters, and HDR/size bypass counters.
+
 ``dlssnr``
     Experimental NVIDIA DLSS neural rendering (often called DLSS 5 in
     community integrations). This is a same-resolution appearance enhancement,

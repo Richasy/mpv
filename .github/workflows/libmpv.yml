@@ -90,6 +90,15 @@ jobs:
             -lm -o /tmp/dlssnr-params-test
           /tmp/dlssnr-params-test
 
+      - name: Test RIFE synchronization policy
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -I. \
+            test/rife_sync.c -o /tmp/rife-sync-test
+          /tmp/rife-sync-test
+          cc -std=c11 -Wall -Wextra -Werror -I. \
+            test/rife_model.c -o /tmp/rife-model-test
+          /tmp/rife-model-test
+
       - name: Test subtitle translation policy
         if: matrix.arch == 'x86_64'
         run: |

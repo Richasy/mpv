@@ -745,6 +745,19 @@ Available mpv-only filters are:
             Intel Video Super Resolution.
         nvidia
             NVIDIA RTX Super Resolution.
+
+        NVIDIA RTX Super Resolution is requested only for NV12 input. NVIDIA
+        drivers accept the extension call for higher-bit-depth D3D11 surfaces
+        such as P010 even when processing them is unsupported, which can
+        produce corrupted output. Such input is passed through without the
+        requested scale.
+
+        A labeled filter exposes ``nvidia-vsr-status`` through
+        ``vf-metadata/<label>``. The value is one of ``disabled``, ``pending``,
+        ``active``, ``unsupported-format``, ``extension-failed``, or
+        ``processing-failed``. ``active`` confirms that the driver accepted the
+        extension for an NV12 surface; the driver does not expose whether its
+        enhancement algorithm changed a particular frame.
     ``interlaced-only=<yes|no>``
         If ``yes``, only deinterlace frames marked as interlaced (default: no).
     ``mode=<blend|bob|adaptive|mocomp|ivtc|none>``

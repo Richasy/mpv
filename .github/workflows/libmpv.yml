@@ -102,6 +102,14 @@ jobs:
             -o /tmp/d3d11-adapter-test
           /tmp/d3d11-adapter-test
 
+      - name: Test D3D11 VSR policy
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -I. \
+            test/d3d11vpp_vsr_policy_test.c \
+            video/filter/d3d11vpp_vsr_policy.c \
+            -o /tmp/d3d11vpp-vsr-policy-test
+          /tmp/d3d11vpp-vsr-policy-test
+
       - name: Test DLSSNR parameters and color matrices
         run: |
           cc -std=c11 -Wall -Wextra -Werror \

@@ -1445,7 +1445,8 @@ d3d_hwaccel = get_option('d3d-hwaccel').require(
 features += {'d3d-hwaccel': d3d_hwaccel.allowed()}
 if features['d3d-hwaccel']
     sources += files('video/d3d.c',
-                     'video/filter/vf_d3d11vpp.c')
+                     'video/filter/vf_d3d11vpp.c',
+                     'video/filter/d3d11vpp_vsr_policy.c')
 endif
 
 amf = cc.has_header('AMF/core/Factory.h', required:

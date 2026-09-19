@@ -38,6 +38,7 @@
 #include "video/mp_image_pool.h"
 #include "video/out/gpu/d3d11_helpers.h"
 #include "video/out/vo.h"
+#include "d3d11vpp_vsr_policy.h"
 
 // For video processor extensions identifiers reference see:
 // https://chromium.googlesource.com/chromium/src/+/5f354f38/ui/gl/swap_chain_presenter.cc
@@ -110,6 +111,7 @@ struct priv {
     D3D11_VIDEO_FRAME_FORMAT d3d_frame_format;
 
     bool require_filtering;
+    enum mp_d3d11_vsr_status nvidia_vsr_status;
     bool true_hdr_active;
     bool true_hdr_unsupported;
 
@@ -149,7 +151,7 @@ static void destroy_video_proc(struct mp_filter *vf)
     p->vp_enum = NULL;
 }
 
-static void enable_nvidia_rtx_extension(struct mp_filter *vf)
+static bool set_nvidia_rtx_extension(struct mp_filter *vf, bool enable)
 {
     struct priv *p = vf->priv;
 
@@ -157,7 +159,7 @@ static void enable_nvidia_rtx_extension(struct mp_filter *vf)
         unsigned int version;
         unsigned int method;
         unsigned int enable;
-    } ext = {1, 2, 1};
+    } ext = {1, 2, enable};
 
     HRESULT hr = ID3D11VideoContext_VideoProcessorSetStreamExtension(p->video_ctx,
                                                                      p->video_proc,
@@ -167,10 +169,13 @@ static void enable_nvidia_rtx_extension(struct mp_filter *vf)
                                                                      &ext);
 
     if (FAILED(hr)) {
-        MP_WARN(vf, "Failed to enable NVIDIA RTX Super Resolution: %s\n", mp_HRESULT_to_str(hr));
-    } else {
-        MP_VERBOSE(vf, "NVIDIA RTX Super Resolution enabled.\n");
+        MP_WARN(vf, "Failed to %s NVIDIA RTX Super Resolution: %s\n",
+                enable ? "enable" : "disable", mp_HRESULT_to_str(hr));
+        return false;
     }
+    if (enable)
+        MP_VERBOSE(vf, "NVIDIA RTX Super Resolution enabled.\n");
+    return true;
 }
 
 static bool supports_nvidia_true_hdr(struct mp_filter *vf)
@@ -330,16 +335,18 @@ static bool should_enable_nvidia_true_hdr_now(struct mp_filter *vf)
 static void recompute_out_params(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
+    float scale = p->nvidia_vsr_status == MP_D3D11_VSR_UNSUPPORTED_FORMAT
+        ? 1.0 : p->opts->scale;
 
     p->out_params = p->params;
-    p->out_params.w = (int)(p->opts->scale * p->params.w);
+    p->out_params.w = (int)(scale * p->params.w);
     p->out_params.w += p->out_params.w % 2 != 0;
-    p->out_params.h = (int)(p->opts->scale * p->params.h);
+    p->out_params.h = (int)(scale * p->params.h);
     p->out_params.h += p->out_params.h % 2 != 0;
-    p->out_params.crop.x0 = lrintf(p->opts->scale * p->out_params.crop.x0);
-    p->out_params.crop.x1 = lrintf(p->opts->scale * p->out_params.crop.x1);
-    p->out_params.crop.y0 = lrintf(p->opts->scale * p->out_params.crop.y0);
-    p->out_params.crop.y1 = lrintf(p->opts->scale * p->out_params.crop.y1);
+    p->out_params.crop.x0 = lrintf(scale * p->out_params.crop.x0);
+    p->out_params.crop.x1 = lrintf(scale * p->out_params.crop.x1);
+    p->out_params.crop.y0 = lrintf(scale * p->out_params.crop.y0);
+    p->out_params.crop.y1 = lrintf(scale * p->out_params.crop.y1);
 
     if (p->opts->format)
         p->out_params.hw_subfmt = p->opts->format;
@@ -592,7 +599,13 @@ static int recreate_video_proc(struct mp_filter *vf)
         enable_intel_vsr_extension(vf);
         break;
     case SCALING_NVIDIA_RTX:
-        enable_nvidia_rtx_extension(vf);
+        p->nvidia_vsr_status = mp_d3d11_vsr_initial_status(
+            true, p->params.hw_subfmt == IMGFMT_NV12);
+        if (p->nvidia_vsr_status == MP_D3D11_VSR_PENDING) {
+            p->nvidia_vsr_status = mp_d3d11_vsr_extension_result(
+                p->nvidia_vsr_status,
+                set_nvidia_rtx_extension(vf, true));
+        }
         break;
     }
 
@@ -754,8 +767,18 @@ static struct mp_image *render(struct mp_filter *vf)
     };
     hr = ID3D11VideoContext_VideoProcessorBlt(p->video_ctx, p->video_proc,
                                               out_view, p->output_seq, 1, &stream);
+    if (mp_d3d11_vsr_should_retry_blt(p->nvidia_vsr_status, SUCCEEDED(hr))) {
+        MP_WARN(vf, "NVIDIA RTX Super Resolution processing failed (%s); "
+                    "retrying with the extension disabled.\n",
+                mp_HRESULT_to_str(hr));
+        set_nvidia_rtx_extension(vf, false);
+        p->nvidia_vsr_status = mp_d3d11_vsr_blt_result(
+            p->nvidia_vsr_status, false);
+        hr = ID3D11VideoContext_VideoProcessorBlt(
+            p->video_ctx, p->video_proc, out_view, p->output_seq, 1, &stream);
+    }
     if (FAILED(hr)) {
-        MP_ERR(vf, "VideoProcessorBlt failed.\n");
+        MP_ERR(vf, "VideoProcessorBlt failed: %s\n", mp_HRESULT_to_str(hr));
         goto cleanup;
     }
 
@@ -784,6 +807,14 @@ static void vf_d3d11vpp_process(struct mp_filter *vf)
         destroy_video_proc(vf);
 
         p->params = in_fmt->params;
+        p->nvidia_vsr_status = mp_d3d11_vsr_initial_status(
+            p->opts->scaling_mode == SCALING_NVIDIA_RTX,
+            p->params.hw_subfmt == IMGFMT_NV12);
+        if (p->nvidia_vsr_status == MP_D3D11_VSR_UNSUPPORTED_FORMAT) {
+            MP_WARN(vf, "NVIDIA RTX Super Resolution requires NV12 input; "
+                        "bypassing it for %s.\n",
+                    mp_imgfmt_to_name(p->params.hw_subfmt));
+        }
         p->true_hdr_active = should_enable_nvidia_true_hdr_now(vf);
         recompute_out_params(vf);
     } else if (p->opts->nvidia_true_hdr) {
@@ -856,6 +887,12 @@ static bool vf_d3d11vpp_command(struct mp_filter *vf, struct mp_filter_command *
                     p->true_hdr_active ? "yes" : "no");
     mp_tags_set_str(tags, "nvidia-true-hdr-requested",
                     p->opts->nvidia_true_hdr ? "yes" : "no");
+    mp_tags_set_str(tags, "nvidia-vsr-status",
+                    mp_d3d11_vsr_status_name(p->nvidia_vsr_status));
+    mp_tags_set_str(tags, "nvidia-vsr-active",
+                    p->nvidia_vsr_status == MP_D3D11_VSR_ACTIVE ? "yes" : "no");
+    mp_tags_set_str(tags, "nvidia-vsr-requested",
+                    p->opts->scaling_mode == SCALING_NVIDIA_RTX ? "yes" : "no");
     *ptags = tags;
     return true;
 }

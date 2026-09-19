@@ -213,6 +213,17 @@ d3d11_adapter = executable('d3d11-adapter',
                            include_directories: incdir)
 test('d3d11-adapter', d3d11_adapter)
 
+if features['d3d-hwaccel']
+    d3d11vpp_vsr_policy = executable(
+        'd3d11vpp-vsr-policy',
+        'd3d11vpp_vsr_policy_test.c',
+        objects: libmpv.extract_objects(
+            'video/filter/d3d11vpp_vsr_policy.c'),
+        include_directories: incdir,
+    )
+    test('d3d11vpp-vsr-policy', d3d11vpp_vsr_policy)
+endif
+
 if features['libcurl']
     avio_crypto_objects = libmpv.extract_objects('demux/avio_crypto.c')
     avio_crypto = executable('avio-crypto', files('avio_crypto.c'),

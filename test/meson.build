@@ -294,6 +294,12 @@ if get_option('libmpv')
                  args: [files('libmpv_network_proxy.py'), mpvlib.full_path()],
                  depends: mpvlib, suite: 'libmpv-network', timeout: 120)
         endif
+
+        if not meson.is_cross_build()
+            test('libmpv-network-family', python,
+                 args: [files('libmpv_network_family.py'), mpvlib.full_path()],
+                 depends: mpvlib, suite: 'libmpv-network', timeout: 120)
+        endif
     endif
 endif
 

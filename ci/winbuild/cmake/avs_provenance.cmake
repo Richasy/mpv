@@ -58,7 +58,7 @@ verify_avs_import(
     06e999884317732470a1598b9a875c98aafe202f2220ea7dce3ba25f7365d053)
 verify_avs_import(
     notices/AVS-THIRD-PARTY-NOTICES.txt
-    21bfffd34ee6644dd7acbeffc65a68afd449e3ec4427f1a67afe46c0fb38517d)
+    819ed813dc6f30a4cac9970054bb1848bf3fe901a74b8877f4eb37ab1cd2ac84)
 verify_avs_import(
     notices/GPL-2.0.txt
     edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6)

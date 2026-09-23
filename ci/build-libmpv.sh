@@ -17,7 +17,7 @@ set -e
 #   MPV_REPO      - mpv git repository URL (default: https://github.com/Richasy/mpv.git)
 #   MPV_COMMIT    - mpv git commit/branch/tag (default: master)
 #   FFMPEG_COMMIT - Richasy/FFmpeg git commit/branch/tag
-#                   (default: 026ddd08e6f80db6251cbb32d011c23c49470713)
+#                   (default: 7f87f7d595b48229a443869e75264389eb4077ca)
 #   MPV_SRC_DIR   - path to mpv source (for copying headers)
 #   BUILD_TYPE    - 'release' (default) or 'debug'. Debug switches mpv meson
 #                   options to -Doptimization=0 -Db_lto=false -Db_ndebug=false
@@ -38,7 +38,7 @@ log() { echo -e "${GREEN}[BUILD]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
-readonly DEFAULT_FFMPEG_COMMIT=026ddd08e6f80db6251cbb32d011c23c49470713
+readonly DEFAULT_FFMPEG_COMMIT=7f87f7d595b48229a443869e75264389eb4077ca
 readonly DAVS2_COMMIT=21d64c8f8e36af71fc7a488cd6f789c86cdd1200
 readonly UAVS3D_COMMIT=0e20d2c291853f196c68922a264bcd8471d75b68
 readonly AVS_PATCH_COMMIT=6788d317a3a67c44f799d02c4ff83f95d6b10165

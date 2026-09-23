@@ -299,6 +299,9 @@ if get_option('libmpv')
             test('libmpv-network-family', python,
                  args: [files('libmpv_network_family.py'), mpvlib.full_path()],
                  depends: mpvlib, suite: 'libmpv-network', timeout: 120)
+            test('libmpv-network-cursors', python,
+                 args: [files('libmpv_network_cursors.py'), mpvlib.full_path()],
+                 depends: mpvlib, suite: 'libmpv-network', timeout: 300)
         endif
     endif
 endif

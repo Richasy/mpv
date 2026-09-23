@@ -44,9 +44,13 @@ static void create_client(void)
     optional_option("curl-enabled", "no");
     set_property_string("stream-lavf-o",
                         "reconnect=0,reconnect_on_network_error=0,multiple_requests=0");
-    // Keep the fixture's tail outside both header buffering and tail prefetch.
+    // Keep the fixture's tail outside both header buffering and tail prefetch,
+    // and reach it with a seek on the stream's own connection rather than by
+    // reading forward or through an additional connection.
     set_property_string("stream-buffer-size", "16384");
     set_property_string("stream-lru-cache-tail-prefetch", "0");
+    set_property_string("stream-lru-cache-read-through", "0");
+    set_property_string("stream-lru-cache-cursors", "1");
     initialize();
 }
 

@@ -134,6 +134,8 @@ struct stream_opts {
     int64_t lru_cache_min_fetch;
     int64_t lru_cache_tail_prefetch;
     int64_t lru_cache_tail_threshold;
+    int lru_cache_cursors;
+    int64_t lru_cache_read_through;
 };
 
 #define OPT_BASE_STRUCT struct stream_opts
@@ -184,6 +186,19 @@ const struct m_sub_options stream_conf = {
         {"stream-lru-cache-tail-threshold",
             OPT_BYTE_SIZE(lru_cache_tail_threshold),
             M_RANGE(0, 1024LL * 1024 * 1024)},
+        // Concurrent connections the cache may use for one stream. A demuxer
+        // that alternates between two distant regions of the file (e.g. an
+        // mp4 whose subtitle samples are stored far from the video samples)
+        // keeps one sequential connection per region instead of reconnecting
+        // on every switch. 1 = serve every miss on the stream's own backend.
+        {"stream-lru-cache-cursors", OPT_INT(lru_cache_cursors),
+            M_RANGE(1, STREAM_LRU_MAX_CURSORS)},
+        // A miss at most this far ahead of a connection is reached by
+        // reading forward on it (caching the skipped bytes) instead of a
+        // seek, which would cost a new connection and redirect chain.
+        {"stream-lru-cache-read-through",
+            OPT_BYTE_SIZE(lru_cache_read_through),
+            M_RANGE(0, 64 * 1024 * 1024)},
         {0}
     },
     .size = sizeof(struct stream_opts),
@@ -206,6 +221,13 @@ const struct m_sub_options stream_conf = {
         // mdat<->moov yo-yo into normal forward reads + cache hits.
         .lru_cache_tail_prefetch = 4 * 1024 * 1024,
         .lru_cache_tail_threshold = 64 * 1024 * 1024,
+        // Two connections cover the common two-region layouts; a larger
+        // number rarely helps and raises the load on servers that count
+        // concurrent connections.
+        .lru_cache_cursors = 2,
+        // 4 MiB takes about as long as one reconnect at 2 MB/s and far less
+        // on faster links.
+        .lru_cache_read_through = 4 * 1024 * 1024,
     },
 };
 
@@ -440,12 +462,15 @@ static int stream_create_instance(const stream_info_t *sinfo,
     struct stream_opts *opts = mp_get_config_group(s, s->global, &stream_conf);
     if (flags & STREAM_SILENT) {
         s->log = mp_null_log;
+    } else if (args->log_parent) {
+        s->log = mp_log_new(s, args->log_parent, args->log_name);
     } else {
         s->log = mp_log_new(s, s->global->log, sinfo->name);
     }
     s->info = sinfo;
     s->autoprobed = !args->sinfo;
     s->cancel = args->cancel;
+    s->open_offset = args->open_offset;
     s->url = talloc_strdup(s, url);
     s->path = talloc_strdup(s, path);
     s->mode = flags & (STREAM_READ | STREAM_WRITE);
@@ -509,28 +534,36 @@ static int stream_create_instance(const stream_info_t *sinfo,
     //   - stream is seekable and read-only
     //   - we know the file size (live streams: no LRU)
     //   - user hasn't disabled it via --stream-lru-cache=0
-    if (s->wants_lru_cache && s->seekable && s->mode == STREAM_READ
-        && opts->lru_cache_size > 0)
+    //   - the stream is not itself an additional connection of a cache
+    if (!args->lru_cursor && s->wants_lru_cache && s->seekable
+        && s->mode == STREAM_READ && opts->lru_cache_size > 0)
     {
         int64_t fsize = s->get_size ? s->get_size(s) : -1;
         if (fsize > 0) {
-            s->lru_cache = stream_lru_cache_create(s, s->log,
-                                                   (size_t)opts->lru_cache_size,
-                                                   (uint32_t)opts->lru_cache_bucket,
-                                                   (uint32_t)opts->lru_cache_min_fetch,
-                                                   (uint32_t)opts->lru_cache_tail_prefetch,
-                                                   (uint64_t)opts->lru_cache_tail_threshold);
+            struct stream_lru_cache_params params = {
+                .capacity_bytes = (size_t)opts->lru_cache_size,
+                .bucket_size = (uint32_t)opts->lru_cache_bucket,
+                .min_fetch_size = (uint32_t)opts->lru_cache_min_fetch,
+                .tail_prefetch = (uint32_t)opts->lru_cache_tail_prefetch,
+                .tail_threshold = (uint64_t)opts->lru_cache_tail_threshold,
+                .max_cursors = opts->lru_cache_cursors,
+                .read_through = (uint32_t)opts->lru_cache_read_through,
+            };
+            s->lru_cache = stream_lru_cache_create(s, &params);
             if (s->lru_cache) {
                 MP_VERBOSE(s, "byte-range LRU cache enabled: "
                            "size=%" PRId64 "B bucket=%" PRId64 "B "
                            "min_fetch=%" PRId64 "B "
                            "tail_prefetch=%" PRId64 "B "
                            "tail_threshold=%" PRId64 "B "
+                           "connections=%d read_through=%" PRId64 "B "
                            "filesize=%" PRId64 "B\n",
                            opts->lru_cache_size, opts->lru_cache_bucket,
                            opts->lru_cache_min_fetch,
                            opts->lru_cache_tail_prefetch,
                            opts->lru_cache_tail_threshold,
+                           opts->lru_cache_cursors,
+                           opts->lru_cache_read_through,
                            fsize);
             }
         }
@@ -605,6 +638,36 @@ struct stream *stream_create(const char *url, int flags,
     return s;
 }
 
+struct stream *stream_open_lru_cursor(struct stream *s,
+                                      struct mp_cancel *cancel, int64_t pos,
+                                      const char *name)
+{
+    mp_assert(cancel && cancel != s->cancel);
+    struct stream_open_args args = {
+        .global = s->global,
+        .cancel = cancel,
+        .url = s->url,
+        .flags = s->mode | s->stream_origin,
+        .sinfo = s->info,
+        .open_offset = pos,
+        .lru_cursor = true,
+        .log_parent = s->log,
+        .log_name = name,
+    };
+    struct stream *cursor = NULL;
+    if (stream_create_instance(s->info, &args, &cursor) != STREAM_OK)
+        return NULL;
+    // A backend that honoured open_offset already starts at pos; any other
+    // one opened at the beginning and seeks there now.
+    if (pos > 0 && !cursor->open_offset_ok &&
+        (!cursor->seek || cursor->seek(cursor, pos) <= 0))
+    {
+        free_stream(cursor);
+        return NULL;
+    }
+    return cursor;
+}
+
 stream_t *open_output_stream(const char *filename, struct mpv_global *global)
 {
     struct stream *s = stream_create(filename, STREAM_ORIGIN_DIRECT | STREAM_WRITE,
@@ -658,10 +721,10 @@ static int stream_read_unbuffered(stream_t *s, void *buf, int len)
     // went stale: the cloud link's short TTL expired or the origin closed the
     // long-lived connection. ffmpeg's own `reconnect` reopens the stale
     // redirect target and gets a 404, killing playback. Instead we reopen the
-    // ORIGINAL url via s->reconnect(), which re-runs the redirect chain and
-    // resolves a *fresh* link, realign the backend to the current logical
-    // offset, and retry. Bounded attempts with a short growing backoff so we
-    // never hammer a backend that may already be throttling us.
+    // ORIGINAL url via s->reconnect() at the current logical offset, which
+    // re-runs the redirect chain and resolves a *fresh* link, and retry.
+    // Bounded attempts with a short growing backoff so we never hammer a
+    // backend that may already be throttling us.
     //
     // s->reconnect is only set for HTTP-like network backends (stream_lavf),
     // so local files and non-network streams skip this entirely.
@@ -683,39 +746,22 @@ static int stream_read_unbuffered(stream_t *s, void *buf, int len)
                 s->pos, s->error, attempt + 1,
                 STREAM_MID_STREAM_REOPEN_ATTEMPTS);
 
-        if (s->reconnect(s) != STREAM_OK) {
+        if (s->reconnect(s, s->pos) != STREAM_OK) {
             // The backend is left unusable (stream_lavf nulls priv on a failed
-            // reopen). Mark the stream broken so no further read/seek touches
-            // the dead backend.
+            // reopen, or it could not reach s->pos). Mark the stream broken so
+            // no further read/seek touches the dead backend.
             MP_WARN(s, "reopen failed; marking stream broken\n");
             s->broken = true;
             break;
         }
 
-        // The reopened backend's byte cursor is at 0. Cached bucket payloads
-        // remain valid (same file content at the same offsets), but the LRU
-        // cache's shadow backend position must be invalidated so it issues a
-        // fresh seek on the next miss.
+        // The reopened backend sits at s->pos. Cached bucket payloads remain
+        // valid (same file content at the same offsets); the LRU cache only
+        // forgets where its own backend was, so its next miss seeks it there
+        // (a no-op at s->pos).
         if (s->lru_cache)
             stream_lru_cache_invalidate_backend_pos(s->lru_cache);
-
-        bool cache_active =
-            s->lru_cache && !stream_lru_cache_is_disabled(s->lru_cache);
         s->error = 0;
-
-        // The cache issues its own seek on the next fetch; the direct path
-        // reads from the backend's current cursor, so realign it with s->pos.
-        // If we cannot realign, the cursor is detached from the logical
-        // position: refuse further access rather than risk serving bytes from
-        // the wrong offset.
-        if (!cache_active && s->pos > 0) {
-            if (!s->seek || s->seek(s, s->pos) <= 0) {
-                MP_WARN(s, "realign to pos %" PRId64 " after reopen failed; "
-                        "marking stream broken\n", s->pos);
-                s->broken = true;
-                break;
-            }
-        }
 
         res = stream_read_backend(s, buf, len);
     }
@@ -1052,7 +1098,12 @@ int stream_control(stream_t *s, int cmd, void *arg)
     // the dead backend.
     if (s->broken)
         return STREAM_ERROR;
-    return s->control ? s->control(s, cmd, arg) : STREAM_UNSUPPORTED;
+    int r = s->control ? s->control(s, cmd, arg) : STREAM_UNSUPPORTED;
+    // A time-based seek moved the backend to a byte position the LRU cache
+    // does not know; its next miss seeks the backend back into agreement.
+    if (cmd == STREAM_CTRL_AVSEEK && r == 1 && s->lru_cache)
+        stream_lru_cache_invalidate_backend_pos(s->lru_cache);
+    return r;
 }
 
 // Return the current size of the stream, or a negative value if unknown.

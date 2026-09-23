@@ -19,7 +19,15 @@ costs a full redirect chain. The cases verify:
   in flight still plays byte-exact, and the cache falls back to one
   connection after a bounded number of failures;
 - ranged-open: an additional connection starts right at the offset it serves,
-  and the open-time probe of the file end costs no request from offset 0.
+  and the open-time probe of the file end costs no request from offset 0;
+- curl-short-range: with the libcurl backend, playback stays byte-exact when
+  the server answers every open-ended range request with a shorter range,
+  which libcurl reports as a clean end of the transfer;
+- curl-cancel: with the libcurl backend, stopping playback promptly
+  interrupts a read that waits for a held response on the stream's own
+  connection after an additional connection was opened.
+
+The curl cases are skipped when libmpv has no libcurl backend.
 """
 
 import array
@@ -30,7 +38,6 @@ import json
 import os
 from pathlib import Path
 import re
-import socket
 import struct
 import subprocess
 import sys
@@ -64,6 +71,15 @@ CDN_LATENCY = 0.1
 # refusing. Covers the gap between a client closing one connection and
 # opening the next.
 EXCLUSIVE_GRACE = 0.05
+# Longest range the short-range server returns for one request.
+SHORT_RANGE = 1024 * 1024
+# Audio bytes the stream's own connection delivers before its response is
+# held, enough to open the file and start playback.
+HOLD_AFTER = 256 * 1024
+# How quickly stopping must end a file whose read waits for a held response.
+STOP_LIMIT = 2.0
+# When the server releases a held response if stopping did not end the file.
+HOLD_RELEASE = 5.0
 
 MATRIX = struct.pack(">9I", 0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000)
 
@@ -131,6 +147,7 @@ class Media:
         head = len(ftyp) + len(moov([0] * chunks, [0] * len(subtitles)))
         data_start = head + 8
         audio_offsets = [data_start + n * chunk_bytes for n in range(chunks)]
+        self.audio_start = data_start
         self.audio_end = data_start + len(self.pcm)
         self.subtitle_start = self.audio_end + SUBTITLE_GAP
         subtitle_offsets = [self.subtitle_start + n * SUBTITLE_SPACING
@@ -250,8 +267,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if start > end:
                 self.reply_empty(416)
                 return
+            if server.short_range:
+                end = min(end, start + server.short_range - 1)
         with server.lock:
             server.requests.append((time.time(), self.connection_id, start))
+        # Only a response that starts before the hold offset, i.e. the one
+        # the stream's own connection reads the audio from, is held there.
+        hold_at = server.hold_at
+        held, release = server.held, server.release
+        hold = hold_at is not None and start < hold_at
         time.sleep(CDN_LATENCY)
         self.send_response(206 if requested else 200)
         self.send_header("Content-Type", "video/mp4")
@@ -265,9 +289,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             view = memoryview(media)
             while start <= end:
                 size = min(65536, end + 1 - start)
+                if hold and start < hold_at:
+                    size = min(size, hold_at - start)
+                elif hold:
+                    held.set()
+                    release.wait(60)
+                    hold = False
                 self.wfile.write(view[start:start + size])
                 start += size
-        except (OSError, socket.timeout):
+        except OSError:
             # The client abandoned the response; so does this connection.
             self.close_connection = True
         finally:
@@ -286,9 +316,13 @@ class Server(http.server.ThreadingHTTPServer):
         self.exclusive = False
         self.reset()
 
-    def reset(self, exclusive=False):
+    def reset(self, exclusive=False, short_range=0, hold_at=None):
         with self.lock:
             self.exclusive = exclusive
+            self.short_range = short_range
+            self.hold_at = hold_at
+            self.held = threading.Event()
+            self.release = threading.Event()
             self.connection_count = getattr(self, "connection_count", 0)
             self.origins = []
             self.requests = []
@@ -356,80 +390,105 @@ class LogMessage(ctypes.Structure):
 EVENT_LOG_MESSAGE = 2
 EVENT_END_FILE = 7
 EVENT_PLAYBACK_RESTART = 21
+MPV_ERROR_OPTION_NOT_FOUND = -5
+CURL = {"curl-enabled": "yes"}
+
+
+def load_libmpv(stack, library):
+    if os.name == "nt":
+        stack.enter_context(os.add_dll_directory(str(Path(library).parent)))
+    mpv = ctypes.CDLL(library)
+    mpv.mpv_create.restype = ctypes.c_void_p
+    mpv.mpv_set_option_string.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+    ]
+    mpv.mpv_initialize.argtypes = [ctypes.c_void_p]
+    mpv.mpv_request_log_messages.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    mpv.mpv_command.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
+    ]
+    mpv.mpv_get_property_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    mpv.mpv_get_property_string.restype = ctypes.c_void_p
+    mpv.mpv_free.argtypes = [ctypes.c_void_p]
+    mpv.mpv_free.restype = None
+    mpv.mpv_wait_event.argtypes = [ctypes.c_void_p, ctypes.c_double]
+    mpv.mpv_wait_event.restype = ctypes.POINTER(Event)
+    mpv.mpv_terminate_destroy.argtypes = [ctypes.c_void_p]
+    mpv.mpv_terminate_destroy.restype = None
+    return mpv
+
+
+def create_client(stack, mpv, options):
+    """An initialized client with options applied over the shared settings."""
+    client = mpv.mpv_create()
+    if not client:
+        raise RuntimeError("Could not create the native client")
+    stack.callback(mpv.mpv_terminate_destroy, client)
+    if mpv.mpv_request_log_messages(client, b"v") < 0:
+        raise RuntimeError("Native diagnostic subscription failed")
+    settings = {
+        "config": "no",
+        "load-scripts": "no",
+        "terminal": "no",
+        "ytdl": "no",
+        "vo": "null",
+        "untimed": "yes",
+        "cache": "yes",
+        "demuxer-max-bytes": "256MiB",
+        "demuxer-max-back-bytes": "256MiB",
+        "network-timeout": "10",
+        "curl-enabled": "no",
+        "stream-lru-cache-tail-threshold": TAIL_THRESHOLD,
+        # Deterministic failures: no reconnects inside libavformat.
+        "stream-lavf-o": "reconnect=0,reconnect_on_network_error=0",
+    }
+    settings.update(options)
+    for name, value in settings.items():
+        result = mpv.mpv_set_option_string(client, name.encode(), value.encode())
+        # A libmpv without libcurl has no curl options to turn off.
+        if result < 0 and not (name == "curl-enabled" and value == "no" and
+                               result == MPV_ERROR_OPTION_NOT_FOUND):
+            raise RuntimeError(f"Native option rejected: {name}")
+    if mpv.mpv_initialize(client) < 0:
+        raise RuntimeError("Native initialization failed")
+    return client
+
+
+def run_command(mpv, client, *words):
+    argv = (ctypes.c_char_p * (len(words) + 1))(*[w.encode() for w in words], None)
+    if mpv.mpv_command(client, argv) < 0:
+        raise RuntimeError(f"Native command failed: {words}")
+
+
+def get_property(mpv, client, name):
+    value = mpv.mpv_get_property_string(client, name.encode())
+    if not value:
+        return None
+    try:
+        return ctypes.string_at(value).decode("utf-8", errors="replace")
+    finally:
+        mpv.mpv_free(value)
 
 
 def run_client(library, url, options, pcm_path, count):
     with contextlib.ExitStack() as stack:
-        if os.name == "nt":
-            stack.enter_context(os.add_dll_directory(str(Path(library).parent)))
-        mpv = ctypes.CDLL(library)
-        mpv.mpv_create.restype = ctypes.c_void_p
-        mpv.mpv_set_option_string.argtypes = [
-            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
-        ]
-        mpv.mpv_initialize.argtypes = [ctypes.c_void_p]
-        mpv.mpv_request_log_messages.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        mpv.mpv_command.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
-        ]
-        mpv.mpv_get_property_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        mpv.mpv_get_property_string.restype = ctypes.c_void_p
-        mpv.mpv_free.argtypes = [ctypes.c_void_p]
-        mpv.mpv_free.restype = None
-        mpv.mpv_wait_event.argtypes = [ctypes.c_void_p, ctypes.c_double]
-        mpv.mpv_wait_event.restype = ctypes.POINTER(Event)
-        mpv.mpv_terminate_destroy.argtypes = [ctypes.c_void_p]
-        mpv.mpv_terminate_destroy.restype = None
-        client = mpv.mpv_create()
-        if not client:
-            raise RuntimeError("Could not create the native client")
-        stack.callback(mpv.mpv_terminate_destroy, client)
-        if mpv.mpv_request_log_messages(client, b"v") < 0:
-            raise RuntimeError("Native diagnostic subscription failed")
-        settings = {
-            "config": "no",
-            "load-scripts": "no",
-            "terminal": "no",
-            "ytdl": "no",
-            "vo": "null",
+        mpv = load_libmpv(stack, library)
+        client = create_client(stack, mpv, {
             "ao": "pcm",
             "ao-pcm-file": pcm_path,
             "ao-pcm-waveheader": "no",
-            "untimed": "yes",
             "keep-open": "yes",
             "sid": "1",
-            "cache": "yes",
-            "demuxer-max-bytes": "256MiB",
-            "demuxer-max-back-bytes": "256MiB",
-            "network-timeout": "10",
-            "curl-enabled": "no",
-            "stream-lru-cache-tail-threshold": TAIL_THRESHOLD,
-            # Deterministic failures: no reconnects inside libavformat.
-            "stream-lavf-o": "reconnect=0,reconnect_on_network_error=0",
-        }
-        settings.update(options)
-        for name, value in settings.items():
-            result = mpv.mpv_set_option_string(client, name.encode(), value.encode())
-            if result < 0 and not (name == "curl-enabled" and result == -5):
-                raise RuntimeError(f"Native option rejected: {name}")
-        if mpv.mpv_initialize(client) < 0:
-            raise RuntimeError("Native initialization failed")
+            **options,
+        })
 
         lines = []
 
         def command(*words):
-            argv = (ctypes.c_char_p * (len(words) + 1))(*[w.encode() for w in words], None)
-            if mpv.mpv_command(client, argv) < 0:
-                raise RuntimeError(f"Native command failed: {words}")
+            run_command(mpv, client, *words)
 
         def prop(name):
-            value = mpv.mpv_get_property_string(client, name.encode())
-            if not value:
-                return None
-            try:
-                return ctypes.string_at(value).decode("utf-8", errors="replace")
-            finally:
-                mpv.mpv_free(value)
+            return get_property(mpv, client, name)
 
         def pump(timeout, until):
             deadline = time.monotonic() + timeout
@@ -475,8 +534,38 @@ def run_client(library, url, options, pcm_path, count):
               flush=True)
 
 
-def run_case(library, server, media, name, options, exclusive=False):
-    server.reset(exclusive)
+def run_stop_client(library, url, options):
+    """Play url until a line on stdin asks to stop, then report how long
+    stopping took to end the file."""
+    with contextlib.ExitStack() as stack:
+        mpv = load_libmpv(stack, library)
+        client = create_client(stack, mpv, {"ao": "null", "sid": "no", **options})
+        asked = threading.Event()
+        threading.Thread(target=lambda: (sys.stdin.readline(), asked.set()),
+                         daemon=True).start()
+        run_command(mpv, client, "loadfile", url)
+        opened = 0
+        stopped = None
+        while True:
+            event = mpv.mpv_wait_event(client, 0.05).contents
+            if event.event_id == EVENT_LOG_MESSAGE:
+                message = ctypes.cast(event.data, ctypes.POINTER(LogMessage)).contents
+                text = message.text.decode("utf-8", errors="replace")
+                if stopped is None and "lru_cache: opened connection" in text:
+                    opened += 1
+            elif event.event_id == EVENT_END_FILE:
+                if stopped is None:
+                    raise RuntimeError("The file ended before playback was stopped")
+                latency = time.monotonic() - stopped
+                break
+            if stopped is None and asked.is_set():
+                stopped = time.monotonic()
+                run_command(mpv, client, "stop")
+        print(json.dumps({"latency": latency, "opened": opened}), flush=True)
+
+
+def run_case(library, server, media, name, options, **server_modes):
+    server.reset(**server_modes)
     url = f"http://127.0.0.1:{server.server_port}/origin/media.mp4"
     with tempfile.TemporaryDirectory(prefix="mpv-network-cursors-") as directory:
         pcm_path = str(Path(directory, "audio.pcm"))
@@ -549,18 +638,95 @@ def check_exclusive(library, server, media):
     print(f"PASS cursors/exclusive ({refused} refused requests)", flush=True)
 
 
+def curl_available(library):
+    """Whether libmpv has the libcurl HTTP backend."""
+    with contextlib.ExitStack() as stack:
+        mpv = load_libmpv(stack, library)
+        client = mpv.mpv_create()
+        if not client:
+            raise RuntimeError("Could not create the native client")
+        stack.callback(mpv.mpv_terminate_destroy, client)
+        result = mpv.mpv_set_option_string(client, b"curl-enabled", b"yes")
+        if result not in (0, MPV_ERROR_OPTION_NOT_FOUND):
+            raise RuntimeError(f"Native option rejected: curl-enabled ({result})")
+        return result == 0
+
+
+def check_curl_short_range(library, server, media):
+    log, _, requests, _ = run_case(library, server, media, "curl-short-range",
+                                   CURL, short_range=SHORT_RANGE)
+    if not any("connection 0 returned no data" in line for line in log):
+        raise RuntimeError("curl-short-range: the stream's own connection never "
+                           "reached the end of a shortened range\n" + "\n".join(log))
+    print(f"PASS cursors/curl-short-range ({len(requests)} requests)", flush=True)
+
+
+def check_curl_cancel(library, server, media):
+    server.reset(hold_at=media.audio_start + HOLD_AFTER)
+    url = f"http://127.0.0.1:{server.server_port}/origin/media.mp4"
+    process = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--stop-child",
+         library, url, json.dumps(CURL)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+    released = False
+    try:
+        deadline = time.monotonic() + 60
+        while not server.held.wait(0.1):
+            if process.poll() is not None:
+                out, err = process.communicate()
+                raise RuntimeError("curl-cancel: the client exited before the "
+                                   f"audio response was held: {out}{err}")
+            if time.monotonic() > deadline:
+                raise RuntimeError("curl-cancel: the audio response was never held")
+        # Let the demuxer consume the delivered bytes and wait for more.
+        time.sleep(1)
+        process.stdin.write("stop\n")
+        process.stdin.flush()
+        try:
+            out, err = process.communicate(timeout=HOLD_RELEASE)
+        except subprocess.TimeoutExpired:
+            released = True
+            server.release.set()
+            out, err = process.communicate(timeout=60)
+    finally:
+        server.release.set()
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+    if process.returncode:
+        raise RuntimeError(f"curl-cancel: {out}{err}")
+    report = json.loads(out.strip().splitlines()[-1])
+    if not report["opened"]:
+        raise RuntimeError("curl-cancel: no additional connection was open when "
+                           "playback was stopped")
+    if released or report["latency"] > STOP_LIMIT:
+        raise RuntimeError(f"curl-cancel: stopping took {report['latency']:.2f} s"
+                           + (", until the server released the held response"
+                              if released else ""))
+    print(f"PASS cursors/curl-cancel ({report['latency']:.2f} s)", flush=True)
+
+
 def main(library):
     media = Media()
     with serve(media.data) as server:
         check_default(library, server, media)
         check_legacy(library, server, media)
         check_exclusive(library, server, media)
+        if curl_available(library):
+            check_curl_short_range(library, server, media)
+            check_curl_cancel(library, server, media)
+        else:
+            print("SKIP cursors/curl-* (libmpv has no libcurl backend)", flush=True)
 
 
 if __name__ == "__main__":
     if len(sys.argv) == 7 and sys.argv[1] == "--child":
         run_client(sys.argv[2], sys.argv[3], json.loads(sys.argv[4]),
                    sys.argv[5], int(sys.argv[6]))
+    elif len(sys.argv) == 5 and sys.argv[1] == "--stop-child":
+        run_stop_client(sys.argv[2], sys.argv[3], json.loads(sys.argv[4]))
     elif len(sys.argv) == 2:
         main(str(Path(sys.argv[1]).resolve(strict=True)))
     else:

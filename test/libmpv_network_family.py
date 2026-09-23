@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-"""Prove that prefer_family orders dual-stack HTTP/TLS connections per file."""
+"""Prove that prefer_family orders dual-stack HTTP/TLS connections per file.
+
+Exits with meson's skip status 77 when the host lacks dual-stack loopback or
+openssl, or when the linked libavformat does not provide the tcp option; any
+runner that only checks for success still sees a failure.
+"""
 
 import contextlib
 import ctypes
@@ -21,6 +26,9 @@ import time
 import wave
 
 BASE_LAVF_OPTIONS = "reconnect=0,reconnect_on_network_error=0"
+# stream_lavf reports options that no protocol consumed after a successful open.
+UNSUPPORTED = "Could not set AVOption prefer_family="
+SKIP = 77
 
 
 class Event(ctypes.Structure):
@@ -45,13 +53,16 @@ class LogMessage(ctypes.Structure):
     ]
 
 
-def wait_for(mpv, client, wanted, messages, timeout=10):
+def wait_for(mpv, client, wanted, messages, unsupported, timeout=10):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         event = mpv.mpv_wait_event(client, 0.25).contents
         if event.event_id == 2:  # MPV_EVENT_LOG_MESSAGE
             message = ctypes.cast(event.data, ctypes.POINTER(LogMessage)).contents
-            messages.append(message.text.decode("utf-8", errors="replace")[:500])
+            text = message.text.decode("utf-8", errors="replace")
+            if text.startswith(UNSUPPORTED):
+                unsupported.append(text)
+            messages.append(text[:500])
             del messages[:-12]
         elif event.event_id == 8:  # MPV_EVENT_FILE_LOADED
             if wanted == "loaded":
@@ -93,7 +104,8 @@ def run_client(library, url, preference, expected):
         if not client:
             raise RuntimeError("Could not create the native client")
         stack.callback(mpv.mpv_terminate_destroy, client)
-        if mpv.mpv_request_log_messages(client, b"warn") < 0:
+        level = b"v" if expected == "probe" else b"warn"
+        if mpv.mpv_request_log_messages(client, level) < 0:
             raise RuntimeError("Native diagnostic subscription failed")
         options = {
             "config": "no",
@@ -121,16 +133,18 @@ def run_client(library, url, preference, expected):
         if mpv.mpv_command(client, command) < 0:
             raise RuntimeError("Native load command failed")
         messages = []
-        end = wait_for(mpv, client, expected, messages)
+        unsupported = []
+        loads = expected in ("loaded", "probe")
+        end = wait_for(mpv, client, "loaded" if loads else expected, messages, unsupported)
         if expected == "failed" and (end.reason != 4 or end.error != -13):
             raise RuntimeError(
                 f"Unexpected failure: reason={end.reason}, error={end.error}\n"
                 + "".join(messages))
-        if expected == "loaded":
+        if loads:
             stop = (ctypes.c_char_p * 2)(b"stop", None)
             if mpv.mpv_command(client, stop) < 0:
                 raise RuntimeError("Native stop command failed")
-            wait_for(mpv, client, "ended", messages)
+            wait_for(mpv, client, "ended", messages, unsupported)
 
         value = mpv.mpv_get_property_string(client, b"stream-lavf-o")
         if not value:
@@ -141,6 +155,8 @@ def run_client(library, url, preference, expected):
             mpv.mpv_free(value)
         if "prefer_family" in restored:
             raise RuntimeError(f"The per-file preference leaked past its file: {restored}")
+        if expected == "probe" and unsupported:
+            raise SystemExit(SKIP)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -252,7 +268,37 @@ def find_openssl():
                       r"C:\Program Files\Git\mingw64\bin\openssl.exe"):
         if Path(candidate).exists():
             return candidate
-    raise RuntimeError("The TLS cases need an openssl executable")
+    return None
+
+
+def has_ipv6_loopback():
+    if not socket.has_ipv6:
+        return False
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(("::1", 0))
+    except OSError:
+        return False
+    return True
+
+
+def skip(reason):
+    print(f"SKIP {reason}", flush=True)
+    raise SystemExit(SKIP)
+
+
+def supports_preference(library, url):
+    """Load an IPv4 literal, where the order is moot, and look for an unconsumed option."""
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--child",
+         library, url, "ipv4", "probe"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode == SKIP:
+        return False
+    if result.returncode:
+        raise RuntimeError(f"capability probe: {result.stdout}{result.stderr}")
+    return True
 
 
 def run_case(library, name, url, preference, expected, servers, hit):
@@ -273,17 +319,23 @@ def run_case(library, name, url, preference, expected, servers, hit):
 
 def main(library):
     families = {info[0] for info in socket.getaddrinfo("localhost", 80, type=socket.SOCK_STREAM)}
-    if not {socket.AF_INET, socket.AF_INET6} <= families:
-        raise RuntimeError("localhost must resolve to both IPv4 and IPv6 for this test")
+    if not {socket.AF_INET, socket.AF_INET6} <= families or not has_ipv6_loopback():
+        skip("localhost does not resolve and bind to both IPv4 and IPv6")
+    openssl = find_openssl()
+    if not openssl:
+        skip("the TLS cases need an openssl executable")
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as audio:
         audio.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
         audio.writeframes(bytes(16000))
     media = buffer.getvalue()
+    with serve(socket.AF_INET, "127.0.0.1", 0, media, None) as server:
+        if not supports_preference(library, f"http://127.0.0.1:{server.server_port}/media.wav"):
+            skip("the linked libavformat has no tcp prefer_family option")
     with tempfile.TemporaryDirectory(prefix="mpv-network-family-") as directory:
         cert, key = (str(Path(directory, name)) for name in ("cert.pem", "key.pem"))
         subprocess.run(
-            [find_openssl(), "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
              "-keyout", key, "-out", cert, "-days", "1", "-subj", "/CN=localhost"],
             check=True, capture_output=True, timeout=30,
         )

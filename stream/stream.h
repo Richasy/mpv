@@ -236,19 +236,18 @@ typedef struct stream {
     int (*control)(struct stream *s, int cmd, void *arg);
     // Close
     void (*close)(struct stream *s);
-    // Optional: tear down and reopen the underlying transport in place.
-    // Used by the byte-range LRU cache when it needs to abandon a keep-alive
-    // HTTP socket that the server / CDN has likely closed (typical case: the
-    // previous Range response was drained all the way to EOF, after which
-    // many CDNs close the socket; reusing it for the next backward Range
-    // silently returns EOF). Backends that don't implement this leave it
-    // NULL and the cache falls back to the legacy behaviour. On success the
-    // backend must be in a state equivalent to a freshly-opened stream
-    // (priv re-initialised, fill_buffer / seek / etc. still set, internal
-    // byte cursor at 0). Returns STREAM_OK on success or a STREAM_ERROR_*
-    // code on failure; on failure the backend may be left in an unusable
-    // state and the caller should treat the stream as broken.
-    int (*reconnect)(struct stream *s);
+    // Optional: tear down and reopen the underlying transport in place, with
+    // its byte cursor at pos. Used to recover a network stream whose
+    // redirected link went stale mid-stream, and by the byte-range LRU cache
+    // when a connection stops returning data before the known end of the
+    // file (e.g. a dead keep-alive socket). Reopening re-runs the redirect
+    // chain from the original URL. Backends that don't implement this leave
+    // it NULL. On success the backend must be in a state equivalent to a
+    // freshly-opened stream (priv re-initialised, fill_buffer / seek / etc.
+    // still set) positioned at pos. Returns STREAM_OK on success or a
+    // STREAM_ERROR_* code on failure; on failure the backend may be left in
+    // an unusable state and the caller should treat the stream as broken.
+    int (*reconnect)(struct stream *s, int64_t pos);
 
     int64_t pos;
     int eof; // valid only after read calls that returned a short result
@@ -288,6 +287,13 @@ typedef struct stream {
     bool autoprobed : 1; // opened by the autoprobe loop, not explicitly
                          // requested, failures should stay quiet
     bool wants_lru_cache : 1; // backend opts in to byte-range LRU cache (set in open_f)
+    // Set by a backend that honoured open_offset: its transport starts at
+    // exactly that byte, so no seek is needed to get there.
+    bool open_offset_ok : 1;
+    // Requested initial byte offset for the backend's transport (0 = start).
+    // Backends that can start a transfer at an offset (a ranged HTTP request)
+    // honour it and set open_offset_ok; others ignore it.
+    int64_t open_offset;
     struct stream_lru_cache *lru_cache; // optional, owned by talloc parent (this stream)
     struct mp_log *log;
     struct mpv_global *global;
@@ -377,9 +383,24 @@ struct stream_open_args {
     int flags;                  // STREAM_READ etc.
     const stream_info_t *sinfo; // NULL = autoprobe, otherwise force stream impl.
     void *special_arg;          // specific to impl., use only with sinfo
+    int64_t open_offset;        // see stream.open_offset
+    // Additional connection of an LRU-cached stream: never gets a cache of
+    // its own and logs as log_name below log_parent.
+    bool lru_cursor;
+    struct mp_log *log_parent;
+    const char *log_name;
 };
 
 int stream_create_with_args(struct stream_open_args *args, struct stream **ret);
+// Open another connection to the same resource as s, positioned at pos, for
+// the byte-range LRU cache. cancel is the connection's own cancel object: a
+// slave of s->cancel that outlives the returned stream. It must not be
+// s->cancel itself, because a backend may install a wakeup callback on it
+// (stream_curl does) and an mp_cancel holds only one. Returns NULL on
+// failure. Free with free_stream().
+struct stream *stream_open_lru_cursor(struct stream *s,
+                                      struct mp_cancel *cancel, int64_t pos,
+                                      const char *name);
 struct stream *stream_create(const char *url, int flags,
                              struct mp_cancel *c, struct mpv_global *global);
 stream_t *open_output_stream(const char *filename, struct mpv_global *global);

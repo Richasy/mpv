@@ -1026,6 +1026,10 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
         }
         if (oa->end_offset > 0)
             p->request_end = oa->end_offset;
+    } else if (args->open_offset > 0) {
+        // Additional connection of the byte-range LRU cache: start there.
+        p->start_offset = args->open_offset;
+        p->request_start = args->open_offset;
     }
 
     mp_mutex_init(&p->mtx);
@@ -1072,6 +1076,9 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     s->control = curl_control;
     s->close = curl_close;
     s->pos = p->start_offset;
+    // The first request already started at the requested offset (a
+    // mismatching range was rejected above).
+    s->open_offset_ok = args->open_offset > 0 && !args->special_arg;
 
     // Opt in to the byte-range LRU cache for seekable, full-file HTTP(S)
     // streams. Without it, every demuxer "yo-yo" seek -- a poorly-interleaved

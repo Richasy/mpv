@@ -5790,6 +5790,47 @@ Cache
     See ``--list-options`` for defaults and value range. ``<bytesize>`` options
     accept suffixes such as ``KiB`` and ``MiB``.
 
+``--stream-lru-cache=<bytesize>``
+    Size of the byte-range cache between HTTP-like network streams (``http``,
+    ``https``, ``mmsh``, and the libcurl backend) and the stream byte buffer
+    (default: 256MiB). The cache keeps the bytes of recently read regions, so
+    a demuxer that jumps back into a region it already read, such as the mov
+    demuxer alternating between an mp4's sample tables and its sample data,
+    does not need another request. It is only used for seekable streams with
+    a known size. ``0`` disables it.
+
+``--stream-lru-cache-bucket=<bytesize>``
+    Granularity of the byte-range cache (default: 64KiB). Rounded up to a
+    power of two between 4KiB and 1MiB.
+
+``--stream-lru-cache-min-fetch=<bytesize>``
+    Bytes to read on one connection before a cache miss returns (default:
+    16KiB). ``0`` returns after a single read call.
+
+``--stream-lru-cache-tail-prefetch=<bytesize>``, ``--stream-lru-cache-tail-threshold=<bytesize>``
+    A cache miss within the last ``--stream-lru-cache-tail-threshold`` bytes
+    of the file (default: 64MiB) reads ``--stream-lru-cache-tail-prefetch``
+    bytes ahead (default: 4MiB), which covers the moov atom of an mp4 that
+    stores it at the end in one request. ``0`` disables the prefetch.
+
+``--stream-lru-cache-cursors=<1-4>``
+    Number of network connections the byte-range cache may use for one stream
+    (default: 2). A demuxer that alternates between two distant regions of
+    the file, for example an mp4 whose subtitle samples are stored far away
+    from the video samples with the same timestamps, then keeps one
+    sequential connection per region instead of opening a new connection
+    (and following every redirect again) for each switch. Additional
+    connections start with a ranged request at the position they serve. If
+    they fail, for instance because the server limits concurrent
+    connections, playback continues on the stream's own connection. ``1``
+    uses a single connection.
+
+``--stream-lru-cache-read-through=<bytesize>``
+    A cache miss at most this far ahead of one of the stream's connections is
+    reached by reading forward on that connection instead of seeking, which
+    over HTTP would cost a new connection (default: 4MiB). The bytes read on
+    the way are cached. ``0`` always seeks.
+
 ``--vd-queue-enable=<yes|no>, --ad-queue-enable``
     Enable running the video/audio decoder on a separate thread (default: no).
     If enabled, the decoder is run on a separate thread, and a frame queue is

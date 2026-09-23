@@ -251,26 +251,34 @@ static void close_f(stream_t *stream)
     }
 }
 
-// Tear down and reopen the AVIOContext in place. Used by the LRU cache to
-// recover from EOF-induced keep-alive socket death (see stream.h::reconnect
-// for full rationale). open_f() is idempotent for our purposes: it re-runs
+// Tear down and reopen the AVIOContext in place, positioned at pos (see
+// stream.h::reconnect). open_f() is idempotent for our purposes: it re-runs
 // the URL parse + avio_open2 + option dict construction, repopulating
 // stream->seek / fill_buffer / get_size / control / close / wants_lru_cache
 // / streaming / is_network with the same values it set the first time. The
 // stream-layer LRU cache pointer (stream->lru_cache) lives outside open_f
-// and is preserved across the call.
+// and is preserved across the call. A ranged open reaches pos with a single
+// request; otherwise the transport restarts at 0 and seeks.
 //
 // On open failure stream->priv is left NULL and STREAM_* error code is
-// returned; the caller (cache_lru.c) treats this as "backend dead" and
-// disables itself so the demuxer surfaces the error rather than spinning.
-static int reconnect_f(stream_t *stream)
+// returned; the caller treats this as "backend dead" (cache_lru.c disables
+// itself, the stream is marked broken) so the demuxer surfaces the error
+// rather than spinning.
+static int reconnect_f(stream_t *stream, int64_t pos)
 {
     close_f(stream);
+    stream->open_offset = pos;
     int res = open_f(stream);
+    stream->open_offset = 0;
+    if (res == STREAM_OK && pos > 0 && !stream->open_offset_ok &&
+        (!stream->seek || seek(stream, pos) <= 0))
+    {
+        res = STREAM_ERROR;
+    }
     if (res != STREAM_OK) {
         MP_WARN(stream, "stream_lavf reconnect failed (res=%d)\n", res);
     } else {
-        MP_VERBOSE(stream, "stream_lavf reconnect ok\n");
+        MP_VERBOSE(stream, "stream_lavf reconnect ok at %" PRId64 "\n", pos);
     }
     return res;
 }
@@ -591,6 +599,20 @@ static int open_f(stream_t *stream)
     bstr protocol = mp_split_proto(bstr0(filename), NULL);
     for (int n = 0; http_like[n]; n++)
         p->network_diagnostics |= bstr_equals0(protocol, http_like[n]);
+
+    // Start the transfer right at open_offset with a ranged request
+    // (libavformat's http "offset" option). That protocol rejects a
+    // response beginning at any other byte instead of silently starting
+    // elsewhere, so a successful open is exactly positioned.
+    int64_t open_offset = stream->mode == STREAM_READ ? stream->open_offset : 0;
+    bool ranged_open = open_offset > 0 &&
+        (bstr_equals0(protocol, "http") || bstr_equals0(protocol, "https"));
+    stream->open_offset_ok = false;
+    AVDictionary *plain_dict = NULL;
+    if (ranged_open) {
+        av_dict_copy(&plain_dict, dict, 0);
+        av_dict_set_int(&dict, "offset", open_offset, 0);
+    }
     if (p->network_diagnostics) {
         MP_VERBOSE(stream, "network_io requested_options timeout_us=%s "
                    "rw_timeout_us=%s seekable=%s multiple_requests=%s reconnect=%s "
@@ -618,15 +640,40 @@ static int open_f(stream_t *stream)
         av_dict_set(&dict, "timeout", "0", 0);
     }
 
-    begin_io(p, "open", 0, 0, true);
+    begin_io(p, "open", open_offset, 0, true);
     int err = avio_open2(&avio, filename, flags, &cb, &dict);
     p->avio = avio;
     end_io(p, err, err < 0);
+    if (err == AVERROR(EIO) && ranged_open && !mp_cancel_test(stream->cancel)) {
+        // A server that ignores the range of the first request answers from
+        // the beginning, which the http protocol reports as EIO. Open from
+        // the start and let the caller seek.
+        MP_VERBOSE(stream, "network_io ranged open at %" PRId64 " failed; "
+                   "opening from the start\n", open_offset);
+        av_dict_free(&dict);
+        dict = plain_dict;
+        plain_dict = NULL;
+        ranged_open = false;
+        begin_io(p, "open", 0, 0, true);
+        err = avio_open2(&avio, filename, flags, &cb, &dict);
+        p->avio = avio;
+        end_io(p, err, err < 0);
+    }
+    av_dict_free(&plain_dict);
     if (err < 0) {
         if (err == AVERROR_PROTOCOL_NOT_FOUND)
             MP_ERR(stream, "Protocol not found. Make sure"
                    " FFmpeg is compiled with networking support.\n");
         goto out;
+    }
+
+    if (ranged_open && !av_dict_get(dict, "offset", NULL, 0)) {
+        // The transport starts at open_offset while the fresh AVIOContext
+        // still counts from 0. Its buffer is empty, so moving its file
+        // position is all avio_tell() and avio_seek() need to agree with the
+        // transport.
+        avio->pos = open_offset;
+        stream->open_offset_ok = true;
     }
 
     mp_avdict_print_unset(stream->log, MSGL_V, dict);

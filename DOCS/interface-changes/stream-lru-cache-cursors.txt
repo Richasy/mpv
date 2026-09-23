@@ -1,0 +1,1 @@
+add `--stream-lru-cache-cursors` and `--stream-lru-cache-read-through` options

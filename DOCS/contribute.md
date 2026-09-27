@@ -8,6 +8,15 @@ The main contact for mpv development is IRC, specifically #mpv
 and #mpv-devel on Libera.chat. GitHub is used for code review and
 long term discussions.
 
+Reporting issues
+----------------
+
+- Fill in the issue template and attach the log file. Describe the symptom and
+  the exact steps to reproduce it.
+- Report what you observed, not what you concluded. Leave out any claim you did
+  not verify yourself. A wrong diagnosis costs more time than none.
+- Less is more. A short report with a log and a sample beats pages of analysis.
+
 Sending patches
 ---------------
 
@@ -21,6 +30,12 @@ Sending patches
   "[RFC]" in the commit message or the pull request title.
 - Be sure to test your changes. If you didn't, please say so in the commit
   message and the pull request text.
+- Keep the pull request description short and about the change. Say what was
+  wrong and what the change does. For a non-trivial change, say why and how.
+  Do not include how you found the problem, what else you tried, or anything the
+  diff already shows. More text is more review surface. Be prepared to give
+  more detail on the issue and the reproduction when a reviewer asks for it.
+- Keep the pull request focused. Do one thing and do it fully.
 
 Copyright of contributions
 --------------------------
@@ -252,6 +267,10 @@ General coding
 - Prefer fusing declaration and initialization, rather than putting declarations
   on the top of a block. Obvious data flow is more important than avoiding
   mixing declarations and statements, which is just a C90 artifact.
+- Fix the cause, not the symptom. Hacks, workarounds and shortcuts that "make
+  it work" are not accepted. This includes checks, fallbacks or special cases
+  that paper over a bug instead of removing it. If you do not know why something
+  fails, find out first.
 - If you add features that require intrusive changes, discuss them on the dev
   channel first. There might be a better way to add a feature and it can avoid
   wasted work.
@@ -264,15 +283,23 @@ General coding
 AI-assisted Contributions
 -------------------------
 
-If you have used an AI/LLM for your contribution, you must disclose this in the
-PR description. Such contributions are not forbidden, but the submitter takes
-full responsibility for the code changes. This includes having full
-understanding of the code (knowing what was changed and why), the ability to
-participate in the code review process with human-written responses, and
-confirming that the code can be submitted under the same license as the
-relevant files (usually LGPLv2 or GPLv2).
+Using an AI/LLM for a contribution is allowed, as long as the result meets the
+same standard as any other contribution and can be reviewed and merged as is.
+How much you used it does not matter. You do not need to know all of mpv, but
+you must be able to explain your patch and to fix it yourself when review
+finds a problem. We do not finish, clean up or debug contributions. Please be
+considerate of everyone's time, reviewers included. We want to see your change
+merged. Ask whenever something is unclear or you need help.
 
-Clearly vibe-coded patches will not be considered.
+- Disclose AI/LLM use in the pull request description or issue, including the
+  model and tool used. AI-assisted commit messages and pull request descriptions
+  are allowed; review them and take responsibility for every word you submit.
+- Understand the code well enough to explain and fix it during review, and
+  ensure it can be submitted under the license of the relevant files (usually
+  LGPLv2.1+ or GPLv2).
+- Reproduce and verify technical claims before submitting them. If a claim
+  cannot be verified, describe the symptom and how to reproduce it instead.
+- Clearly vibe-coded patches will not be considered.
 
 Code of Conduct
 ---------------

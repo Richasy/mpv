@@ -26,6 +26,7 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/rational.h>
+#include <libavutil/stereo3d.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libplacebo/utils/libav.h>
@@ -1130,6 +1131,10 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
     };
 
     dst->params.chroma_location = pl_chroma_from_av(src->chroma_location);
+
+    sd = av_frame_get_side_data(src, AV_FRAME_DATA_STEREO3D);
+    if (sd)
+        dst->params.stereo3d = mp_stereo3d_from_av((const AVStereo3D *)sd->data);
 
     if (src->opaque_ref) {
         struct mp_image_params *p = (void *)src->opaque_ref->data;

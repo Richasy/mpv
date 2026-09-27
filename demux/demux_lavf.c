@@ -37,6 +37,7 @@
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/replaygain.h>
+#include <libavutil/stereo3d.h>
 
 #include "audio/chmap_avchannel.h"
 
@@ -58,6 +59,7 @@
 #include "options/m_option.h"
 #include "options/options.h"
 #include "options/path.h"
+#include "video/csputils.h"
 
 #define INITIAL_PROBE_SIZE STREAM_BUFFER_SIZE
 #define PROBE_BUF_SIZE (10 * 1024 * 1024)
@@ -804,6 +806,9 @@ static void handle_new_stream(demuxer_t *demuxer, int i)
                 sh->codec->rotate = (((int)(-r) % 360) + 360) % 360;
         }
 
+        if ((sd = mp_av_stream_get_side_data(st, AV_PKT_DATA_STEREO3D)))
+            sh->codec->stereo_mode = mp_stereo3d_from_av((const AVStereo3D *)sd);
+
         if ((sd = mp_av_stream_get_side_data(st, AV_PKT_DATA_DOVI_CONF))) {
             const AVDOVIDecoderConfigurationRecord *cfg = (void *) sd;
             MP_VERBOSE(demuxer, "Found Dolby Vision config record: profile "
@@ -1111,6 +1116,7 @@ static void build_editions(demuxer_t *demuxer)
             if (name_idx >= 0)
                 prefix = mp_tags_get_str(priv->streams[name_idx]->sh->tags, "comment");
         }
+        char buf[42];
         if (!prefix) {
             char *vb = mp_tags_get_str(ed.metadata, "variant_bitrate");
             char *end;
@@ -1118,8 +1124,8 @@ static void build_editions(demuxer_t *demuxer)
             if (rate > 0 && *end == '\0') {
                 rate /= 1000.0;
                 prefix = rate < 1000
-                    ? mp_tprintf(42, "Bitrate: %.f kbps", rate)
-                    : mp_tprintf(42, "Bitrate: %.3f Mbps", rate / 1000.0);
+                    ? mp_tprintf_buf(buf, sizeof(buf), "Bitrate: %.f kbps", rate)
+                    : mp_tprintf_buf(buf, sizeof(buf), "Bitrate: %.3f Mbps", rate / 1000.0);
             }
         }
 

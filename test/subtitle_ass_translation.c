@@ -28,6 +28,89 @@ static uint64_t image_hash(ASS_Image *image)
     return hash;
 }
 
+static ASS_Track *new_cue_track(ASS_Library *library)
+{
+    static const char header[] =
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        "PlayResX: 640\n"
+        "PlayResY: 360\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,"
+        "OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,"
+        "ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
+        "Alignment,MarginL,MarginR,MarginV,Encoding\n"
+        "\n"
+        "[Events]\n"
+        "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n";
+    ASS_Track *track = ass_new_track(library);
+    assert(track);
+    ass_process_codec_private(track, header, (int)sizeof(header) - 1);
+    assert(track->n_styles == 1 && track->n_events == 0);
+    return track;
+}
+
+static void add_cue(ASS_Track *track, const char *profile, int order,
+                    long long start, long long duration, const char *text)
+{
+    char packet[256];
+    int length = snprintf(packet, sizeof(packet),
+                          "%d,0,Default,,0,0,0,,%s", order, text);
+    assert(length > 0 && (size_t)length < sizeof(packet));
+    int first = track->n_events;
+    ass_process_chunk(track, packet, length, start, duration);
+    assert(track->n_events == first + 1);
+    mp_ass_clip_whisper_cues(track, first, profile);
+}
+
+static void check_whisper_cue_timing(ASS_Library *library, ASS_Renderer *renderer)
+{
+    ASS_Track *track = new_cue_track(library);
+    add_cue(track, "whisper", 11, 2196795, 8200, "earlier");
+    add_cue(track, "whisper", 14, 2201023, 500, "next");
+    assert(track->events[0].Duration == 4228);
+    assert(track->events[1].Duration == 500);
+
+    add_cue(track, "whisper", 18, 2208423, 10000,
+            "{\\fs72}translated\\N{\\fs48}original");
+    assert(track->events[1].Duration == 500);
+    add_cue(track, "whisper", 20, 2211039, 1000, "second speaker");
+    assert(track->events[2].Duration == 2616);
+    assert(track->events[3].Duration == 1000);
+    assert(!strcmp(track->events[2].Text,
+                   "{\\fs72}translated\\N{\\fs48}original"));
+
+    ASS_Track *expected = new_cue_track(library);
+    add_cue(expected, NULL, 20, 2211039, 1000, "second speaker");
+    int changed;
+    assert(image_hash(ass_render_frame(renderer, track, 2211500, &changed)) ==
+           image_hash(ass_render_frame(renderer, expected, 2211500, &changed)));
+    ass_free_track(expected);
+    ass_free_track(track);
+
+    track = new_cue_track(library);
+    add_cue(track, "whisper", 37, 2249087, 2000, "later");
+    add_cue(track, "whisper", 35, 2240071, 10000, "earlier");
+    assert(track->events[1].Duration == 9016);
+    add_cue(track, "whisper", 38, 2241087, 2000, "middle");
+    assert(track->events[1].Duration == 1016);
+    assert(track->events[2].Duration == 2000);
+    assert(track->events[0].Duration == 2000);
+    expected = new_cue_track(library);
+    add_cue(expected, NULL, 38, 2241087, 2000, "middle");
+    assert(image_hash(ass_render_frame(renderer, track, 2241500, &changed)) ==
+           image_hash(ass_render_frame(renderer, expected, 2241500, &changed)));
+    ass_free_track(expected);
+    ass_free_track(track);
+
+    track = new_cue_track(library);
+    add_cue(track, NULL, 18, 2208423, 10000, "ordinary ASS");
+    add_cue(track, NULL, 20, 2211039, 1000, "later ASS");
+    assert(track->events[0].Duration == 10000);
+    ass_free_track(track);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -94,6 +177,7 @@ int main(int argc, char **argv)
     assert(image_hash(mp_ass_render_replacements(
         renderer, track, 1200, &changed, &replacement, 1, -1)) ==
         translated_image);
+    check_whisper_cue_timing(library, renderer);
 #if LIBASS_VERSION >= 0x01703010
     // Auto-pruning must never free a borrowed translated Text pointer.
     ass_configure_prune(track, 0);

@@ -220,6 +220,7 @@ jobs:
             ${{ env.BUILD_DIR }}/packages/ffmpeg-prefix/src/ffmpeg-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/davs2-prefix/src/davs2-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/uavs3d-prefix/src/uavs3d-stamp/*.log
+            ${{ env.BUILD_DIR }}/packages/vulkan-prefix/src/vulkan-stamp/*-configure-*.log
             ${{ env.BUILD_DIR }}/packages/curl-prefix/src/curl-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/mbedtls-prefix/src/mbedtls-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-stamp/*.log

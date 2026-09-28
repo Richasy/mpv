@@ -164,6 +164,13 @@ build() {
     rm -rf "$BUILD_DIR/packages/harfbuzz-prefix/src/harfbuzz-stamp" 2>/dev/null || true
     rm -rf "$BUILD_DIR/packages/harfbuzz-prefix/src/harfbuzz-build" 2>/dev/null || true
 
+    # The pinned Vulkan Loader requires headers newer than a cached legacy
+    # runner checkout; refresh the main-tracking headers before configuring it.
+    log "Removing Vulkan-Headers cache to force re-clone..."
+    rm -rf "$SRC_PACKAGES/vulkan-header" 2>/dev/null || true
+    rm -rf "$BUILD_DIR/packages/vulkan-header-prefix/src/vulkan-header-stamp" 2>/dev/null || true
+    rm -rf "$BUILD_DIR/packages/vulkan-header-prefix/src/vulkan-header-build" 2>/dev/null || true
+
     # Force ffmpeg re-clone to pick up new configure options (e.g. --enable-whisper)
     log "Removing ffmpeg source cache to force re-clone..."
     rm -rf "$SRC_PACKAGES/ffmpeg" 2>/dev/null || true

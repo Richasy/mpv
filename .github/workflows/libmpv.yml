@@ -29,6 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+      runner_label: ${{ steps.select-runner.outputs.label }}
     steps:
       - id: set-matrix
         run: |
@@ -47,10 +48,21 @@ jobs:
           matrix="{\"include\":[$(IFS=,; echo "${entries[*]}")]}"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
+      - id: select-runner
+        run: |
+          hour=$(TZ=Asia/Shanghai date +%H)
+          if (( 10#$hour >= 6 && 10#$hour < 15 )); then
+            label=mpv-build-legacy
+          else
+            label=mpv-build-wsl-cpc-anran-fhr6h
+          fi
+          echo "Beijing hour $hour: $label"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+
   build:
     needs: prepare
     if: needs.prepare.outputs.matrix != '{"include":[]}'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, "${{ needs.prepare.outputs.runner_label }}"]
     strategy:
       fail-fast: false
       # Both architectures share dependency sources and compiler caches.

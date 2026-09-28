@@ -18,6 +18,7 @@ ExternalProject_Add(harfbuzz
         -Dicu=disabled
         -Dglib=disabled
         -Dgobject=disabled
+        -Dfreetype=enabled
         -Dgpu=disabled
         -Dutilities=disabled
         -Dtests=disabled
@@ -25,6 +26,7 @@ ExternalProject_Add(harfbuzz
         -Dbenchmark=disabled
     BUILD_COMMAND ${EXEC} ninja -C <BINARY_DIR>
     INSTALL_COMMAND ${EXEC} ninja -C <BINARY_DIR> install
+        COMMAND ${EXEC} test -f ${MINGW_INSTALL_PREFIX}/include/harfbuzz/hb-ft.h
     LOG_DOWNLOAD 1 LOG_UPDATE 1 LOG_CONFIGURE 1 LOG_BUILD 1 LOG_INSTALL 1
 )
 

@@ -10,7 +10,8 @@ ExternalProject_Add(openssl
     GIT_SUBMODULES ""
     UPDATE_COMMAND ""
     PATCH_COMMAND ${EXEC} git apply --ignore-whitespace ${CMAKE_CURRENT_SOURCE_DIR}/openssl-*.patch
-    CONFIGURE_COMMAND ${EXEC} CONF=1 <SOURCE_DIR>/Configure
+    CONFIGURE_COMMAND ${EXEC} mkdir -p apps/include
+    COMMAND ${EXEC} CONF=1 <SOURCE_DIR>/Configure
         --cross-compile-prefix=${TARGET_ARCH}-
         --prefix=${MINGW_INSTALL_PREFIX}
         --libdir=lib

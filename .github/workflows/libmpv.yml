@@ -51,6 +51,7 @@ jobs:
       - id: select-runner
         run: |
           hour=$(TZ=Asia/Shanghai date +%H)
+          # Beijing 06:00-14:59 uses the legacy runner; do not fall back if busy.
           if (( 10#$hour >= 6 && 10#$hour < 15 )); then
             label=mpv-build-legacy
           else

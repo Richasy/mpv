@@ -124,6 +124,11 @@ jobs:
         run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Build libmpv for ${{ matrix.name }}
+        env:
+          GIT_AUTHOR_NAME: libmpv CI
+          GIT_AUTHOR_EMAIL: libmpv-ci@localhost
+          GIT_COMMITTER_NAME: libmpv CI
+          GIT_COMMITTER_EMAIL: libmpv-ci@localhost
         run: |
           export MPV_SRC_DIR="$GITHUB_WORKSPACE"
           bash ci/build-libmpv.sh all

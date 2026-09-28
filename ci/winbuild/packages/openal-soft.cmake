@@ -15,6 +15,7 @@ ExternalProject_Add(openal-soft
         -DALSOFT_EXAMPLES=OFF
         -DALSOFT_TESTS=OFF
         -DALSOFT_BACKEND_PIPEWIRE=OFF
+        -DALSOFT_ENABLE_MODULES=OFF
         -DCMAKE_C_FLAGS='-include stdlib.h'
         -DCMAKE_CXX_FLAGS='-I<SOURCE_DIR>/gsl/include -include cstdlib'
     BUILD_COMMAND ${EXEC} ninja -C <BINARY_DIR>

@@ -18,6 +18,8 @@ ExternalProject_Add(harfbuzz
         -Dicu=disabled
         -Dglib=disabled
         -Dgobject=disabled
+        -Dgpu=disabled
+        -Dutilities=disabled
         -Dtests=disabled
         -Ddocs=disabled
         -Dbenchmark=disabled

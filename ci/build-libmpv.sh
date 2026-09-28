@@ -157,6 +157,13 @@ build() {
     rm -rf "$BUILD_DIR/packages/libplacebo-prefix/src/libplacebo-stamp" 2>/dev/null || true
     rm -rf "$BUILD_DIR/packages/libplacebo-prefix/src/libplacebo-build" 2>/dev/null || true
 
+    # Cached HarfBuzz checkouts can predate the gpu Meson option used by this
+    # build; force a fresh clone instead of reconfiguring the stale checkout.
+    log "Removing HarfBuzz cache to force re-clone..."
+    rm -rf "$SRC_PACKAGES/harfbuzz" 2>/dev/null || true
+    rm -rf "$BUILD_DIR/packages/harfbuzz-prefix/src/harfbuzz-stamp" 2>/dev/null || true
+    rm -rf "$BUILD_DIR/packages/harfbuzz-prefix/src/harfbuzz-build" 2>/dev/null || true
+
     # Force ffmpeg re-clone to pick up new configure options (e.g. --enable-whisper)
     log "Removing ffmpeg source cache to force re-clone..."
     rm -rf "$SRC_PACKAGES/ffmpeg" 2>/dev/null || true

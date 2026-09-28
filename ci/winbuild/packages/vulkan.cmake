@@ -1,3 +1,5 @@
+set(vulkan_loader_commit 3270cf8a1349306f0ddee1b500ee2b0d552e1c82)
+
 ExternalProject_Add(vulkan
     DEPENDS vulkan-header
     GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Loader.git
@@ -6,7 +8,8 @@ ExternalProject_Add(vulkan
     UPDATE_COMMAND ""
     GIT_REMOTE_NAME origin
     GIT_TAG main
-    PATCH_COMMAND ${EXEC} bash ${CMAKE_CURRENT_SOURCE_DIR}/vulkan-apply-patch.sh <SOURCE_DIR> ${CMAKE_CURRENT_SOURCE_DIR}/vulkan-0001-cross-compile-static-linking-hacks.patch
+    GIT_RESET ${vulkan_loader_commit}
+    PATCH_COMMAND ${EXEC} bash ${CMAKE_CURRENT_SOURCE_DIR}/vulkan-apply-patch.sh <SOURCE_DIR> ${CMAKE_CURRENT_SOURCE_DIR}/vulkan-0001-cross-compile-static-linking-hacks.patch ${vulkan_loader_commit}
     CONFIGURE_COMMAND ${EXEC} CONF=1 cmake -H<SOURCE_DIR> -B<BINARY_DIR>
         -G Ninja
         -DCMAKE_BUILD_TYPE=Release

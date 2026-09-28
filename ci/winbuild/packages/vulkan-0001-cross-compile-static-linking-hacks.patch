@@ -94,7 +94,7 @@ index 9deff6881..41d347eb1 100644
  #endif
  }
 diff --git a/loader/loader.h b/loader/loader.h
-index a5527b964..2760de929 100644
+index 6f63851..ec2cbae 100644
 --- a/loader/loader.h
 +++ b/loader/loader.h
 @@ -33,7 +33,9 @@
@@ -106,9 +106,9 @@ index a5527b964..2760de929 100644
 +#endif
  
  static inline VkPhysicalDevice loader_unwrap_physical_device(VkPhysicalDevice physicalDevice) {
-     struct loader_physical_device_tramp *phys_dev = (struct loader_physical_device_tramp *)physicalDevice;
-@@ -94,7 +96,7 @@ VkResult loader_validate_instance_extensions(struct loader_instance *inst, const
-                                              const struct loader_envvar_all_filters *layer_filters,
+     if (VK_NULL_HANDLE == physicalDevice) {
+@@ -92,7 +94,7 @@ VkResult loader_validate_instance_extensions(struct loader_instance *inst, const
+                                              const struct loader_pointer_layer_list *expanded_layers,
                                               const VkInstanceCreateInfo *pCreateInfo);
  
 -#if defined(_WIN32)
@@ -133,7 +133,7 @@ index 0dc4227da..e7fcea06f 100644
  // All set through CMake
  #define VER_FILE_VERSION ${LOADER_VER_FILE_VERSION}
 diff --git a/loader/loader_windows.c b/loader/loader_windows.c
-index f73659c09..bf0ae0d57 100644
+index 5ed7d02..4329fb0 100644
 --- a/loader/loader_windows.c
 +++ b/loader/loader_windows.c
 @@ -95,6 +95,7 @@ void windows_initialization(void) {
@@ -141,17 +141,17 @@ index f73659c09..bf0ae0d57 100644
  }
  
 +#if defined(LOADER_DYNAMIC_LIB)
- BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
-     (void)hinst;
+ BOOL WINAPI DllMain(HINSTANCE hinstance, DWORD reason, LPVOID reserved) {
+     (void)hinstance;
      switch (reason) {
-@@ -116,6 +117,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
+@@ -115,6 +116,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstance, DWORD reason, LPVOID reserved) {
      }
      return TRUE;
  }
 +#endif
  
- bool windows_add_json_entry(const struct loader_instance *inst,
-                             char **reg_data,    // list of JSON files
+ VkResult windows_add_json_entry(const struct loader_instance *inst, struct loader_string_list *search_paths,
+                                 LPCSTR key_name,  // key name - used for debug prints - i.e. VulkanDriverName
 diff --git a/loader/vk_loader_platform.h b/loader/vk_loader_platform.h
 index 9a3b9c1c9..93807ee30 100644
 --- a/loader/vk_loader_platform.h
@@ -211,4 +211,3 @@ index 000000000..ed2f30bb2
 +Cflags: -I${includedir}
 -- 
 2.47.1
-

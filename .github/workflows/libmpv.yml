@@ -29,6 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+      runner_label: ${{ steps.select-runner.outputs.label }}
     steps:
       - id: set-matrix
         run: |
@@ -47,10 +48,22 @@ jobs:
           matrix="{\"include\":[$(IFS=,; echo "${entries[*]}")]}"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
+      - id: select-runner
+        run: |
+          hour=$(TZ=Asia/Shanghai date +%H)
+          # Beijing 06:00-14:59 uses the legacy runner; do not fall back if busy.
+          if (( 10#$hour >= 6 && 10#$hour < 15 )); then
+            label=mpv-build-legacy
+          else
+            label=mpv-build-wsl-cpc-anran-fhr6h
+          fi
+          echo "Beijing hour $hour: $label"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+
   build:
     needs: prepare
     if: needs.prepare.outputs.matrix != '{"include":[]}'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, "${{ needs.prepare.outputs.runner_label }}"]
     strategy:
       fail-fast: false
       # Both architectures share dependency sources and compiler caches.
@@ -112,6 +125,11 @@ jobs:
         run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Build libmpv for ${{ matrix.name }}
+        env:
+          GIT_AUTHOR_NAME: libmpv CI
+          GIT_AUTHOR_EMAIL: libmpv-ci@localhost
+          GIT_COMMITTER_NAME: libmpv CI
+          GIT_COMMITTER_EMAIL: libmpv-ci@localhost
         run: |
           export MPV_SRC_DIR="$GITHUB_WORKSPACE"
           bash ci/build-libmpv.sh all

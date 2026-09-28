@@ -8,7 +8,8 @@ ExternalProject_Add(fontconfig
     SOURCE_DIR ${SOURCE_LOCATION}
     UPDATE_COMMAND ""
     GIT_REMOTE_NAME origin
-    GIT_TAG main
+    GIT_TAG 63725de8dc85dba3d730f5247f54061203d09340
+    GIT_RESET 63725de8dc85dba3d730f5247f54061203d09340
     GIT_CLONE_FLAGS "--filter=tree:0"
     PATCH_COMMAND ${EXEC} git apply --ignore-whitespace ${CMAKE_CURRENT_SOURCE_DIR}/fontconfig-*.patch
     CONFIGURE_COMMAND ""

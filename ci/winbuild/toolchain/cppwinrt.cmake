@@ -10,7 +10,8 @@ ExternalProject_Add(cppwinrt
         -DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}
     BUILD_COMMAND ${EXEC} ninja -C <BINARY_DIR>
     INSTALL_COMMAND ${EXEC} ninja -C <BINARY_DIR> install
-            COMMAND ${EXEC} wget -O <BINARY_DIR>/Windows.winmd  https://github.com/microsoft/windows-rs/raw/master/crates/libs/bindgen/default/Windows.winmd
+            # Windows.winmd was removed from windows-rs master.
+            COMMAND ${EXEC} wget -O <BINARY_DIR>/Windows.winmd https://raw.githubusercontent.com/microsoft/windows-rs/4ad797be890f1d9404fa376a223ba0cedc061582/crates/libs/bindgen/default/Windows.winmd
             COMMAND ${EXEC} cppwinrt -input <BINARY_DIR>/Windows.winmd -output ${MINGW_INSTALL_PREFIX}/include/
     LOG_DOWNLOAD 1 LOG_UPDATE 1 LOG_CONFIGURE 1 LOG_BUILD 1 LOG_INSTALL 1
 )

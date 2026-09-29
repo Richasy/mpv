@@ -286,6 +286,7 @@ void mp_dash_source_response(struct mpv_global *global, mpv_dash_track_kind trac
         if (status != 206) {
             mpv_dash_source_failure failure =
                 status == 412 ? MPV_DASH_FAILURE_HTTP_RISK :
+                status == 416 ? MPV_DASH_FAILURE_HTTP_RANGE :
                 status == 401 || status == 403 ? MPV_DASH_FAILURE_HTTP_AUTH :
                 MPV_DASH_FAILURE_HTTP_STATUS;
             first = set_failure(state, track, failure);

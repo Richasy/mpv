@@ -504,7 +504,7 @@ typedef enum mpv_dash_source_failure {
     MPV_DASH_FAILURE_HTTP_AUTH = 3,      /* HTTP 401 or 403. */
     MPV_DASH_FAILURE_HTTP_RISK = 4,      /* HTTP 412. */
     MPV_DASH_FAILURE_HTTP_STATUS = 5,    /* Other non-206 response. */
-    MPV_DASH_FAILURE_HTTP_RANGE = 6,     /* Invalid/missing Content-Range. */
+    MPV_DASH_FAILURE_HTTP_RANGE = 6,     /* Invalid/missing Content-Range or HTTP 416. */
     MPV_DASH_FAILURE_TRANSPORT = 7,      /* No response, short body, etc. */
     MPV_DASH_FAILURE_TRACK_SELECTION = 8,
     MPV_DASH_FAILURE_PLAYBACK = 9,       /* Unclassified decoder/output failure. */

@@ -377,7 +377,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     f"http://127.0.0.1:{self.server.server_port}/redirect-target",
                 )
                 self.send_header("Content-Length", "0")
-            elif code in (401, 403, 404, 412):
+            elif code in (401, 403, 404, 412, 416):
                 self.send_header("Content-Length", "64")
             else:
                 self.send_header("Content-Type", f"{role}/mp4")
@@ -404,7 +404,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if not self.server.release_audio_body.wait(15):
                         return
                 self.wfile.write(data[start:end + 1])
-            elif code in (401, 403, 404, 412):
+            elif code in (401, 403, 404, 412, 416):
                 self.server.error_headers.set()
                 if self.server.release_error_body.wait(10):
                     self.wfile.write(bytes(64))
@@ -1139,7 +1139,7 @@ def test_composition_first_frame(mpv, server, previous_generation,
     return stopped.source_generation, last_serial
 
 
-def test_failure(mpv, server, failed_role, expected):
+def test_failure(mpv, server, failed_role, expected, expected_http=None):
     with client(mpv) as handle:
         source = source_for(server)
         assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
@@ -1152,7 +1152,10 @@ def test_failure(mpv, server, failed_role, expected):
         assert not frame_snapshot(mpv, handle).presented_frame_serial
         assert state.failed_track == (VIDEO if failed_role == "video" else AUDIO)
         assert not prop(mpv, handle, "video-params/w")
-        if expected in (RISK, AUTH):
+        if expected_http is not None:
+            assert (state.video_http_status if failed_role == "video" else
+                    state.audio_http_status) == expected_http
+        if expected in (RISK, AUTH) or expected_http == 416:
             assert server.error_headers.is_set()
             assert server.error_body_bytes == 0, "Error body was delivered"
     assert len(server.requests_for(failed_role)) == 1
@@ -1307,6 +1310,12 @@ def main():
             with serve(tracks) as server:
                 server.bad_range = "audio"
                 test_failure(mpv, server, "audio", HTTP_RANGE)
+            for role in ("video", "audio"):
+                print(f"[dash] {role} HTTP 416 is an invalid range", flush=True)
+                with serve(tracks) as server:
+                    server.deny = role
+                    server.deny_code = 416
+                    test_failure(mpv, server, role, HTTP_RANGE, expected_http=416)
             print("[dash] no redirect", flush=True)
             with serve(tracks) as server:
                 server.redirect = "video"

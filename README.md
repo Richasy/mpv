@@ -101,6 +101,12 @@ archive (`x86_64`/`libmpv-x64.7z` or
 `aarch64`/`libmpv-arm64.7z`). GitHub-only runs omit ARM64; `build_arm64` is
 honored only when `upload_target` is `azure` or `both`. Azure uploads retry
 each file up to three times with bounded backoff.
+An Azure dispatch selecting **both** architectures also publishes every
+runtime file under a run-specific `native/builds/<run-id>-<attempt>/<arch>/`
+path. Only after both uploads and their build metadata are verified does CI
+replace the Azure `native/latest.json` pointer with that build's path and
+source commit. Consumers can fetch the latest complete pair without relying
+on the individually overwritten legacy `native/<arch>/` paths.
 
 ### AVS2 and AVS3 decoding
 

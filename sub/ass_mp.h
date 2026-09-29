@@ -46,6 +46,8 @@ struct mp_log;
 struct sub_text_replacement;
 
 uint64_t mp_ass_event_id(const ASS_Event *event);
+void mp_ass_clip_whisper_cues(ASS_Track *track, int first,
+                              const char *codec_profile);
 // Caller holds the decoder lock. Canonical events are restored before pruning.
 ASS_Image *mp_ass_render_replacements(
     ASS_Renderer *renderer, ASS_Track *track, long long ts, int *changed,

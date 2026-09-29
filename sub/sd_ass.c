@@ -394,6 +394,28 @@ static bool is_animated(const char *str)
     return false;
 }
 
+void mp_ass_clip_whisper_cues(ASS_Track *track, int first,
+                              const char *codec_profile)
+{
+    if (!codec_profile || strcmp(codec_profile, "whisper") != 0)
+        return;
+
+    // Translation results can arrive on either side of an existing cue.
+    for (int n = first; n < track->n_events; n++) {
+        ASS_Event *added = &track->events[n];
+        for (int i = 0; i < track->n_events; i++) {
+            ASS_Event *other = &track->events[i];
+            if (added->Start == other->Start)
+                continue;
+            ASS_Event *earlier = added->Start < other->Start ? added : other;
+            ASS_Event *later = earlier == added ? other : added;
+            long long until_next = later->Start - earlier->Start;
+            if (earlier->Duration > until_next)
+                earlier->Duration = until_next;
+        }
+    }
+}
+
 // Note: pkt is not necessarily a fully valid refcounted packet.
 static int filter_and_add(struct sd *sd, struct demux_packet *pkt)
 {
@@ -415,6 +437,8 @@ static int filter_and_add(struct sd *sd, struct demux_packet *pkt)
     ass_process_chunk(ctx->ass_track, pkt->buffer, pkt->len,
                       floor(pkt->pts * 1000 + 1e-6),
                       floor(pkt->duration * 1000 + 1e-6));
+    if (!ctx->is_converted)
+        mp_ass_clip_whisper_cues(track, old_n_events, sd->codec->codec_profile);
 
     // This bookkeeping only has any practical use for ASS subs
     // over a VO with no video.

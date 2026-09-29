@@ -33,6 +33,11 @@ API changes
 ::
 
  --- mpv 0.41.0 ---
+ 2.10   - let ordinary typed DASH media responses reach the existing demuxer,
+          including unknown-length streams; only 401/403/412 and redirects
+          remain status-line terminal. A nonzero byte position or unsatisfied
+          consumer window still fails, and only verified 206 Content-Range
+          establishes seek capability (Richasy/mpv fork).
  2.9    - add mpv_dash_source_get_range_capability() with a versioned,
           size-checked, per-track and source-generation-bound numeric result.
           A full-body initial HTTP 200 may play but does not establish seek

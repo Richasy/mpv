@@ -269,7 +269,7 @@ void mp_dash_source_fail(struct mpv_global *global, mpv_dash_track_kind track,
 }
 
 void mp_dash_source_response(struct mpv_global *global, mpv_dash_track_kind track,
-                             int status, bool initial_full_body)
+                             int status, mpv_dash_source_failure failure)
 {
     struct mp_dash_source_state *state = global->dash_source;
     mp_mutex_lock(&state->lock);
@@ -285,14 +285,8 @@ void mp_dash_source_response(struct mpv_global *global, mpv_dash_track_kind trac
         *last = status;
         if (*count < UINT32_MAX)
             (*count)++;
-        if (status != 206 && !(status == 200 && initial_full_body)) {
-            mpv_dash_source_failure failure =
-                status == 412 ? MPV_DASH_FAILURE_HTTP_RISK :
-                status == 416 ? MPV_DASH_FAILURE_HTTP_RANGE :
-                status == 401 || status == 403 ? MPV_DASH_FAILURE_HTTP_AUTH :
-                MPV_DASH_FAILURE_HTTP_STATUS;
+        if (failure != MPV_DASH_FAILURE_NONE)
             first = set_failure(state, track, failure);
-        }
     }
     mp_mutex_unlock(&state->lock);
     if (first)
@@ -310,6 +304,21 @@ void mp_dash_source_range_validated(struct mpv_global *global,
         (track == MPV_DASH_TRACK_VIDEO || track == MPV_DASH_TRACK_AUDIO))
         state->validated_ranges |= (uint32_t)track;
     mp_mutex_unlock(&state->lock);
+}
+
+bool mp_dash_source_has_validated_range(struct mpv_global *global,
+                                        mpv_dash_track_kind track)
+{
+    struct mp_dash_source_state *state = global->dash_source;
+    mp_mutex_lock(&state->lock);
+    bool proven = state->status.generation &&
+                  state->status.phase != MPV_DASH_SOURCE_FAILED &&
+                  state->status.phase != MPV_DASH_SOURCE_STOPPED &&
+                  (track == MPV_DASH_TRACK_VIDEO ||
+                   track == MPV_DASH_TRACK_AUDIO) &&
+                  !!(state->validated_ranges & track);
+    mp_mutex_unlock(&state->lock);
+    return proven;
 }
 
 void mp_dash_source_bound(struct mpv_global *global)
@@ -512,10 +521,13 @@ bool mp_dash_source_get_track(struct mpv_global *global, const char *alias,
                               struct mp_dash_track_config *config)
 { (void)global; (void)alias; (void)parent; (void)kind; (void)config; return false; }
 void mp_dash_source_response(struct mpv_global *global, mpv_dash_track_kind track,
-                             int status, bool initial_full_body)
-{ (void)global; (void)track; (void)status; (void)initial_full_body; }
+                             int status, mpv_dash_source_failure failure)
+{ (void)global; (void)track; (void)status; (void)failure; }
 void mp_dash_source_range_validated(struct mpv_global *global,
                                     mpv_dash_track_kind track)
 { (void)global; (void)track; }
+bool mp_dash_source_has_validated_range(struct mpv_global *global,
+                                        mpv_dash_track_kind track)
+{ (void)global; (void)track; return false; }
 
 #endif

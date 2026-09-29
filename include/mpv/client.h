@@ -248,7 +248,7 @@ extern "C" {
  * relational operators (<, >, <=, >=).
  */
 #define MPV_MAKE_VERSION(major, minor) (((major) << 16) | (minor) | 0UL)
-#define MPV_CLIENT_API_VERSION MPV_MAKE_VERSION(2, 9)
+#define MPV_CLIENT_API_VERSION MPV_MAKE_VERSION(2, 10)
 
 /**
  * The API user is allowed to "#define MPV_ENABLE_DEPRECATED 0" before
@@ -503,8 +503,8 @@ typedef enum mpv_dash_source_failure {
     MPV_DASH_FAILURE_AUDIO_OPEN = 2,
     MPV_DASH_FAILURE_HTTP_AUTH = 3,      /* HTTP 401 or 403. */
     MPV_DASH_FAILURE_HTTP_RISK = 4,      /* HTTP 412. */
-    MPV_DASH_FAILURE_HTTP_STATUS = 5,    /* Response other than valid 206 or initial full 200. */
-    MPV_DASH_FAILURE_HTTP_RANGE = 6,     /* Invalid/missing Content-Range or HTTP 416. */
+    MPV_DASH_FAILURE_HTTP_STATUS = 5,    /* Invalid status line or disallowed redirect. */
+    MPV_DASH_FAILURE_HTTP_RANGE = 6,     /* Unsatisfied byte position/window or invalid 206 range. */
     MPV_DASH_FAILURE_TRANSPORT = 7,      /* No response, short body, etc. */
     MPV_DASH_FAILURE_TRACK_SELECTION = 8,
     MPV_DASH_FAILURE_PLAYBACK = 9,       /* Unclassified decoder/output failure. */

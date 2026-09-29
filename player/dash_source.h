@@ -47,8 +47,10 @@ bool mp_dash_source_get_track(struct mpv_global *global, const char *alias,
                               void *parent, mpv_dash_track_kind *kind,
                               struct mp_dash_track_config *config);
 void mp_dash_source_response(struct mpv_global *global, mpv_dash_track_kind track,
-                             int status, bool initial_full_body);
+                             int status, mpv_dash_source_failure failure);
 void mp_dash_source_range_validated(struct mpv_global *global,
                                     mpv_dash_track_kind track);
+bool mp_dash_source_has_validated_range(struct mpv_global *global,
+                                        mpv_dash_track_kind track);
 
 #endif

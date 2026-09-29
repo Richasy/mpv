@@ -175,6 +175,8 @@ struct curl_ctx {
     int test_success_branches;
     int test_blocked_continuations;
     int test_added_after_stop;
+    int test_window_role;
+    int test_window_end;
 #endif
 };
 
@@ -198,8 +200,9 @@ struct priv {
     bool dash_status_seen;
     bool dash_interim_headers;
     unsigned dash_interim_count;
-    bool dash_initial_full_body;
+    bool dash_ordinary_response;
     bool dash_headers_ok;
+    bool dash_response_length_known;
     uint64_t dash_requested_end;
     uint64_t dash_response_length;
 
@@ -463,6 +466,16 @@ int mp_curl_dash_test_control(struct mpv_global *global, int command, int value)
     case MP_CURL_DASH_TEST_ADDED_AFTER_STOP:
         result = ctx->test_added_after_stop;
         break;
+    case MP_CURL_DASH_TEST_AUDIO_WINDOW:
+    case MP_CURL_DASH_TEST_VIDEO_WINDOW:
+        if (value <= 0) {
+            result = -1;
+            break;
+        }
+        ctx->test_window_role = command == MP_CURL_DASH_TEST_AUDIO_WINDOW ?
+                                MPV_DASH_TRACK_AUDIO : MPV_DASH_TRACK_VIDEO;
+        ctx->test_window_end = value;
+        break;
     default:
         result = -1;
         break;
@@ -542,11 +555,21 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
                            mp_dash_source_terminal(p->global))))
         return CURL_WRITEFUNC_ERROR;
 
-    if (p->dash_kind &&
+    if (p->dash_kind && p->request_end &&
+        (p->request_start >= p->request_end ||
+         p->request_received > p->request_end - p->request_start ||
+         bytes > p->request_end - p->request_start - p->request_received))
+    {
+        mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_HTTP_RANGE);
+        return CURL_WRITEFUNC_ERROR;
+    }
+    if (p->dash_kind && p->dash_response_length_known &&
         (p->request_received > p->dash_response_length ||
          bytes > p->dash_response_length - p->request_received))
     {
-        mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_HTTP_RANGE);
+        mp_dash_source_fail(p->global, p->dash_kind, p->dash_ordinary_response ?
+                            MPV_DASH_FAILURE_TRANSPORT :
+                            MPV_DASH_FAILURE_HTTP_RANGE);
         return CURL_WRITEFUNC_ERROR;
     }
 
@@ -772,23 +795,26 @@ static bool dash_content_range(struct priv *p, uint64_t *length, int64_t *total)
     return true;
 }
 
-static bool dash_full_body_length(struct priv *p, uint64_t *length)
+static bool dash_media_length(struct priv *p, uint64_t *length, bool *known)
 {
-    if (header_value(p->curl, "Content-Range"))
-        return false;
-    const char *encoding = header_value(p->curl, "Content-Encoding");
-    if (encoding && encoding[0] && strcasecmp(encoding, "identity"))
-        return false;
-    const char *type = header_value(p->curl, "Content-Type");
-    if (type && (!strncasecmp(type, "text/html", 9) ||
-                 !strncasecmp(type, "application/xhtml+xml", 21)))
-        return false;
+    const char *declared = header_value(p->curl, "Content-Length");
     curl_off_t size = -1;
     if (curl_easy_getinfo(p->curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T,
-                          &size) != CURLE_OK ||
-        size <= 0 || (uint64_t)size > INT64_MAX)
+                          &size) != CURLE_OK)
         return false;
-    *length = size;
+    if (declared) {
+        if (size < 0 || (uint64_t)size > INT64_MAX)
+            return false;
+        *length = size;
+        *known = true;
+    } else {
+        *length = 0;
+        *known = false;
+    }
+    // A per-request size hint is not a consumer-owned end_offset window.
+    if (p->request_end && *known &&
+        *length > p->request_end - p->request_start)
+        return false;
     return true;
 }
 
@@ -826,12 +852,20 @@ static size_t dash_header_callback(struct priv *p, struct bstr line, size_t byte
         }
         p->dash_interim_headers = false;
         p->dash_status_seen = true;
-        p->dash_initial_full_body = status == 200 && !p->probed &&
-                                    !p->start_offset && !p->request_start &&
-                                    !p->request_end && !p->opts->max_request_size;
-        mp_dash_source_response(p->global, p->dash_kind, status,
-                                p->dash_initial_full_body);
-        return status == 206 || p->dash_initial_full_body ? bytes : 0;
+        p->dash_ordinary_response = status != 206;
+        mpv_dash_source_failure failure = MPV_DASH_FAILURE_NONE;
+        if (status == 401 || status == 403)
+            failure = MPV_DASH_FAILURE_HTTP_AUTH;
+        else if (status == 412)
+            failure = MPV_DASH_FAILURE_HTTP_RISK;
+        else if (status >= 300 && status < 400)
+            failure = MPV_DASH_FAILURE_HTTP_STATUS;
+        else if (p->dash_ordinary_response &&
+                 (p->request_start || p->start_offset ||
+                  (status == 416 && p->request_end)))
+            failure = MPV_DASH_FAILURE_HTTP_RANGE;
+        mp_dash_source_response(p->global, p->dash_kind, status, failure);
+        return failure == MPV_DASH_FAILURE_NONE ? bytes : 0;
     }
     if (line.len)
         return bytes;
@@ -841,25 +875,30 @@ static size_t dash_header_callback(struct priv *p, struct bstr line, size_t byte
     }
     int64_t total = -1;
     bool valid = p->dash_status_seen &&
-        (p->dash_initial_full_body ?
-         dash_full_body_length(p, &p->dash_response_length) :
+        (p->dash_ordinary_response ?
+         dash_media_length(p, &p->dash_response_length,
+                           &p->dash_response_length_known) :
          dash_content_range(p, &p->dash_response_length, &total));
+    if (valid && !p->dash_ordinary_response)
+        p->dash_response_length_known = true;
     if (!valid)
     {
-        mp_dash_source_fail(p->global, p->dash_kind, p->dash_initial_full_body ?
-                            MPV_DASH_FAILURE_HTTP_STATUS :
+        mp_dash_source_fail(p->global, p->dash_kind, p->dash_ordinary_response ?
+                            (p->request_end ? MPV_DASH_FAILURE_HTTP_RANGE :
+                             MPV_DASH_FAILURE_TRANSPORT) :
                             MPV_DASH_FAILURE_HTTP_RANGE);
         if (!p->probed)
             finalize_probe(p);
         return 0;
     }
-    if (p->dash_initial_full_body)
-        total = p->dash_response_length;
-    else
+    if (!p->dash_ordinary_response)
         mp_dash_source_range_validated(p->global, p->dash_kind);
     if (!p->probed) {
-        p->content_size = total;
-        p->seekable = !p->dash_initial_full_body;
+        p->content_size = p->dash_ordinary_response ?
+            (p->dash_response_length_known ? (int64_t)p->dash_response_length : -1) :
+            total;
+        p->seekable = !p->dash_ordinary_response ||
+            mp_dash_source_has_validated_range(p->global, p->dash_kind);
         p->stream_ok = true;
     }
     p->dash_headers_ok = true;
@@ -1005,8 +1044,9 @@ static void start_request(struct priv *p)
         p->dash_status_seen = false;
         p->dash_interim_headers = false;
         p->dash_interim_count = 0;
-        p->dash_initial_full_body = false;
+        p->dash_ordinary_response = false;
         p->dash_headers_ok = false;
+        p->dash_response_length_known = false;
         p->dash_response_length = 0;
     }
     if (p->dash_kind && mp_dash_source_terminal(p->global)) {
@@ -1062,7 +1102,8 @@ static void on_done(struct priv *p, CURLcode code)
 
     if (p->dash_kind &&
         (!p->dash_headers_ok || code != CURLE_OK ||
-         p->request_received != p->dash_response_length ||
+         (p->dash_response_length_known &&
+          p->request_received != p->dash_response_length) ||
          mp_dash_source_terminal(p->global)))
     {
         if (!aborted && !mp_dash_source_terminal(p->global))
@@ -1083,6 +1124,15 @@ static void on_done(struct priv *p, CURLcode code)
 
     if (code == CURLE_OK && !aborted) {
         p->retry_count = 0;
+
+        if (p->dash_kind && p->dash_ordinary_response) {
+            p->finished = true;
+            mp_mutex_lock(&p->mtx);
+            p->stream_eof = true;
+            mp_cond_broadcast(&p->cond);
+            mp_mutex_unlock(&p->mtx);
+            return;
+        }
 
         bool chunked = p->seekable && p->opts->max_request_size > 0;
         bool past_size = p->content_size > 0 && p->request_start >= p->content_size;
@@ -1428,6 +1478,17 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
         p->start_offset = args->open_offset;
         p->request_start = args->open_offset;
     }
+
+#ifdef MPV_DASH_TEST_HOOKS
+    if (dash && !p->request_end && p->dash.allow_loopback_http &&
+        !strncmp(p->url, "http://127.0.0.1:", 17))
+    {
+        mp_mutex_lock(&p->ctx->test_lock);
+        if (p->ctx->test_window_role == p->dash_kind)
+            p->request_end = p->ctx->test_window_end;
+        mp_mutex_unlock(&p->ctx->test_lock);
+    }
+#endif
 
     mp_mutex_init(&p->mtx);
     mp_cond_init(&p->cond);

@@ -380,15 +380,17 @@ int mp_dash_source_range_snapshot(struct mpv_global *global,
     return MPV_ERROR_SUCCESS;
 }
 
-bool mp_dash_source_seek_ready(struct mpv_global *global)
+bool mp_dash_source_seek_blocked(struct mpv_global *global)
 {
     struct mp_dash_source_state *state = global->dash_source;
     mp_mutex_lock(&state->lock);
-    bool ready = state->status.phase == MPV_DASH_SOURCE_TRACKS_BOUND &&
-                 state->validated_ranges ==
-                     (MPV_DASH_TRACK_VIDEO | MPV_DASH_TRACK_AUDIO);
+    bool blocked = state->status.generation && state->mpctx->filename &&
+                   !strcmp(state->mpctx->filename, MP_DASH_VIDEO_URL) &&
+                   (state->status.phase != MPV_DASH_SOURCE_TRACKS_BOUND ||
+                    state->validated_ranges !=
+                        (MPV_DASH_TRACK_VIDEO | MPV_DASH_TRACK_AUDIO));
     mp_mutex_unlock(&state->lock);
-    return ready;
+    return blocked;
 }
 
 int mp_dash_source_frame_snapshot(struct mpv_global *global,
@@ -494,7 +496,7 @@ int mp_dash_source_snapshot(struct mpv_global *global, mpv_dash_source_status *o
 int mp_dash_source_range_snapshot(struct mpv_global *global,
                                   mpv_dash_range_capability *out)
 { (void)global; (void)out; return MPV_ERROR_UNSUPPORTED; }
-bool mp_dash_source_seek_ready(struct mpv_global *global)
+bool mp_dash_source_seek_blocked(struct mpv_global *global)
 { (void)global; return false; }
 int mp_dash_source_frame_snapshot(struct mpv_global *global,
                                   mpv_dash_frame_status *out)

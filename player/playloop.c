@@ -24,6 +24,7 @@
 #include "client.h"
 #include "command.h"
 #include "core.h"
+#include "dash_source.h"
 #include "mpv_talloc.h"
 #include "screenshot.h"
 #include "sub_translate.h"
@@ -307,6 +308,9 @@ static double calculate_framestep_pts(MPContext *mpctx, double current_time,
 
 static void mp_seek(MPContext *mpctx, struct seek_params seek)
 {
+    if (mp_dash_source_seek_blocked(mpctx->global))
+        return;
+
     struct MPOpts *opts = mpctx->opts;
 
     if (!mpctx->demuxer || !seek.type || seek.amount == MP_NOPTS_VALUE)
@@ -475,6 +479,9 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
 void queue_seek(struct MPContext *mpctx, enum seek_type type, double amount,
                 enum seek_precision exact, int flags)
 {
+    if (type != MPSEEK_NONE && mp_dash_source_seek_blocked(mpctx->global))
+        return;
+
     struct seek_params *seek = &mpctx->seek;
 
     mp_wakeup_core(mpctx);
@@ -518,6 +525,10 @@ void queue_seek(struct MPContext *mpctx, enum seek_type type, double amount,
 void execute_queued_seek(struct MPContext *mpctx)
 {
     if (mpctx->seek.type) {
+        if (mp_dash_source_seek_blocked(mpctx->global)) {
+            mpctx->seek = (struct seek_params){0};
+            return;
+        }
         bool queued_hr_seek = mpctx->seek.exact != MPSEEK_KEYFRAME;
         // Let explicitly imprecise seeks cancel precise seeks:
         if (mpctx->hrseek_active && !queued_hr_seek)
@@ -940,6 +951,8 @@ static void handle_loop_file(struct MPContext *mpctx)
 {
     if (mpctx->stop_play != AT_END_OF_FILE)
         return;
+    if (mp_dash_source_seek_blocked(mpctx->global))
+        return;
 
     double target = MP_NOPTS_VALUE;
     enum seek_precision prec = MPSEEK_DEFAULT;
@@ -978,6 +991,8 @@ static void handle_loop_file(struct MPContext *mpctx)
 
 void seek_to_last_frame(struct MPContext *mpctx)
 {
+    if (mp_dash_source_seek_blocked(mpctx->global))
+        return;
     if (!mpctx->vo_chain)
         return;
     if (mpctx->hrseek_lastframe) // exit if we already tried this

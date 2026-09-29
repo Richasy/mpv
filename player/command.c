@@ -835,6 +835,8 @@ static int mp_property_percent_pos(void *ctx, struct m_property *prop,
 
     switch (action) {
     case M_PROPERTY_SET: {
+        if (mp_dash_source_seek_blocked(mpctx->global))
+            return M_PROPERTY_UNAVAILABLE;
         double pos = *(double *)arg;
         queue_seek(mpctx, MPSEEK_FACTOR, pos / 100.0, MPSEEK_DEFAULT, 0);
         return M_PROPERTY_OK;
@@ -873,6 +875,8 @@ static int mp_property_time_pos(void *ctx, struct m_property *prop,
         return M_PROPERTY_UNAVAILABLE;
 
     if (action == M_PROPERTY_SET) {
+        if (mp_dash_source_seek_blocked(mpctx->global))
+            return M_PROPERTY_UNAVAILABLE;
         queue_seek(mpctx, MPSEEK_ABSOLUTE, *(double *)arg, MPSEEK_DEFAULT, 0);
         return M_PROPERTY_OK;
     }
@@ -970,6 +974,8 @@ static int mp_property_chapter(void *ctx, struct m_property *prop,
     }
     case M_PROPERTY_SWITCH:
     case M_PROPERTY_SET: ;
+        if (mp_dash_source_seek_blocked(mpctx->global))
+            return M_PROPERTY_UNAVAILABLE;
         mark_seek(mpctx);
         int step_all;
         if (action == M_PROPERTY_SWITCH) {
@@ -6333,10 +6339,7 @@ static void cmd_seek(void *p)
         cmd->success = false;
         return;
     }
-    if (mp_dash_source_active(mpctx->global) && mpctx->filename &&
-        !strcmp(mpctx->filename, MP_DASH_VIDEO_URL) &&
-        !mp_dash_source_seek_ready(mpctx->global))
-    {
+    if (mp_dash_source_seek_blocked(mpctx->global)) {
         cmd->success = false;
         return;
     }
@@ -6390,6 +6393,10 @@ static void cmd_revert_seek(void *p)
     struct command_ctx *cmdctx = mpctx->command_ctx;
 
     if (!mpctx->playback_initialized) {
+        cmd->success = false;
+        return;
+    }
+    if (mp_dash_source_seek_blocked(mpctx->global)) {
         cmd->success = false;
         return;
     }
@@ -6553,6 +6560,10 @@ static void cmd_frame_step(void *p)
         cmd->success = false;
         return;
     }
+    if (mp_dash_source_seek_blocked(mpctx->global)) {
+        cmd->success = false;
+        return;
+    }
 
     if (flags == 1) {
         // frame-step command has on_updown set so it is called on both down
@@ -6674,6 +6685,10 @@ static void cmd_sub_step_seek(void *p)
     int track_ind = cmd->args[1].v.i;
 
     if (!mpctx->playback_initialized) {
+        cmd->success = false;
+        return;
+    }
+    if (!step && mp_dash_source_seek_blocked(mpctx->global)) {
         cmd->success = false;
         return;
     }

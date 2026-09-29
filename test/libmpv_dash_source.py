@@ -38,6 +38,7 @@ IDLE, QUEUED, BOUND, FAILED, STOPPED = range(5)
 AUTH, RISK, HTTP_STATUS, HTTP_RANGE = 3, 4, 5, 6
 VIDEO, AUDIO = 1, 2
 FILE_LOADED, END_FILE, LOG_MESSAGE = 8, 7, 2
+SEEK_EVENT, DOUBLE = 20, 5
 END_ERROR = 4
 MARKER = b"private-local-test"
 TEST_ARM, TEST_WAIT, TEST_RELEASE, TEST_SUCCESS_BRANCHES, \
@@ -497,6 +498,8 @@ def configure_library(mpv):
         ctypes.c_void_p, ctypes.POINTER(RangeCapability)]
     mpv.mpv_dash_source_get_frame_status.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(FrameStatus)]
+    mpv.mpv_set_property.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
     mpv.mpv_acquire_d3d11_composition_surface.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(CompositionSurface)]
     mpv.mpv_release_d3d11_composition_surface.argtypes = [
@@ -622,6 +625,12 @@ def command(mpv, handle, *args):
     result = mpv.mpv_command(handle, argv)
     if result < 0:
         raise AssertionError(f"Command {args[0]} failed: {result}")
+
+
+def set_position(mpv, handle, name, value):
+    position = ctypes.c_double(value)
+    return mpv.mpv_set_property(
+        handle, name.encode(), DOUBLE, ctypes.byref(position))
 
 
 def await_event(mpv, handle, wanted, timeout=12):
@@ -796,6 +805,24 @@ def test_playback(mpv, server):
         assert prop(mpv, handle, "video-params/w") == "160"
         assert prop(mpv, handle, "audio-params/samplerate") == "48000"
         assert prop(mpv, handle, "audio-out-params/samplerate") == "48000"
+        for name, value, expected in (
+            ("time-pos", 4.0, 4.0),
+            ("percent-pos", 50.0, 9.0),
+            ("playback-time", 2.0, 2.0),
+        ):
+            assert set_position(mpv, handle, name, value) == 0, name
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                event = mpv.mpv_wait_event(handle, 0.05).contents
+                if event.event_id == END_FILE:
+                    raise AssertionError(f"{name} ended dual-206 playback")
+                position = prop(mpv, handle, "time-pos")
+                if position and abs(float(position) - expected) <= 0.4:
+                    break
+            else:
+                raise AssertionError(f"{name} did not seek both 206 tracks")
+            assert range_capability(mpv, handle).audio_validated_206 == 1
+            assert snapshot(mpv, handle).phase == BOUND
         assert snapshot(mpv, handle).phase == BOUND
         assert not frame_snapshot(mpv, handle).presented_frame_serial
         command(mpv, handle, "stop")
@@ -841,11 +868,42 @@ def test_full_body_playback(mpv, server, full_role):
         else:
             raise AssertionError("Full-body MP4 did not decode both tracks and AO")
         assert_private(mpv, handle)
-        count = len(server.requests_for(full_role))
+        command(mpv, handle, "set", "pause", "yes")
+        before = prop(mpv, handle, "time-pos")
+        assert before is not None
+        counts = {role: len(server.requests_for(role))
+                  for role in ("video", "audio")}
         argv = (ctypes.c_char_p * 4)(b"seek", b"8", b"absolute+exact", None)
         assert mpv.mpv_command(handle, argv) < 0, \
             "One unproven track must not permit a single-track seek"
-        assert len(server.requests_for(full_role)) == count
+        for name, value in (
+            ("time-pos", 8.0),
+            ("percent-pos", 80.0),
+            ("playback-time", 8.0),
+        ):
+            assert set_position(mpv, handle, name, value) < 0, \
+                f"{name} bypassed dual-track seek evidence"
+        for name, params in (
+            ("revert-seek", ()),
+            ("frame-step", ("1",)),
+            ("frame-back-step", ()),
+            ("sub-seek", ("1",)),
+        ):
+            args = (ctypes.c_char_p * (len(params) + 2))(
+                name.encode(), *(param.encode() for param in params), None)
+            assert mpv.mpv_command(handle, args) < 0, \
+                f"{name} bypassed dual-track seek evidence"
+        deadline = time.monotonic() + 0.25
+        while time.monotonic() < deadline:
+            event = mpv.mpv_wait_event(handle, 0.05).contents
+            if event.event_id == SEEK_EVENT:
+                raise AssertionError("Mixed 206/200 source queued a seek")
+        after = prop(mpv, handle, "time-pos")
+        assert after is not None and abs(float(after) - float(before)) < 0.6
+        assert all(len(server.requests_for(role)) == counts[role]
+                   for role in counts), "Seek emitted a new video or audio Range"
+        assert snapshot(mpv, handle).phase == BOUND
+        assert prop(mpv, handle, "audio-out-params/samplerate") == "48000"
         command(mpv, handle, "stop")
         await_event(mpv, handle, END_FILE)
         assert snapshot(mpv, handle).phase == STOPPED

@@ -683,6 +683,24 @@ def command(mpv, handle, *args):
         raise AssertionError(f"Command {args[0]} failed: {result}")
 
 
+def await_dual_decoder_ao(mpv, handle, context):
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        event = mpv.mpv_wait_event(handle, 0.05).contents
+        if event.event_id == LOG_MESSAGE:
+            message = ctypes.cast(
+                event.data, ctypes.POINTER(LogMessage)).contents
+            if MARKER in ctypes.string_at(message.text):
+                raise AssertionError("Private media URL appeared in a native log")
+        if event.event_id == END_FILE:
+            raise AssertionError(f"{context} ended before decoder/AO readiness")
+        if (prop(mpv, handle, "video-params/w") == "160" and
+            prop(mpv, handle, "audio-params/samplerate") == "48000" and
+            prop(mpv, handle, "audio-out-params/samplerate") == "48000"):
+            return
+    raise AssertionError(f"{context} did not produce dual decoder/AO parameters")
+
+
 def set_position(mpv, handle, name, value):
     position = ctypes.c_double(value)
     return mpv.mpv_set_property(
@@ -873,9 +891,9 @@ def test_playback(mpv, server):
             print("[dash] decoder properties=" +
                   repr({name: prop(mpv, handle, name) for name in names}),
                   flush=True)
-        assert prop(mpv, handle, "video-params/w") == "160"
-        assert prop(mpv, handle, "audio-params/samplerate") == "48000"
-        assert prop(mpv, handle, "audio-out-params/samplerate") == "48000"
+        command(mpv, handle, "set", "pause", "no")
+        await_dual_decoder_ao(mpv, handle, "Dual-206 initial seek")
+        command(mpv, handle, "set", "pause", "yes")
         for name, value, expected in (
             ("time-pos", 4.0, 4.0),
             ("percent-pos", 50.0, 9.0),
@@ -894,7 +912,8 @@ def test_playback(mpv, server):
                 raise AssertionError(f"{name} did not seek both 206 tracks")
             assert range_capability(mpv, handle).audio_validated_206 == 1
             assert snapshot(mpv, handle).phase == BOUND
-        assert snapshot(mpv, handle).phase == BOUND
+        command(mpv, handle, "set", "pause", "no")
+        await_dual_decoder_ao(mpv, handle, "Dual-206 property seeks")
         assert not frame_snapshot(mpv, handle).presented_frame_serial
         command(mpv, handle, "stop")
         await_event(mpv, handle, END_FILE)

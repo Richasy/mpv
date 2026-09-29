@@ -70,6 +70,7 @@ extern const stream_info_t stream_info_cb;
 extern const stream_info_t stream_info_smb;
 #endif
 extern const stream_info_t stream_info_curl;
+extern const stream_info_t stream_info_dash;
 extern const stream_info_t stream_info_env;
 
 static const stream_info_t *const stream_list[] = {
@@ -112,6 +113,7 @@ static const stream_info_t *const stream_list[] = {
     &stream_info_fd,
     &stream_info_cb,
 #if HAVE_LIBCURL
+    &stream_info_dash,
     &stream_info_curl,
 #endif
     &stream_info_ffmpeg,

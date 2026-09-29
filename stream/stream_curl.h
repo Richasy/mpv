@@ -46,3 +46,16 @@ int mp_curl_avio_open(struct demuxer *demuxer, AVIOContext **pb_out,
 
 // Tear down an AVIOContext previously produced by mp_curl_avio_open().
 void mp_curl_avio_close(AVIOContext *pb, void *data);
+
+#ifdef MPV_DASH_TEST_HOOKS
+enum mp_curl_dash_test_command {
+    MP_CURL_DASH_TEST_ARM = 1,
+    MP_CURL_DASH_TEST_WAIT = 2,
+    MP_CURL_DASH_TEST_RELEASE = 3,
+    MP_CURL_DASH_TEST_SUCCESS_BRANCHES = 4,
+    MP_CURL_DASH_TEST_BLOCKED_CONTINUATIONS = 5,
+    MP_CURL_DASH_TEST_ADDED_AFTER_STOP = 6,
+};
+
+int mp_curl_dash_test_control(struct mpv_global *global, int command, int value);
+#endif

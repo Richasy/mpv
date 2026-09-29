@@ -25,6 +25,7 @@
 #include "video/out/gpu/context.h"
 #include "video/out/gpu/d3d11_helpers.h"
 #include "video/out/gpu/spirv.h"
+#include "video/out/display_surface.h"
 #include "video/out/w32_common.h"
 #include "video/out/win32/displayconfig.h"
 #include "context.h"
@@ -277,6 +278,9 @@ static bool d3d11_submit_frame(struct ra_swapchain *sw,
 
     ra_d3d11_flush(sw->ctx->ra);
     ra_tex_free(sw->ctx->ra, &p->backbuffer);
+    if (sw->ctx->opts.composition && frame && frame->current)
+        vo_display_surface_prepare_frame(sw->ctx->vo->extra.display_surface,
+                                         frame->frame_id);
     return true;
 }
 
@@ -312,6 +316,9 @@ static void d3d11_swap_buffers(struct ra_swapchain *sw)
     p->last_submit_qpc = perf_count.QuadPart;
 
     HRESULT hr = IDXGISwapChain_Present(p->swapchain, p->opts->sync_interval, 0);
+    if (sw->ctx->opts.composition)
+        vo_display_surface_present_frame(sw->ctx->vo->extra.display_surface,
+                                         hr == S_OK ? p->swapchain : NULL);
     if (FAILED(hr)) {
         p->present_result = hr;
         MP_FATAL(sw->ctx, "Couldn't present swapchain: %s\n",

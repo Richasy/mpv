@@ -1,0 +1,1331 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+"""Exercise the opt-in typed source against two locally generated DASH MP4 tracks.
+
+Run with the published local-build directory, not an older/system libmpv:
+    python test/libmpv_dash_source.py build/local-libmpv/x86_64
+The --scheduler mode requires a separate test-only DLL compiled from the same
+snapshot with MPV_DASH_TEST_HOOKS; the production DLL must not export its hook.
+All media is generated under that repository-owned ignored build directory and
+removed after the test. This never requests a remote media service.
+"""
+
+import contextlib
+import ctypes
+from datetime import datetime, timezone
+import faulthandler
+import gc
+import http.server
+import os
+from pathlib import Path
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+
+VERSION = 1
+ALLOW_LOOPBACK = 1
+SEGMENT_BASE = 1
+INVALID = -4
+UNSUPPORTED = -18
+IDLE, QUEUED, BOUND, FAILED, STOPPED = range(5)
+AUTH, RISK, HTTP_STATUS, HTTP_RANGE = 3, 4, 5, 6
+VIDEO, AUDIO = 1, 2
+FILE_LOADED, END_FILE, LOG_MESSAGE = 8, 7, 2
+END_ERROR = 4
+MARKER = b"private-local-test"
+TEST_ARM, TEST_WAIT, TEST_RELEASE, TEST_SUCCESS_BRANCHES, \
+    TEST_BLOCKED_CONTINUATIONS, TEST_ADDED_AFTER_STOP = range(1, 7)
+
+
+class Range(ctypes.Structure):
+    _fields_ = [("start", ctypes.c_int64), ("end", ctypes.c_int64)]
+
+
+class Track(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("url", ctypes.c_char_p),
+        ("mime_type", ctypes.c_char_p),
+        ("codec", ctypes.c_char_p),
+        ("bandwidth", ctypes.c_uint64),
+        ("quality", ctypes.c_int32),
+        ("width", ctypes.c_int32),
+        ("height", ctypes.c_int32),
+        ("initialization", Range),
+        ("index", Range),
+    ]
+
+
+class Source(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("api_version", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("video", Track),
+        ("audio", Track),
+        ("duration_seconds", ctypes.c_double),
+        ("user_agent", ctypes.c_char_p),
+        ("referer", ctypes.c_char_p),
+    ]
+
+
+class Status(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("api_version", ctypes.c_uint32),
+        ("generation", ctypes.c_uint64),
+        ("phase", ctypes.c_int32),
+        ("failure", ctypes.c_int32),
+        ("failed_track", ctypes.c_int32),
+        ("video_http_status", ctypes.c_int32),
+        ("audio_http_status", ctypes.c_int32),
+        ("video_responses", ctypes.c_uint32),
+        ("audio_responses", ctypes.c_uint32),
+    ]
+
+
+class FrameStatus(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("api_version", ctypes.c_uint32),
+        ("source_generation", ctypes.c_uint64),
+        ("presented_generation", ctypes.c_uint64),
+        ("presented_frame_serial", ctypes.c_uint64),
+        ("presented_surface_epoch", ctypes.c_uint64),
+    ]
+
+
+class CompositionSurface(ctypes.Structure):
+    _fields_ = [("swapchain", ctypes.c_void_p), ("epoch", ctypes.c_uint64)]
+
+
+class Event(ctypes.Structure):
+    _fields_ = [
+        ("event_id", ctypes.c_int),
+        ("error", ctypes.c_int),
+        ("reply_userdata", ctypes.c_uint64),
+        ("data", ctypes.c_void_p),
+    ]
+
+
+class EndFile(ctypes.Structure):
+    _fields_ = [("reason", ctypes.c_int), ("error", ctypes.c_int)]
+
+
+class LogMessage(ctypes.Structure):
+    _fields_ = [
+        ("prefix", ctypes.c_char_p),
+        ("level", ctypes.c_char_p),
+        ("text", ctypes.c_char_p),
+        ("log_level", ctypes.c_int),
+    ]
+
+
+def boxes(data):
+    result = []
+    pos = 0
+    while pos + 8 <= len(data):
+        size = int.from_bytes(data[pos:pos + 4], "big")
+        if size < 8 or pos + size > len(data):
+            break
+        result.append(data[pos + 4:pos + 8])
+        pos += size
+    return result
+
+
+def first_fragment_offset(data):
+    pos = 0
+    while pos + 8 <= len(data):
+        size = int.from_bytes(data[pos:pos + 4], "big")
+        if data[pos + 4:pos + 8] == b"moof":
+            return pos
+        if size < 8 or pos + size > len(data):
+            break
+        pos += size
+    raise AssertionError("Generated video has no first media fragment")
+
+
+def generate_tracks(directory):
+    files = {}
+    inputs = {
+        "video": [
+            "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=12",
+            "-t", "18", "-an", "-c:v", "libx264", "-preset", "ultrafast",
+            "-crf", "17", "-pix_fmt", "yuv420p", "-g", "12",
+        ],
+        "audio": [
+            "-f", "lavfi", "-i",
+            "anoisesrc=color=white:amplitude=0.03:sample_rate=48000",
+            "-t", "18", "-vn", "-c:a", "aac", "-b:a", "160k",
+        ],
+    }
+    for role, arguments in inputs.items():
+        path = directory / (role + ".mp4")
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
+             "-y", *arguments, "-movflags",
+             "+frag_keyframe+empty_moov+global_sidx+dash",
+             "-f", "mp4", str(path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(f"Local media generator failed for {role}: "
+                               f"{result.stderr[-400:]}")
+        data = path.read_bytes()
+        top = boxes(data)
+        if not all(box in top for box in (b"ftyp", b"moov", b"sidx",
+                                           b"moof", b"mdat")):
+            raise AssertionError(f"Local {role} fixture is not indexed DASH fMP4")
+        files[role] = data
+    return files
+
+
+def generate_tls_certificates(directory):
+    def wsl_path(path):
+        absolute = path.resolve()
+        return f"/mnt/{absolute.drive[0].lower()}/{absolute.relative_to(absolute.anchor).as_posix()}"
+
+    def openssl(*args):
+        result = subprocess.run(
+            ["wsl.exe", "-d", "mpv-build", "--", "openssl", *args],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=30, check=False,
+        )
+        if result.returncode:
+            raise AssertionError("Local synthetic TLS certificate generation failed")
+
+    ca_cert, ca_key = directory / "ca.pem", directory / "ca-key.pem"
+    client_cert, client_key = directory / "client.pem", directory / "client-key.pem"
+    server_cert, server_key = directory / "server.pem", directory / "server-key.pem"
+    client_request = directory / "client.csr"
+    client_extensions = directory / "client-ext.cnf"
+    client_extensions.write_text(
+        "basicConstraints=critical,CA:FALSE\n"
+        "keyUsage=critical,digitalSignature\n"
+        "extendedKeyUsage=clientAuth\n", encoding="ascii")
+
+    openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", wsl_path(ca_key), "-out", wsl_path(ca_cert),
+            "-subj", "/CN=local-test-ca", "-days", "1")
+    openssl("req", "-new", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", wsl_path(client_key), "-out", wsl_path(client_request),
+            "-subj", "/CN=local-test-client")
+    openssl("x509", "-req", "-in", wsl_path(client_request),
+            "-CA", wsl_path(ca_cert), "-CAkey", wsl_path(ca_key),
+            "-CAcreateserial", "-out", wsl_path(client_cert),
+            "-extfile", wsl_path(client_extensions), "-days", "1")
+    openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", wsl_path(server_key), "-out", wsl_path(server_cert),
+            "-subj", "/CN=server-local-test",
+            "-addext", "subjectAltName=IP:127.0.0.1", "-days", "1")
+    validity = subprocess.run(
+        ["wsl.exe", "-d", "mpv-build", "--", "openssl", "x509",
+         "-in", wsl_path(client_cert), "-noout", "-startdate"],
+        capture_output=True, text=True, timeout=15, check=True,
+    ).stdout.strip()
+    if not validity.startswith("notBefore="):
+        raise AssertionError("Synthetic client certificate validity is unavailable")
+    not_before = datetime.strptime(
+        validity.removeprefix("notBefore="), "%b %d %H:%M:%S %Y GMT"
+    ).replace(tzinfo=timezone.utc).timestamp()
+    wait = max(0, not_before - time.time() + 0.5)
+    if wait > 30:
+        raise AssertionError("Windows/WSL certificate clock skew exceeds 30 seconds")
+    time.sleep(wait)
+    return {
+        "ca": (ca_cert, ca_key),
+        "client": (client_cert, client_key),
+        "server": (server_cert, server_key),
+    }
+
+
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
+
+    def __init__(self, tracks, certificates=None):
+        super().__init__(("127.0.0.1", 0), Handler)
+        self.secure = certificates is not None
+        if certificates:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(*map(str, certificates["server"]))
+            context.load_verify_locations(cafile=str(certificates["ca"][0]))
+            context.verify_mode = ssl.CERT_OPTIONAL
+            self.socket = context.wrap_socket(self.socket, server_side=True)
+        self.tracks = tracks
+        self.lock = threading.Lock()
+        self.requests = []
+        self.early_hints_roles = set()
+        self.short_initial_roles = set()
+        self.short_initial_bytes = 2048
+        self.pause_first_body_role = None
+        self.first_body_held = threading.Event()
+        self.release_first_body = threading.Event()
+        self.release_first_body.set()
+        self.hold_followup_role = None
+        self.followup_requested = threading.Event()
+        self.release_followup_headers = threading.Event()
+        self.release_followup_headers.set()
+        self.redirect = None
+        self.bad_range = None
+        self.deny = None
+        self.deny_code = 412
+        self.arm_failure = None
+        self.arm_code = 412
+        self.redirect_hits = 0
+        self.error_body_bytes = 0
+        self.error_headers = threading.Event()
+        self.release_error_body = threading.Event()
+        self.video_header_bytes = first_fragment_offset(tracks["video"])
+        self.hold_video_body = False
+        self.video_body_blocked = threading.Event()
+        self.release_video_body = threading.Event()
+        self.release_video_body.set()
+        self.hold_audio_body = False
+        self.audio_body_blocked = threading.Event()
+        self.release_audio_body = threading.Event()
+        self.release_audio_body.set()
+        self.active = 0
+
+    def record(self, role, start, status, headers, has_client_cert):
+        with self.lock:
+            self.requests.append((role, start, status,
+                                  headers.get("User-Agent"),
+                                  headers.get("Referer"),
+                                  headers.get("Cookie"), has_client_cert))
+
+    def requests_for(self, role):
+        with self.lock:
+            return [r for r in self.requests if r[0] == role]
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_args):
+        pass
+
+    def do_GET(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/redirect-target":
+            with self.server.lock:
+                self.server.redirect_hits += 1
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        role = path.removeprefix("/")
+        if role not in self.server.tracks:
+            self.send_error(404)
+            return
+
+        requested = self.headers.get("Range", "")
+        match = re.fullmatch(r"bytes=(\d+)-(\d*)", requested)
+        if not match:
+            self.send_error(416)
+            return
+        data = self.server.tracks[role]
+        start = int(match[1])
+        end = min(int(match[2]) if match[2] else len(data) - 1, len(data) - 1)
+        if self.server.hold_video_body and role == "video" and start == 0:
+            end = min(end, self.server.video_header_bytes - 1)
+        if role in self.server.short_initial_roles and start == 0:
+            end = min(end, self.server.short_initial_bytes - 1)
+        if start > end:
+            self.send_error(416)
+            return
+        if self.server.hold_followup_role == role and start > 0:
+            self.server.followup_requested.set()
+            if not self.server.release_followup_headers.wait(10):
+                return
+
+        if self.server.redirect == role:
+            code = 302
+        elif self.server.deny == role:
+            code = self.server.deny_code
+        elif self.server.arm_failure == role and start > 0:
+            code = self.server.arm_code
+        else:
+            code = 206
+        client_cert = (
+            isinstance(self.connection, ssl.SSLSocket) and
+            bool(self.connection.getpeercert(binary_form=True))
+        )
+        self.server.record(role, start, code, self.headers, client_cert)
+        with self.server.lock:
+            self.server.active += 1
+        try:
+            if role in self.server.early_hints_roles:
+                self.send_response_only(103, "Early Hints")
+                self.send_header("Link", "</unused>; rel=preload")
+                self.end_headers()
+                self.wfile.flush()
+            self.send_response(code)
+            if code == 302:
+                self.send_header(
+                    "Location",
+                    f"http://127.0.0.1:{self.server.server_port}/redirect-target",
+                )
+                self.send_header("Content-Length", "0")
+            elif code in (401, 403, 404, 412):
+                self.send_header("Content-Length", "64")
+            else:
+                self.send_header("Content-Type", f"{role}/mp4")
+                self.send_header("Accept-Ranges", "bytes")
+                actual_start = start + 1 if self.server.bad_range == role else start
+                self.send_header(
+                    "Content-Range", f"bytes {actual_start}-{end}/{len(data)}"
+                )
+                self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if code == 206:
+                if self.server.pause_first_body_role == role and start == 0:
+                    self.server.first_body_held.set()
+                    if not self.server.release_first_body.wait(15):
+                        return
+                if (self.server.hold_video_body and role == "video" and
+                    end >= self.server.video_header_bytes):
+                    self.server.video_body_blocked.set()
+                    if not self.server.release_video_body.wait(15):
+                        return
+                if self.server.hold_audio_body and role == "audio":
+                    self.server.audio_body_blocked.set()
+                    if not self.server.release_audio_body.wait(15):
+                        return
+                self.wfile.write(data[start:end + 1])
+            elif code in (401, 403, 404, 412):
+                self.server.error_headers.set()
+                if self.server.release_error_body.wait(10):
+                    self.wfile.write(bytes(64))
+                    with self.server.lock:
+                        self.server.error_body_bytes += 64
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
+                ssl.SSLEOFError):
+            pass
+        finally:
+            self.close_connection = True
+            with self.server.lock:
+                self.server.active -= 1
+
+
+@contextlib.contextmanager
+def serve(tracks, certificates=None):
+    server = Server(tracks, certificates)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.release_error_body.set()
+        server.release_video_body.set()
+        server.release_audio_body.set()
+        server.release_first_body.set()
+        server.release_followup_headers.set()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            with server.lock:
+                if server.active == 0:
+                    break
+            time.sleep(0.02)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+        with server.lock:
+            if server.active:
+                raise AssertionError("Media request survived native session teardown")
+
+
+def configure_library(mpv):
+    mpv.mpv_client_api_version.restype = ctypes.c_ulong
+    mpv.mpv_create.restype = ctypes.c_void_p
+    mpv.mpv_initialize.argtypes = [ctypes.c_void_p]
+    mpv.mpv_set_option_string.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+    mpv.mpv_request_log_messages.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    mpv.mpv_dash_source_load.argtypes = [ctypes.c_void_p, ctypes.POINTER(Source)]
+    mpv.mpv_dash_source_get_status.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(Status)]
+    mpv.mpv_dash_source_get_frame_status.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(FrameStatus)]
+    mpv.mpv_acquire_d3d11_composition_surface.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(CompositionSurface)]
+    mpv.mpv_release_d3d11_composition_surface.argtypes = [
+        ctypes.POINTER(CompositionSurface)]
+    mpv.mpv_release_d3d11_composition_surface.restype = None
+    mpv.mpv_wait_event.argtypes = [ctypes.c_void_p, ctypes.c_double]
+    mpv.mpv_wait_event.restype = ctypes.POINTER(Event)
+    mpv.mpv_command.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p)]
+    mpv.mpv_get_property_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    mpv.mpv_get_property_string.restype = ctypes.c_void_p
+    mpv.mpv_free.argtypes = [ctypes.c_void_p]
+    mpv.mpv_terminate_destroy.argtypes = [ctypes.c_void_p]
+
+
+@contextlib.contextmanager
+def client(mpv, overrides=None):
+    if os.getenv("DASH_TEST_DEBUG"):
+        print("[dash] create core", flush=True)
+    handle = mpv.mpv_create()
+    if not handle:
+        raise AssertionError("mpv_create failed")
+    try:
+        settings = {
+            "config": "no", "load-scripts": "no", "terminal": "no",
+            "ytdl": "no",
+            "vo": "null", "ao": "null", "pause": "yes",
+            "network-timeout": "6", "stream-buffer-size": "128KiB",
+            "curl-buffer-size": "32KiB", "demuxer-readahead-secs": "1",
+            "demuxer-max-bytes": "128KiB", "demuxer-max-back-bytes": "128KiB",
+            "keep-open": "yes", "hwdec": "no",
+        }
+        settings.update(overrides or {})
+        for name, value in settings.items():
+            result = mpv.mpv_set_option_string(
+                handle, name.encode(), value.encode())
+            if result < 0:
+                raise AssertionError(f"Option {name} rejected: {result}")
+        if mpv.mpv_request_log_messages(handle, b"trace") < 0:
+            raise AssertionError("Could not subscribe to log messages")
+        if mpv.mpv_initialize(handle) < 0:
+            raise AssertionError("Could not initialize mpv")
+        if os.getenv("DASH_TEST_DEBUG"):
+            print("[dash] initialized core", flush=True)
+        yield handle
+    finally:
+        if os.getenv("DASH_TEST_DEBUG"):
+            print("[dash] terminate core", flush=True)
+        worker = threading.Thread(
+            target=mpv.mpv_terminate_destroy, args=(handle,), daemon=True)
+        worker.start()
+        worker.join(timeout=8)
+        if worker.is_alive():
+            raise AssertionError("Native DASH termination exceeded 8 seconds")
+        if os.getenv("DASH_TEST_DEBUG"):
+            print("[dash] terminated core", flush=True)
+
+
+def source_for(server):
+    scheme = "https" if server.secure else "http"
+    origin = f"{scheme}://127.0.0.1:{server.server_port}"
+    tracks = []
+    for role, codec, dimensions in (
+        ("video", b"avc1.42E01E", (160, 90)),
+        ("audio", b"mp4a.40.2", (0, 0)),
+    ):
+        tracks.append(Track(
+            ctypes.sizeof(Track), 0,
+            f"{origin}/{role}?ticket={MARKER.decode()}".encode(),
+            f"{role}/mp4".encode(), codec, 160000, 64, *dimensions,
+            Range(), Range(),
+        ))
+    return Source(
+        ctypes.sizeof(Source), VERSION, ALLOW_LOOPBACK, 0,
+        *tracks, 18.0, b"mpv-dash-local", b"https://example.invalid/",
+    )
+
+
+def snapshot(mpv, handle):
+    state = Status()
+    state.struct_size = ctypes.sizeof(Status)
+    state.api_version = VERSION
+    result = mpv.mpv_dash_source_get_status(handle, ctypes.byref(state))
+    if result != 0:
+        raise AssertionError(f"Status failed: {result}")
+    return state
+
+
+def frame_snapshot(mpv, handle):
+    state = FrameStatus()
+    state.struct_size = ctypes.sizeof(FrameStatus)
+    state.api_version = VERSION
+    result = mpv.mpv_dash_source_get_frame_status(handle, ctypes.byref(state))
+    if result != 0:
+        raise AssertionError(f"Frame status failed: {result}")
+    return state
+
+
+def prop(mpv, handle, name):
+    ptr = mpv.mpv_get_property_string(handle, name.encode())
+    if not ptr:
+        return None
+    try:
+        return ctypes.string_at(ptr).decode(errors="replace")
+    finally:
+        mpv.mpv_free(ptr)
+
+
+def command(mpv, handle, *args):
+    argv = (ctypes.c_char_p * (len(args) + 1))(
+        *(arg.encode() for arg in args), None)
+    result = mpv.mpv_command(handle, argv)
+    if result < 0:
+        raise AssertionError(f"Command {args[0]} failed: {result}")
+
+
+def await_event(mpv, handle, wanted, timeout=12):
+    deadline = time.monotonic() + timeout
+    event_counts = {}
+    recent_logs = []
+    while time.monotonic() < deadline:
+        event = mpv.mpv_wait_event(handle, 0.05).contents
+        event_counts[event.event_id] = event_counts.get(event.event_id, 0) + 1
+        if event.event_id == LOG_MESSAGE:
+            message = ctypes.cast(
+                event.data, ctypes.POINTER(LogMessage)).contents
+            text = ctypes.string_at(message.text)
+            if MARKER in text:
+                raise AssertionError("Private media URL appeared in a native log")
+            if os.getenv("DASH_TEST_DEBUG"):
+                safe = re.sub(r"\S+://\S+", "[uri]",
+                              text.decode(errors="replace").strip())
+                recent_logs.append(safe[:160])
+                recent_logs = recent_logs[-25:]
+        if event.event_id in (FILE_LOADED, END_FILE):
+            if event.event_id != wanted:
+                raise AssertionError(
+                    f"Unexpected event {event.event_id}; "
+                    f"phase={snapshot(mpv, handle).phase}, "
+                    f"failure={snapshot(mpv, handle).failure}"
+                )
+            return event
+        if wanted == END_FILE and snapshot(mpv, handle).phase == FAILED:
+            # The core's terminal event should follow the status promptly.
+            continue
+    state = snapshot(mpv, handle)
+    if os.getenv("DASH_TEST_DEBUG"):
+        result = []
+
+        def get_core_status():
+            result.append(prop(mpv, handle, "pause"))
+
+        worker = threading.Thread(target=get_core_status, daemon=True)
+        worker.start()
+        worker.join(2)
+        print(f"[dash] timeout events={event_counts}, "
+              f"core_responsive={not worker.is_alive()}, "
+              f"pause={result[0] if result else None}", flush=True)
+        print("[dash] latest sanitized logs=" + repr(recent_logs), flush=True)
+    raise AssertionError(f"Timed out awaiting event {wanted}; "
+                         f"phase={state.phase}, failure={state.failure}")
+
+
+def assert_private(mpv, handle):
+    for name in ("path", "stream-open-filename", "audio-files",
+                 "track-list/0/external-filename"):
+        value = prop(mpv, handle, name)
+        if value and MARKER.decode() in value:
+            raise AssertionError(f"Property {name} exposed media URL")
+
+
+def assert_headers(server):
+    for role in ("video", "audio"):
+        requests = server.requests_for(role)
+        if not requests:
+            raise AssertionError(f"No HTTP Range response for {role}")
+        for entry in requests:
+            if entry[3] != "mpv-dash-local" or \
+                    entry[4] != "https://example.invalid/" or entry[5]:
+                raise AssertionError(f"Unexpected {role} request headers")
+
+
+def test_invalid(mpv, server):
+    with client(mpv) as handle:
+        assert snapshot(mpv, handle).phase == IDLE
+        empty_frame = frame_snapshot(mpv, handle)
+        assert not empty_frame.source_generation
+        assert not empty_frame.presented_frame_serial
+        bad_frame = FrameStatus()
+        bad_frame.struct_size = 0
+        bad_frame.api_version = VERSION
+        assert mpv.mpv_dash_source_get_frame_status(
+            handle, ctypes.byref(bad_frame)) == INVALID
+        bad_frame.struct_size = ctypes.sizeof(FrameStatus)
+        bad_frame.api_version = VERSION + 1
+        assert mpv.mpv_dash_source_get_frame_status(
+            handle, ctypes.byref(bad_frame)) == INVALID
+        source = source_for(server)
+        source.api_version = VERSION + 1
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        source = source_for(server)
+        source.video.struct_size = 0
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        source = source_for(server)
+        source.audio.url = None
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        source = source_for(server)
+        source.video.url = b"http://localhost:99/fake"
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        source.video.url = b"https://user@example.invalid/fake"
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        source = source_for(server)
+        source.user_agent = b"safe\r\nCookie: fake"
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        source = source_for(server)
+        source.referer = b"http://127.0.0.1/"
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        source = source_for(server)
+        source.video.flags = SEGMENT_BASE
+        source.video.initialization = Range(-1, 20)
+        source.video.index = Range(21, 40)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        source.video.initialization = Range(10, 20)
+        source.video.index = Range(20, 40)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        source.video.index = Range(21, 40)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == UNSUPPORTED
+        source.video.flags = 0
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        assert snapshot(mpv, handle).generation == 0
+    assert not server.requests
+
+
+def test_playback(mpv, server):
+    with client(mpv) as handle:
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        source.video.url = b"https://example.invalid/replaced"
+        source.audio.url = b"https://example.invalid/replaced"
+        source.user_agent = b"replaced"
+        source.referer = b"https://example.invalid/replaced"
+        gc.collect()
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == UNSUPPORTED
+        await_event(mpv, handle, FILE_LOADED)
+        state = snapshot(mpv, handle)
+        assert state.phase == BOUND, (state.phase, state.failure)
+        frame = frame_snapshot(mpv, handle)
+        assert frame.source_generation == state.generation
+        assert not frame.presented_frame_serial, \
+            "FILE_LOADED on a headless VO cannot mean Composition first frame"
+        assert state.video_http_status == state.audio_http_status == 206
+        assert prop(mpv, handle, "vid") not in (None, "no")
+        assert prop(mpv, handle, "aid") not in (None, "no")
+        assert_private(mpv, handle)
+        command(mpv, handle, "seek", "8", "absolute+exact")
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            mpv.mpv_wait_event(handle, 0.05)
+            pos = prop(mpv, handle, "time-pos")
+            if pos and abs(float(pos) - 8) <= 0.25:
+                break
+        else:
+            raise AssertionError("Typed dual-track seek failed")
+        if os.getenv("DASH_TEST_DEBUG"):
+            names = ("video-params/w", "audio-params/samplerate",
+                     "audio-out-params/samplerate")
+            print("[dash] decoder properties=" +
+                  repr({name: prop(mpv, handle, name) for name in names}),
+                  flush=True)
+        assert prop(mpv, handle, "video-params/w") == "160"
+        assert prop(mpv, handle, "audio-params/samplerate") == "48000"
+        assert prop(mpv, handle, "audio-out-params/samplerate") == "48000"
+        assert snapshot(mpv, handle).phase == BOUND
+        assert not frame_snapshot(mpv, handle).presented_frame_serial
+        command(mpv, handle, "stop")
+        await_event(mpv, handle, END_FILE)
+        assert snapshot(mpv, handle).phase == STOPPED
+    assert_headers(server)
+    return state.generation
+
+
+def test_generic(mpv, server):
+    with client(mpv) as handle:
+        command(mpv, handle, "loadfile",
+                f"http://127.0.0.1:{server.server_port}/video")
+        await_event(mpv, handle, FILE_LOADED)
+        assert snapshot(mpv, handle).phase == IDLE
+        assert not frame_snapshot(mpv, handle).source_generation
+        assert prop(mpv, handle, "vid") not in (None, "no")
+        command(mpv, handle, "stop")
+        await_event(mpv, handle, END_FILE)
+        assert snapshot(mpv, handle).generation == 0
+
+
+def test_invalid_alias(mpv, server):
+    for alias in ("dash://unknown", "DASH://unknown",
+                  "dash://video?unexpected"):
+        with client(mpv) as handle:
+            command(mpv, handle, "loadfile", alias)
+            event = await_event(mpv, handle, END_FILE)
+            assert ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents.reason == END_ERROR
+            assert snapshot(mpv, handle).phase == IDLE
+            command(mpv, handle, "stop")
+    assert not server.requests
+
+
+def test_short_first_range(mpv, server, role):
+    server.short_initial_roles.add(role)
+    server.hold_followup_role = role
+    server.release_followup_headers.clear()
+    with client(mpv) as handle:
+        try:
+            source = source_for(server)
+            assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+            deadline = time.monotonic() + 8
+            while not server.followup_requested.is_set() and time.monotonic() < deadline:
+                event = mpv.mpv_wait_event(handle, 0.05).contents
+                if event.event_id == END_FILE:
+                    raise AssertionError("First valid short 206 rejected before followup")
+            assert server.followup_requested.is_set(), "No short-range continuation"
+            state = snapshot(mpv, handle)
+            assert (state.video_http_status if role == "video" else
+                    state.audio_http_status) == 206
+            time.sleep(0.1)
+            assert snapshot(mpv, handle).failure == 0
+        finally:
+            server.release_followup_headers.set()
+        await_event(mpv, handle, FILE_LOADED)
+        state = snapshot(mpv, handle)
+        assert state.phase == BOUND
+        assert (state.video_responses if role == "video" else
+                state.audio_responses) >= 2
+        command(mpv, handle, "stop")
+        await_event(mpv, handle, END_FILE)
+
+
+def test_stop_before_short_continuation(mpv, server, role):
+    server.short_initial_roles.add(role)
+    server.pause_first_body_role = role
+    server.release_first_body.clear()
+    with client(mpv) as handle:
+        try:
+            source = source_for(server)
+            assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+            deadline = time.monotonic() + 10
+            while not server.first_body_held.is_set() and time.monotonic() < deadline:
+                event = mpv.mpv_wait_event(handle, 0.05).contents
+                if event.event_id in (FILE_LOADED, END_FILE):
+                    raise AssertionError("Playback advanced before short 206 body was held")
+            assert server.first_body_held.is_set()
+            initial = snapshot(mpv, handle)
+            assert (initial.video_http_status if role == "video" else
+                    initial.audio_http_status) == 206
+            assert len(server.requests_for(role)) == 1
+            command(mpv, handle, "stop")
+            stopped = snapshot(mpv, handle)
+            assert stopped.phase == STOPPED and stopped.failure == 0
+            with server.lock:
+                count_at_stop = len(server.requests)
+            server.release_first_body.set()
+            event = await_event(mpv, handle, END_FILE)
+            assert ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents.reason == 2
+            time.sleep(0.2)
+            with server.lock:
+                assert len(server.requests) == count_at_stop, \
+                    "A new media GET began after STOPPED"
+            after = snapshot(mpv, handle)
+            assert after.phase == STOPPED and after.failure == 0
+            assert after.video_http_status == stopped.video_http_status
+            assert after.audio_http_status == stopped.audio_http_status
+            assert after.video_responses == stopped.video_responses
+            assert after.audio_responses == stopped.audio_responses
+        finally:
+            server.release_first_body.set()
+
+
+def test_exact_on_done_stop(mpv, server, role):
+    server.short_initial_roles.add(role)
+    track = VIDEO if role == "video" else AUDIO
+    with client(mpv) as handle:
+        control = mpv.mpv_dash_test_control
+        assert control(handle, TEST_ARM, track) == 0
+        try:
+            source = source_for(server)
+            assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+            mpv.mpv_wait_event(handle, 0)
+            assert control(handle, TEST_WAIT, 8000) == 1, \
+                "Clean short 206 did not reach on_done continuation branch"
+            assert control(handle, TEST_SUCCESS_BRANCHES, 0) == 1
+            initial = snapshot(mpv, handle)
+            assert (initial.video_http_status if role == "video" else
+                    initial.audio_http_status) == 206
+            assert len(server.requests_for(role)) == 1
+
+            command(mpv, handle, "stop")
+            stopped = snapshot(mpv, handle)
+            assert stopped.phase == STOPPED and stopped.failure == 0
+            with server.lock:
+                count_at_stop = len(server.requests)
+            assert control(handle, TEST_RELEASE, 0) == 0
+            deadline = time.monotonic() + 8
+            while (control(handle, TEST_BLOCKED_CONTINUATIONS, 0) < 1 and
+                   time.monotonic() < deadline):
+                time.sleep(0.01)
+            assert control(handle, TEST_BLOCKED_CONTINUATIONS, 0) >= 1, \
+                "Stopped source did not reject on_done's next Range"
+            assert control(handle, TEST_ADDED_AFTER_STOP, 0) == 0
+            event = await_event(mpv, handle, END_FILE)
+            assert ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents.reason == 2
+            time.sleep(0.2)
+            with server.lock:
+                assert len(server.requests) == count_at_stop, \
+                    "Curl issued a GET after on_done resumed against STOPPED"
+            after = snapshot(mpv, handle)
+            assert after.phase == STOPPED and after.failure == 0
+            assert after.video_responses == stopped.video_responses
+            assert after.audio_responses == stopped.audio_responses
+        finally:
+            control(handle, TEST_RELEASE, 0)
+
+
+def test_stop_before_late_risk(mpv, server):
+    server.short_initial_roles.add("video")
+    server.hold_followup_role = "video"
+    server.release_followup_headers.clear()
+    with client(mpv) as handle:
+        try:
+            source = source_for(server)
+            assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+            deadline = time.monotonic() + 10
+            while not server.followup_requested.is_set() and time.monotonic() < deadline:
+                event = mpv.mpv_wait_event(handle, 0.05).contents
+                assert event.event_id not in (FILE_LOADED, END_FILE)
+            assert server.followup_requested.is_set()
+            command(mpv, handle, "stop")
+            assert snapshot(mpv, handle).phase == STOPPED
+            with server.lock:
+                count_at_stop = len(server.requests)
+            server.deny = "video"
+            server.release_followup_headers.set()
+            event = await_event(mpv, handle, END_FILE)
+            assert ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents.reason == 2
+            time.sleep(0.2)
+            with server.lock:
+                assert len(server.requests) <= count_at_stop + 1
+            state = snapshot(mpv, handle)
+            assert state.phase == STOPPED and state.failure == 0
+            assert state.video_http_status == 206
+            assert state.video_responses == 1
+        finally:
+            server.release_followup_headers.set()
+
+
+def test_risk_latched_before_stop(mpv, server):
+    server.deny = "video"
+    with client(mpv) as handle:
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        deadline = time.monotonic() + 10
+        while snapshot(mpv, handle).failure != RISK and time.monotonic() < deadline:
+            mpv.mpv_wait_event(handle, 0.05)
+        assert snapshot(mpv, handle).failure == RISK
+        command(mpv, handle, "stop")
+        state = snapshot(mpv, handle)
+        assert state.phase == FAILED and state.failure == RISK
+        assert state.video_http_status == 412
+    assert len(server.requests_for("video")) == 1
+
+
+def test_stop_queued(mpv, server):
+    with client(mpv) as handle:
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        assert snapshot(mpv, handle).phase == QUEUED
+        command(mpv, handle, "stop")
+        state = snapshot(mpv, handle)
+        assert state.phase == STOPPED and state.failure == 0
+        deadline = time.monotonic() + 0.3
+        while time.monotonic() < deadline:
+            event = mpv.mpv_wait_event(handle, 0.03).contents
+            assert event.event_id != FILE_LOADED
+        assert snapshot(mpv, handle).phase == STOPPED
+    assert not server.requests
+
+
+def test_stop_while_opening(mpv, server, role):
+    if role == "video":
+        server.hold_video_body = True
+        server.release_video_body.clear()
+        blocked = server.video_body_blocked
+        release = server.release_video_body
+    else:
+        server.hold_audio_body = True
+        server.release_audio_body.clear()
+        blocked = server.audio_body_blocked
+        release = server.release_audio_body
+    with client(mpv) as handle:
+        try:
+            source = source_for(server)
+            assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+            deadline = time.monotonic() + 10
+            while not blocked.is_set() and time.monotonic() < deadline:
+                event = mpv.mpv_wait_event(handle, 0.05).contents
+                assert event.event_id not in (FILE_LOADED, END_FILE)
+            assert blocked.is_set(), f"{role} opener was not blocked on media"
+            command(mpv, handle, "stop")
+            event = await_event(mpv, handle, END_FILE)
+            assert ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents.reason == 2
+            state = snapshot(mpv, handle)
+            assert state.phase == STOPPED and state.failure == 0
+            assert state.failed_track == 0
+            assert not frame_snapshot(mpv, handle).presented_frame_serial
+        finally:
+            release.set()
+
+
+def test_tls_certificate_isolation(mpv, server, certificates, typed):
+    options = {
+        "tls-verify": "no",
+        "tls-cert-file": str(certificates["client"][0]),
+        "tls-key-file": str(certificates["client"][1]),
+        "curl-enabled": "yes",
+    }
+    with client(mpv, options) as handle:
+        if typed:
+            source = source_for(server)
+            assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        else:
+            command(mpv, handle, "loadfile",
+                    f"https://127.0.0.1:{server.server_port}/video")
+        await_event(mpv, handle, FILE_LOADED)
+        if typed:
+            assert snapshot(mpv, handle).phase == BOUND
+            for role in ("video", "audio"):
+                assert server.requests_for(role)
+                assert all(not entry[6] for entry in server.requests_for(role))
+        else:
+            assert any(entry[6] for entry in server.requests_for("video")), \
+                "Generic TLS control did not present its configured client certificate"
+        command(mpv, handle, "stop")
+        await_event(mpv, handle, END_FILE)
+
+
+def test_composition_first_frame(mpv, server, previous_generation,
+                                 previous_serial):
+    options = {
+        "vo": "gpu-next", "gpu-api": "d3d11", "d3d11-warp": "yes",
+        "d3d11-output-mode": "composition",
+        "d3d11-composition-size": "160x90",
+    }
+    with client(mpv, options) as handle:
+        assert prop(mpv, handle, "options/d3d11-output-mode") == "composition"
+        assert not frame_snapshot(mpv, handle).presented_frame_serial
+        source = source_for(server)
+        server.hold_video_body = True
+        server.release_video_body.clear()
+        saw_file_loaded = False
+        try:
+            assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+            deadline = time.monotonic() + 10
+            while not server.video_body_blocked.is_set() and time.monotonic() < deadline:
+                event = mpv.mpv_wait_event(handle, 0.05).contents
+                if event.event_id == LOG_MESSAGE:
+                    message = ctypes.cast(
+                        event.data, ctypes.POINTER(LogMessage)).contents
+                    if MARKER in ctypes.string_at(message.text):
+                        raise AssertionError("Private media URL appeared in a native log")
+                if event.event_id == FILE_LOADED:
+                    saw_file_loaded = True
+                    assert not frame_snapshot(mpv, handle).presented_frame_serial
+                if event.event_id == END_FILE:
+                    raise AssertionError("Composition stopped before video media was released")
+            if not server.video_body_blocked.is_set():
+                raise AssertionError("Fixture did not isolate video header from first media fragment")
+            time.sleep(0.1)
+            before = frame_snapshot(mpv, handle)
+            before_source = snapshot(mpv, handle)
+            before_surface = CompositionSurface()
+            assert mpv.mpv_acquire_d3d11_composition_surface(
+                handle, ctypes.byref(before_surface)) == 0
+            if os.getenv("DASH_TEST_DEBUG"):
+                print("[dash] held-video pre-Present: " +
+                      repr((saw_file_loaded, before_source.phase,
+                            bool(before_surface.swapchain),
+                            before_surface.epoch,
+                            before.presented_frame_serial)), flush=True)
+            mpv.mpv_release_d3d11_composition_surface(
+                ctypes.byref(before_surface))
+            assert before.source_generation > previous_generation
+            assert not before.presented_generation
+            assert not before.presented_frame_serial
+            assert not before.presented_surface_epoch
+        finally:
+            server.release_video_body.set()
+        if not saw_file_loaded:
+            await_event(mpv, handle, FILE_LOADED, 20)
+        started = time.monotonic()
+        resumed = False
+        ready = False
+        while time.monotonic() - started < 20:
+            event = mpv.mpv_wait_event(handle, 0.05).contents
+            if event.event_id == LOG_MESSAGE:
+                message = ctypes.cast(
+                    event.data, ctypes.POINTER(LogMessage)).contents
+                if MARKER in ctypes.string_at(message.text):
+                    raise AssertionError("Private media URL appeared in a native log")
+            if event.event_id == END_FILE:
+                raise AssertionError("Native Composition ended before a real frame")
+            state = snapshot(mpv, handle)
+            frame = frame_snapshot(mpv, handle)
+            surface = CompositionSurface()
+            result = mpv.mpv_acquire_d3d11_composition_surface(
+                handle, ctypes.byref(surface))
+            if result != 0:
+                raise AssertionError(f"Composition acquire failed: {result}")
+            try:
+                if (state.phase == BOUND and state.video_http_status == 206 and
+                    state.audio_http_status == 206 and
+                    frame.source_generation == state.generation and
+                    frame.presented_generation == state.generation and
+                    frame.presented_frame_serial and
+                    frame.presented_surface_epoch == surface.epoch and
+                    surface.swapchain and
+                    prop(mpv, handle, "video-params/w") == "160" and
+                    prop(mpv, handle, "audio-out-params/samplerate") == "48000"):
+                    ready = True
+                    break
+            finally:
+                mpv.mpv_release_d3d11_composition_surface(
+                    ctypes.byref(surface))
+                assert not surface.swapchain
+            if not resumed and time.monotonic() - started > 2:
+                command(mpv, handle, "set", "pause", "no")
+                resumed = True
+        if not ready:
+            frame = frame_snapshot(mpv, handle)
+            raise AssertionError(
+                "No native Composition video Present with both tracks and "
+                f"lease: generation={frame.source_generation}, "
+                f"serial={frame.presented_frame_serial}, "
+                f"epoch={frame.presented_surface_epoch}"
+            )
+        assert frame.source_generation > previous_generation
+        assert frame.presented_frame_serial > previous_serial
+        first_serial = frame.presented_frame_serial
+        first_epoch = frame.presented_surface_epoch
+        command(mpv, handle, "set", "pause", "no")
+        command(mpv, handle, "seek", "8", "absolute+exact")
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            event = mpv.mpv_wait_event(handle, 0.05).contents
+            if event.event_id == LOG_MESSAGE:
+                message = ctypes.cast(
+                    event.data, ctypes.POINTER(LogMessage)).contents
+                if MARKER in ctypes.string_at(message.text):
+                    raise AssertionError("Private media URL appeared in a native log")
+            if event.event_id == END_FILE:
+                raise AssertionError("Composition stopped during seek")
+            next_frame = frame_snapshot(mpv, handle)
+            if (next_frame.presented_frame_serial > first_serial and
+                next_frame.presented_surface_epoch == first_epoch and
+                next_frame.presented_generation == frame.source_generation):
+                break
+        else:
+            raise AssertionError("Composition frame serial did not increase after seek")
+        last_serial = frame_snapshot(mpv, handle).presented_frame_serial
+        command(mpv, handle, "stop")
+        await_event(mpv, handle, END_FILE)
+        stopped = frame_snapshot(mpv, handle)
+        assert stopped.source_generation == frame.source_generation
+        assert not stopped.presented_frame_serial
+        assert not stopped.presented_surface_epoch
+        surface = CompositionSurface()
+        assert mpv.mpv_acquire_d3d11_composition_surface(
+            handle, ctypes.byref(surface)) == 0
+        assert not surface.swapchain
+        assert surface.epoch > first_epoch
+    assert_headers(server)
+    return stopped.source_generation, last_serial
+
+
+def test_failure(mpv, server, failed_role, expected):
+    with client(mpv) as handle:
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        event = await_event(mpv, handle, END_FILE)
+        result = ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents
+        assert result.reason == END_ERROR, result.reason
+        state = snapshot(mpv, handle)
+        assert state.phase == FAILED and state.failure == expected, \
+            (state.phase, state.failure, expected)
+        assert not frame_snapshot(mpv, handle).presented_frame_serial
+        assert state.failed_track == (VIDEO if failed_role == "video" else AUDIO)
+        assert not prop(mpv, handle, "video-params/w")
+        if expected in (RISK, AUTH):
+            assert server.error_headers.is_set()
+            assert server.error_body_bytes == 0, "Error body was delivered"
+    assert len(server.requests_for(failed_role)) == 1
+
+
+def test_late_status(mpv, server, role, code, failure):
+    with client(mpv) as handle:
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        await_event(mpv, handle, FILE_LOADED)
+        before = len(server.requests_for(role))
+        server.arm_failure = role
+        if os.getenv("DASH_TEST_DEBUG"):
+            print(f"[dash] armed late {role}, prior responses={before}", flush=True)
+        command(mpv, handle, "seek", "15", "absolute+exact")
+        try:
+            event = await_event(mpv, handle, END_FILE, 12)
+        except AssertionError:
+            if os.getenv("DASH_TEST_DEBUG"):
+                requests = [(item[1], item[2])
+                            for item in server.requests_for(role)]
+                print(f"[dash] late {role} response positions={requests}",
+                      flush=True)
+            raise
+        result = ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents
+        state = snapshot(mpv, handle)
+        assert result.reason == END_ERROR
+        assert state.phase == FAILED and state.failure == failure, \
+            (state.phase, state.failure)
+        assert state.failed_track == (VIDEO if role == "video" else AUDIO)
+        assert (state.video_http_status if role == "video" else
+                state.audio_http_status) == code
+        assert len(server.requests_for(role)) > before
+        assert server.error_headers.is_set() and server.error_body_bytes == 0
+        count = len(server.requests_for(role))
+        time.sleep(0.2)
+        assert len(server.requests_for(role)) == count, "Terminal HTTP was retried"
+
+
+def main():
+    scheduler = len(sys.argv) == 3 and sys.argv[2] == "--scheduler"
+    if not (len(sys.argv) == 2 or scheduler):
+        raise SystemExit("usage: python test/libmpv_dash_source.py "
+                         "build/local-libmpv/x86_64 [--scheduler]")
+    runtime = Path(sys.argv[1]).resolve()
+    directory = runtime / f"dash-generated-{os.getpid()}"
+    if not runtime.is_dir() or not (runtime / "libmpv-2.dll").is_file():
+        raise AssertionError("Locally built x64 runtime directory required")
+    directory.mkdir()
+    try:
+        if os.getenv("DASH_TEST_DEBUG"):
+            faulthandler.dump_traceback_later(30)
+        print("[dash] generate legal local fMP4 tracks", flush=True)
+        tracks = generate_tracks(directory)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(os.add_dll_directory(str(runtime)))
+            mpv = ctypes.CDLL(str(runtime / "libmpv-2.dll"))
+            configure_library(mpv)
+            if scheduler:
+                if not hasattr(mpv, "mpv_dash_test_control"):
+                    raise AssertionError("Test-only scheduler symbol is missing")
+                mpv.mpv_dash_test_control.argtypes = [
+                    ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+                mpv.mpv_dash_test_control.restype = ctypes.c_int
+                for role in ("video", "audio"):
+                    print(f"[dash] exact on_done(CURLE_OK) STOPPED {role}",
+                          flush=True)
+                    with serve(tracks) as server:
+                        test_exact_on_done_stop(mpv, server, role)
+                with serve(tracks) as server:
+                    test_risk_latched_before_stop(mpv, server)
+                print("DASH_TEST_ONLY_EXACT_ON_DONE_INTERLEAVE_PASS")
+                return
+            if hasattr(mpv, "mpv_dash_test_control"):
+                raise AssertionError("Production DLL exposes a test-only hook")
+            assert mpv.mpv_client_api_version() == (2 << 16) | 8
+            print("[dash] invalid descriptor", flush=True)
+            with serve(tracks) as server:
+                test_invalid(mpv, server)
+            print("[dash] invalid DASH alias fails without native abort", flush=True)
+            with serve(tracks) as server:
+                test_invalid_alias(mpv, server)
+            print("[dash] dual track and seek", flush=True)
+            with serve(tracks) as server:
+                previous_generation = test_playback(mpv, server)
+            print("[dash] existing generic HTTP path", flush=True)
+            with serve(tracks) as server:
+                test_generic(mpv, server)
+            for role in ("video", "audio"):
+                print(f"[dash] short first 206 {role} still opens", flush=True)
+                with serve(tracks) as server:
+                    test_short_first_range(mpv, server, role)
+            for role in ("video", "audio"):
+                print(f"[dash] stop before short 206 {role} continuation", flush=True)
+                with serve(tracks) as server:
+                    test_stop_before_short_continuation(mpv, server, role)
+            print("[dash] stop before late 412 keeps STOPPED", flush=True)
+            with serve(tracks) as server:
+                test_stop_before_late_risk(mpv, server)
+            print("[dash] 412 observed before stop stays latched", flush=True)
+            with serve(tracks) as server:
+                test_risk_latched_before_stop(mpv, server)
+            print("[dash] queued stop remains stopped", flush=True)
+            with serve(tracks) as server:
+                test_stop_queued(mpv, server)
+            for role in ("video", "audio"):
+                print(f"[dash] stop during required {role} open", flush=True)
+                with serve(tracks) as server:
+                    test_stop_while_opening(mpv, server, role)
+            print("[dash] 103 before two final 206 responses", flush=True)
+            with serve(tracks) as server:
+                server.early_hints_roles.update(("video", "audio"))
+                test_playback(mpv, server)
+            print("[dash] 103 before terminal 412 still stops", flush=True)
+            with serve(tracks) as server:
+                server.early_hints_roles.add("video")
+                server.deny = "video"
+                test_failure(mpv, server, "video", RISK)
+            print("[dash] TLS client certificate isolation", flush=True)
+            certificates = generate_tls_certificates(directory)
+            with serve(tracks, certificates) as server:
+                test_tls_certificate_isolation(mpv, server, certificates, True)
+            with serve(tracks, certificates) as server:
+                test_tls_certificate_isolation(mpv, server, certificates, False)
+            print("[dash] D3D11 Composition real Present/lease", flush=True)
+            with serve(tracks) as server:
+                source_generation, presented_serial = test_composition_first_frame(
+                    mpv, server, previous_generation, 0)
+            print("[dash] new source cannot reuse prior Present serial", flush=True)
+            with serve(tracks) as server:
+                test_composition_first_frame(
+                    mpv, server, source_generation, presented_serial)
+            print("[dash] required audio 412", flush=True)
+            with serve(tracks) as server:
+                server.deny = "audio"
+                test_failure(mpv, server, "audio", RISK)
+            print("[dash] required audio 404", flush=True)
+            with serve(tracks) as server:
+                server.deny = "audio"
+                server.deny_code = 404
+                test_failure(mpv, server, "audio", HTTP_STATUS)
+            print("[dash] video auth 401", flush=True)
+            with serve(tracks) as server:
+                server.deny = "video"
+                server.deny_code = 401
+                test_failure(mpv, server, "video", AUTH)
+            print("[dash] malformed Content-Range", flush=True)
+            with serve(tracks) as server:
+                server.bad_range = "video"
+                test_failure(mpv, server, "video", HTTP_RANGE)
+            print("[dash] malformed audio Content-Range", flush=True)
+            with serve(tracks) as server:
+                server.bad_range = "audio"
+                test_failure(mpv, server, "audio", HTTP_RANGE)
+            print("[dash] no redirect", flush=True)
+            with serve(tracks) as server:
+                server.redirect = "video"
+                test_failure(mpv, server, "video", HTTP_STATUS)
+                assert server.redirect_hits == 0
+            for role, code, failure in (
+                ("video", 412, RISK), ("audio", 412, RISK),
+                ("audio", 403, AUTH),
+            ):
+                print(f"[dash] late {role} {code}", flush=True)
+                with serve(tracks) as server:
+                    server.arm_code = code
+                    test_late_status(mpv, server, role, code, failure)
+        print("DASH ABI: validation, dual track, seek, required audio, "
+              "range, redirect, repeated 412, native Composition first "
+              "Present/lease, stop/lifetime PASS")
+    finally:
+        shutil.rmtree(directory)
+
+
+if __name__ == "__main__":
+    main()

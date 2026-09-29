@@ -69,6 +69,7 @@
 #include "core.h"
 #include "client.h"
 #include "command.h"
+#include "dash_source.h"
 #include "screenshot.h"
 #include "sub_translate.h"
 #include "translation.h"
@@ -298,6 +299,7 @@ struct MPContext *mp_create(void)
 
     mpctx->global = talloc_zero(mpctx, struct mpv_global);
 
+    mp_dash_source_init(mpctx->global, mpctx);
     demux_packet_pool_init(mpctx->global);
     stats_global_init(mpctx->global);
 #if HAVE_LIBCURL

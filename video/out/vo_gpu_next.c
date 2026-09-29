@@ -42,6 +42,7 @@
 #include "video/fmt-conversion.h"
 #include "video/mp_image.h"
 #include "video/out/placebo/ra_pl.h"
+#include "video/out/display_surface.h"
 #include "placebo/utils.h"
 #include "gpu/context.h"
 #include "gpu/hwdec.h"
@@ -147,6 +148,7 @@ struct priv {
     bool want_reset;
     bool flush_cache;
     bool frame_pending;
+    uint64_t pending_video_frame_id;
     bool paused;
 
     pl_options pars;
@@ -1322,6 +1324,7 @@ static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
+    p->pending_video_frame_id = 0;
     pl_options pars = p->pars;
     pl_gpu gpu = p->gpu;
     update_options(vo);
@@ -1747,6 +1750,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         MP_ERR(vo, "Failed rendering frame!\n");
         goto done;
     }
+    if (frame->current && mix.num_frames > 0)
+        p->pending_video_frame_id = frame->frame_id;
 
     struct pl_frame ref_frame;
     pl_frames_infer_mix(p->rr, &mix, &target, &ref_frame);
@@ -1788,10 +1793,15 @@ static void flip_page(struct vo *vo)
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
 
     if (p->frame_pending) {
-        if (!pl_swapchain_submit_frame(p->sw))
+        if (!pl_swapchain_submit_frame(p->sw)) {
             MP_ERR(vo, "Failed presenting frame!\n");
+        } else if (p->pending_video_frame_id) {
+            vo_display_surface_prepare_frame(vo->extra.display_surface,
+                                             p->pending_video_frame_id);
+        }
         p->frame_pending = false;
     }
+    p->pending_video_frame_id = 0;
 
     sw->fns->swap_buffers(sw);
 }

@@ -16,8 +16,10 @@
  */
 
 #include <inttypes.h>
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <curl/curl.h>
@@ -49,6 +51,7 @@
 #include "options/path.h"
 #include "osdep/threads.h"
 #include "osdep/timer.h"
+#include "player/dash_source.h"
 
 enum curl_proto {
     MP_CURL_PROTO_HTTP,
@@ -162,6 +165,17 @@ struct curl_ctx {
     struct mp_dispatch_queue *dispatch;
     CURLM *multi;
     bool exit;
+#ifdef MPV_DASH_TEST_HOOKS
+    mp_mutex test_lock;
+    mp_cond test_cond;
+    int test_role;
+    bool test_armed;
+    bool test_entered;
+    bool test_release;
+    int test_success_branches;
+    int test_blocked_continuations;
+    int test_added_after_stop;
+#endif
 };
 
 // Per-stream state, owned by the curl thread.
@@ -179,6 +193,14 @@ struct priv {
     char *url;
     const char *effective_url;
     const struct curl_scheme *scheme;
+    mpv_dash_track_kind dash_kind;
+    struct mp_dash_track_config dash;
+    bool dash_status_seen;
+    bool dash_interim_headers;
+    unsigned dash_interim_count;
+    bool dash_headers_ok;
+    uint64_t dash_requested_end;
+    uint64_t dash_response_length;
 
     // Stream parameters
     bool seekable;
@@ -196,6 +218,8 @@ struct priv {
 
     // Probe state. Set on the curl thread read by curl_open after.
     bool probed;
+    bool initial_probe_ok;
+    bool initial_probe_seekable;
     bool stream_ok;
 
     // Shared state, protected by mtx.
@@ -250,6 +274,8 @@ static void run_cmd(void *arg)
         }
         break;
     case CMD_UNPAUSE:
+        if (c->p->dash_kind && mp_dash_source_terminal(c->p->global))
+            break;
         // The consumer freed enough buffer space. Clear the pause flag and
         // resume the transfer.
         mp_mutex_lock(&c->p->mtx);
@@ -358,9 +384,19 @@ static MP_THREAD_VOID curl_thread(void *arg)
 static void mp_curl_destroy(void *ptr)
 {
     struct curl_ctx *ctx = ptr;
+#ifdef MPV_DASH_TEST_HOOKS
+    mp_mutex_lock(&ctx->test_lock);
+    ctx->test_release = true;
+    mp_cond_broadcast(&ctx->test_cond);
+    mp_mutex_unlock(&ctx->test_lock);
+#endif
     struct cmd c = { .kind = CMD_EXIT, .ctx = ctx };
     mp_dispatch_run(ctx->dispatch, run_cmd, &c);
     mp_thread_join(ctx->thread);
+#ifdef MPV_DASH_TEST_HOOKS
+    mp_cond_destroy(&ctx->test_cond);
+    mp_mutex_destroy(&ctx->test_lock);
+#endif
 }
 
 void mp_curl_global_init(struct mpv_global *global)
@@ -369,8 +405,109 @@ void mp_curl_global_init(struct mpv_global *global)
     talloc_set_destructor(ctx, mp_curl_destroy);
     ctx->dispatch = mp_dispatch_create(ctx);
     global->curl = ctx;
+#ifdef MPV_DASH_TEST_HOOKS
+    mp_mutex_init(&ctx->test_lock);
+    mp_cond_init(&ctx->test_cond);
+#endif
     mp_require(!mp_thread_create(&ctx->thread, curl_thread, ctx));
 }
+
+#ifdef MPV_DASH_TEST_HOOKS
+int mp_curl_dash_test_control(struct mpv_global *global, int command, int value)
+{
+    if (!global || !global->curl)
+        return -1;
+    struct curl_ctx *ctx = global->curl;
+    int result = 0;
+    mp_mutex_lock(&ctx->test_lock);
+    switch (command) {
+    case MP_CURL_DASH_TEST_ARM:
+        if ((value != MPV_DASH_TRACK_VIDEO && value != MPV_DASH_TRACK_AUDIO) ||
+            ctx->test_armed)
+        {
+            result = -1;
+            break;
+        }
+        ctx->test_role = value;
+        ctx->test_armed = true;
+        ctx->test_entered = false;
+        ctx->test_release = false;
+        ctx->test_success_branches = 0;
+        ctx->test_blocked_continuations = 0;
+        ctx->test_added_after_stop = 0;
+        break;
+    case MP_CURL_DASH_TEST_WAIT: {
+        if (value <= 0 || value > 15000) {
+            result = -1;
+            break;
+        }
+        int64_t deadline = mp_time_ns_add(mp_time_ns(), value / 1000.0);
+        while (!ctx->test_entered &&
+               !mp_cond_timedwait_until(&ctx->test_cond, &ctx->test_lock, deadline))
+        {
+        }
+        result = ctx->test_entered ? 1 : 0;
+        break;
+    }
+    case MP_CURL_DASH_TEST_RELEASE:
+        ctx->test_release = true;
+        mp_cond_broadcast(&ctx->test_cond);
+        break;
+    case MP_CURL_DASH_TEST_SUCCESS_BRANCHES:
+        result = ctx->test_success_branches;
+        break;
+    case MP_CURL_DASH_TEST_BLOCKED_CONTINUATIONS:
+        result = ctx->test_blocked_continuations;
+        break;
+    case MP_CURL_DASH_TEST_ADDED_AFTER_STOP:
+        result = ctx->test_added_after_stop;
+        break;
+    default:
+        result = -1;
+        break;
+    }
+    mp_mutex_unlock(&ctx->test_lock);
+    return result;
+}
+
+static void dash_test_before_continuation(struct priv *p)
+{
+    // Only a test build and an explicit loopback source can pause the real
+    // CURLE_OK continuation path; release is bounded if the test fails.
+    if (!p->dash_kind || !p->dash.allow_loopback_http ||
+        strncmp(p->url, "http://127.0.0.1:", 17))
+        return;
+
+    struct curl_ctx *ctx = p->ctx;
+    mp_mutex_lock(&ctx->test_lock);
+    if (ctx->test_armed && ctx->test_role == p->dash_kind) {
+        ctx->test_armed = false;
+        ctx->test_entered = true;
+        ctx->test_success_branches++;
+        mp_cond_broadcast(&ctx->test_cond);
+        int64_t deadline = mp_time_ns_add(mp_time_ns(), 10);
+        while (!ctx->test_release &&
+               !mp_cond_timedwait_until(&ctx->test_cond, &ctx->test_lock, deadline))
+        {
+        }
+    }
+    mp_mutex_unlock(&ctx->test_lock);
+}
+
+static void dash_test_record_continuation(struct priv *p, bool added)
+{
+    struct curl_ctx *ctx = p->ctx;
+    mp_mutex_lock(&ctx->test_lock);
+    if (ctx->test_entered && ctx->test_role == p->dash_kind) {
+        if (added)
+            ctx->test_added_after_stop++;
+        else
+            ctx->test_blocked_continuations++;
+        mp_cond_broadcast(&ctx->test_cond);
+    }
+    mp_mutex_unlock(&ctx->test_lock);
+}
+#endif
 
 // Curl callbacks
 
@@ -399,8 +536,18 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
 
     // header_callback validated the response and logged any error status,
     // we don't care about error body.
-    if (!p->stream_ok)
+    if (!p->stream_ok || (p->dash_kind &&
+                          (!p->dash_headers_ok ||
+                           mp_dash_source_terminal(p->global))))
         return CURL_WRITEFUNC_ERROR;
+
+    if (p->dash_kind &&
+        (p->request_received > p->dash_response_length ||
+         bytes > p->dash_response_length - p->request_received))
+    {
+        mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_HTTP_RANGE);
+        return CURL_WRITEFUNC_ERROR;
+    }
 
     if (atomic_load_explicit(&p->aborted, memory_order_relaxed))
         return CURL_WRITEFUNC_ERROR;
@@ -430,7 +577,8 @@ static int xferinfo_callback(void *userdata, curl_off_t dl_total, curl_off_t dl_
                              curl_off_t ul_total, curl_off_t ul_now)
 {
     struct priv *p = userdata;
-    return atomic_load_explicit(&p->aborted, memory_order_relaxed);
+    return atomic_load_explicit(&p->aborted, memory_order_relaxed) ||
+           (p->dash_kind && mp_dash_source_terminal(p->global));
 }
 
 static const char *header_value(CURL *c, const char *name)
@@ -467,15 +615,22 @@ static void finalize_probe(struct priv *p)
 {
     if (mp_msg_test(p->log, MSGL_DEBUG)) {
         long resp = 0;
-        char *ctype = NULL;
         curl_easy_getinfo(p->curl, CURLINFO_RESPONSE_CODE, &resp);
-        curl_easy_getinfo(p->curl, CURLINFO_CONTENT_TYPE, &ctype);
-        MP_DBG(p, "proto=%.*s ok=%d code=%ld size=%" PRId64 " seekable=%d type=%s\n",
-               BSTR_P(p->scheme->scheme), p->stream_ok, resp,
-               p->content_size, p->seekable, ctype ? ctype : "-");
+        if (p->dash_kind) {
+            MP_DBG(p, "DASH track=%d ok=%d code=%ld size=%" PRId64 "\n",
+                   p->dash_kind, p->stream_ok, resp, p->content_size);
+        } else {
+            char *ctype = NULL;
+            curl_easy_getinfo(p->curl, CURLINFO_CONTENT_TYPE, &ctype);
+            MP_DBG(p, "proto=%.*s ok=%d code=%ld size=%" PRId64 " seekable=%d type=%s\n",
+                   BSTR_P(p->scheme->scheme), p->stream_ok, resp,
+                   p->content_size, p->seekable, ctype ? ctype : "-");
+        }
     }
 
     mp_mutex_lock(&p->mtx);
+    p->initial_probe_ok = p->stream_ok;
+    p->initial_probe_seekable = p->seekable;
     p->probed = true;
     mp_cond_broadcast(&p->cond);
     mp_mutex_unlock(&p->mtx);
@@ -574,12 +729,120 @@ static void probe_ftp(struct priv *p, struct bstr line)
     finalize_probe(p);
 }
 
+static bool parse_range_number(const char **at, uint64_t *value)
+{
+    if (**at < '0' || **at > '9')
+        return false;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long n = strtoull(*at, &end, 10);
+    if (errno || end == *at || n > INT64_MAX)
+        return false;
+    *value = n;
+    *at = end;
+    return true;
+}
+
+static bool dash_content_range(struct priv *p, uint64_t *length, int64_t *total)
+{
+    const char *at = header_value(p->curl, "Content-Range");
+    if (!at || strncmp(at, "bytes ", 6))
+        return false;
+    at += 6;
+    uint64_t start, end, size;
+    if (!parse_range_number(&at, &start) || *at++ != '-' ||
+        !parse_range_number(&at, &end) || *at++ != '/' ||
+        !parse_range_number(&at, &size) || *at ||
+        !size || start != p->request_start || end < start ||
+        end >= size || end > p->dash_requested_end ||
+        (p->content_size > 0 && size != p->content_size))
+        return false;
+
+    curl_off_t content_length = -1;
+    if (curl_easy_getinfo(p->curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T,
+                          &content_length) != CURLE_OK ||
+        (content_length >= 0 && (uint64_t)content_length != end - start + 1))
+        return false;
+    const char *encoding = header_value(p->curl, "Content-Encoding");
+    if (encoding && encoding[0] && strcasecmp(encoding, "identity"))
+        return false;
+    *length = end - start + 1;
+    *total = size;
+    return true;
+}
+
+static size_t dash_header_callback(struct priv *p, struct bstr line, size_t bytes)
+{
+    if (mp_dash_source_terminal(p->global))
+        return 0;
+    if (bstr_startswith0(line, "HTTP/")) {
+        bstr rest;
+        int space = bstrchr(line, ' ');
+        if (space < 0) {
+            mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_HTTP_STATUS);
+            return 0;
+        }
+        rest = bstr_cut(line, space + 1);
+        if (rest.len < 3 || rest.start[0] < '0' || rest.start[0] > '9' ||
+            rest.start[1] < '0' || rest.start[1] > '9' ||
+            rest.start[2] < '0' || rest.start[2] > '9' ||
+            (rest.len > 3 && rest.start[3] != ' '))
+        {
+            mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_HTTP_STATUS);
+            return 0;
+        }
+        int status = (rest.start[0] - '0') * 100 +
+                     (rest.start[1] - '0') * 10 + rest.start[2] - '0';
+        if (status >= 100 && status < 200 && !p->dash_status_seen &&
+            p->dash_interim_count++ < 8)
+        {
+            p->dash_interim_headers = true;
+            return bytes;
+        }
+        if (p->dash_status_seen || status < 200) {
+            mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_HTTP_STATUS);
+            return 0;
+        }
+        p->dash_interim_headers = false;
+        p->dash_status_seen = true;
+        mp_dash_source_response(p->global, p->dash_kind, status);
+        return status == 206 ? bytes : 0;
+    }
+    if (line.len)
+        return bytes;
+    if (p->dash_interim_headers) {
+        p->dash_interim_headers = false;
+        return bytes;
+    }
+    int64_t total = -1;
+    if (!p->dash_status_seen ||
+        !dash_content_range(p, &p->dash_response_length, &total))
+    {
+        mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_HTTP_RANGE);
+        if (!p->probed)
+            finalize_probe(p);
+        return 0;
+    }
+    if (!p->probed) {
+        p->content_size = total;
+        p->seekable = true;
+        p->stream_ok = true;
+    }
+    p->dash_headers_ok = true;
+    if (!p->probed)
+        finalize_probe(p);
+    return bytes;
+}
+
 // Called per header line.
 static size_t header_callback(char *buffer, size_t size, size_t nitems, void *userdata)
 {
     struct priv *p = userdata;
     size_t bytes = size * nitems;
 
+    if (p->dash_kind)
+        return dash_header_callback(p, bstr_strip_linebreaks((bstr){buffer, bytes}),
+                                    bytes);
     if (p->probed)
         return bytes;
 
@@ -616,6 +879,19 @@ static int debug_callback(CURL *handle, curl_infotype type, char *data, size_t s
 
 // Request handling
 
+static void finish_dash_terminal(struct priv *p)
+{
+    bool failed = mp_dash_source_failed(p->global);
+    p->finished = true;
+    mp_mutex_lock(&p->mtx);
+    p->head = p->tail = p->count = 0;
+    p->stream_error = failed;
+    p->stream_eof = !failed;
+    p->probed = true;
+    mp_cond_broadcast(&p->cond);
+    mp_mutex_unlock(&p->mtx);
+}
+
 static bool is_recoverable_error(CURLcode code)
 {
     switch (code) {
@@ -636,6 +912,13 @@ static bool is_recoverable_error(CURLcode code)
 
 static void start_request(struct priv *p)
 {
+    if (p->dash_kind && mp_dash_source_terminal(p->global)) {
+#ifdef MPV_DASH_TEST_HOOKS
+        dash_test_record_continuation(p, false);
+#endif
+        finish_dash_terminal(p);
+        return;
+    }
     if (p->finished) {
         mp_mutex_lock(&p->mtx);
         p->stream_eof = true;
@@ -646,7 +929,7 @@ static void start_request(struct priv *p)
 
     uint64_t start = p->request_start;
 
-    bool ranged = !p->probed || p->seekable;
+    bool ranged = p->dash_kind || !p->probed || p->seekable;
     bool chunked = ranged && p->opts->max_request_size > 0;
     bool capped = ranged && p->request_end > 0;
 
@@ -662,14 +945,18 @@ static void start_request(struct priv *p)
     }
 
     char range[64];
+    p->dash_requested_end = INT64_MAX;
     if (chunked || capped) {
         uint64_t end = UINT64_MAX;
-        if (chunked)
-            end = start + p->opts->max_request_size - 1;
+        if (chunked) {
+            uint64_t cap = p->opts->max_request_size - 1;
+            end = cap > INT64_MAX - start ? INT64_MAX : start + cap;
+        }
         if (p->content_size > 0)
             end = MPMIN(end, p->content_size - 1);
         if (capped)
             end = MPMIN(end, p->request_end - 1);
+        p->dash_requested_end = end;
         snprintf(range, sizeof(range), "%" PRIu64 "-%" PRIu64, start, end);
         curl_easy_setopt(p->curl, CURLOPT_RANGE, range);
     } else if (ranged) {
@@ -680,8 +967,27 @@ static void start_request(struct priv *p)
     }
 
     p->request_received = 0;
+    if (p->dash_kind) {
+        p->dash_status_seen = false;
+        p->dash_interim_headers = false;
+        p->dash_interim_count = 0;
+        p->dash_headers_ok = false;
+        p->dash_response_length = 0;
+    }
+    if (p->dash_kind && mp_dash_source_terminal(p->global)) {
+        finish_dash_terminal(p);
+        return;
+    }
     p->active = true;
     curl_multi_add_handle(p->ctx->multi, p->curl);
+    if (p->dash_kind && mp_dash_source_terminal(p->global)) {
+#ifdef MPV_DASH_TEST_HOOKS
+        dash_test_record_continuation(p, true);
+#endif
+        curl_multi_remove_handle(p->ctx->multi, p->curl);
+        p->active = false;
+        finish_dash_terminal(p);
+    }
 }
 
 static void log_curl_error(struct priv *p, const char *what, CURLcode code)
@@ -702,12 +1008,34 @@ static void on_done(struct priv *p, CURLcode code)
 {
     bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
 
+    if (p->dash_kind && mp_dash_source_terminal(p->global)) {
+        finish_dash_terminal(p);
+        return;
+    }
     if (!p->probed) {
         // Connection died before any headers arrived.
-        if (code != CURLE_OK && !aborted)
+        if (p->dash_kind && !aborted && !mp_dash_source_terminal(p->global))
+            mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_TRANSPORT);
+        if (code != CURLE_OK && !aborted && !p->dash_kind)
             log_curl_error(p, "error", code);
         mp_mutex_lock(&p->mtx);
         p->probed = true;
+        mp_cond_broadcast(&p->cond);
+        mp_mutex_unlock(&p->mtx);
+        return;
+    }
+
+    if (p->dash_kind &&
+        (!p->dash_headers_ok || code != CURLE_OK ||
+         p->request_received != p->dash_response_length ||
+         mp_dash_source_terminal(p->global)))
+    {
+        if (!aborted && !mp_dash_source_terminal(p->global))
+            mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_TRANSPORT);
+        mp_mutex_lock(&p->mtx);
+        p->head = p->tail = p->count = 0;
+        p->stream_error = true;
+        p->error_code = code;
         mp_cond_broadcast(&p->cond);
         mp_mutex_unlock(&p->mtx);
         return;
@@ -724,7 +1052,10 @@ static void on_done(struct priv *p, CURLcode code)
         bool chunked = p->seekable && p->opts->max_request_size > 0;
         bool past_size = p->content_size > 0 && p->request_start >= p->content_size;
         bool past_end = p->request_end > 0 && p->request_start >= p->request_end;
-        if (chunked && !past_size && !past_end) {
+        if ((chunked || p->dash_kind) && !past_size && !past_end) {
+#ifdef MPV_DASH_TEST_HOOKS
+            dash_test_before_continuation(p);
+#endif
             start_request(p);
             return;
         }
@@ -776,16 +1107,17 @@ static void on_cancel(void *ctx)
 static struct curl_slist *build_header_list(struct priv *p)
 {
     struct curl_slist *list = NULL;
-    if (p->net_opts->referrer && p->net_opts->referrer[0]) {
-        char *h = talloc_asprintf(NULL, "Referer: %s", p->net_opts->referrer);
+    const char *referer = p->dash_kind ? p->dash.referer : p->net_opts->referrer;
+    if (referer && referer[0]) {
+        char *h = talloc_asprintf(NULL, "Referer: %s", referer);
         list = curl_slist_append(list, h);
         talloc_free(h);
     }
-    if (p->net_opts->http_header_fields) {
+    if (!p->dash_kind && p->net_opts->http_header_fields) {
         for (int i = 0; p->net_opts->http_header_fields[i]; i++)
             list = curl_slist_append(list, p->net_opts->http_header_fields[i]);
     }
-    if (p->scheme->proto == MP_CURL_PROTO_HTTP)
+    if (!p->dash_kind && p->scheme->proto == MP_CURL_PROTO_HTTP)
         list = curl_slist_append(list, "Icy-MetaData: 1");
     return list;
 }
@@ -808,27 +1140,36 @@ static void setup_curl(struct priv *p)
     curl_easy_setopt(c, CURLOPT_XFERINFODATA, p);
 
     // Enable verbose output with trace level logging.
-    curl_easy_setopt(c, CURLOPT_VERBOSE, mp_msg_test(p->log, MSGL_TRACE) ? 1L : 0L);
+    curl_easy_setopt(c, CURLOPT_VERBOSE,
+                     !p->dash_kind && mp_msg_test(p->log, MSGL_TRACE) ? 1L : 0L);
     curl_easy_setopt(c, CURLOPT_DEBUGFUNCTION, debug_callback);
     curl_easy_setopt(c, CURLOPT_DEBUGDATA, p);
 
-    bool identity = p->start_offset > 0 || p->request_end > 0;
+    bool identity = p->dash_kind || p->start_offset > 0 || p->request_end > 0;
     curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, identity ? "identity" : "");
-    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(c, CURLOPT_MAXREDIRS, (long)p->opts->max_redirects);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, p->dash_kind ? 0L : 1L);
+    curl_easy_setopt(c, CURLOPT_MAXREDIRS,
+                     p->dash_kind ? 0L : (long)p->opts->max_redirects);
+    if (p->dash_kind) {
+        curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR,
+                         p->dash.allow_loopback_http ? "https,http" : "https");
+        curl_easy_setopt(c, CURLOPT_PROXY, "");
+        curl_easy_setopt(c, CURLOPT_FRESH_CONNECT, 1L);
+        curl_easy_setopt(c, CURLOPT_FORBID_REUSE, 1L);
+    }
     curl_easy_setopt(c, CURLOPT_HTTP_VERSION, (long)p->opts->http_version);
     curl_easy_setopt(c, CURLOPT_HSTS_CTRL, (long)CURLHSTS_ENABLE);
     curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS,
                      (long)(p->opts->connect_timeout * 1000));
 
-    const char *ua = p->net_opts->useragent;
+    const char *ua = p->dash_kind ? p->dash.user_agent : p->net_opts->useragent;
     if (!ua || !ua[0])
-        ua = p->net_opts->default_useragent;
+        ua = p->dash_kind ? "libmpv" : p->net_opts->default_useragent;
     if (ua && ua[0])
         curl_easy_setopt(c, CURLOPT_USERAGENT, ua);
     // An explicitly empty proxy disables the backend's environment fallback.
-    if (p->net_opts->http_proxy)
+    if (!p->dash_kind && p->net_opts->http_proxy)
         curl_easy_setopt(c, CURLOPT_PROXY, p->net_opts->http_proxy);
 
     curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
@@ -838,16 +1179,16 @@ static void setup_curl(struct priv *p)
         char *path = mp_get_user_path(p, p->global, p->net_opts->tls_ca_file);
         curl_easy_setopt(c, CURLOPT_CAINFO, path);
     }
-    if (p->net_opts->tls_cert_file) {
+    if (!p->dash_kind && p->net_opts->tls_cert_file) {
         char *path = mp_get_user_path(p, p->global, p->net_opts->tls_cert_file);
         curl_easy_setopt(c, CURLOPT_SSLCERT, path);
     }
-    if (p->net_opts->tls_key_file) {
+    if (!p->dash_kind && p->net_opts->tls_key_file) {
         char *path = mp_get_user_path(p, p->global, p->net_opts->tls_key_file);
         curl_easy_setopt(c, CURLOPT_SSLKEY, path);
     }
 
-    if (p->net_opts->cookies_enabled) {
+    if (!p->dash_kind && p->net_opts->cookies_enabled) {
         curl_easy_setopt(c, CURLOPT_COOKIEFILE, "");
         char *file = p->net_opts->cookies_file;
         if (file && file[0]) {
@@ -880,6 +1221,10 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
     struct priv *p = s->priv;
     if (max_len <= 0)
         return 0;
+    if (p->dash_kind && mp_dash_source_terminal(p->global)) {
+        s->error = mp_dash_source_failed(p->global) ? -1 : 0;
+        return 0;
+    }
 
     mp_mutex_lock(&p->mtx);
 
@@ -906,6 +1251,10 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
 
     mp_mutex_unlock(&p->mtx);
 
+    if (p->dash_kind && mp_dash_source_terminal(p->global)) {
+        s->error = mp_dash_source_failed(p->global) ? -1 : 0;
+        return 0;
+    }
     if (unpause)
         cmd_async(p, CMD_UNPAUSE);
 
@@ -930,7 +1279,7 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
 static int curl_seek(struct stream *s, int64_t pos)
 {
     struct priv *p = s->priv;
-    if (pos < 0)
+    if (pos < 0 || (p->dash_kind && mp_dash_source_terminal(p->global)))
         return 0;
     cmd_sync(p, CMD_SEEK, pos, true);
     return 1;
@@ -995,8 +1344,14 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
         return STREAM_ERROR;
     }
 
+    bool dash = !strcmp(s->url, MP_DASH_VIDEO_URL) ||
+                !strcmp(s->url, MP_DASH_AUDIO_URL);
+    if (!dash && !strncasecmp(s->url, "dash://", 7)) {
+        MP_ERR(s, "Unsupported DASH source alias\n");
+        return STREAM_ERROR;
+    }
     struct curl_opts *opts = mp_get_config_group(s, s->global, &curl_conf);
-    if (!opts->enabled)
+    if (!opts->enabled && !dash)
         return STREAM_NO_MATCH;
 
     struct priv *p = talloc_zero(s, struct priv);
@@ -1009,7 +1364,14 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     p->s = s;
     p->opts = talloc_steal(p, opts);
     p->net_opts = mp_get_config_group(p, s->global, &mp_network_conf);
-    p->url = normalize_url(p, s->url);
+    if (dash) {
+        if (!mp_dash_source_get_track(s->global, s->url, p, &p->dash_kind,
+                                      &p->dash))
+            return STREAM_ERROR;
+        p->url = p->dash.url;
+    } else {
+        p->url = normalize_url(p, s->url);
+    }
     p->scheme = curl_scheme_lookup(bstr0(p->url));
     // Only supported URLs are supposed to reach here.
     mp_assert(p->scheme);
@@ -1050,23 +1412,32 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     mp_mutex_lock(&p->mtx);
     while (!p->probed && !atomic_load_explicit(&p->aborted, memory_order_relaxed))
         mp_cond_wait(&p->cond, &p->mtx);
+    bool initial_ok = p->initial_probe_ok;
+    bool initial_seekable = p->initial_probe_seekable;
     mp_mutex_unlock(&p->mtx);
 
-    if (!p->stream_ok || atomic_load(&p->aborted))
+    if (!initial_ok || atomic_load(&p->aborted) ||
+        (p->dash_kind && mp_dash_source_terminal(p->global)))
         return STREAM_ERROR;
 
-    char *content_type = NULL;
-    curl_easy_getinfo(p->curl, CURLINFO_CONTENT_TYPE, &content_type);
-    bstr mime = bstr_strip(bstr_split(bstr0(content_type), ";", NULL));
-    if (mime.len)
-        s->mime_type = bstrto0(s, mime);
-    s->server_filename = talloc_strdup(s, p->server_filename);
+    if (p->dash_kind) {
+        s->mime_type = talloc_strdup(s, p->dash_kind == MPV_DASH_TRACK_VIDEO ?
+                                    "video/mp4" : "audio/mp4");
+    } else {
+        char *content_type = NULL;
+        curl_easy_getinfo(p->curl, CURLINFO_CONTENT_TYPE, &content_type);
+        bstr mime = bstr_strip(bstr_split(bstr0(content_type), ";", NULL));
+        if (mime.len)
+            s->mime_type = bstrto0(s, mime);
+        s->server_filename = talloc_strdup(s, p->server_filename);
+    }
 
     const char *effective_url = NULL;
     curl_easy_getinfo(p->curl, CURLINFO_EFFECTIVE_URL, &effective_url);
-    p->effective_url = effective_url ? effective_url : p->url;
+    p->effective_url = p->dash_kind ? s->url :
+                       effective_url ? effective_url : p->url;
 
-    s->seekable = p->seekable;
+    s->seekable = p->dash_kind ? initial_seekable : p->seekable;
     s->is_network = true;
     s->streaming = true;
     s->fast_skip = true;
@@ -1099,7 +1470,7 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     // (request_end != 0, e.g. lavf nested IO fetching HLS byte-range segments):
     // those are short-lived, read forward and would only waste a cache buffer
     // each. FTP pays no redirect cost, so it is left out too.
-    if (s->mode == STREAM_READ && s->seekable && p->request_end == 0 &&
+    if (!p->dash_kind && s->mode == STREAM_READ && s->seekable && p->request_end == 0 &&
         p->scheme->proto == MP_CURL_PROTO_HTTP)
     {
         s->wants_lru_cache = true;
@@ -1132,6 +1503,13 @@ const stream_info_t stream_info_curl = {
     .name = "curl",
     .open2 = curl_open,
     .get_protocols = curl_get_protocols,
+    .stream_origin = STREAM_ORIGIN_NET,
+};
+
+const stream_info_t stream_info_dash = {
+    .name = "dash",
+    .open2 = curl_open,
+    .protocols = (const char *const[]){"dash", NULL},
     .stream_origin = STREAM_ORIGIN_NET,
 };
 

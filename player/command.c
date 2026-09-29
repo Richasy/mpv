@@ -46,6 +46,7 @@
 #include "common/stats.h"
 #include "filters/f_decoder_wrapper.h"
 #include "command.h"
+#include "dash_source.h"
 #include "osdep/als.h"
 #include "osdep/threads.h"
 #include "osdep/timer.h"
@@ -6979,6 +6980,10 @@ static void cmd_stop(void *p)
     struct mp_cmd_ctx *cmd = p;
     struct MPContext *mpctx = cmd->mpctx;
     int flags = cmd->args[0].v.i;
+    bool dash_source = mp_dash_source_active(mpctx->global) &&
+        ((mpctx->filename && !strcmp(mpctx->filename, MP_DASH_VIDEO_URL)) ||
+         (mpctx->playlist->current &&
+          !strcmp(mpctx->playlist->current->filename, MP_DASH_VIDEO_URL)));
 
     if (!(flags & 1))
         playlist_clear(mpctx->playlist);
@@ -6991,6 +6996,8 @@ static void cmd_stop(void *p)
 
     if (mpctx->stop_play != PT_QUIT)
         mpctx->stop_play = PT_STOP;
+    if (dash_source)
+        mp_dash_source_stopped(mpctx->global, false);
     mp_wakeup_core(mpctx);
 }
 

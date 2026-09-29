@@ -26,6 +26,7 @@
 #include "common/global.h"
 #include "common/msg.h"
 #include "common/msg_control.h"
+#include "common/playlist.h"
 #include "input/input.h"
 #include "input/cmd.h"
 #include "misc/ctype.h"
@@ -42,10 +43,14 @@
 #include "osdep/timer.h"
 #include "osdep/io.h"
 #include "stream/stream.h"
+#ifdef MPV_DASH_TEST_HOOKS
+#include "stream/stream_curl.h"
+#endif
 
 #include "command.h"
 #include "core.h"
 #include "client.h"
+#include "dash_source.h"
 #include "video/out/display_surface.h"
 
 #if HAVE_WIN32_DESKTOP
@@ -1561,6 +1566,138 @@ void mpv_release_d3d11_composition_surface(
 #endif
     *surface = (mpv_d3d11_composition_surface){0};
 }
+
+struct dash_load_request {
+    struct MPContext *mpctx;
+    const mpv_dash_source *source;
+    int result;
+};
+
+static bool dash_set_flag(struct MPContext *mpctx, const char *name, int value)
+{
+    mpv_node option = {.format = MPV_FORMAT_FLAG, .u.flag = value};
+    return m_config_set_option_node(mpctx->mconfig, bstr0(name), &option, 0) >= 0;
+}
+
+static bool dash_clear_files(struct MPContext *mpctx, const char *name)
+{
+    mpv_node_list list = {0};
+    mpv_node option = {.format = MPV_FORMAT_NODE_ARRAY, .u.list = &list};
+    return m_config_set_option_node(mpctx->mconfig, bstr0(name), &option, 0) >= 0;
+}
+
+static bool dash_disable_auto(struct MPContext *mpctx, const char *name)
+{
+    mpv_node option = {.format = MPV_FORMAT_STRING, .u.string = "no"};
+    return m_config_set_option_node(mpctx->mconfig, bstr0(name), &option, 0) >= 0;
+}
+
+static void dash_load_complete(struct mp_cmd_ctx *cmd)
+{
+    struct dash_load_request *request = cmd->on_completion_priv;
+    request->result = cmd->success ? MPV_ERROR_SUCCESS : MPV_ERROR_COMMAND;
+}
+
+static void dash_load_locked(void *ptr)
+{
+    struct dash_load_request *request = ptr;
+    struct MPContext *mpctx = request->mpctx;
+    if (mpctx->playing || mpctx->playlist->num_entries ||
+        mp_dash_source_active(mpctx->global)) {
+        request->result = MPV_ERROR_UNSUPPORTED;
+        return;
+    }
+
+    request->result = mp_dash_source_begin(mpctx->global, request->source);
+    if (request->result < 0)
+        return;
+
+    mpv_node audio = {.format = MPV_FORMAT_STRING,
+                      .u.string = MP_DASH_AUDIO_URL};
+    mpv_node_list list = {.num = 1, .values = &audio};
+    mpv_node option = {.format = MPV_FORMAT_NODE_ARRAY, .u.list = &list};
+    if (m_config_set_option_node(mpctx->mconfig, bstr0("audio-files"),
+                                 &option, 0) < 0 ||
+        !dash_clear_files(mpctx, "sub-files") ||
+        !dash_clear_files(mpctx, "cover-art-files") ||
+        !dash_clear_files(mpctx, "external-files") ||
+        !dash_set_flag(mpctx, "autoload-files", 1) ||
+        !dash_disable_auto(mpctx, "sub-auto") ||
+        !dash_disable_auto(mpctx, "audio-file-auto") ||
+        !dash_disable_auto(mpctx, "cover-art-auto") ||
+        !dash_set_flag(mpctx, "ytdl", 0) ||
+        !dash_set_flag(mpctx, "access-references", 0))
+    {
+        request->result = MPV_ERROR_OPTION_ERROR;
+        mp_dash_source_fail(mpctx->global, MPV_DASH_TRACK_NONE,
+                            MPV_DASH_FAILURE_TRACK_SELECTION);
+        return;
+    }
+
+    const char *argv[] = {"loadfile", MP_DASH_VIDEO_URL, "replace", NULL};
+    struct mp_cmd *cmd = mp_input_parse_cmd_strv(mpctx->log, argv);
+    if (!cmd) {
+        request->result = MPV_ERROR_COMMAND;
+        mp_dash_source_fail(mpctx->global, MPV_DASH_TRACK_NONE,
+                            MPV_DASH_FAILURE_TRACK_SELECTION);
+        return;
+    }
+    cmd->flags = (cmd->flags & ~MP_ASYNC_CMD) | MP_SYNC_CMD;
+    run_command(mpctx, cmd, NULL, dash_load_complete, request);
+    if (request->result < 0)
+        mp_dash_source_fail(mpctx->global, MPV_DASH_TRACK_NONE,
+                            MPV_DASH_FAILURE_TRACK_SELECTION);
+}
+
+int mpv_dash_source_load(mpv_handle *ctx, const mpv_dash_source *source)
+{
+    if (!ctx)
+        return MPV_ERROR_INVALID_PARAMETER;
+    if (!ctx->mpctx->initialized)
+        return MPV_ERROR_UNINITIALIZED;
+    int result = mp_dash_source_validate(source);
+    if (result < 0)
+        return result;
+    struct dash_load_request request = {
+        .mpctx = ctx->mpctx,
+        .source = source,
+        .result = MPV_ERROR_COMMAND,
+    };
+    run_locked(ctx, dash_load_locked, &request);
+    return request.result;
+}
+
+int mpv_dash_source_get_status(mpv_handle *ctx, mpv_dash_source_status *status)
+{
+    if (!ctx || !status)
+        return MPV_ERROR_INVALID_PARAMETER;
+    if (!ctx->mpctx->initialized)
+        return MPV_ERROR_UNINITIALIZED;
+    return mp_dash_source_snapshot(ctx->mpctx->global, status);
+}
+
+int mpv_dash_source_get_frame_status(mpv_handle *ctx,
+                                      mpv_dash_frame_status *status)
+{
+    if (!ctx || !status)
+        return MPV_ERROR_INVALID_PARAMETER;
+    if (!ctx->mpctx->initialized)
+        return MPV_ERROR_UNINITIALIZED;
+    return mp_dash_source_frame_snapshot(ctx->mpctx->global, status);
+}
+
+#ifdef MPV_DASH_TEST_HOOKS
+MPV_EXPORT int mpv_dash_test_control(mpv_handle *ctx, int command, int value);
+
+int mpv_dash_test_control(mpv_handle *ctx, int command, int value)
+{
+    if (!ctx)
+        return MPV_ERROR_INVALID_PARAMETER;
+    if (!ctx->mpctx->initialized)
+        return MPV_ERROR_UNINITIALIZED;
+    return mp_curl_dash_test_control(ctx->mpctx->global, command, value);
+}
+#endif
 
 int mpv_get_property_async(mpv_handle *ctx, uint64_t ud, const char *name,
                            mpv_format format)

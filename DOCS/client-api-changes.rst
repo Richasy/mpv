@@ -33,6 +33,11 @@ API changes
 ::
 
  --- mpv 0.41.0 ---
+ 2.8    - add mpv_dash_source_load(), mpv_dash_source_get_status(), and
+          mpv_dash_source_get_frame_status() with versioned, size-checked
+          mpv_dash_source, mpv_dash_source_status, and mpv_dash_frame_status
+          descriptors (Richasy/mpv fork addition). Accepted/queued does not
+          imply FILE_LOADED or a successfully presented video frame.
  2.7    - add mpv_acquire_d3d11_composition_surface(),
           mpv_release_d3d11_composition_surface(), and
           mpv_d3d11_composition_surface (Richasy/mpv fork addition).

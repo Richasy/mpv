@@ -248,7 +248,7 @@ extern "C" {
  * relational operators (<, >, <=, >=).
  */
 #define MPV_MAKE_VERSION(major, minor) (((major) << 16) | (minor) | 0UL)
-#define MPV_CLIENT_API_VERSION MPV_MAKE_VERSION(2, 7)
+#define MPV_CLIENT_API_VERSION MPV_MAKE_VERSION(2, 8)
 
 /**
  * The API user is allowed to "#define MPV_ENABLE_DEPRECATED 0" before
@@ -437,6 +437,160 @@ MPV_EXPORT int mpv_acquire_d3d11_composition_surface(
  */
 MPV_EXPORT void mpv_release_d3d11_composition_surface(
     mpv_d3d11_composition_surface *surface);
+
+/**
+ * Version 1 of the opt-in, two-track DASH source ABI.
+ *
+ * This is for two independently addressable MP4 media tracks, not an MPD or a
+ * request for mpv to select a quality. Strings are UTF-8 and are copied before
+ * mpv_dash_source_load() returns. No cookie, authorization header, or other
+ * caller-supplied HTTP header is accepted. A fresh mpv instance accepts at
+ * most one source; create a new instance to switch sources.
+ */
+#define MPV_DASH_SOURCE_API_VERSION 1u
+
+typedef struct mpv_dash_byte_range {
+    int64_t start;                   /* Inclusive. */
+    int64_t end;                     /* Inclusive. */
+} mpv_dash_byte_range;
+
+typedef enum mpv_dash_track_flags {
+    MPV_DASH_TRACK_SEGMENT_BASE = 1u,
+} mpv_dash_track_flags;
+
+typedef struct mpv_dash_track {
+    uint32_t struct_size;            /* sizeof(mpv_dash_track) */
+    uint32_t flags;                  /* mpv_dash_track_flags */
+    const char *url;                 /* HTTPS (or explicitly allowed loopback). */
+    const char *mime_type;           /* video/mp4 or audio/mp4. */
+    const char *codec;               /* Informational; not used to force a decoder. */
+    uint64_t bandwidth;             /* Bits per second; informational. */
+    int32_t quality;                 /* Server's nonnegative quality identifier. */
+    int32_t width;                   /* Video only; zero if unknown. */
+    int32_t height;                  /* Video only; zero if unknown. */
+    mpv_dash_byte_range initialization;
+    mpv_dash_byte_range index;
+} mpv_dash_track;
+
+typedef enum mpv_dash_source_flags {
+    /* Test-only: permits http://127.0.0.1:<port> and http://[::1]:<port>. */
+    MPV_DASH_SOURCE_ALLOW_LOOPBACK_HTTP = 1u,
+} mpv_dash_source_flags;
+
+typedef struct mpv_dash_source {
+    uint32_t struct_size;            /* sizeof(mpv_dash_source) */
+    uint32_t api_version;            /* MPV_DASH_SOURCE_API_VERSION */
+    uint32_t flags;                  /* mpv_dash_source_flags */
+    uint32_t reserved;               /* Must be zero. */
+    mpv_dash_track video;
+    mpv_dash_track audio;
+    double duration_seconds;         /* Optional; zero if unknown. */
+    const char *user_agent;           /* Optional, shared by both tracks. */
+    const char *referer;              /* Optional HTTPS URL, shared by both. */
+} mpv_dash_source;
+
+typedef enum mpv_dash_source_phase {
+    MPV_DASH_SOURCE_IDLE = 0,
+    MPV_DASH_SOURCE_QUEUED = 1,
+    MPV_DASH_SOURCE_TRACKS_BOUND = 2,
+    MPV_DASH_SOURCE_FAILED = 3,
+    MPV_DASH_SOURCE_STOPPED = 4,
+} mpv_dash_source_phase;
+
+typedef enum mpv_dash_source_failure {
+    MPV_DASH_FAILURE_NONE = 0,
+    MPV_DASH_FAILURE_VIDEO_OPEN = 1,
+    MPV_DASH_FAILURE_AUDIO_OPEN = 2,
+    MPV_DASH_FAILURE_HTTP_AUTH = 3,      /* HTTP 401 or 403. */
+    MPV_DASH_FAILURE_HTTP_RISK = 4,      /* HTTP 412. */
+    MPV_DASH_FAILURE_HTTP_STATUS = 5,    /* Other non-206 response. */
+    MPV_DASH_FAILURE_HTTP_RANGE = 6,     /* Invalid/missing Content-Range. */
+    MPV_DASH_FAILURE_TRANSPORT = 7,      /* No response, short body, etc. */
+    MPV_DASH_FAILURE_TRACK_SELECTION = 8,
+    MPV_DASH_FAILURE_PLAYBACK = 9,       /* Unclassified decoder/output failure. */
+} mpv_dash_source_failure;
+
+typedef enum mpv_dash_track_kind {
+    MPV_DASH_TRACK_NONE = 0,
+    MPV_DASH_TRACK_VIDEO = 1,
+    MPV_DASH_TRACK_AUDIO = 2,
+} mpv_dash_track_kind;
+
+typedef struct mpv_dash_source_status {
+    uint32_t struct_size;            /* Set to sizeof(mpv_dash_source_status). */
+    uint32_t api_version;            /* Set to MPV_DASH_SOURCE_API_VERSION. */
+    uint64_t generation;             /* Zero until a source is accepted. */
+    int32_t phase;                   /* mpv_dash_source_phase, not decoder/AO ready. */
+    int32_t failure;                 /* mpv_dash_source_failure; latched. */
+    int32_t failed_track;            /* mpv_dash_track_kind. */
+    int32_t video_http_status;       /* Last numeric response, or zero. */
+    int32_t audio_http_status;       /* Last numeric response, or zero. */
+    uint32_t video_responses;        /* Includes seek/reopen/error responses. */
+    uint32_t audio_responses;
+} mpv_dash_source_status;
+
+/** Version 1 of the numeric D3D11 Composition presentation snapshot. */
+#define MPV_DASH_FRAME_STATUS_API_VERSION 1u
+
+typedef struct mpv_dash_frame_status {
+    uint32_t struct_size;            /* Set to sizeof(mpv_dash_frame_status). */
+    uint32_t api_version;            /* MPV_DASH_FRAME_STATUS_API_VERSION. */
+    uint64_t source_generation;      /* Zero until accepted; then process-unique. */
+    uint64_t presented_generation;   /* Zero until a real video frame presents. */
+    uint64_t presented_frame_serial; /* Process-monotonic; zero if stale. */
+    uint64_t presented_surface_epoch; /* Must match the acquired lease's epoch. */
+} mpv_dash_frame_status;
+
+/**
+ * Atomically bind exactly one video and one required audio track to a new load.
+ *
+ * Input errors return MPV_ERROR_INVALID_PARAMETER before opening either URL.
+ * Valid explicit SegmentBase ranges return MPV_ERROR_UNSUPPORTED until their
+ * byte-range implementation exists. With no ranges, the MP4 must supply its
+ * own seekable index/SIDX; no range is guessed. HTTP/decoding results arrive
+ * later via mpv_dash_source_get_status() and MPV_EVENT_FILE_LOADED/END_FILE.
+ * Success here means QUEUED, not that either track played. TRACKS_BOUND means
+ * both tracks were selected before FILE_LOADED; the caller must still verify
+ * video frames, audio output, and the current playback generation.
+ *
+ * The source is reachable only through opaque, non-credential properties.
+ * The caller must disable terminal output and never forward native log text
+ * (even though this path suppresses URL-bearing curl diagnostics).
+ */
+MPV_EXPORT int mpv_dash_source_load(mpv_handle *ctx,
+                                    const mpv_dash_source *source);
+
+/**
+ * Return a numeric, per-instance snapshot; never a URL or HTTP header.
+ *
+ * HTTP failures are latched across subsequent seeks and stop. HTTP 412 is
+ * rejected at the response headers before any body is delivered, never
+ * retried or redirected. The caller must treat RISK/AUTH as terminal for its
+ * process; this ABI cannot reset a failed source in the same mpv instance.
+ */
+MPV_EXPORT int mpv_dash_source_get_status(mpv_handle *ctx,
+                                           mpv_dash_source_status *status);
+
+/**
+ * Query a frame actually submitted and successfully Present-ed by the native
+ * D3D11 Composition VO; FILE_LOADED and VIDEO_RECONFIG do not imply a frame.
+ *
+ * Configure --vo=gpu-next, --gpu-api=d3d11,
+ * --d3d11-output-mode=composition and --d3d11-composition-size=<w>x<h>
+ * before mpv_initialize(), not after mpv_dash_source_load(). The hosting
+ * application owns the surface attachment, never ResizeBuffers or Present.
+ *
+ * Poll this numeric snapshot after FILE_LOADED: Ready requires a non-NULL
+ * mpv_acquire_d3d11_composition_surface() lease, matching lease.epoch and
+ * presented_surface_epoch, presented_generation == source_generation == the
+ * current mpv_dash_source_status.generation, a nonzero presented_frame_serial,
+ * both decoder/AO parameters, and source phase TRACKS_BOUND. A lost/replaced
+ * swapchain, non-Composition VO, failed/stopped source, or idle/OSD-only draw
+ * returns zero presentation fields. It does not prove that the host attached
+ * the surface or that a physical display has shown it.
+ */
+MPV_EXPORT int mpv_dash_source_get_frame_status(
+    mpv_handle *ctx, mpv_dash_frame_status *status);
 
 /**
  * Return the name of this client handle. Every client has its own unique
@@ -2019,6 +2173,12 @@ MPV_DEFINE_SYM_PTR(mpv_acquire_d3d11_composition_surface)
 #define mpv_acquire_d3d11_composition_surface pfn_mpv_acquire_d3d11_composition_surface
 MPV_DEFINE_SYM_PTR(mpv_release_d3d11_composition_surface)
 #define mpv_release_d3d11_composition_surface pfn_mpv_release_d3d11_composition_surface
+MPV_DEFINE_SYM_PTR(mpv_dash_source_load)
+#define mpv_dash_source_load pfn_mpv_dash_source_load
+MPV_DEFINE_SYM_PTR(mpv_dash_source_get_status)
+#define mpv_dash_source_get_status pfn_mpv_dash_source_get_status
+MPV_DEFINE_SYM_PTR(mpv_dash_source_get_frame_status)
+#define mpv_dash_source_get_frame_status pfn_mpv_dash_source_get_frame_status
 MPV_DEFINE_SYM_PTR(mpv_client_name)
 #define mpv_client_name pfn_mpv_client_name
 MPV_DEFINE_SYM_PTR(mpv_client_id)

@@ -59,6 +59,7 @@
 #include "video/out/vo.h"
 
 #include "core.h"
+#include "dash_source.h"
 #include "sub_translate.h"
 #include "command.h"
 
@@ -1669,13 +1670,54 @@ static void load_external_opts_thread(void *p)
 
     mp_core_lock(mpctx);
 
-    load_chapters(mpctx);
+    bool dash = mp_dash_source_active(mpctx->global) && mpctx->filename &&
+                !strcmp(mpctx->filename, MP_DASH_VIDEO_URL);
+    if (mpctx->stop_play)
+        goto done;
+    if (dash) {
+        char **audio_files = mpctx->opts->audio_files;
+        if (!audio_files || !audio_files[0] ||
+            strcmp(audio_files[0], MP_DASH_AUDIO_URL) || audio_files[1])
+        {
+            mp_dash_source_fail(mpctx->global, MPV_DASH_TRACK_AUDIO,
+                                MPV_DASH_FAILURE_TRACK_SELECTION);
+            mpctx->error_playing = MPV_ERROR_LOADING_FAILED;
+            mpctx->stop_play = PT_ERROR;
+            goto done;
+        }
+    } else {
+        load_chapters(mpctx);
+    }
     open_external_files(mpctx, mpctx->opts->audio_files, STREAM_AUDIO);
+    if (mpctx->stop_play ||
+        (dash && mp_cancel_test(mpctx->playback_abort) &&
+         !mp_dash_source_failed(mpctx->global)))
+        goto done;
+    if (dash) {
+        bool found_audio = false;
+        for (int n = 0; n < mpctx->num_tracks; n++) {
+            struct track *track = mpctx->tracks[n];
+            if (track->type == STREAM_AUDIO && track->is_external &&
+                track->external_filename &&
+                !strcmp(track->external_filename, MP_DASH_AUDIO_URL))
+                found_audio = true;
+        }
+        if (!found_audio) {
+            mp_dash_source_fail(mpctx->global, MPV_DASH_TRACK_AUDIO,
+                                MPV_DASH_FAILURE_AUDIO_OPEN);
+            mpctx->error_playing = MPV_ERROR_LOADING_FAILED;
+            mpctx->stop_play = PT_ERROR;
+        }
+        goto done;
+    }
+    if (mpctx->stop_play)
+        goto done;
     open_external_files(mpctx, mpctx->opts->sub_name, STREAM_SUB);
     open_external_files(mpctx, mpctx->opts->coverart_files, STREAM_VIDEO);
     open_external_files(mpctx, mpctx->opts->external_files, STREAM_TYPE_COUNT);
     autoload_external_files(mpctx, mpctx->playback_abort);
 
+done:
     mp_waiter_wakeup(waiter, 0);
     mp_wakeup_core(mpctx);
     mp_core_unlock(mpctx);
@@ -1906,6 +1948,12 @@ static void play_current_file(struct MPContext *mpctx)
             open_demux_reentrant(mpctx);
         }
     }
+    if (!mpctx->demuxer &&
+        (!mpctx->stop_play || mpctx->stop_play == PT_ERROR) &&
+        mp_dash_source_active(mpctx->global) &&
+        !strcmp(mpctx->filename, MP_DASH_VIDEO_URL))
+        mp_dash_source_fail(mpctx->global, MPV_DASH_TRACK_VIDEO,
+                            MPV_DASH_FAILURE_VIDEO_OPEN);
     if (!mpctx->demuxer || mpctx->stop_play)
         goto terminate_playback;
 
@@ -2012,6 +2060,26 @@ static void play_current_file(struct MPContext *mpctx)
     // For lavfi-complex mode reinit_video_chain skips chain setup, so set up
     // the enhancement-layer pairing here. No-op in non-lavfi-complex mode.
     update_vo_chain_el_pair(mpctx);
+
+    if (mp_dash_source_active(mpctx->global) &&
+        !strcmp(mpctx->filename, MP_DASH_VIDEO_URL))
+    {
+        struct track *video = mpctx->current_track[0][STREAM_VIDEO];
+        struct track *audio = mpctx->current_track[0][STREAM_AUDIO];
+        if (mp_dash_source_failed(mpctx->global) ||
+            !mpctx->vo_chain || !mpctx->ao_chain ||
+            !video || video->demuxer != mpctx->demuxer ||
+            !audio || !audio->is_external || !audio->external_filename ||
+            strcmp(audio->external_filename, MP_DASH_AUDIO_URL))
+        {
+            mp_dash_source_fail(mpctx->global, MPV_DASH_TRACK_NONE,
+                                MPV_DASH_FAILURE_TRACK_SELECTION);
+            mpctx->error_playing = MPV_ERROR_NOTHING_TO_PLAY;
+            mpctx->stop_play = PT_ERROR;
+            goto terminate_playback;
+        }
+        mp_dash_source_bound(mpctx->global);
+    }
 
     if (mpctx->encode_lavc_ctx) {
         if (mpctx->vo_chain)
@@ -2185,6 +2253,10 @@ terminate_playback:
     case PT_STOP:           end_event.reason = MPV_END_FILE_REASON_STOP; break;
     case PT_QUIT:           end_event.reason = MPV_END_FILE_REASON_QUIT; break;
     };
+    if (mp_dash_source_active(mpctx->global) && mpctx->filename &&
+        !strcmp(mpctx->filename, MP_DASH_VIDEO_URL))
+        mp_dash_source_stopped(mpctx->global,
+                               end_event.reason == MPV_END_FILE_REASON_ERROR);
     mp_notify(mpctx, MPV_EVENT_END_FILE, &end_event);
 
     MP_VERBOSE(mpctx, "finished playback, %s (reason %d)\n",

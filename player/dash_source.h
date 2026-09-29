@@ -32,9 +32,15 @@ int mp_dash_source_validate(const mpv_dash_source *source);
 int mp_dash_source_begin(struct mpv_global *global, const mpv_dash_source *source);
 void mp_dash_source_fail(struct mpv_global *global, mpv_dash_track_kind track,
                          mpv_dash_source_failure failure);
+void mp_dash_source_fail_with_origin(struct mpv_global *global,
+                                     mpv_dash_track_kind track,
+                                     mpv_dash_source_failure failure,
+                                     mpv_dash_failure_origin origin);
 void mp_dash_source_bound(struct mpv_global *global);
 void mp_dash_source_stopped(struct mpv_global *global, bool error);
 int mp_dash_source_snapshot(struct mpv_global *global, mpv_dash_source_status *out);
+int mp_dash_source_failure_snapshot(struct mpv_global *global,
+                                    mpv_dash_failure_detail *out);
 int mp_dash_source_range_snapshot(struct mpv_global *global,
                                   mpv_dash_range_capability *out);
 bool mp_dash_source_seek_blocked(struct mpv_global *global);
@@ -47,7 +53,8 @@ bool mp_dash_source_get_track(struct mpv_global *global, const char *alias,
                               void *parent, mpv_dash_track_kind *kind,
                               struct mp_dash_track_config *config);
 void mp_dash_source_response(struct mpv_global *global, mpv_dash_track_kind track,
-                             int status, mpv_dash_source_failure failure);
+                             int status, mpv_dash_source_failure failure,
+                             mpv_dash_failure_origin origin);
 void mp_dash_source_range_validated(struct mpv_global *global,
                                     mpv_dash_track_kind track);
 bool mp_dash_source_has_validated_range(struct mpv_global *global,

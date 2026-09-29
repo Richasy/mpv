@@ -36,6 +36,9 @@ INVALID = -4
 UNSUPPORTED = -18
 IDLE, QUEUED, BOUND, FAILED, STOPPED = range(5)
 AUTH, RISK, HTTP_STATUS, HTTP_RANGE, TRANSPORT = 3, 4, 5, 6, 7
+ORIGIN_NONE, ORIGIN_OTHER, ORIGIN_MALFORMED, ORIGIN_DUPLICATE, \
+    ORIGIN_INTERIM, ORIGIN_REDIRECT, ORIGIN_LENGTH, ORIGIN_OFFSET, \
+    ORIGIN_WINDOW, ORIGIN_PARTIAL, ORIGIN_BODY_LENGTH = range(11)
 VIDEO, AUDIO = 1, 2
 FILE_LOADED, END_FILE, LOG_MESSAGE = 8, 7, 2
 SEEK_EVENT, DOUBLE = 20, 5
@@ -92,6 +95,18 @@ class Status(ctypes.Structure):
         ("audio_http_status", ctypes.c_int32),
         ("video_responses", ctypes.c_uint32),
         ("audio_responses", ctypes.c_uint32),
+    ]
+
+
+class FailureDetail(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("api_version", ctypes.c_uint32),
+        ("source_generation", ctypes.c_uint64),
+        ("origin", ctypes.c_int32),
+        ("failed_track", ctypes.c_int32),
+        ("http_status", ctypes.c_int32),
+        ("response_count", ctypes.c_uint32),
     ]
 
 
@@ -278,6 +293,9 @@ class Server(http.server.ThreadingHTTPServer):
         self.lock = threading.Lock()
         self.requests = []
         self.early_hints_roles = set()
+        self.interim_count_roles = {}
+        self.malformed_status_roles = set()
+        self.duplicate_final_roles = set()
         self.short_initial_roles = set()
         self.short_initial_bytes = 2048
         self.pause_first_body_role = None
@@ -302,6 +320,7 @@ class Server(http.server.ThreadingHTTPServer):
         self.full_body_lengths = {}
         self.full_body_encodings = {}
         self.full_body_with_range = set()
+        self.content_length_conflict_roles = set()
         self.redirect_hits = 0
         self.error_body_bytes = 0
         self.error_headers = threading.Event()
@@ -394,11 +413,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with self.server.lock:
             self.server.active += 1
         try:
-            if role in self.server.early_hints_roles:
+            if role in self.server.malformed_status_roles:
+                self.wfile.write(
+                    b"HTTP/1.1 20X Invalid\r\nContent-Length: 0\r\n"
+                    b"Connection: close\r\n\r\n")
+                return
+            hints = self.server.interim_count_roles.get(
+                role, int(role in self.server.early_hints_roles))
+            for _ in range(hints):
                 self.send_response_only(103, "Early Hints")
                 self.send_header("Link", "</unused>; rel=preload")
                 self.end_headers()
                 self.wfile.flush()
+            if role in self.server.duplicate_final_roles:
+                self.send_response_only(code)
             self.send_response(code)
             if code == 302:
                 self.send_header(
@@ -422,6 +450,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 length = self.server.full_body_lengths.get(role, str(len(body)))
                 if length is not None:
                     self.send_header("Content-Length", str(length))
+                if role in self.server.content_length_conflict_roles:
+                    self.send_header("Transfer-Encoding", "chunked")
             elif code in (200, 401, 403, 404, 412, 416):
                 self.send_header("Content-Length", "64")
             else:
@@ -450,7 +480,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         return
                 self.wfile.write(data[start:end + 1])
             elif media_candidate:
-                self.wfile.write(body)
+                if role in self.server.content_length_conflict_roles:
+                    self.wfile.write(
+                        f"{len(body):X}\r\n".encode() + body + b"\r\n0\r\n\r\n")
+                else:
+                    self.wfile.write(body)
             elif code in (200, 401, 403, 404, 412, 416):
                 self.server.error_headers.set()
                 if self.server.release_error_body.wait(10):
@@ -503,6 +537,8 @@ def configure_library(mpv):
     mpv.mpv_dash_source_load.argtypes = [ctypes.c_void_p, ctypes.POINTER(Source)]
     mpv.mpv_dash_source_get_status.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(Status)]
+    mpv.mpv_dash_source_get_failure_detail.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(FailureDetail)]
     mpv.mpv_dash_source_get_range_capability.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(RangeCapability)]
     mpv.mpv_dash_source_get_frame_status.argtypes = [
@@ -595,6 +631,17 @@ def snapshot(mpv, handle):
     if result != 0:
         raise AssertionError(f"Status failed: {result}")
     return state
+
+
+def failure_detail(mpv, handle):
+    detail = FailureDetail()
+    detail.struct_size = ctypes.sizeof(FailureDetail)
+    detail.api_version = VERSION
+    result = mpv.mpv_dash_source_get_failure_detail(
+        handle, ctypes.byref(detail))
+    if result != 0:
+        raise AssertionError(f"Failure detail query failed: {result}")
+    return detail
 
 
 def range_capability(mpv, handle):
@@ -711,6 +758,18 @@ def assert_headers(server):
 def test_invalid(mpv, server):
     with client(mpv) as handle:
         assert snapshot(mpv, handle).phase == IDLE
+        empty_failure = failure_detail(mpv, handle)
+        assert not empty_failure.source_generation
+        assert empty_failure.origin == ORIGIN_NONE
+        bad_detail = FailureDetail()
+        bad_detail.struct_size = 0
+        bad_detail.api_version = VERSION
+        assert mpv.mpv_dash_source_get_failure_detail(
+            handle, ctypes.byref(bad_detail)) == INVALID
+        bad_detail.struct_size = ctypes.sizeof(FailureDetail)
+        bad_detail.api_version = VERSION + 1
+        assert mpv.mpv_dash_source_get_failure_detail(
+            handle, ctypes.byref(bad_detail)) == INVALID
         empty_range = range_capability(mpv, handle)
         assert not empty_range.source_generation
         assert not empty_range.video_validated_206
@@ -785,6 +844,9 @@ def test_playback(mpv, server):
         await_event(mpv, handle, FILE_LOADED)
         state = snapshot(mpv, handle)
         assert state.phase == BOUND, (state.phase, state.failure)
+        detail = failure_detail(mpv, handle)
+        assert detail.source_generation == state.generation
+        assert detail.origin == ORIGIN_NONE
         frame = frame_snapshot(mpv, handle)
         assert frame.source_generation == state.generation
         assert not frame.presented_frame_serial, \
@@ -856,6 +918,7 @@ def test_full_body_playback(mpv, server, full_role, http_status=200,
         state = snapshot(mpv, handle)
         ranged = range_capability(mpv, handle)
         assert state.phase == BOUND and not state.failure
+        assert failure_detail(mpv, handle).origin == ORIGIN_NONE
         assert (state.video_http_status, state.audio_http_status) == (
             (http_status, 206) if full_role == "video" else (206, http_status))
         assert ranged.source_generation == state.generation
@@ -1380,7 +1443,8 @@ def test_composition_first_frame(mpv, server, previous_generation,
     return stopped.source_generation, last_serial
 
 
-def test_failure(mpv, server, failed_role, expected, expected_http=None):
+def test_failure(mpv, server, failed_role, expected, expected_http=None,
+                 expected_origin=None):
     with client(mpv) as handle:
         source = source_for(server)
         assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
@@ -1391,6 +1455,19 @@ def test_failure(mpv, server, failed_role, expected, expected_http=None):
         failures = expected if isinstance(expected, tuple) else (expected,)
         assert state.phase == FAILED and state.failure in failures, \
             (state.phase, state.failure, expected)
+        detail = failure_detail(mpv, handle)
+        assert detail.source_generation == state.generation
+        assert detail.failed_track == state.failed_track
+        assert detail.origin != ORIGIN_NONE
+        if expected_origin is not None:
+            assert detail.origin == expected_origin, \
+                (detail.origin, expected_origin)
+        if state.failed_track == VIDEO:
+            assert detail.http_status == state.video_http_status
+            assert detail.response_count == state.video_responses
+        elif state.failed_track == AUDIO:
+            assert detail.http_status == state.audio_http_status
+            assert detail.response_count == state.audio_responses
         failed_range = range_capability(mpv, handle)
         assert failed_range.source_generation == state.generation
         assert not failed_range.video_validated_206
@@ -1412,7 +1489,8 @@ def test_failure(mpv, server, failed_role, expected, expected_http=None):
     assert len(server.requests_for(failed_role)) == 1
 
 
-def test_full_body_rejected(mpv, server, expected_failures, allow_file_loaded=False):
+def test_full_body_rejected(mpv, server, expected_failures, allow_file_loaded=False,
+                            expected_origin=None):
     server.full_body_roles.add("audio")
     with client(mpv) as handle:
         source = source_for(server)
@@ -1445,6 +1523,13 @@ def test_full_body_rejected(mpv, server, expected_failures, allow_file_loaded=Fa
         state = snapshot(mpv, handle)
         assert state.phase == FAILED and state.failure in expected_failures, \
             (state.phase, state.failure, expected_failures)
+        assert state.failure != HTTP_STATUS, \
+            "An ordinary media response was rejected by HTTP status alone"
+        detail = failure_detail(mpv, handle)
+        assert detail.origin != ORIGIN_NONE
+        if expected_origin is not None:
+            assert detail.origin == expected_origin, \
+                (detail.origin, expected_origin)
         assert state.failed_track == AUDIO
         assert not prop(mpv, handle, "audio-out-params/samplerate")
         ranged = range_capability(mpv, handle)
@@ -1452,6 +1537,27 @@ def test_full_body_rejected(mpv, server, expected_failures, allow_file_loaded=Fa
         assert not ranged.video_validated_206
         assert not ranged.audio_validated_206
     assert len(server.requests_for("audio")) == 1
+
+
+def test_status_syntax_control(mpv, server, expected_origin):
+    server.full_body_roles.add("audio")
+    server.full_body_payloads["audio"] = b""
+    with client(mpv) as handle:
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        await_event(mpv, handle, END_FILE)
+        state = snapshot(mpv, handle)
+        detail = failure_detail(mpv, handle)
+        assert state.phase == FAILED
+        assert detail.source_generation == state.generation
+        assert detail.failed_track == state.failed_track
+        if state.failure == HTTP_STATUS:
+            assert detail.origin == expected_origin, \
+                (detail.origin, expected_origin)
+            return True
+        assert detail.origin == ORIGIN_OTHER, \
+            (detail.origin, state.failure)
+        return False
 
 
 def test_consumer_window(mpv, tracks, end_offset, length_known=True,
@@ -1478,6 +1584,7 @@ def test_consumer_window(mpv, tracks, end_offset, length_known=True,
                 failed = snapshot(mpv, handle)
                 assert failed.phase == FAILED
                 assert failed.failure == HTTP_RANGE and failed.failed_track == AUDIO
+                assert failure_detail(mpv, handle).origin == ORIGIN_WINDOW
                 assert failed.audio_http_status == code
                 assert not prop(mpv, handle, "audio-out-params/samplerate")
             assert server.requests_for("audio")[0][7] == \
@@ -1510,6 +1617,13 @@ def test_late_status(mpv, server, role, code, failure):
         assert state.phase == FAILED and state.failure == failure, \
             (state.phase, state.failure)
         assert state.failed_track == (VIDEO if role == "video" else AUDIO)
+        detail = failure_detail(mpv, handle)
+        assert detail.source_generation == state.generation
+        assert detail.failed_track == state.failed_track
+        assert detail.http_status == code
+        assert detail.response_count == (
+            state.video_responses if role == "video" else state.audio_responses)
+        assert detail.origin == (ORIGIN_OFFSET if code == 200 else ORIGIN_OTHER)
         assert (state.video_http_status if role == "video" else
                 state.audio_http_status) == code
         assert len(server.requests_for(role)) > before
@@ -1520,6 +1634,12 @@ def test_late_status(mpv, server, role, code, failure):
         count = len(server.requests_for(role))
         time.sleep(0.2)
         assert len(server.requests_for(role)) == count, "Terminal HTTP was retried"
+        frozen = (detail.origin, detail.failed_track, detail.http_status,
+                  detail.response_count)
+        command(mpv, handle, "stop")
+        after = failure_detail(mpv, handle)
+        assert (after.origin, after.failed_track, after.http_status,
+                after.response_count) == frozen, "First-failure reason was overwritten"
 
 
 def main():
@@ -1564,7 +1684,9 @@ def main():
                     return
             if hasattr(mpv, "mpv_dash_test_control"):
                 raise AssertionError("Production DLL exposes a test-only hook")
-            assert mpv.mpv_client_api_version() == (2 << 16) | 10
+            assert mpv.mpv_client_api_version() == (2 << 16) | 11
+            assert ctypes.sizeof(FailureDetail) == 32
+            assert FailureDetail.source_generation.offset == 8
             assert ctypes.sizeof(RangeCapability) == 24
             assert RangeCapability.source_generation.offset == 8
             assert RangeCapability.video_validated_206.offset == 16
@@ -1597,6 +1719,9 @@ def main():
                                         expected_range="bytes=0-16383")
             with serve(tracks) as server:
                 server.full_body_with_range.add("audio")
+                test_full_body_playback(mpv, server, "audio")
+            with serve(tracks) as server:
+                server.full_body_types["audio"] = "text/html"
                 test_full_body_playback(mpv, server, "audio")
             for code in (404, 500, 416):
                 with serve(tracks) as server:
@@ -1637,6 +1762,19 @@ def main():
                 server.early_hints_roles.add("video")
                 server.deny = "video"
                 test_failure(mpv, server, "video", RISK)
+            print("[dash] numeric first-failure status branches", flush=True)
+            with serve(tracks) as server:
+                server.interim_count_roles["audio"] = 9
+                test_failure(mpv, server, "audio", HTTP_STATUS,
+                             expected_origin=ORIGIN_INTERIM)
+            for name, expected in (
+                ("malformed_status_roles", ORIGIN_MALFORMED),
+                ("duplicate_final_roles", ORIGIN_DUPLICATE),
+            ):
+                with serve(tracks) as server:
+                    getattr(server, name).add("audio")
+                    observed = test_status_syntax_control(mpv, server, expected)
+                    print(f"[dash] {name} exposed={int(observed)}", flush=True)
             print("[dash] TLS client certificate isolation", flush=True)
             certificates = generate_tls_certificates(directory)
             with serve(tracks, certificates) as server:
@@ -1681,6 +1819,10 @@ def main():
                     server.full_body_payloads["audio"] = b""
                     test_full_body_rejected(mpv, server, (2, 8, 9, TRANSPORT))
             print("[dash] full-body 200 invalid Content-Length", flush=True)
+            with serve(tracks) as server:
+                server.content_length_conflict_roles.add("audio")
+                test_full_body_rejected(mpv, server, (TRANSPORT,),
+                                        expected_origin=ORIGIN_LENGTH)
             for length in ("0", "-1", "invalid", str(1 << 70)):
                 with serve(tracks) as server:
                     server.full_body_lengths["audio"] = length
@@ -1716,11 +1858,13 @@ def main():
             print("[dash] malformed Content-Range", flush=True)
             with serve(tracks) as server:
                 server.bad_range = "video"
-                test_failure(mpv, server, "video", HTTP_RANGE)
+                test_failure(mpv, server, "video", HTTP_RANGE,
+                             expected_origin=ORIGIN_PARTIAL)
             print("[dash] malformed audio Content-Range", flush=True)
             with serve(tracks) as server:
                 server.bad_range = "audio"
-                test_failure(mpv, server, "audio", HTTP_RANGE)
+                test_failure(mpv, server, "audio", HTTP_RANGE,
+                             expected_origin=ORIGIN_PARTIAL)
             for role in ("video", "audio"):
                 print(f"[dash] {role} unbounded HTTP 416 is media candidate",
                       flush=True)
@@ -1732,7 +1876,8 @@ def main():
             print("[dash] no redirect", flush=True)
             with serve(tracks) as server:
                 server.redirect = "video"
-                test_failure(mpv, server, "video", HTTP_STATUS)
+                test_failure(mpv, server, "video", HTTP_STATUS,
+                             expected_origin=ORIGIN_REDIRECT)
                 assert server.redirect_hits == 0
             for role, code, failure in (
                 ("video", 412, RISK), ("audio", 412, RISK),

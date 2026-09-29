@@ -33,6 +33,9 @@ API changes
 ::
 
  --- mpv 0.41.0 ---
+ 2.11   - add mpv_dash_source_get_failure_detail() with a versioned,
+          generation-bound numeric first-failure origin. The existing v1
+          status and failure codes are unchanged (Richasy/mpv fork).
  2.10   - let ordinary typed DASH media responses reach the existing demuxer,
           including unknown-length streams; only 401/403/412 and redirects
           remain status-line terminal. A nonzero byte position or unsatisfied

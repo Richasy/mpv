@@ -560,16 +560,19 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
          p->request_received > p->request_end - p->request_start ||
          bytes > p->request_end - p->request_start - p->request_received))
     {
-        mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_HTTP_RANGE);
+        mp_dash_source_fail_with_origin(p->global, p->dash_kind,
+            MPV_DASH_FAILURE_HTTP_RANGE, MPV_DASH_ORIGIN_CONSUMER_WINDOW);
         return CURL_WRITEFUNC_ERROR;
     }
     if (p->dash_kind && p->dash_response_length_known &&
         (p->request_received > p->dash_response_length ||
          bytes > p->dash_response_length - p->request_received))
     {
-        mp_dash_source_fail(p->global, p->dash_kind, p->dash_ordinary_response ?
-                            MPV_DASH_FAILURE_TRANSPORT :
-                            MPV_DASH_FAILURE_HTTP_RANGE);
+        mp_dash_source_fail_with_origin(p->global, p->dash_kind,
+            p->dash_ordinary_response ? MPV_DASH_FAILURE_TRANSPORT :
+                                        MPV_DASH_FAILURE_HTTP_RANGE,
+            p->dash_ordinary_response ? MPV_DASH_ORIGIN_BODY_LENGTH :
+                                        MPV_DASH_ORIGIN_INVALID_PARTIAL_RANGE);
         return CURL_WRITEFUNC_ERROR;
     }
 
@@ -795,16 +798,17 @@ static bool dash_content_range(struct priv *p, uint64_t *length, int64_t *total)
     return true;
 }
 
-static bool dash_media_length(struct priv *p, uint64_t *length, bool *known)
+static mpv_dash_failure_origin dash_media_length(struct priv *p,
+                                                 uint64_t *length, bool *known)
 {
     const char *declared = header_value(p->curl, "Content-Length");
     curl_off_t size = -1;
     if (curl_easy_getinfo(p->curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T,
                           &size) != CURLE_OK)
-        return false;
+        return MPV_DASH_ORIGIN_DECLARED_LENGTH;
     if (declared) {
         if (size < 0 || (uint64_t)size > INT64_MAX)
-            return false;
+            return MPV_DASH_ORIGIN_DECLARED_LENGTH;
         *length = size;
         *known = true;
     } else {
@@ -814,8 +818,8 @@ static bool dash_media_length(struct priv *p, uint64_t *length, bool *known)
     // A per-request size hint is not a consumer-owned end_offset window.
     if (p->request_end && *known &&
         *length > p->request_end - p->request_start)
-        return false;
-    return true;
+        return MPV_DASH_ORIGIN_CONSUMER_WINDOW;
+    return MPV_DASH_ORIGIN_NONE;
 }
 
 static size_t dash_header_callback(struct priv *p, struct bstr line, size_t bytes)
@@ -826,7 +830,8 @@ static size_t dash_header_callback(struct priv *p, struct bstr line, size_t byte
         bstr rest;
         int space = bstrchr(line, ' ');
         if (space < 0) {
-            mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_HTTP_STATUS);
+            mp_dash_source_fail_with_origin(p->global, p->dash_kind,
+                MPV_DASH_FAILURE_HTTP_STATUS, MPV_DASH_ORIGIN_MALFORMED_STATUS);
             return 0;
         }
         rest = bstr_cut(line, space + 1);
@@ -835,7 +840,8 @@ static size_t dash_header_callback(struct priv *p, struct bstr line, size_t byte
             rest.start[2] < '0' || rest.start[2] > '9' ||
             (rest.len > 3 && rest.start[3] != ' '))
         {
-            mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_HTTP_STATUS);
+            mp_dash_source_fail_with_origin(p->global, p->dash_kind,
+                MPV_DASH_FAILURE_HTTP_STATUS, MPV_DASH_ORIGIN_MALFORMED_STATUS);
             return 0;
         }
         int status = (rest.start[0] - '0') * 100 +
@@ -847,24 +853,33 @@ static size_t dash_header_callback(struct priv *p, struct bstr line, size_t byte
             return bytes;
         }
         if (p->dash_status_seen || status < 200) {
-            mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_HTTP_STATUS);
+            mp_dash_source_fail_with_origin(p->global, p->dash_kind,
+                MPV_DASH_FAILURE_HTTP_STATUS,
+                p->dash_status_seen ? MPV_DASH_ORIGIN_DUPLICATE_STATUS :
+                                      MPV_DASH_ORIGIN_INTERIM_LIMIT);
             return 0;
         }
         p->dash_interim_headers = false;
         p->dash_status_seen = true;
         p->dash_ordinary_response = status != 206;
         mpv_dash_source_failure failure = MPV_DASH_FAILURE_NONE;
+        mpv_dash_failure_origin origin = MPV_DASH_ORIGIN_OTHER;
         if (status == 401 || status == 403)
             failure = MPV_DASH_FAILURE_HTTP_AUTH;
         else if (status == 412)
             failure = MPV_DASH_FAILURE_HTTP_RISK;
-        else if (status >= 300 && status < 400)
+        else if (status >= 300 && status < 400) {
             failure = MPV_DASH_FAILURE_HTTP_STATUS;
-        else if (p->dash_ordinary_response &&
-                 (p->request_start || p->start_offset ||
-                  (status == 416 && p->request_end)))
+            origin = MPV_DASH_ORIGIN_REDIRECT;
+        } else if (p->dash_ordinary_response &&
+                   (p->request_start || p->start_offset)) {
             failure = MPV_DASH_FAILURE_HTTP_RANGE;
-        mp_dash_source_response(p->global, p->dash_kind, status, failure);
+            origin = MPV_DASH_ORIGIN_NONZERO_OFFSET;
+        } else if (status == 416 && p->request_end) {
+            failure = MPV_DASH_FAILURE_HTTP_RANGE;
+            origin = MPV_DASH_ORIGIN_CONSUMER_WINDOW;
+        }
+        mp_dash_source_response(p->global, p->dash_kind, status, failure, origin);
         return failure == MPV_DASH_FAILURE_NONE ? bytes : 0;
     }
     if (line.len)
@@ -874,19 +889,27 @@ static size_t dash_header_callback(struct priv *p, struct bstr line, size_t byte
         return bytes;
     }
     int64_t total = -1;
-    bool valid = p->dash_status_seen &&
-        (p->dash_ordinary_response ?
-         dash_media_length(p, &p->dash_response_length,
-                           &p->dash_response_length_known) :
-         dash_content_range(p, &p->dash_response_length, &total));
+    mpv_dash_failure_origin origin = p->dash_status_seen ?
+                                    MPV_DASH_ORIGIN_NONE :
+                                    MPV_DASH_ORIGIN_MALFORMED_STATUS;
+    if (origin == MPV_DASH_ORIGIN_NONE) {
+        if (p->dash_ordinary_response) {
+            origin = dash_media_length(p, &p->dash_response_length,
+                                       &p->dash_response_length_known);
+        } else if (!dash_content_range(p, &p->dash_response_length, &total)) {
+            origin = MPV_DASH_ORIGIN_INVALID_PARTIAL_RANGE;
+        }
+    }
+    bool valid = origin == MPV_DASH_ORIGIN_NONE;
     if (valid && !p->dash_ordinary_response)
         p->dash_response_length_known = true;
     if (!valid)
     {
-        mp_dash_source_fail(p->global, p->dash_kind, p->dash_ordinary_response ?
-                            (p->request_end ? MPV_DASH_FAILURE_HTTP_RANGE :
-                             MPV_DASH_FAILURE_TRANSPORT) :
-                            MPV_DASH_FAILURE_HTTP_RANGE);
+        mp_dash_source_fail_with_origin(p->global, p->dash_kind,
+            p->dash_ordinary_response ?
+                (origin == MPV_DASH_ORIGIN_CONSUMER_WINDOW ?
+                    MPV_DASH_FAILURE_HTTP_RANGE : MPV_DASH_FAILURE_TRANSPORT) :
+                MPV_DASH_FAILURE_HTTP_RANGE, origin);
         if (!p->probed)
             finalize_probe(p);
         return 0;
@@ -1107,7 +1130,11 @@ static void on_done(struct priv *p, CURLcode code)
          mp_dash_source_terminal(p->global)))
     {
         if (!aborted && !mp_dash_source_terminal(p->global))
-            mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_TRANSPORT);
+            mp_dash_source_fail_with_origin(p->global, p->dash_kind,
+                MPV_DASH_FAILURE_TRANSPORT,
+                p->dash_response_length_known &&
+                    p->request_received != p->dash_response_length ?
+                    MPV_DASH_ORIGIN_BODY_LENGTH : MPV_DASH_ORIGIN_OTHER);
         mp_mutex_lock(&p->mtx);
         p->head = p->tail = p->count = 0;
         p->stream_error = true;

@@ -248,7 +248,7 @@ extern "C" {
  * relational operators (<, >, <=, >=).
  */
 #define MPV_MAKE_VERSION(major, minor) (((major) << 16) | (minor) | 0UL)
-#define MPV_CLIENT_API_VERSION MPV_MAKE_VERSION(2, 10)
+#define MPV_CLIENT_API_VERSION MPV_MAKE_VERSION(2, 11)
 
 /**
  * The API user is allowed to "#define MPV_ENABLE_DEPRECATED 0" before
@@ -529,6 +529,33 @@ typedef struct mpv_dash_source_status {
     uint32_t audio_responses;
 } mpv_dash_source_status;
 
+/** Version 1 of numeric first-failure diagnostics for a typed DASH source. */
+#define MPV_DASH_FAILURE_DETAIL_API_VERSION 1u
+
+typedef enum mpv_dash_failure_origin {
+    MPV_DASH_ORIGIN_NONE = 0,
+    MPV_DASH_ORIGIN_OTHER = 1,
+    MPV_DASH_ORIGIN_MALFORMED_STATUS = 2,
+    MPV_DASH_ORIGIN_DUPLICATE_STATUS = 3,
+    MPV_DASH_ORIGIN_INTERIM_LIMIT = 4,
+    MPV_DASH_ORIGIN_REDIRECT = 5,
+    MPV_DASH_ORIGIN_DECLARED_LENGTH = 6,
+    MPV_DASH_ORIGIN_NONZERO_OFFSET = 7,
+    MPV_DASH_ORIGIN_CONSUMER_WINDOW = 8,
+    MPV_DASH_ORIGIN_INVALID_PARTIAL_RANGE = 9,
+    MPV_DASH_ORIGIN_BODY_LENGTH = 10,
+} mpv_dash_failure_origin;
+
+typedef struct mpv_dash_failure_detail {
+    uint32_t struct_size;        /* Set to sizeof(mpv_dash_failure_detail). */
+    uint32_t api_version;        /* MPV_DASH_FAILURE_DETAIL_API_VERSION. */
+    uint64_t source_generation;  /* Match mpv_dash_source_status.generation. */
+    int32_t origin;              /* mpv_dash_failure_origin, first failure only. */
+    int32_t failed_track;        /* mpv_dash_track_kind, first failure only. */
+    int32_t http_status;         /* Last numeric status at first failure, or zero. */
+    uint32_t response_count;     /* Track response count at first failure. */
+} mpv_dash_failure_detail;
+
 /** Version 1 of the source-generation-bound, numeric DASH range capability. */
 #define MPV_DASH_RANGE_CAPABILITY_API_VERSION 1u
 
@@ -581,6 +608,17 @@ MPV_EXPORT int mpv_dash_source_load(mpv_handle *ctx,
  */
 MPV_EXPORT int mpv_dash_source_get_status(mpv_handle *ctx,
                                            mpv_dash_source_status *status);
+
+/**
+ * Return the first failure's numeric origin without changing the v1 status.
+ *
+ * A zero origin means no failure was latched. The details are bound to the
+ * current source generation and remain unchanged after stop. Numeric HTTP
+ * status and count cannot identify a response body or prove server behavior.
+ * No URL, response header, cookie, or media byte is exposed.
+ */
+MPV_EXPORT int mpv_dash_source_get_failure_detail(
+    mpv_handle *ctx, mpv_dash_failure_detail *detail);
 
 /**
  * Return per-track range evidence for the current source generation.
@@ -2200,6 +2238,8 @@ MPV_DEFINE_SYM_PTR(mpv_dash_source_load)
 #define mpv_dash_source_load pfn_mpv_dash_source_load
 MPV_DEFINE_SYM_PTR(mpv_dash_source_get_status)
 #define mpv_dash_source_get_status pfn_mpv_dash_source_get_status
+MPV_DEFINE_SYM_PTR(mpv_dash_source_get_failure_detail)
+#define mpv_dash_source_get_failure_detail pfn_mpv_dash_source_get_failure_detail
 MPV_DEFINE_SYM_PTR(mpv_dash_source_get_range_capability)
 #define mpv_dash_source_get_range_capability pfn_mpv_dash_source_get_range_capability
 MPV_DEFINE_SYM_PTR(mpv_dash_source_get_frame_status)

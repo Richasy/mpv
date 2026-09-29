@@ -34,6 +34,7 @@ struct mp_dash_source_state {
     uint64_t baseline_present_serial;
     uint32_t validated_ranges;
     mpv_dash_source_status status;
+    mpv_dash_failure_detail failure_detail;
 };
 
 static _Atomic uint64_t dash_generation_seed;
@@ -217,6 +218,11 @@ int mp_dash_source_begin(struct mpv_global *global, const mpv_dash_source *sourc
         .generation = generation,
         .phase = MPV_DASH_SOURCE_QUEUED,
     };
+    state->failure_detail = (mpv_dash_failure_detail) {
+        .struct_size = sizeof(mpv_dash_failure_detail),
+        .api_version = MPV_DASH_FAILURE_DETAIL_API_VERSION,
+        .source_generation = generation,
+    };
     mp_mutex_unlock(&state->lock);
     return MPV_ERROR_SUCCESS;
 }
@@ -245,7 +251,8 @@ static void signal_failure(struct mp_dash_source_state *state)
 }
 
 static bool set_failure(struct mp_dash_source_state *state,
-                        mpv_dash_track_kind track, mpv_dash_source_failure failure)
+                        mpv_dash_track_kind track, mpv_dash_source_failure failure,
+                        mpv_dash_failure_origin origin)
 {
     if (state->status.phase == MPV_DASH_SOURCE_FAILED ||
         state->status.phase == MPV_DASH_SOURCE_STOPPED ||
@@ -254,22 +261,42 @@ static bool set_failure(struct mp_dash_source_state *state,
     state->status.phase = MPV_DASH_SOURCE_FAILED;
     state->status.failure = failure;
     state->status.failed_track = track;
+    state->failure_detail.origin = origin == MPV_DASH_ORIGIN_NONE ?
+                                   MPV_DASH_ORIGIN_OTHER : origin;
+    state->failure_detail.failed_track = track;
+    if (track == MPV_DASH_TRACK_VIDEO) {
+        state->failure_detail.http_status = state->status.video_http_status;
+        state->failure_detail.response_count = state->status.video_responses;
+    } else if (track == MPV_DASH_TRACK_AUDIO) {
+        state->failure_detail.http_status = state->status.audio_http_status;
+        state->failure_detail.response_count = state->status.audio_responses;
+    }
     return true;
 }
 
-void mp_dash_source_fail(struct mpv_global *global, mpv_dash_track_kind track,
-                         mpv_dash_source_failure failure)
+void mp_dash_source_fail_with_origin(struct mpv_global *global,
+                                     mpv_dash_track_kind track,
+                                     mpv_dash_source_failure failure,
+                                     mpv_dash_failure_origin origin)
 {
     struct mp_dash_source_state *state = global->dash_source;
     mp_mutex_lock(&state->lock);
-    bool first = set_failure(state, track, failure);
+    bool first = set_failure(state, track, failure, origin);
     mp_mutex_unlock(&state->lock);
     if (first)
         signal_failure(state);
 }
 
+void mp_dash_source_fail(struct mpv_global *global, mpv_dash_track_kind track,
+                         mpv_dash_source_failure failure)
+{
+    mp_dash_source_fail_with_origin(global, track, failure,
+                                    MPV_DASH_ORIGIN_OTHER);
+}
+
 void mp_dash_source_response(struct mpv_global *global, mpv_dash_track_kind track,
-                             int status, mpv_dash_source_failure failure)
+                             int status, mpv_dash_source_failure failure,
+                             mpv_dash_failure_origin origin)
 {
     struct mp_dash_source_state *state = global->dash_source;
     mp_mutex_lock(&state->lock);
@@ -286,7 +313,7 @@ void mp_dash_source_response(struct mpv_global *global, mpv_dash_track_kind trac
         if (*count < UINT32_MAX)
             (*count)++;
         if (failure != MPV_DASH_FAILURE_NONE)
-            first = set_failure(state, track, failure);
+            first = set_failure(state, track, failure, origin);
     }
     mp_mutex_unlock(&state->lock);
     if (first)
@@ -339,8 +366,8 @@ void mp_dash_source_stopped(struct mpv_global *global, bool error)
         state->status.phase != MPV_DASH_SOURCE_STOPPED)
     {
         if (error) {
-            state->status.failure = MPV_DASH_FAILURE_PLAYBACK;
-            state->status.phase = MPV_DASH_SOURCE_FAILED;
+            set_failure(state, MPV_DASH_TRACK_NONE,
+                        MPV_DASH_FAILURE_PLAYBACK, MPV_DASH_ORIGIN_OTHER);
         } else {
             state->status.phase = MPV_DASH_SOURCE_STOPPED;
         }
@@ -361,6 +388,23 @@ int mp_dash_source_snapshot(struct mpv_global *global, mpv_dash_source_status *o
     status.struct_size = sizeof(status);
     status.api_version = MPV_DASH_SOURCE_API_VERSION;
     *out = status;
+    return MPV_ERROR_SUCCESS;
+}
+
+int mp_dash_source_failure_snapshot(struct mpv_global *global,
+                                    mpv_dash_failure_detail *out)
+{
+    if (!out || out->struct_size != sizeof(*out) ||
+        out->api_version != MPV_DASH_FAILURE_DETAIL_API_VERSION)
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    struct mp_dash_source_state *state = global->dash_source;
+    mp_mutex_lock(&state->lock);
+    mpv_dash_failure_detail detail = state->failure_detail;
+    mp_mutex_unlock(&state->lock);
+    detail.struct_size = sizeof(detail);
+    detail.api_version = MPV_DASH_FAILURE_DETAIL_API_VERSION;
+    *out = detail;
     return MPV_ERROR_SUCCESS;
 }
 
@@ -496,11 +540,19 @@ int mp_dash_source_begin(struct mpv_global *global, const mpv_dash_source *sourc
 void mp_dash_source_fail(struct mpv_global *global, mpv_dash_track_kind track,
                          mpv_dash_source_failure failure)
 { (void)global; (void)track; (void)failure; }
+void mp_dash_source_fail_with_origin(struct mpv_global *global,
+                                     mpv_dash_track_kind track,
+                                     mpv_dash_source_failure failure,
+                                     mpv_dash_failure_origin origin)
+{ (void)global; (void)track; (void)failure; (void)origin; }
 void mp_dash_source_bound(struct mpv_global *global)
 { (void)global; }
 void mp_dash_source_stopped(struct mpv_global *global, bool error)
 { (void)global; (void)error; }
 int mp_dash_source_snapshot(struct mpv_global *global, mpv_dash_source_status *out)
+{ (void)global; (void)out; return MPV_ERROR_UNSUPPORTED; }
+int mp_dash_source_failure_snapshot(struct mpv_global *global,
+                                    mpv_dash_failure_detail *out)
 { (void)global; (void)out; return MPV_ERROR_UNSUPPORTED; }
 int mp_dash_source_range_snapshot(struct mpv_global *global,
                                   mpv_dash_range_capability *out)
@@ -521,8 +573,9 @@ bool mp_dash_source_get_track(struct mpv_global *global, const char *alias,
                               struct mp_dash_track_config *config)
 { (void)global; (void)alias; (void)parent; (void)kind; (void)config; return false; }
 void mp_dash_source_response(struct mpv_global *global, mpv_dash_track_kind track,
-                             int status, mpv_dash_source_failure failure)
-{ (void)global; (void)track; (void)status; (void)failure; }
+                             int status, mpv_dash_source_failure failure,
+                             mpv_dash_failure_origin origin)
+{ (void)global; (void)track; (void)status; (void)failure; (void)origin; }
 void mp_dash_source_range_validated(struct mpv_global *global,
                                     mpv_dash_track_kind track)
 { (void)global; (void)track; }

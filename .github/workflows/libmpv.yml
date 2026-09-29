@@ -244,26 +244,47 @@ jobs:
       - name: Publish latest complete Azure build
         run: |
           set -euo pipefail
-          prefix="native/builds/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           info=$(mktemp)
           marker=$(mktemp)
           trap 'rm -f "$info" "$marker"' EXIT
           for arch in x64 arm64; do
-            for name in libmpv-2.dll build-info.txt ggml-base.dll ggml.dll \
-                ggml-cpu.dll ggml-vulkan.dll libwhisper.dll; do
-              exists=$(az storage blob exists \
-                --container-name rodel-player-deps \
-                --name "$prefix/$arch/$name" \
-                --connection-string "$AZURE_STORAGE_CONNECTION_STRING" \
-                --query exists --output tsv)
-              if [ "${exists,,}" != "true" ]; then
-                echo "::error::Incomplete Azure native build: $prefix/$arch/$name"
-                exit 1
+            required=(
+              libmpv-2.dll libmpv-2.pdb build-info.txt
+              ggml-base.dll ggml.dll ggml-cpu.dll ggml-vulkan.dll libwhisper.dll
+              DirectML.dll onnxruntime.dll onnxruntime_providers_shared.dll
+              AVS-THIRD-PARTY-NOTICES.txt GPL-2.0.txt GPL-3.0.txt
+              UAVS3D-BSD-3-Clause.txt
+            )
+            if [ "$arch" = x64 ]; then
+              required+=(mpv-nvngx.dll)
+            fi
+            selected=""
+            for ((attempt=GITHUB_RUN_ATTEMPT; attempt>=1; attempt--)); do
+              candidate="native/builds/${GITHUB_RUN_ID}-${attempt}/$arch"
+              complete=true
+              for name in "${required[@]}"; do
+                exists=$(az storage blob exists \
+                  --container-name rodel-player-deps \
+                  --name "$candidate/$name" \
+                  --connection-string "$AZURE_STORAGE_CONNECTION_STRING" \
+                  --query exists --output tsv)
+                if [ "${exists,,}" != "true" ]; then
+                  complete=false
+                  break
+                fi
+              done
+              if [ "$complete" = true ]; then
+                selected="$candidate"
+                break
               fi
             done
+            if [ -z "$selected" ]; then
+              echo "::error::No complete $arch Azure native set for workflow run $GITHUB_RUN_ID"
+              exit 1
+            fi
             az storage blob download \
               --container-name rodel-player-deps \
-              --name "$prefix/$arch/build-info.txt" \
+              --name "$selected/build-info.txt" \
               --file "$info" --overwrite --no-progress \
               --connection-string "$AZURE_STORAGE_CONNECTION_STRING" \
               --output none
@@ -271,9 +292,14 @@ jobs:
               echo "::error::Azure $arch build provenance differs from $GITHUB_SHA"
               exit 1
             fi
+            if [ "$arch" = x64 ]; then
+              x64_path="$selected"
+            else
+              arm64_path="$selected"
+            fi
           done
-          printf '{"schemaVersion":1,"mpvCommit":"%s","buildPath":"%s"}\n' \
-            "$GITHUB_SHA" "$prefix" > "$marker"
+          printf '{"schemaVersion":2,"mpvCommit":"%s","buildPaths":{"x64":"%s","arm64":"%s"}}\n' \
+            "$GITHUB_SHA" "$x64_path" "$arm64_path" > "$marker"
           az storage blob upload \
             --container-name rodel-player-deps \
             --name native/latest.json \
@@ -281,4 +307,4 @@ jobs:
             --content-type application/json \
             --connection-string "$AZURE_STORAGE_CONNECTION_STRING" \
             --output none
-          echo "Published latest complete Azure native build: $prefix ($GITHUB_SHA)"
+          echo "Published latest complete Azure native build: x64=$x64_path arm64=$arm64_path ($GITHUB_SHA)"

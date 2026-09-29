@@ -104,9 +104,11 @@ each file up to three times with bounded backoff.
 An Azure dispatch selecting **both** architectures also publishes every
 runtime file under a run-specific `native/builds/<run-id>-<attempt>/<arch>/`
 path. Only after both uploads and their build metadata are verified does CI
-replace the Azure `native/latest.json` pointer with that build's path and
-source commit. Consumers can fetch the latest complete pair without relying
-on the individually overwritten legacy `native/<arch>/` paths.
+replace the Azure `native/latest.json` pointer with both architecture paths
+and their source commit. A failed-job rerun can reuse the other architecture's
+complete run-specific path from an earlier attempt of the same source commit.
+Consumers can fetch the latest complete pair without relying on the
+individually overwritten legacy `native/<arch>/` paths.
 
 ### AVS2 and AVS3 decoding
 

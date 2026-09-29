@@ -6333,6 +6333,13 @@ static void cmd_seek(void *p)
         cmd->success = false;
         return;
     }
+    if (mp_dash_source_active(mpctx->global) && mpctx->filename &&
+        !strcmp(mpctx->filename, MP_DASH_VIDEO_URL) &&
+        !mp_dash_source_seek_ready(mpctx->global))
+    {
+        cmd->success = false;
+        return;
+    }
 
     mark_seek(mpctx);
     switch (abs) {

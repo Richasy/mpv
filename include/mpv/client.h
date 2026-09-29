@@ -248,7 +248,7 @@ extern "C" {
  * relational operators (<, >, <=, >=).
  */
 #define MPV_MAKE_VERSION(major, minor) (((major) << 16) | (minor) | 0UL)
-#define MPV_CLIENT_API_VERSION MPV_MAKE_VERSION(2, 8)
+#define MPV_CLIENT_API_VERSION MPV_MAKE_VERSION(2, 9)
 
 /**
  * The API user is allowed to "#define MPV_ENABLE_DEPRECATED 0" before
@@ -503,7 +503,7 @@ typedef enum mpv_dash_source_failure {
     MPV_DASH_FAILURE_AUDIO_OPEN = 2,
     MPV_DASH_FAILURE_HTTP_AUTH = 3,      /* HTTP 401 or 403. */
     MPV_DASH_FAILURE_HTTP_RISK = 4,      /* HTTP 412. */
-    MPV_DASH_FAILURE_HTTP_STATUS = 5,    /* Other non-206 response. */
+    MPV_DASH_FAILURE_HTTP_STATUS = 5,    /* Response other than valid 206 or initial full 200. */
     MPV_DASH_FAILURE_HTTP_RANGE = 6,     /* Invalid/missing Content-Range or HTTP 416. */
     MPV_DASH_FAILURE_TRANSPORT = 7,      /* No response, short body, etc. */
     MPV_DASH_FAILURE_TRACK_SELECTION = 8,
@@ -528,6 +528,17 @@ typedef struct mpv_dash_source_status {
     uint32_t video_responses;        /* Includes seek/reopen/error responses. */
     uint32_t audio_responses;
 } mpv_dash_source_status;
+
+/** Version 1 of the source-generation-bound, numeric DASH range capability. */
+#define MPV_DASH_RANGE_CAPABILITY_API_VERSION 1u
+
+typedef struct mpv_dash_range_capability {
+    uint32_t struct_size;            /* Set to sizeof(mpv_dash_range_capability). */
+    uint32_t api_version;            /* MPV_DASH_RANGE_CAPABILITY_API_VERSION. */
+    uint64_t source_generation;      /* Match mpv_dash_source_status.generation. */
+    uint32_t video_validated_206;    /* Valid 206 and Content-Range for this source. */
+    uint32_t audio_validated_206;    /* Valid 206 and Content-Range for this source. */
+} mpv_dash_range_capability;
 
 /** Version 1 of the numeric D3D11 Composition presentation snapshot. */
 #define MPV_DASH_FRAME_STATUS_API_VERSION 1u
@@ -570,6 +581,18 @@ MPV_EXPORT int mpv_dash_source_load(mpv_handle *ctx,
  */
 MPV_EXPORT int mpv_dash_source_get_status(mpv_handle *ctx,
                                            mpv_dash_source_status *status);
+
+/**
+ * Return per-track range evidence for the current source generation.
+ *
+ * A successful initial full-body HTTP 200 is not range evidence. Each flag
+ * becomes one only after that track validates a 206 Content-Range; failed or
+ * stopped sources report zero flags. Seek requires both flags, a matching
+ * generation, and mpv_dash_source_status.phase == MPV_DASH_SOURCE_TRACKS_BOUND.
+ * No URL, response header, or media bytes are exposed.
+ */
+MPV_EXPORT int mpv_dash_source_get_range_capability(
+    mpv_handle *ctx, mpv_dash_range_capability *capability);
 
 /**
  * Query a frame actually submitted and successfully Present-ed by the native
@@ -2177,6 +2200,8 @@ MPV_DEFINE_SYM_PTR(mpv_dash_source_load)
 #define mpv_dash_source_load pfn_mpv_dash_source_load
 MPV_DEFINE_SYM_PTR(mpv_dash_source_get_status)
 #define mpv_dash_source_get_status pfn_mpv_dash_source_get_status
+MPV_DEFINE_SYM_PTR(mpv_dash_source_get_range_capability)
+#define mpv_dash_source_get_range_capability pfn_mpv_dash_source_get_range_capability
 MPV_DEFINE_SYM_PTR(mpv_dash_source_get_frame_status)
 #define mpv_dash_source_get_frame_status pfn_mpv_dash_source_get_frame_status
 MPV_DEFINE_SYM_PTR(mpv_client_name)

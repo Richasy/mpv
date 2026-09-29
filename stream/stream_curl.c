@@ -198,6 +198,7 @@ struct priv {
     bool dash_status_seen;
     bool dash_interim_headers;
     unsigned dash_interim_count;
+    bool dash_initial_full_body;
     bool dash_headers_ok;
     uint64_t dash_requested_end;
     uint64_t dash_response_length;
@@ -771,6 +772,26 @@ static bool dash_content_range(struct priv *p, uint64_t *length, int64_t *total)
     return true;
 }
 
+static bool dash_full_body_length(struct priv *p, uint64_t *length)
+{
+    if (header_value(p->curl, "Content-Range"))
+        return false;
+    const char *encoding = header_value(p->curl, "Content-Encoding");
+    if (encoding && encoding[0] && strcasecmp(encoding, "identity"))
+        return false;
+    const char *type = header_value(p->curl, "Content-Type");
+    if (type && (!strncasecmp(type, "text/html", 9) ||
+                 !strncasecmp(type, "application/xhtml+xml", 21)))
+        return false;
+    curl_off_t size = -1;
+    if (curl_easy_getinfo(p->curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T,
+                          &size) != CURLE_OK ||
+        size <= 0 || (uint64_t)size > INT64_MAX)
+        return false;
+    *length = size;
+    return true;
+}
+
 static size_t dash_header_callback(struct priv *p, struct bstr line, size_t bytes)
 {
     if (mp_dash_source_terminal(p->global))
@@ -805,8 +826,12 @@ static size_t dash_header_callback(struct priv *p, struct bstr line, size_t byte
         }
         p->dash_interim_headers = false;
         p->dash_status_seen = true;
-        mp_dash_source_response(p->global, p->dash_kind, status);
-        return status == 206 ? bytes : 0;
+        p->dash_initial_full_body = status == 200 && !p->probed &&
+                                    !p->start_offset && !p->request_start &&
+                                    !p->request_end && !p->opts->max_request_size;
+        mp_dash_source_response(p->global, p->dash_kind, status,
+                                p->dash_initial_full_body);
+        return status == 206 || p->dash_initial_full_body ? bytes : 0;
     }
     if (line.len)
         return bytes;
@@ -815,17 +840,26 @@ static size_t dash_header_callback(struct priv *p, struct bstr line, size_t byte
         return bytes;
     }
     int64_t total = -1;
-    if (!p->dash_status_seen ||
-        !dash_content_range(p, &p->dash_response_length, &total))
+    bool valid = p->dash_status_seen &&
+        (p->dash_initial_full_body ?
+         dash_full_body_length(p, &p->dash_response_length) :
+         dash_content_range(p, &p->dash_response_length, &total));
+    if (!valid)
     {
-        mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_HTTP_RANGE);
+        mp_dash_source_fail(p->global, p->dash_kind, p->dash_initial_full_body ?
+                            MPV_DASH_FAILURE_HTTP_STATUS :
+                            MPV_DASH_FAILURE_HTTP_RANGE);
         if (!p->probed)
             finalize_probe(p);
         return 0;
     }
+    if (p->dash_initial_full_body)
+        total = p->dash_response_length;
+    else
+        mp_dash_source_range_validated(p->global, p->dash_kind);
     if (!p->probed) {
         p->content_size = total;
-        p->seekable = true;
+        p->seekable = !p->dash_initial_full_body;
         p->stream_ok = true;
     }
     p->dash_headers_ok = true;
@@ -971,6 +1005,7 @@ static void start_request(struct priv *p)
         p->dash_status_seen = false;
         p->dash_interim_headers = false;
         p->dash_interim_count = 0;
+        p->dash_initial_full_body = false;
         p->dash_headers_ok = false;
         p->dash_response_length = 0;
     }

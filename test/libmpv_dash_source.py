@@ -93,6 +93,16 @@ class Status(ctypes.Structure):
     ]
 
 
+class RangeCapability(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("api_version", ctypes.c_uint32),
+        ("source_generation", ctypes.c_uint64),
+        ("video_validated_206", ctypes.c_uint32),
+        ("audio_validated_206", ctypes.c_uint32),
+    ]
+
+
 class FrameStatus(ctypes.Structure):
     _fields_ = [
         ("struct_size", ctypes.c_uint32),
@@ -282,6 +292,12 @@ class Server(http.server.ThreadingHTTPServer):
         self.deny_code = 412
         self.arm_failure = None
         self.arm_code = 412
+        self.full_body_roles = set()
+        self.full_body_payloads = {}
+        self.full_body_types = {}
+        self.full_body_lengths = {}
+        self.full_body_encodings = {}
+        self.full_body_with_range = set()
         self.redirect_hits = 0
         self.error_body_bytes = 0
         self.error_headers = threading.Event()
@@ -302,7 +318,8 @@ class Server(http.server.ThreadingHTTPServer):
             self.requests.append((role, start, status,
                                   headers.get("User-Agent"),
                                   headers.get("Referer"),
-                                  headers.get("Cookie"), has_client_cert))
+                                  headers.get("Cookie"), has_client_cert,
+                                  headers.get("Range")))
 
     def requests_for(self, role):
         with self.lock:
@@ -355,6 +372,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             code = self.server.deny_code
         elif self.server.arm_failure == role and start > 0:
             code = self.server.arm_code
+        elif role in self.server.full_body_roles and start == 0:
+            code = 200
         else:
             code = 206
         client_cert = (
@@ -377,7 +396,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     f"http://127.0.0.1:{self.server.server_port}/redirect-target",
                 )
                 self.send_header("Content-Length", "0")
-            elif code in (401, 403, 404, 412, 416):
+            elif code == 200 and role in self.server.full_body_roles and start == 0:
+                body = self.server.full_body_payloads.get(role, data)
+                self.send_header(
+                    "Content-Type",
+                    self.server.full_body_types.get(role, f"{role}/mp4"),
+                )
+                self.send_header("Accept-Ranges", "bytes")
+                if role in self.server.full_body_encodings:
+                    self.send_header(
+                        "Content-Encoding", self.server.full_body_encodings[role])
+                if role in self.server.full_body_with_range:
+                    self.send_header(
+                        "Content-Range", f"bytes 0-{len(body) - 1}/{len(body)}")
+                length = self.server.full_body_lengths.get(role, str(len(body)))
+                if length is not None:
+                    self.send_header("Content-Length", str(length))
+            elif code in (200, 401, 403, 404, 412, 416):
                 self.send_header("Content-Length", "64")
             else:
                 self.send_header("Content-Type", f"{role}/mp4")
@@ -404,7 +439,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if not self.server.release_audio_body.wait(15):
                         return
                 self.wfile.write(data[start:end + 1])
-            elif code in (401, 403, 404, 412, 416):
+            elif code == 200 and role in self.server.full_body_roles and start == 0:
+                self.wfile.write(body)
+            elif code in (200, 401, 403, 404, 412, 416):
                 self.server.error_headers.set()
                 if self.server.release_error_body.wait(10):
                     self.wfile.write(bytes(64))
@@ -456,6 +493,8 @@ def configure_library(mpv):
     mpv.mpv_dash_source_load.argtypes = [ctypes.c_void_p, ctypes.POINTER(Source)]
     mpv.mpv_dash_source_get_status.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(Status)]
+    mpv.mpv_dash_source_get_range_capability.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(RangeCapability)]
     mpv.mpv_dash_source_get_frame_status.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(FrameStatus)]
     mpv.mpv_acquire_d3d11_composition_surface.argtypes = [
@@ -543,6 +582,17 @@ def snapshot(mpv, handle):
     result = mpv.mpv_dash_source_get_status(handle, ctypes.byref(state))
     if result != 0:
         raise AssertionError(f"Status failed: {result}")
+    return state
+
+
+def range_capability(mpv, handle):
+    state = RangeCapability()
+    state.struct_size = ctypes.sizeof(RangeCapability)
+    state.api_version = VERSION
+    result = mpv.mpv_dash_source_get_range_capability(
+        handle, ctypes.byref(state))
+    if result != 0:
+        raise AssertionError(f"Range capability failed: {result}")
     return state
 
 
@@ -643,6 +693,19 @@ def assert_headers(server):
 def test_invalid(mpv, server):
     with client(mpv) as handle:
         assert snapshot(mpv, handle).phase == IDLE
+        empty_range = range_capability(mpv, handle)
+        assert not empty_range.source_generation
+        assert not empty_range.video_validated_206
+        assert not empty_range.audio_validated_206
+        bad_range = RangeCapability()
+        bad_range.struct_size = 0
+        bad_range.api_version = VERSION
+        assert mpv.mpv_dash_source_get_range_capability(
+            handle, ctypes.byref(bad_range)) == INVALID
+        bad_range.struct_size = ctypes.sizeof(RangeCapability)
+        bad_range.api_version = VERSION + 1
+        assert mpv.mpv_dash_source_get_range_capability(
+            handle, ctypes.byref(bad_range)) == INVALID
         empty_frame = frame_snapshot(mpv, handle)
         assert not empty_frame.source_generation
         assert not empty_frame.presented_frame_serial
@@ -709,6 +772,9 @@ def test_playback(mpv, server):
         assert not frame.presented_frame_serial, \
             "FILE_LOADED on a headless VO cannot mean Composition first frame"
         assert state.video_http_status == state.audio_http_status == 206
+        ranged = range_capability(mpv, handle)
+        assert ranged.source_generation == state.generation
+        assert ranged.video_validated_206 == ranged.audio_validated_206 == 1
         assert prop(mpv, handle, "vid") not in (None, "no")
         assert prop(mpv, handle, "aid") not in (None, "no")
         assert_private(mpv, handle)
@@ -735,8 +801,60 @@ def test_playback(mpv, server):
         command(mpv, handle, "stop")
         await_event(mpv, handle, END_FILE)
         assert snapshot(mpv, handle).phase == STOPPED
+        stopped_range = range_capability(mpv, handle)
+        assert stopped_range.source_generation == state.generation
+        assert not stopped_range.video_validated_206
+        assert not stopped_range.audio_validated_206
     assert_headers(server)
     return state.generation
+
+
+def test_full_body_playback(mpv, server, full_role):
+    server.full_body_roles.add(full_role)
+    with client(mpv) as handle:
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        await_event(mpv, handle, FILE_LOADED)
+        state = snapshot(mpv, handle)
+        ranged = range_capability(mpv, handle)
+        assert state.phase == BOUND and not state.failure
+        assert (state.video_http_status, state.audio_http_status) == (
+            (200, 206) if full_role == "video" else (206, 200))
+        assert ranged.source_generation == state.generation
+        assert ranged.video_validated_206 == (full_role != "video")
+        assert ranged.audio_validated_206 == (full_role != "audio")
+        command(mpv, handle, "set", "pause", "no")
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            event = mpv.mpv_wait_event(handle, 0.05).contents
+            if event.event_id == LOG_MESSAGE:
+                message = ctypes.cast(
+                    event.data, ctypes.POINTER(LogMessage)).contents
+                if MARKER in ctypes.string_at(message.text):
+                    raise AssertionError("Private media URL appeared in a native log")
+            if event.event_id == END_FILE:
+                raise AssertionError("Full-body MP4 ended before both tracks decoded")
+            if (prop(mpv, handle, "video-params/w") == "160" and
+                prop(mpv, handle, "audio-params/samplerate") == "48000" and
+                prop(mpv, handle, "audio-out-params/samplerate") == "48000"):
+                break
+        else:
+            raise AssertionError("Full-body MP4 did not decode both tracks and AO")
+        assert_private(mpv, handle)
+        count = len(server.requests_for(full_role))
+        argv = (ctypes.c_char_p * 4)(b"seek", b"8", b"absolute+exact", None)
+        assert mpv.mpv_command(handle, argv) < 0, \
+            "One unproven track must not permit a single-track seek"
+        assert len(server.requests_for(full_role)) == count
+        command(mpv, handle, "stop")
+        await_event(mpv, handle, END_FILE)
+        assert snapshot(mpv, handle).phase == STOPPED
+        stopped_range = range_capability(mpv, handle)
+        assert stopped_range.source_generation == state.generation
+        assert not stopped_range.video_validated_206
+        assert not stopped_range.audio_validated_206
+    assert server.requests_for(full_role)[0][7] == "bytes=0-"
+    assert_headers(server)
 
 
 def test_generic(mpv, server):
@@ -1002,7 +1120,7 @@ def test_tls_certificate_isolation(mpv, server, certificates, typed):
 
 
 def test_composition_first_frame(mpv, server, previous_generation,
-                                 previous_serial):
+                                 previous_serial, audio_status=206):
     options = {
         "vo": "gpu-next", "gpu-api": "d3d11", "d3d11-warp": "yes",
         "d3d11-output-mode": "composition",
@@ -1075,7 +1193,7 @@ def test_composition_first_frame(mpv, server, previous_generation,
                 raise AssertionError(f"Composition acquire failed: {result}")
             try:
                 if (state.phase == BOUND and state.video_http_status == 206 and
-                    state.audio_http_status == 206 and
+                    state.audio_http_status == audio_status and
                     frame.source_generation == state.generation and
                     frame.presented_generation == state.generation and
                     frame.presented_frame_serial and
@@ -1104,25 +1222,33 @@ def test_composition_first_frame(mpv, server, previous_generation,
         assert frame.presented_frame_serial > previous_serial
         first_serial = frame.presented_frame_serial
         first_epoch = frame.presented_surface_epoch
-        command(mpv, handle, "set", "pause", "no")
-        command(mpv, handle, "seek", "8", "absolute+exact")
-        deadline = time.monotonic() + 8
-        while time.monotonic() < deadline:
-            event = mpv.mpv_wait_event(handle, 0.05).contents
-            if event.event_id == LOG_MESSAGE:
-                message = ctypes.cast(
-                    event.data, ctypes.POINTER(LogMessage)).contents
-                if MARKER in ctypes.string_at(message.text):
-                    raise AssertionError("Private media URL appeared in a native log")
-            if event.event_id == END_FILE:
-                raise AssertionError("Composition stopped during seek")
-            next_frame = frame_snapshot(mpv, handle)
-            if (next_frame.presented_frame_serial > first_serial and
-                next_frame.presented_surface_epoch == first_epoch and
-                next_frame.presented_generation == frame.source_generation):
-                break
+        ranged = range_capability(mpv, handle)
+        assert ranged.source_generation == frame.source_generation
+        assert ranged.video_validated_206 == 1
+        assert ranged.audio_validated_206 == (audio_status == 206)
+        if audio_status == 206:
+            command(mpv, handle, "set", "pause", "no")
+            command(mpv, handle, "seek", "8", "absolute+exact")
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                event = mpv.mpv_wait_event(handle, 0.05).contents
+                if event.event_id == LOG_MESSAGE:
+                    message = ctypes.cast(
+                        event.data, ctypes.POINTER(LogMessage)).contents
+                    if MARKER in ctypes.string_at(message.text):
+                        raise AssertionError("Private media URL appeared in a native log")
+                if event.event_id == END_FILE:
+                    raise AssertionError("Composition stopped during seek")
+                next_frame = frame_snapshot(mpv, handle)
+                if (next_frame.presented_frame_serial > first_serial and
+                    next_frame.presented_surface_epoch == first_epoch and
+                    next_frame.presented_generation == frame.source_generation):
+                    break
+            else:
+                raise AssertionError("Composition frame serial did not increase after seek")
         else:
-            raise AssertionError("Composition frame serial did not increase after seek")
+            argv = (ctypes.c_char_p * 4)(b"seek", b"8", b"absolute+exact", None)
+            assert mpv.mpv_command(handle, argv) < 0
         last_serial = frame_snapshot(mpv, handle).presented_frame_serial
         command(mpv, handle, "stop")
         await_event(mpv, handle, END_FILE)
@@ -1135,6 +1261,9 @@ def test_composition_first_frame(mpv, server, previous_generation,
             handle, ctypes.byref(surface)) == 0
         assert not surface.swapchain
         assert surface.epoch > first_epoch
+        stopped_range = range_capability(mpv, handle)
+        assert not stopped_range.video_validated_206
+        assert not stopped_range.audio_validated_206
     assert_headers(server)
     return stopped.source_generation, last_serial
 
@@ -1149,6 +1278,10 @@ def test_failure(mpv, server, failed_role, expected, expected_http=None):
         state = snapshot(mpv, handle)
         assert state.phase == FAILED and state.failure == expected, \
             (state.phase, state.failure, expected)
+        failed_range = range_capability(mpv, handle)
+        assert failed_range.source_generation == state.generation
+        assert not failed_range.video_validated_206
+        assert not failed_range.audio_validated_206
         assert not frame_snapshot(mpv, handle).presented_frame_serial
         assert state.failed_track == (VIDEO if failed_role == "video" else AUDIO)
         assert not prop(mpv, handle, "video-params/w")
@@ -1159,6 +1292,48 @@ def test_failure(mpv, server, failed_role, expected, expected_http=None):
             assert server.error_headers.is_set()
             assert server.error_body_bytes == 0, "Error body was delivered"
     assert len(server.requests_for(failed_role)) == 1
+
+
+def test_full_body_rejected(mpv, server, expected_failures, allow_file_loaded=False):
+    server.full_body_roles.add("audio")
+    with client(mpv) as handle:
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        deadline = time.monotonic() + 12
+        resumed = False
+        while time.monotonic() < deadline:
+            event = mpv.mpv_wait_event(handle, 0.05).contents
+            if event.event_id == LOG_MESSAGE:
+                message = ctypes.cast(
+                    event.data, ctypes.POINTER(LogMessage)).contents
+                if MARKER in ctypes.string_at(message.text):
+                    raise AssertionError("Private media URL appeared in a native log")
+            if event.event_id == FILE_LOADED and not allow_file_loaded:
+                raise AssertionError("Invalid full-body media reached FILE_LOADED")
+            if event.event_id == FILE_LOADED and allow_file_loaded and not resumed:
+                command(mpv, handle, "set", "pause", "no")
+                resumed = True
+            if event.event_id == END_FILE:
+                reason = ctypes.cast(
+                    event.data, ctypes.POINTER(EndFile)).contents.reason
+                assert reason == END_ERROR, reason
+                break
+        else:
+            state = snapshot(mpv, handle)
+            raise AssertionError(
+                "Invalid full-body media did not terminate: "
+                f"phase={state.phase}, failure={state.failure}, "
+                f"audio_http={state.audio_http_status}, resumed={resumed}")
+        state = snapshot(mpv, handle)
+        assert state.phase == FAILED and state.failure in expected_failures, \
+            (state.phase, state.failure, expected_failures)
+        assert state.failed_track == AUDIO
+        assert not prop(mpv, handle, "audio-out-params/samplerate")
+        ranged = range_capability(mpv, handle)
+        assert ranged.source_generation == state.generation
+        assert not ranged.video_validated_206
+        assert not ranged.audio_validated_206
+    assert len(server.requests_for("audio")) == 1
 
 
 def test_late_status(mpv, server, role, code, failure):
@@ -1190,6 +1365,9 @@ def test_late_status(mpv, server, role, code, failure):
                 state.audio_http_status) == code
         assert len(server.requests_for(role)) > before
         assert server.error_headers.is_set() and server.error_body_bytes == 0
+        ranged = range_capability(mpv, handle)
+        assert not ranged.video_validated_206
+        assert not ranged.audio_validated_206
         count = len(server.requests_for(role))
         time.sleep(0.2)
         assert len(server.requests_for(role)) == count, "Terminal HTTP was retried"
@@ -1231,7 +1409,11 @@ def main():
                 return
             if hasattr(mpv, "mpv_dash_test_control"):
                 raise AssertionError("Production DLL exposes a test-only hook")
-            assert mpv.mpv_client_api_version() == (2 << 16) | 8
+            assert mpv.mpv_client_api_version() == (2 << 16) | 9
+            assert ctypes.sizeof(RangeCapability) == 24
+            assert RangeCapability.source_generation.offset == 8
+            assert RangeCapability.video_validated_206.offset == 16
+            assert RangeCapability.audio_validated_206.offset == 20
             print("[dash] invalid descriptor", flush=True)
             with serve(tracks) as server:
                 test_invalid(mpv, server)
@@ -1241,6 +1423,10 @@ def main():
             print("[dash] dual track and seek", flush=True)
             with serve(tracks) as server:
                 previous_generation = test_playback(mpv, server)
+            for role in ("audio", "video"):
+                print(f"[dash] first full-body MP4 200 {role}, no seek", flush=True)
+                with serve(tracks) as server:
+                    test_full_body_playback(mpv, server, role)
             print("[dash] existing generic HTTP path", flush=True)
             with serve(tracks) as server:
                 test_generic(mpv, server)
@@ -1288,6 +1474,37 @@ def main():
             with serve(tracks) as server:
                 test_composition_first_frame(
                     mpv, server, source_generation, presented_serial)
+            print("[dash] full-body audio 200 with D3D11 Present and AO", flush=True)
+            with serve(tracks) as server:
+                server.full_body_roles.add("audio")
+                test_composition_first_frame(
+                    mpv, server, source_generation, presented_serial,
+                    audio_status=200)
+            print("[dash] full-body 200 HTML rejected before Ready", flush=True)
+            for mime in ("text/html", "audio/mp4"):
+                with serve(tracks) as server:
+                    server.full_body_types["audio"] = mime
+                    server.full_body_payloads["audio"] = b"<!doctype html><html>no media</html>"
+                    test_full_body_rejected(
+                        mpv, server, (HTTP_STATUS, 2, 8, 9))
+            print("[dash] full-body 200 invalid Content-Length", flush=True)
+            for length in (None, "0", "-1", "invalid", str(1 << 70)):
+                with serve(tracks) as server:
+                    server.full_body_lengths["audio"] = length
+                    test_full_body_rejected(mpv, server, (HTTP_STATUS, 7))
+            for mode in ("encoded", "range-on-200"):
+                with serve(tracks) as server:
+                    if mode == "encoded":
+                        server.full_body_encodings["audio"] = "gzip"
+                    else:
+                        server.full_body_with_range.add("audio")
+                    test_full_body_rejected(mpv, server, (HTTP_STATUS, 7))
+            print("[dash] full-body 200 short body fails visibly", flush=True)
+            with serve(tracks) as server:
+                server.full_body_payloads["audio"] = tracks["audio"][:len(tracks["audio"]) // 2]
+                server.full_body_lengths["audio"] = len(tracks["audio"])
+                test_full_body_rejected(
+                    mpv, server, (7, 2, 8, 9), allow_file_loaded=True)
             print("[dash] required audio 412", flush=True)
             with serve(tracks) as server:
                 server.deny = "audio"
@@ -1324,6 +1541,8 @@ def main():
             for role, code, failure in (
                 ("video", 412, RISK), ("audio", 412, RISK),
                 ("audio", 403, AUTH),
+                ("audio", 200, HTTP_STATUS),
+                ("video", 200, HTTP_STATUS),
             ):
                 print(f"[dash] late {role} {code}", flush=True)
                 with serve(tracks) as server:

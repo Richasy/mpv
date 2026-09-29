@@ -35,6 +35,9 @@ void mp_dash_source_fail(struct mpv_global *global, mpv_dash_track_kind track,
 void mp_dash_source_bound(struct mpv_global *global);
 void mp_dash_source_stopped(struct mpv_global *global, bool error);
 int mp_dash_source_snapshot(struct mpv_global *global, mpv_dash_source_status *out);
+int mp_dash_source_range_snapshot(struct mpv_global *global,
+                                  mpv_dash_range_capability *out);
+bool mp_dash_source_seek_ready(struct mpv_global *global);
 int mp_dash_source_frame_snapshot(struct mpv_global *global,
                                   mpv_dash_frame_status *out);
 bool mp_dash_source_active(struct mpv_global *global);
@@ -44,6 +47,8 @@ bool mp_dash_source_get_track(struct mpv_global *global, const char *alias,
                               void *parent, mpv_dash_track_kind *kind,
                               struct mp_dash_track_config *config);
 void mp_dash_source_response(struct mpv_global *global, mpv_dash_track_kind track,
-                             int status);
+                             int status, bool initial_full_body);
+void mp_dash_source_range_validated(struct mpv_global *global,
+                                    mpv_dash_track_kind track);
 
 #endif

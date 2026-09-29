@@ -1676,6 +1676,16 @@ int mpv_dash_source_get_status(mpv_handle *ctx, mpv_dash_source_status *status)
     return mp_dash_source_snapshot(ctx->mpctx->global, status);
 }
 
+int mpv_dash_source_get_range_capability(mpv_handle *ctx,
+                                         mpv_dash_range_capability *capability)
+{
+    if (!ctx || !capability)
+        return MPV_ERROR_INVALID_PARAMETER;
+    if (!ctx->mpctx->initialized)
+        return MPV_ERROR_UNINITIALIZED;
+    return mp_dash_source_range_snapshot(ctx->mpctx->global, capability);
+}
+
 int mpv_dash_source_get_frame_status(mpv_handle *ctx,
                                       mpv_dash_frame_status *status)
 {

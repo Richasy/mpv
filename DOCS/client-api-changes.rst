@@ -33,6 +33,10 @@ API changes
 ::
 
  --- mpv 0.41.0 ---
+ 2.9    - add mpv_dash_source_get_range_capability() with a versioned,
+          size-checked, per-track and source-generation-bound numeric result.
+          A full-body initial HTTP 200 may play but does not establish seek
+          capability; only a validated 206 Content-Range does (Richasy/mpv fork).
  2.8    - add mpv_dash_source_load(), mpv_dash_source_get_status(), and
           mpv_dash_source_get_frame_status() with versioned, size-checked
           mpv_dash_source, mpv_dash_source_status, and mpv_dash_frame_status

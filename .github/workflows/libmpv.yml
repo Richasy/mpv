@@ -160,6 +160,7 @@ jobs:
         run: |
           ARCH_OUT="$OUTPUT_DIR/${{ matrix.arch }}"
           AZ_DIR="native/${{ matrix.name }}"
+          BUILD_BLOB_DIR="native/builds/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${{ matrix.name }}"
           SYMBOL_DIR="symbols/${{ github.sha }}/${{ matrix.name }}"
           DLL_PATH="$ARCH_OUT/libmpv-2.dll"
           if [ ! -f "$DLL_PATH" ]; then
@@ -191,13 +192,15 @@ jobs:
               sleep "$delay"
             done
           }
-          # Upload runtime artifacts and current symbols to the stable paths.
-          # shared libraries (BUILD_SHARED_LIBS=ON + GGML_BACKEND_DL=ON). The
-          # consumer app needs all of them deployed alongside libmpv-2.dll;
-          # missing any breaks whisper realtime captions or libmpv loading.
+          # Publish the same complete runtime set to stable and run-specific paths.
+          # Dependent shared libraries must accompany libmpv-2.dll.
           shopt -s nullglob
           for f in "$ARCH_OUT"/*.dll "$ARCH_OUT"/*.pdb "$ARCH_OUT"/*.txt; do
             upload "$f"
+            if [ "${{ inputs.build_x64 }}" = "true" ] &&
+               [ "${{ inputs.build_arm64 }}" = "true" ]; then
+              upload "$f" "$BUILD_BLOB_DIR"
+            fi
           done
           # Preserve exact DLL/PDB pairs by commit so future customer dumps
           # remain symbolizable after the stable native path is overwritten.
@@ -227,3 +230,55 @@ jobs:
             ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-build/CMakeFiles/CMakeOutput.log
             ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-build/CMakeFiles/CMakeError.log
           retention-days: 7
+
+  publish-latest:
+    needs: [prepare, build]
+    if: >-
+      needs.build.result == 'success' &&
+      inputs.build_x64 && inputs.build_arm64 &&
+      (inputs.upload_target == 'azure' || inputs.upload_target == 'both')
+    runs-on: [self-hosted, Linux, X64, "${{ needs.prepare.outputs.runner_label }}"]
+    env:
+      AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+    steps:
+      - name: Publish latest complete Azure build
+        run: |
+          set -euo pipefail
+          prefix="native/builds/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          info=$(mktemp)
+          marker=$(mktemp)
+          trap 'rm -f "$info" "$marker"' EXIT
+          for arch in x64 arm64; do
+            for name in libmpv-2.dll build-info.txt ggml-base.dll ggml.dll \
+                ggml-cpu.dll ggml-vulkan.dll libwhisper.dll; do
+              exists=$(az storage blob exists \
+                --container-name rodel-player-deps \
+                --name "$prefix/$arch/$name" \
+                --connection-string "$AZURE_STORAGE_CONNECTION_STRING" \
+                --query exists --output tsv)
+              if [ "${exists,,}" != "true" ]; then
+                echo "::error::Incomplete Azure native build: $prefix/$arch/$name"
+                exit 1
+              fi
+            done
+            az storage blob download \
+              --container-name rodel-player-deps \
+              --name "$prefix/$arch/build-info.txt" \
+              --file "$info" --overwrite --no-progress \
+              --connection-string "$AZURE_STORAGE_CONNECTION_STRING" \
+              --output none
+            if ! grep -Fxq "mpv_commit=$GITHUB_SHA" "$info"; then
+              echo "::error::Azure $arch build provenance differs from $GITHUB_SHA"
+              exit 1
+            fi
+          done
+          printf '{"schemaVersion":1,"mpvCommit":"%s","buildPath":"%s"}\n' \
+            "$GITHUB_SHA" "$prefix" > "$marker"
+          az storage blob upload \
+            --container-name rodel-player-deps \
+            --name native/latest.json \
+            --file "$marker" --overwrite \
+            --content-type application/json \
+            --connection-string "$AZURE_STORAGE_CONNECTION_STRING" \
+            --output none
+          echo "Published latest complete Azure native build: $prefix ($GITHUB_SHA)"

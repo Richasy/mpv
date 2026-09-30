@@ -145,6 +145,14 @@ jobs:
               echo "::endgroup::"
             fi
           done
+          if [ -f "$SRC_PACKAGES/llvm/libunwind/src/Unwind-seh.cpp" ]; then
+            echo "::group::Cached LLVM unwind source"
+            git -C "$SRC_PACKAGES/llvm" rev-parse HEAD
+            git -C "$SRC_PACKAGES/llvm" diff -- libunwind/src/Unwind-seh.cpp | sed -n '1,100p'
+            grep -n -A 8 -B 4 -E 'ExceptionExecuteHandler|EXCEPTION_DISPOSITION|ms_act =' \
+              "$SRC_PACKAGES/llvm/libunwind/src/Unwind-seh.cpp" | sed -n '1,120p'
+            echo "::endgroup::"
+          fi
 
       - name: Package artifacts as 7z
         run: |

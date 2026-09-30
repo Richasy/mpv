@@ -148,6 +148,11 @@ class EndFile(ctypes.Structure):
     _fields_ = [("reason", ctypes.c_int), ("error", ctypes.c_int)]
 
 
+class EventProperty(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char_p), ("format", ctypes.c_int),
+                ("data", ctypes.c_void_p)]
+
+
 class LogMessage(ctypes.Structure):
     _fields_ = [
         ("prefix", ctypes.c_char_p),
@@ -552,6 +557,8 @@ def configure_library(mpv):
         ctypes.c_void_p, ctypes.POINTER(FrameStatus)]
     mpv.mpv_set_property.argtypes = [
         ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
+    mpv.mpv_observe_property.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_int]
     mpv.mpv_acquire_d3d11_composition_surface.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(CompositionSurface)]
     mpv.mpv_release_d3d11_composition_surface.argtypes = [
@@ -1097,6 +1104,38 @@ def test_control_lifecycle(mpv, server):
         assert len(server.requests) == before
         assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == UNSUPPORTED
     assert_headers(server)
+
+
+def test_observed_seek_capability(mpv, server):
+    with client(mpv) as handle:
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        await_event(mpv, handle, FILE_LOADED)
+        audio = prop(mpv, handle, "aid")
+        assert audio not in (None, "no")
+        assert mpv.mpv_observe_property(handle, 701, b"seekable", 3) == 0
+
+        def expect(expected):
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                event = mpv.mpv_wait_event(handle, 0.02).contents
+                if event.event_id == 22 and event.reply_userdata == 701:
+                    value = ctypes.cast(event.data, ctypes.POINTER(EventProperty)).contents
+                    if value.format == 3 and value.data:
+                        if ctypes.cast(value.data, ctypes.POINTER(ctypes.c_int)).contents.value == expected:
+                            assert prop(mpv, handle, "seekable") == ("yes" if expected else "no")
+                            return
+            raise AssertionError(f"seekable observer did not publish {expected}")
+
+        expect(1)
+        command(mpv, handle, "set", "aid", "no")
+        expect(0)
+        assert set_position(mpv, handle, "time-pos", 4) < 0
+        command(mpv, handle, "set", "aid", audio)
+        expect(1)
+        generation = snapshot(mpv, handle).generation
+        confirm_position(mpv, handle, 4, generation,
+                         lambda: command(mpv, handle, "seek", "4", "absolute+exact"))
 
 
 def test_repeated_zero_response(mpv, server):
@@ -1825,6 +1864,8 @@ def main():
                 print("[dash] complete same-instance native controls", flush=True)
                 with serve(tracks) as server:
                     test_control_lifecycle(mpv, server)
+                with serve(tracks) as server:
+                    test_observed_seek_capability(mpv, server)
                 for role in ("video", "audio"):
                     print(f"[dash] {role} 200 advertisement and direct seek", flush=True)
                     with serve(tracks) as server:
@@ -1861,6 +1902,8 @@ def main():
                     test_unseekable_track(mpv, server, role)
             with serve(tracks) as server:
                 test_control_lifecycle(mpv, server)
+            with serve(tracks) as server:
+                test_observed_seek_capability(mpv, server)
             print("[dash] ordinary response media, absent length, finite hint", flush=True)
             with serve(tracks) as server:
                 server.full_body_lengths["audio"] = None

@@ -134,6 +134,18 @@ jobs:
           export MPV_SRC_DIR="$GITHUB_WORKSPACE"
           bash ci/build-libmpv.sh all
 
+      - name: Print failed C++ runtime build diagnostics
+        if: failure()
+        run: |
+          shopt -s nullglob
+          for log in "$BUILD_DIR"/toolchain/llvm-libcxx-prefix/src/llvm-libcxx-stamp/*-build-*.log; do
+            if [ -s "$log" ]; then
+              echo "::group::$(basename "$log")"
+              tail -n 80 "$log"
+              echo "::endgroup::"
+            fi
+          done
+
       - name: Package artifacts as 7z
         run: |
           archive="$OUTPUT_DIR/libmpv-${{ matrix.name }}.7z"
@@ -218,6 +230,7 @@ jobs:
         with:
           name: build-logs-${{ matrix.name }}
           path: |
+            ${{ env.BUILD_DIR }}/toolchain/llvm-libcxx-prefix/src/llvm-libcxx-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/mpv-prefix/src/mpv-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/mpv-prefix/src/mpv-build/meson-logs/*.txt
             ${{ env.BUILD_DIR }}/packages/ffmpeg-prefix/src/ffmpeg-stamp/*.log

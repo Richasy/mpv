@@ -38,7 +38,8 @@ ExternalProject_Add(llvm-libcxx
         -DLIBCXXABI_ENABLE_SHARED=OFF
         -DLIBCXXABI_LIBDIR_SUFFIX=''
     # Backport llvm/llvm-project#180513 for MinGW's enum EXCEPTION_DISPOSITION.
-    BUILD_COMMAND ${EXEC} bash -c "git -C <SOURCE_DIR> apply -R --check ${CMAKE_CURRENT_LIST_DIR}/libunwind-exception-disposition.patch >/dev/null 2>&1 || git -C <SOURCE_DIR> apply ${CMAKE_CURRENT_LIST_DIR}/libunwind-exception-disposition.patch"
+    # exec re-evaluates its arguments, so keep this quoted shell program outside it.
+    BUILD_COMMAND bash -c "git -C <SOURCE_DIR> apply -R --check ${CMAKE_CURRENT_LIST_DIR}/libunwind-exception-disposition.patch >/dev/null 2>&1 || git -C <SOURCE_DIR> apply ${CMAKE_CURRENT_LIST_DIR}/libunwind-exception-disposition.patch"
         COMMAND ${EXEC} LTO=0 ninja -C <BINARY_DIR>
     INSTALL_COMMAND ${EXEC} LTO=0 ninja -C <BINARY_DIR> install
             COMMAND bash -c "cp ${MINGW_INSTALL_PREFIX}/lib/libc++.a ${MINGW_INSTALL_PREFIX}/lib/libstdc++.a"

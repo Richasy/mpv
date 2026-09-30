@@ -33,6 +33,13 @@ API changes
 ::
 
  --- mpv 0.41.0 ---
+        - fix typed DASH seek admission to use both selected demuxers rather
+          than previously observed HTTP 206 responses. An initial 200 may
+          advertise byte ranges, as on the ordinary HTTP path; actual byte
+          positions, response validation and terminal failures remain enforced.
+          Range-capability flags remain observations with unchanged layout.
+          Asynchronous typed demux seek failures now terminate both tracks
+          instead of leaving a successful-looking video-only seek.
  2.11   - add mpv_dash_source_get_failure_detail() with a versioned,
           generation-bound numeric first-failure origin. The existing v1
           status and failure codes are unchanged (Richasy/mpv fork).

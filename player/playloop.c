@@ -397,11 +397,16 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
 
     demux_flags |= SEEK_BLOCK;
 
+    bool typed_dash = mp_dash_source_active(mpctx->global) &&
+        mpctx->filename && !strcmp(mpctx->filename, MP_DASH_VIDEO_URL);
     if (!demux_seek(mpctx->demuxer, demux_pts, demux_flags)) {
         if (!mpctx->demuxer->seekable) {
             MP_ERR(mpctx, "Cannot seek in this stream.\n");
             MP_ERR(mpctx, "You can force it with '--force-seekable=yes'.\n");
         }
+        if (typed_dash)
+            mp_dash_source_fail(mpctx->global, MPV_DASH_TRACK_VIDEO,
+                                MPV_DASH_FAILURE_PLAYBACK);
         return;
     }
 
@@ -416,8 +421,19 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
                 main_new_pos += get_track_seek_offset(mpctx, track);
             if (demux_flags & SEEK_FACTOR)
                 main_new_pos = seek_pts;
-            demux_seek(track->demuxer, main_new_pos,
-                       demux_flags & (SEEK_SATAN | SEEK_BLOCK));
+            int accepted = demux_seek(track->demuxer, main_new_pos,
+                                     demux_flags & (SEEK_SATAN | SEEK_BLOCK));
+            if (!accepted && typed_dash && track->type == STREAM_AUDIO) {
+                demux_block_reading(mpctx->demuxer, false);
+                for (int n = 0; n < mpctx->num_tracks; n++) {
+                    struct track *selected = mpctx->tracks[n];
+                    if (selected->selected && selected->demuxer)
+                        demux_block_reading(selected->demuxer, false);
+                }
+                mp_dash_source_fail(mpctx->global, MPV_DASH_TRACK_AUDIO,
+                                    MPV_DASH_FAILURE_PLAYBACK);
+                return;
+            }
         }
     }
 

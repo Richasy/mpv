@@ -41,7 +41,7 @@ ORIGIN_NONE, ORIGIN_OTHER, ORIGIN_MALFORMED, ORIGIN_DUPLICATE, \
     ORIGIN_WINDOW, ORIGIN_PARTIAL, ORIGIN_BODY_LENGTH = range(11)
 VIDEO, AUDIO = 1, 2
 FILE_LOADED, END_FILE, LOG_MESSAGE = 8, 7, 2
-SEEK_EVENT, DOUBLE = 20, 5
+SEEK_EVENT, PLAYBACK_RESTART, DOUBLE = 20, 21, 5
 END_ERROR = 4
 MARKER = b"private-local-test"
 TEST_ARM, TEST_WAIT, TEST_RELEASE, TEST_SUCCESS_BRANCHES, \
@@ -311,8 +311,10 @@ class Server(http.server.ThreadingHTTPServer):
         self.deny = None
         self.deny_code = 412
         self.arm_failure = None
+        self.truncate_range_role = None
         self.arm_code = 412
         self.full_body_roles = set()
+        self.no_range_advertisement = set()
         self.full_body_after_first_zero = set()
         self.full_body_status = {}
         self.full_body_payloads = {}
@@ -440,7 +442,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "Content-Type",
                     self.server.full_body_types.get(role, f"{role}/mp4"),
                 )
-                self.send_header("Accept-Ranges", "bytes")
+                if role not in self.server.no_range_advertisement:
+                    self.send_header("Accept-Ranges", "bytes")
                 if role in self.server.full_body_encodings:
                     self.send_header(
                         "Content-Encoding", self.server.full_body_encodings[role])
@@ -465,6 +468,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             if code == 206:
+                if self.server.truncate_range_role == role and start > 0:
+                    self.wfile.write(data[start:start + min(32, end - start)])
+                    self.wfile.flush()
+                    return
                 if self.server.pause_first_body_role == role and start == 0:
                     self.server.first_body_held.set()
                     if not self.server.release_first_body.wait(15):
@@ -707,6 +714,34 @@ def set_position(mpv, handle, name, value):
         handle, name.encode(), DOUBLE, ctypes.byref(position))
 
 
+def confirm_position(mpv, handle, target, generation, submit):
+    while True:
+        event = mpv.mpv_wait_event(handle, 0).contents
+        if event.event_id == 0:
+            break
+        if event.event_id == END_FILE:
+            raise AssertionError("Source ended before a control command")
+    submit()
+    restarted = False
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        event = mpv.mpv_wait_event(handle, 0.02).contents
+        if event.event_id in (END_FILE, FILE_LOADED):
+            raise AssertionError("Seek ended or reloaded the source")
+        if event.event_id == PLAYBACK_RESTART:
+            restarted = True
+        state = snapshot(mpv, handle)
+        assert state.generation == generation
+        assert state.phase == BOUND and not state.failure, \
+            (state.phase, state.failure, state.failed_track)
+        position = prop(mpv, handle, "time-pos")
+        if (restarted and prop(mpv, handle, "seeking") == "no" and
+            prop(mpv, handle, "eof-reached") == "no" and position is not None and
+            abs(float(position) - target) <= 0.4):
+            return
+    raise AssertionError("Native playback restart did not confirm the seek")
+
+
 def await_event(mpv, handle, wanted, timeout=12):
     deadline = time.monotonic() + timeout
     event_counts = {}
@@ -938,11 +973,11 @@ def test_full_body_playback(mpv, server, full_role, http_status=200,
         ranged = range_capability(mpv, handle)
         assert state.phase == BOUND and not state.failure
         assert failure_detail(mpv, handle).origin == ORIGIN_NONE
-        assert (state.video_http_status, state.audio_http_status) == (
-            (http_status, 206) if full_role == "video" else (206, http_status))
+        assert server.requests_for(full_role)[0][2] == http_status
         assert ranged.source_generation == state.generation
-        assert ranged.video_validated_206 == (full_role != "video")
-        assert ranged.audio_validated_206 == (full_role != "audio")
+        for role, observed in (("video", ranged.video_validated_206),
+                               ("audio", ranged.audio_validated_206)):
+            assert observed == any(r[2] == 206 for r in server.requests_for(role))
         command(mpv, handle, "set", "pause", "no")
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
@@ -962,45 +997,22 @@ def test_full_body_playback(mpv, server, full_role, http_status=200,
             raise AssertionError("Full-body MP4 did not decode both tracks and AO")
         assert_private(mpv, handle)
         command(mpv, handle, "set", "pause", "yes")
-        before = prop(mpv, handle, "time-pos")
-        assert before is not None
-        counts = {role: len(server.requests_for(role))
-                  for role in ("video", "audio")}
-        argv = (ctypes.c_char_p * 4)(b"seek", b"8", b"absolute+exact", None)
-        assert mpv.mpv_command(handle, argv) < 0, \
-            "One unproven track must not permit a single-track seek"
-        for name, value in (
-            ("time-pos", 8.0),
-            ("percent-pos", 80.0),
-            ("playback-time", 8.0),
+        assert prop(mpv, handle, "seekable") == "yes", \
+            "Advertised range capability must not require prior 206 on both tracks"
+        confirm_position(mpv, handle, 8, state.generation,
+                         lambda: command(mpv, handle, "seek", "8", "absolute+exact"))
+        for name, value, target in (
+            ("time-pos", 4.0, 4.0),
+            ("percent-pos", 50.0, 9.0),
+            ("playback-time", 2.0, 2.0),
         ):
-            assert set_position(mpv, handle, name, value) < 0, \
-                f"{name} bypassed dual-track seek evidence"
-        for name, params in (
-            ("revert-seek", ()),
-            ("frame-step", ("1",)),
-            ("frame-back-step", ()),
-            ("sub-seek", ("1",)),
-        ):
-            args = (ctypes.c_char_p * (len(params) + 2))(
-                name.encode(), *(param.encode() for param in params), None)
-            assert mpv.mpv_command(handle, args) < 0, \
-                f"{name} bypassed dual-track seek evidence"
-        deadline = time.monotonic() + 0.25
-        while time.monotonic() < deadline:
-            event = mpv.mpv_wait_event(handle, 0.05).contents
-            if event.event_id == SEEK_EVENT:
-                raise AssertionError("Mixed 206/200 source queued a seek")
-        after = prop(mpv, handle, "time-pos")
-        assert after is not None and abs(float(after) - float(before)) < 0.6
-        assert len(server.requests_for(full_role)) == counts[full_role], \
-            "Rejected seek restarted the ordinary-response track"
-        if not options or not options.get("curl-max-request-size"):
-            other = "audio" if full_role == "video" else "video"
-            assert len(server.requests_for(other)) == counts[other], \
-                "Rejected seek emitted a new Range on the other track"
+            def submit():
+                assert set_position(mpv, handle, name, value) == 0, name
+            confirm_position(mpv, handle, target, state.generation, submit)
+            assert prop(mpv, handle, "pause") == "yes"
         assert snapshot(mpv, handle).phase == BOUND
-        assert prop(mpv, handle, "audio-out-params/samplerate") == "48000"
+        command(mpv, handle, "set", "pause", "no")
+        await_dual_decoder_ao(mpv, handle, "Mixed response seek")
         command(mpv, handle, "stop")
         await_event(mpv, handle, END_FILE)
         assert snapshot(mpv, handle).phase == STOPPED
@@ -1009,7 +1021,81 @@ def test_full_body_playback(mpv, server, full_role, http_status=200,
         assert not stopped_range.video_validated_206
         assert not stopped_range.audio_validated_206
     assert server.requests_for(full_role)[0][7] == expected_range
-    assert len(server.requests_for(full_role)) == 1
+    assert_headers(server)
+
+
+def test_unseekable_track(mpv, server, role):
+    server.full_body_roles.add(role)
+    server.no_range_advertisement.add(role)
+    with client(mpv) as handle:
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        await_event(mpv, handle, FILE_LOADED)
+        state = snapshot(mpv, handle)
+        assert state.phase == BOUND and not state.failure
+        assert prop(mpv, handle, "seekable") == "no"
+        before = len(server.requests)
+        argv = (ctypes.c_char_p * 4)(b"seek", b"8", b"absolute+exact", None)
+        assert mpv.mpv_command(handle, argv) < 0
+        for name in ("time-pos", "percent-pos", "playback-time"):
+            assert set_position(mpv, handle, name, 8.0) < 0
+        until = time.monotonic() + 0.2
+        while time.monotonic() < until:
+            event = mpv.mpv_wait_event(handle, 0.02).contents
+            assert event.event_id not in (SEEK_EVENT, FILE_LOADED, END_FILE)
+        assert len(server.requests) == before
+        command(mpv, handle, "stop")
+        await_event(mpv, handle, END_FILE)
+        assert snapshot(mpv, handle).phase == STOPPED
+
+
+def test_control_lifecycle(mpv, server):
+    server.full_body_roles.add("audio")
+    with client(mpv) as handle:
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        await_event(mpv, handle, FILE_LOADED)
+        generation = snapshot(mpv, handle).generation
+        for name, value in (("volume", "37"), ("mute", "yes"), ("speed", "1.5")):
+            command(mpv, handle, "set", name, value)
+        for target in (12, 3, 14, 1):
+            confirm_position(mpv, handle, target, generation,
+                             lambda: command(mpv, handle, "seek", str(target),
+                                             "absolute+exact"))
+            assert prop(mpv, handle, "pause") == "yes"
+            assert float(prop(mpv, handle, "volume")) == 37
+            assert prop(mpv, handle, "mute") == "yes"
+            assert float(prop(mpv, handle, "speed")) == 1.5
+        confirm_position(mpv, handle, 4, generation,
+                         lambda: command(mpv, handle, "seek", "3", "relative+exact"))
+        command(mpv, handle, "set", "mute", "no")
+        command(mpv, handle, "set", "speed", "1")
+        confirm_position(mpv, handle, 17, generation,
+                         lambda: command(mpv, handle, "seek", "17", "absolute+exact"))
+        command(mpv, handle, "set", "pause", "no")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            event = mpv.mpv_wait_event(handle, 0.02).contents
+            assert event.event_id not in (FILE_LOADED, END_FILE)
+            if prop(mpv, handle, "eof-reached") == "yes":
+                break
+        else:
+            raise AssertionError("Healthy natural EOF was not observable")
+        assert snapshot(mpv, handle).phase == BOUND
+        confirm_position(mpv, handle, 0, generation,
+                         lambda: command(mpv, handle, "seek", "0", "absolute+exact"))
+        command(mpv, handle, "set", "pause", "no")
+        await_dual_decoder_ao(mpv, handle, "Same-instance EOF Replay")
+        assert float(prop(mpv, handle, "volume")) == 37
+        assert snapshot(mpv, handle).generation == generation
+        command(mpv, handle, "stop")
+        await_event(mpv, handle, END_FILE)
+        assert snapshot(mpv, handle).phase == STOPPED
+        before = len(server.requests)
+        argv = (ctypes.c_char_p * 4)(b"seek", b"0", b"absolute+exact", None)
+        assert mpv.mpv_command(handle, argv) < 0
+        assert len(server.requests) == before
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == UNSUPPORTED
     assert_headers(server)
 
 
@@ -1366,6 +1452,7 @@ def test_composition_first_frame(mpv, server, previous_generation,
             server.release_video_body.set()
         if not saw_file_loaded:
             await_event(mpv, handle, FILE_LOADED, 20)
+        assert server.requests_for("audio")[0][2] == audio_status
         started = time.monotonic()
         resumed = False
         ready = False
@@ -1386,8 +1473,7 @@ def test_composition_first_frame(mpv, server, previous_generation,
             if result != 0:
                 raise AssertionError(f"Composition acquire failed: {result}")
             try:
-                if (state.phase == BOUND and state.video_http_status == 206 and
-                    state.audio_http_status == audio_status and
+                if (state.phase == BOUND and not state.failure and
                     frame.source_generation == state.generation and
                     frame.presented_generation == state.generation and
                     frame.presented_frame_serial and
@@ -1419,8 +1505,9 @@ def test_composition_first_frame(mpv, server, previous_generation,
         ranged = range_capability(mpv, handle)
         assert ranged.source_generation == frame.source_generation
         assert ranged.video_validated_206 == 1
-        assert ranged.audio_validated_206 == (audio_status == 206)
-        if audio_status == 206:
+        assert ranged.audio_validated_206 == any(
+            r[2] == 206 for r in server.requests_for("audio"))
+        if audio_status >= 200:
             command(mpv, handle, "set", "pause", "no")
             command(mpv, handle, "seek", "8", "absolute+exact")
             deadline = time.monotonic() + 8
@@ -1434,15 +1521,15 @@ def test_composition_first_frame(mpv, server, previous_generation,
                 if event.event_id == END_FILE:
                     raise AssertionError("Composition stopped during seek")
                 next_frame = frame_snapshot(mpv, handle)
+                position = prop(mpv, handle, "time-pos")
                 if (next_frame.presented_frame_serial > first_serial and
                     next_frame.presented_surface_epoch == first_epoch and
-                    next_frame.presented_generation == frame.source_generation):
+                    next_frame.presented_generation == frame.source_generation and
+                    prop(mpv, handle, "seeking") == "no" and
+                    position is not None and abs(float(position) - 8) <= 0.5):
                     break
             else:
                 raise AssertionError("Composition frame serial did not increase after seek")
-        else:
-            argv = (ctypes.c_char_p * 4)(b"seek", b"8", b"absolute+exact", None)
-            assert mpv.mpv_command(handle, argv) < 0
         last_serial = frame_snapshot(mpv, handle).presented_frame_serial
         command(mpv, handle, "stop")
         await_event(mpv, handle, END_FILE)
@@ -1661,11 +1748,35 @@ def test_late_status(mpv, server, role, code, failure):
                 after.response_count) == frozen, "First-failure reason was overwritten"
 
 
+def test_truncated_seek_response(mpv, server, role):
+    with client(mpv) as handle:
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        await_event(mpv, handle, FILE_LOADED)
+        generation = snapshot(mpv, handle).generation
+        before = len(server.requests_for(role))
+        server.truncate_range_role = role
+        command(mpv, handle, "seek", "15", "absolute+exact")
+        event = await_event(mpv, handle, END_FILE)
+        assert ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents.reason == END_ERROR
+        state = snapshot(mpv, handle)
+        detail = failure_detail(mpv, handle)
+        assert state.generation == generation and state.phase == FAILED
+        assert state.failed_track == (VIDEO if role == "video" else AUDIO)
+        assert state.failure == TRANSPORT
+        assert detail.origin == ORIGIN_BODY_LENGTH
+        assert len(server.requests_for(role)) > before
+        count = len(server.requests_for(role))
+        time.sleep(0.2)
+        assert len(server.requests_for(role)) == count, "Truncated response was retried"
+
+
 def main():
     scheduler = len(sys.argv) == 3 and sys.argv[2] == "--scheduler"
-    if not (len(sys.argv) == 2 or scheduler):
+    controls = len(sys.argv) == 3 and sys.argv[2] == "--controls"
+    if not (len(sys.argv) == 2 or scheduler or controls):
         raise SystemExit("usage: python test/libmpv_dash_source.py "
-                         "build/local-libmpv/x86_64 [--scheduler]")
+                         "build/local-libmpv/x86_64 [--scheduler|--controls]")
     runtime = Path(sys.argv[1]).resolve()
     directory = runtime / f"dash-generated-{os.getpid()}"
     if not runtime.is_dir() or not (runtime / "libmpv-2.dll").is_file():
@@ -1710,6 +1821,29 @@ def main():
             assert RangeCapability.source_generation.offset == 8
             assert RangeCapability.video_validated_206.offset == 16
             assert RangeCapability.audio_validated_206.offset == 20
+            if controls:
+                print("[dash] complete same-instance native controls", flush=True)
+                with serve(tracks) as server:
+                    test_control_lifecycle(mpv, server)
+                for role in ("video", "audio"):
+                    print(f"[dash] {role} 200 advertisement and direct seek", flush=True)
+                    with serve(tracks) as server:
+                        test_full_body_playback(mpv, server, role)
+                    print(f"[dash] {role} genuinely nonseekable admission", flush=True)
+                    with serve(tracks) as server:
+                        test_unseekable_track(mpv, server, role)
+                    with serve(tracks) as server:
+                        test_truncated_seek_response(mpv, server, role)
+                for role, code, failure in (
+                    ("video", 412, RISK), ("audio", 412, RISK),
+                    ("video", 401, AUTH), ("audio", 403, AUTH),
+                    ("video", 200, HTTP_RANGE), ("audio", 200, HTTP_RANGE),
+                ):
+                    with serve(tracks) as server:
+                        server.arm_code = code
+                        test_late_status(mpv, server, role, code, failure)
+                print("DASH_NATIVE_CONTROL_LIFECYCLE_PASS", flush=True)
+                return
             print("[dash] invalid descriptor", flush=True)
             with serve(tracks) as server:
                 test_invalid(mpv, server)
@@ -1720,9 +1854,13 @@ def main():
             with serve(tracks) as server:
                 previous_generation = test_playback(mpv, server)
             for role in ("audio", "video"):
-                print(f"[dash] first full-body MP4 200 {role}, no seek", flush=True)
+                print(f"[dash] first full-body MP4 200 {role}, direct seek", flush=True)
                 with serve(tracks) as server:
                     test_full_body_playback(mpv, server, role)
+                with serve(tracks) as server:
+                    test_unseekable_track(mpv, server, role)
+            with serve(tracks) as server:
+                test_control_lifecycle(mpv, server)
             print("[dash] ordinary response media, absent length, finite hint", flush=True)
             with serve(tracks) as server:
                 server.full_body_lengths["audio"] = None
@@ -1855,10 +1993,17 @@ def main():
                 test_full_body_rejected(mpv, server, (2, 8, 9, TRANSPORT))
             print("[dash] full-body 200 short body fails visibly", flush=True)
             with serve(tracks) as server:
+                # Consume the short response instead of intentionally abandoning
+                # it for a healthy index range before its EOF is observable.
+                server.no_range_advertisement.add("audio")
                 server.full_body_payloads["audio"] = tracks["audio"][:len(tracks["audio"]) // 2]
                 server.full_body_lengths["audio"] = len(tracks["audio"])
                 test_full_body_rejected(
                     mpv, server, (7, 2, 8, 9), allow_file_loaded=True)
+            for role in ("video", "audio"):
+                print(f"[dash] active {role} seek response truncation is terminal", flush=True)
+                with serve(tracks) as server:
+                    test_truncated_seek_response(mpv, server, role)
             print("[dash] required audio 412", flush=True)
             with serve(tracks) as server:
                 server.deny = "audio"

@@ -914,14 +914,23 @@ static size_t dash_header_callback(struct priv *p, struct bstr line, size_t byte
             finalize_probe(p);
         return 0;
     }
-    if (!p->dash_ordinary_response)
+    if (!p->dash_ordinary_response) {
         mp_dash_source_range_validated(p->global, p->dash_kind);
+        // An initially unknown-length 200 can become byte-addressable later.
+        // Retain the validated total so EOF is not probed past the object.
+        mp_mutex_lock(&p->mtx);
+        p->content_size = total;
+        mp_mutex_unlock(&p->mtx);
+    }
     if (!p->probed) {
         p->content_size = p->dash_ordinary_response ?
             (p->dash_response_length_known ? (int64_t)p->dash_response_length : -1) :
             total;
+        const char *ar = header_value(p->curl, "Accept-Ranges");
+        // As in probe_http, 200 at offset zero may advertise later byte seeks.
+        // Every actual response still passes the typed byte-window checks.
         p->seekable = !p->dash_ordinary_response ||
-            mp_dash_source_has_validated_range(p->global, p->dash_kind);
+            (ar && strcasecmp(ar, "bytes") == 0);
         p->stream_ok = true;
     }
     p->dash_headers_ok = true;
@@ -1400,7 +1409,10 @@ static int curl_seek(struct stream *s, int64_t pos)
 static int64_t curl_get_size(struct stream *s)
 {
     struct priv *p = s->priv;
-    return p->content_size;
+    mp_mutex_lock(&p->mtx);
+    int64_t size = p->content_size;
+    mp_mutex_unlock(&p->mtx);
+    return size;
 }
 
 static int curl_control(struct stream *s, int cmd, void *arg)

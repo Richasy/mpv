@@ -59,6 +59,7 @@
 #include "options/m_option.h"
 #include "options/options.h"
 #include "options/path.h"
+#include "player/dash_source.h"
 #include "video/csputils.h"
 
 #define INITIAL_PROBE_SIZE STREAM_BUFFER_SIZE
@@ -1995,8 +1996,19 @@ static void demux_seek_lavf(demuxer_t *demuxer, double seek_pts, int flags)
         }
     }
 
+    struct stream *stream = priv->stream;
+    mpv_dash_track_kind dash_track = MPV_DASH_TRACK_NONE;
+    if (stream && stream->url && mp_dash_source_active(demuxer->global)) {
+        if (!strcmp(stream->url, MP_DASH_VIDEO_URL))
+            dash_track = MPV_DASH_TRACK_VIDEO;
+        else if (!strcmp(stream->url, MP_DASH_AUDIO_URL))
+            dash_track = MPV_DASH_TRACK_AUDIO;
+    }
+    if (dash_track && mp_dash_source_terminal(demuxer->global))
+        return;
     int r = av_seek_frame(priv->avfc, seek_stream, seek_pts_av, avsflags);
-    if (r < 0 && (avsflags & AVSEEK_FLAG_BACKWARD)) {
+    if (r < 0 && (avsflags & AVSEEK_FLAG_BACKWARD) &&
+        (!dash_track || !mp_dash_source_terminal(demuxer->global))) {
         // When seeking before the beginning of the file, and seeking fails,
         // try again without the backwards flag to make it seek to the
         // beginning.
@@ -2008,6 +2020,9 @@ static void demux_seek_lavf(demuxer_t *demuxer, double seek_pts, int flags)
         char buf[180];
         av_strerror(r, buf, sizeof(buf));
         MP_VERBOSE(demuxer, "Seek failed (%s)\n", buf);
+        if (dash_track)
+            mp_dash_source_fail(demuxer->global, dash_track,
+                                MPV_DASH_FAILURE_PLAYBACK);
     }
     reset_dovi_split_state(demuxer);
 

@@ -625,8 +625,10 @@ MPV_EXPORT int mpv_dash_source_get_failure_detail(
  *
  * A successful initial full-body HTTP 200 is not range evidence. Each flag
  * becomes one only after that track validates a 206 Content-Range; failed or
- * stopped sources report zero flags. Seek requires both flags, a matching
- * generation, and mpv_dash_source_status.phase == MPV_DASH_SOURCE_TRACKS_BOUND.
+ * stopped sources report zero flags. These are observations, not a prerequisite
+ * for seeking. The seekable property and command admission require a bound,
+ * healthy source and seekable selected video/audio demuxers. Each actual byte
+ * seek still validates the returned position and range before delivering data.
  * No URL, response header, or media bytes are exposed.
  */
 MPV_EXPORT int mpv_dash_source_get_range_capability(

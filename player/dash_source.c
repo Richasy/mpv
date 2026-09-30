@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "common/global.h"
+#include "demux/demux.h"
 #include "misc/dispatch.h"
 #include "mpv_talloc.h"
 #include "osdep/threads.h"
@@ -437,13 +438,21 @@ bool mp_dash_source_seek_blocked(struct mpv_global *global)
 {
     struct mp_dash_source_state *state = global->dash_source;
     mp_mutex_lock(&state->lock);
-    bool blocked = state->status.generation && state->mpctx->filename &&
-                   !strcmp(state->mpctx->filename, MP_DASH_VIDEO_URL) &&
-                   (state->status.phase != MPV_DASH_SOURCE_TRACKS_BOUND ||
-                    state->validated_ranges !=
-                        (MPV_DASH_TRACK_VIDEO | MPV_DASH_TRACK_AUDIO));
+    bool current = state->status.generation && state->mpctx->filename &&
+                   !strcmp(state->mpctx->filename, MP_DASH_VIDEO_URL);
+    bool bound = state->status.phase == MPV_DASH_SOURCE_TRACKS_BOUND;
     mp_mutex_unlock(&state->lock);
-    return blocked;
+    if (!current)
+        return false;
+    if (!bound)
+        return true;
+
+    // Called on the core thread. HTTP range observations are telemetry, not
+    // demux capability; both selected media demuxers must accept full seeks.
+    struct track *video = state->mpctx->current_track[0][STREAM_VIDEO];
+    struct track *audio = state->mpctx->current_track[0][STREAM_AUDIO];
+    return !video || !audio || !video->demuxer || !audio->demuxer ||
+           !video->demuxer->seekable || !audio->demuxer->seekable;
 }
 
 int mp_dash_source_frame_snapshot(struct mpv_global *global,

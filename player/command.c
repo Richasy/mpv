@@ -2039,7 +2039,8 @@ static int mp_property_seekable(void *ctx, struct m_property *prop,
     MPContext *mpctx = ctx;
     if (!mpctx->demuxer)
         return M_PROPERTY_UNAVAILABLE;
-    return m_property_bool_ro(action, arg, mpctx->demuxer->seekable);
+    return m_property_bool_ro(action, arg, mpctx->demuxer->seekable &&
+                              !mp_dash_source_seek_blocked(mpctx->global));
 }
 
 static int mp_property_partially_seekable(void *ctx, struct m_property *prop,

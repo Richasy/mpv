@@ -160,16 +160,22 @@ class Mpv:
             result["result"] = image_result(copy_node(c.cast(event.data, c.POINTER(Node)).contents))
         return result
 
-    def load(self, source):
+    def load(self, source, wait_for_cache=True):
         self.command("loadfile", source)
         deadline = time.monotonic() + 20
         loaded = False
+        restarted = False
         while time.monotonic() < deadline:
-            loaded |= self.event()["id"] == 8
-            cache = self.property("demuxer-cache-state") or {}
-            if loaded and cache.get("eof-cached"):
+            event = self.event()
+            loaded |= event["id"] == 8
+            restarted |= event["id"] == 21
+            if not wait_for_cache and loaded and restarted:
                 return
-        raise TimeoutError("Media did not reach the fully cached state")
+            if wait_for_cache:
+                cache = self.property("demuxer-cache-state") or {}
+                if loaded and cache.get("eof-cached"):
+                    return
+        raise TimeoutError("Media did not reach the requested playback/cache state")
 
     def thumbnail(self, mode, position, precision=None):
         args = ["thumbnail-raw", position, 320, mode]

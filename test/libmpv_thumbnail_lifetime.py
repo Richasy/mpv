@@ -10,6 +10,7 @@ the final stop and native destruction must actually finish.
 
 import argparse
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -33,16 +34,36 @@ def exercise(library, fixture):
     settled = 0
     longest_cancel = 0
     try:
-        client.load(fixture)
         client.command("set", "cache", "no")
         client.command("set", "aid", "auto")
+        client.load(fixture, wait_for_cache=False)
+        duration = client.property("duration")
+        assert isinstance(duration, (int, float)) and math.isfinite(duration) and duration >= 2
+        video = client.property("video-params") or {}
+        measurements = []
+        for fraction in (0.05, 0.25, 0.5, 0.75, 0.95):
+            target = duration * fraction
+            fast = client.thumbnail("local", target, "keyframes")
+            assert fast["cached"] and fast["decoded-frames"] == 1, fast
+            assert fast["milliseconds"] < 1000, fast
+            exact = client.thumbnail("local", target, "exact")
+            assert exact["cached"] and abs(exact["pts"] - target) < 0.1, exact
+            measurements.append({
+                "targetSeconds": target,
+                "previewMs": fast["milliseconds"],
+                "exactMs": exact["milliseconds"],
+                "previewPts": fast["pts"],
+                "exactPts": exact["pts"],
+            })
+
+        client.command("seek", duration * 0.25, "absolute+exact")
         client.command("set", "pause", "no")
         print("active playback started", file=sys.stderr, flush=True)
         for index in range(96):
-            target = 1 + ((index * 7) % 10)
+            target = duration * (0.05 + 0.9 * ((index * 7) % 10) / 9)
             if index % 8 == 0:
-                client.command("seek", 8, "absolute+exact")
-                client.command("seek", 1, "absolute+exact")
+                client.command("seek", duration * 0.75, "absolute+exact")
+                client.command("seek", duration * 0.25, "absolute+exact")
 
             reply_id = index + 100
             assert client.api.mpv_command_async(
@@ -69,14 +90,14 @@ def exercise(library, fixture):
             if index % 8 == 0:
                 print(f"settled {settled} requests", file=sys.stderr, flush=True)
 
-        preview = client.thumbnail("local", 4.5, "keyframes")
+        preview = client.thumbnail("local", duration * 0.45, "keyframes")
         assert preview["cached"] and preview["decoded-frames"] == 1, preview
         assert preview["milliseconds"] < 1000, preview
         print("settled preview completed", file=sys.stderr, flush=True)
 
         assert client.api.mpv_command_async(
             client.handle, 300,
-            command_args(["thumbnail-raw", 9.5, 320, "local", "exact"])) >= 0
+            command_args(["thumbnail-raw", duration * 0.8, 320, "local", "exact"])) >= 0
         time.sleep(0.002)
         started = time.monotonic()
         client.command("stop")
@@ -93,6 +114,10 @@ def exercise(library, fixture):
 
     assert destroy_ms < 2000, destroy_ms
     print(json.dumps({
+        "durationSeconds": duration,
+        "videoWidth": video.get("w"),
+        "videoHeight": video.get("h"),
+        "positions": measurements,
         "settledRequests": settled,
         "longestCancelMs": longest_cancel * 1000,
         "settledPreviewMs": preview["milliseconds"],
@@ -105,10 +130,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("library", type=lambda value: str(Path(value).resolve(strict=True)))
     parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument("--media", type=lambda value: str(Path(value).resolve(strict=True)),
+                        help="Read an existing local video instead of generating test media.")
     parser.add_argument("--fixture", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.fixture:
         exercise(args.library, args.fixture)
+        return
+    if args.media:
+        run_child(args.library, args.media, timeout=90)
         return
     with tempfile.TemporaryDirectory(prefix="mpv-thumbnail-lifetime-") as directory:
         fixture = Path(directory) / "interleaved.mp4"
@@ -121,18 +151,22 @@ def main():
             "-sc_threshold", "0", "-bf", "3", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-movflags", "+faststart", str(fixture),
         ], check=True, timeout=120)
-        try:
-            result = subprocess.run([
-                sys.executable, __file__, args.library, "--fixture", str(fixture),
-            ], capture_output=True, text=True, timeout=30)
-        except subprocess.TimeoutExpired as error:
-            progress = error.stderr or b""
-            if isinstance(progress, bytes):
-                progress = progress.decode("utf-8", errors="replace")
-            raise TimeoutError(f"Native thumbnail lifetime did not finish:\n{progress}") from error
-        if result.returncode:
-            raise RuntimeError(result.stderr[-5000:] + result.stdout[-1000:])
-        print(result.stdout, end="")
+        run_child(args.library, fixture, timeout=30)
+
+
+def run_child(library, fixture, timeout):
+    try:
+        result = subprocess.run([
+            sys.executable, "-B", __file__, library, "--fixture", str(fixture),
+        ], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        progress = error.stderr or b""
+        if isinstance(progress, bytes):
+            progress = progress.decode("utf-8", errors="replace")
+        raise TimeoutError(f"Native thumbnail lifetime did not finish:\n{progress}") from error
+    if result.returncode:
+        raise RuntimeError(result.stderr[-5000:] + result.stdout[-1000:])
+    print(result.stdout, end="")
 
 
 if __name__ == "__main__":

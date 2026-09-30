@@ -409,6 +409,15 @@ bool demux_cache_visit_packets(struct demuxer *demuxer,
                                double *out_start, double *out_end,
                                void (*cb)(void *ctx, struct demux_packet *dp),
                                void *ctx);
+// Bounded variant: stop before the next cache read on cancellation or after
+// max_packets read attempts. Zero keeps the original unbounded visit behavior.
+bool demux_cache_visit_packets_limited(struct demuxer *demuxer,
+                                     struct sh_stream *stream,
+                                     double start, double end,
+                                     double *out_start, double *out_end,
+                                     void (*cb)(void *ctx, struct demux_packet *dp),
+                                     void *ctx, int max_packets,
+                                     struct mp_cancel *cancel);
 int demux_cache_dump_get_status(struct demuxer *demuxer);
 
 double demux_probe_cache_dump_target(struct demuxer *demuxer, double pts,

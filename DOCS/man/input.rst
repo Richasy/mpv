@@ -1584,6 +1584,34 @@ Screenshot Commands
             "format"    MPV_FORMAT_STRING
             "data"      MPV_FORMAT_BYTE_ARRAY
 
+``thumbnail-raw <time> [<max-width> [<mode> [<precision>]]]``
+    Return a BGRA video preview without seeking the playing decoder. Width
+    defaults to 320 pixels and is never intentionally upscaled.
+
+    ``mode=local`` uses a persistent secondary demuxer for local files.
+    ``mode=cache`` uses only the selected video track's buffered packets and
+    never opens another connection. ``auto`` selects from the source's network
+    flag. A position that cannot be decoded returns ``{cached: false}``.
+
+    ``precision=exact`` (the default, including older three-argument calls)
+    decodes from the preceding keyframe to the closest target frame and stops
+    as soon as the target is reached. ``keyframes`` returns the first decodable
+    frame after that seek, suitable for an immediate preview before a later
+    exact request. It does not reduce the requested output size.
+
+    A ready result contains ``cached``, ``w``, ``h``, ``stride``, ``format=bgra``
+    and the byte-array ``data``, with the same ownership as ``screenshot-raw``.
+    ``pts`` is the selected frame timestamp when known; ``precision`` reports
+    the requested mode. ``decoded-packets``, ``decoded-frames`` and
+    ``decoder-reused`` report the work performed for this request.
+
+    Submit through the asynchronous client API to use
+    ``mpv_abort_async_command``. Cancellation is checked between packets and
+    frames and interrupts local demuxer I/O. Playback ending also cancels the
+    request. Decoder state is isolated by playback generation, selected video
+    track and codec parameters. Concurrent requests are serialized outside the
+    playback core lock.
+
 Filter Commands
 ~~~~~~~~~~~~~~~
 

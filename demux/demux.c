@@ -5120,9 +5120,21 @@ bool demux_cache_visit_packets(struct demuxer *demuxer,
                                void (*cb)(void *ctx, struct demux_packet *dp),
                                void *ctx)
 {
+    return demux_cache_visit_packets_limited(demuxer, stream, start, end,
+                                            out_start, out_end, cb, ctx, 0, NULL);
+}
+
+bool demux_cache_visit_packets_limited(struct demuxer *demuxer,
+                                      struct sh_stream *stream,
+                                      double start, double end,
+                                      double *out_start, double *out_end,
+                                      void (*cb)(void *ctx, struct demux_packet *dp),
+                                      void *ctx, int max_packets,
+                                      struct mp_cancel *cancel)
+{
     struct demux_internal *in = demuxer->in;
     mp_assert(demuxer == in->d_user);
-    mp_assert(stream && cb);
+    mp_assert(stream && cb && max_packets >= 0);
 
     if (out_start)
         *out_start = MP_NOPTS_VALUE;
@@ -5138,6 +5150,7 @@ bool demux_cache_visit_packets(struct demuxer *demuxer,
     double q_end   = MP_ADD_PTS(end,   -in->ts_offset);
 
     bool visited_any = false;
+    int read_packets = 0;
     double first_pts = MP_NOPTS_VALUE;
     double last_pts  = MP_NOPTS_VALUE;
 
@@ -5147,7 +5160,7 @@ bool demux_cache_visit_packets(struct demuxer *demuxer,
         ranges[num_ranges++] = in->ranges[n];
     qsort(ranges, num_ranges, sizeof(ranges[0]), range_time_compare);
 
-    for (int n = 0; n < num_ranges; n++) {
+    for (int n = 0; n < num_ranges && !mp_cancel_test(cancel); n++) {
         struct demux_cached_range *r = ranges[n];
 
         struct demux_queue *q = NULL;
@@ -5196,7 +5209,8 @@ bool demux_cache_visit_packets(struct demuxer *demuxer,
 
         struct demux_packet *cur = find_seek_target(q, pts, flags);
 
-        while (cur) {
+        while (cur && !mp_cancel_test(cancel) &&
+               (!max_packets || read_packets < max_packets)) {
             double pdts = MP_PTS_OR_DEF(cur->dts, cur->pts);
 
             // Stop once we've crossed the requested end at a keyframe
@@ -5206,6 +5220,7 @@ bool demux_cache_visit_packets(struct demuxer *demuxer,
                 break;
 
             struct demux_packet *dp = read_packet_from_cache(in, cur);
+            read_packets++;
             cur = cur->next;
             if (!dp)
                 continue;

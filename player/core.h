@@ -319,12 +319,9 @@ typedef struct MPContext {
     struct demuxer *demuxer;
     struct mp_tags *filtered_tags;
 
-    // Opaque (struct thumb_ctx *) owned by player/thumbnail.c: a persistent,
-    // independent secondary demuxer + decoder used to render seek-preview
-    // thumbnails for arbitrary timestamps (covers the whole timeline, not just
-    // the buffered range). Only touched by the thumbnail-raw worker thread;
-    // freed via its talloc destructor when the MPContext is destroyed.
+    // Worker-owned preview decoder/demuxer, freed after asynchronous commands drain.
     void *thumbnail;
+    uint64_t thumbnail_generation;
 
     struct track **tracks;
     int num_tracks;

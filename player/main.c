@@ -182,6 +182,9 @@ void mp_destroy(struct MPContext *mpctx)
 {
     mp_shutdown_clients(mpctx);
 
+    // The secondary demuxer still owns config, logging and packet-pool references.
+    TA_FREEP(&mpctx->thumbnail);
+
     mp_uninit_ipc(mpctx->ipc_ctx);
     mpctx->ipc_ctx = NULL;
 

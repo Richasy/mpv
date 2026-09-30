@@ -18,10 +18,8 @@
 #ifndef MPLAYER_THUMBNAIL_H
 #define MPLAYER_THUMBNAIL_H
 
-// Handler for the user-facing `thumbnail-raw` command. Decodes a single video
-// frame near a requested timestamp directly from the demuxer cache (no low
-// level seek, no disturbance to the playing decoder) and returns it as a raw
-// RGB node map, mirroring `screenshot-raw`.
+// Cancellable BGRA preview: local secondary demuxer or network cache-only.
+// Optional precision selects the first decodable frame or the nearest frame.
 void cmd_thumbnail_raw(void *p);
 
 #endif /* MPLAYER_THUMBNAIL_H */

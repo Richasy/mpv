@@ -3265,6 +3265,11 @@ int demux_read_packet_async_until(struct sh_stream *sh, double min_pts,
         r = dequeue_packet(ds, min_pts, out_pkt);
         if (in->threading || in->blocked || r != 0)
             break;
+        // A cancelled synchronous producer will never fill the queue or set EOF.
+        if (demux_cancel_test(in->d_thread)) {
+            r = -1;
+            break;
+        }
         // Needs to actually read packets until we got a packet or EOF.
         thread_work(in);
     }

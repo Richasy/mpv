@@ -1608,7 +1608,9 @@ Screenshot Commands
     Submit through the asynchronous client API to use
     ``mpv_abort_async_command``. Cancellation is checked between packets and
     frames and interrupts local demuxer I/O. Playback ending also cancels the
-    request. Decoder state is isolated by playback generation, selected video
+    request. Non-threaded local packet reads also terminate on cancellation,
+    including an empty queue without an EOF marker when local caching is off.
+    Decoder state is isolated by playback generation, selected video
     track and codec parameters. Concurrent requests are serialized outside the
     playback core lock.
 

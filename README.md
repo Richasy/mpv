@@ -91,10 +91,11 @@ The script will patch `mpv.cmake` to point to this fork, build the LLVM toolchai
 Vulkan-Headers and the Vulkan Loader are refreshed before configuration. The
 Loader source and its architecture-specific ExternalProject state are removed
 together so cached stamps cannot bypass the pinned static-linking patch.
-Vulkan step failures print their detailed logs. In-source zimg builds reapply
-the MinGW header-name fix during configuration because successful-package
-cleanup restores the shared checkout between architectures. CI retains every
-ExternalProject step log, including dependency build and install failures.
+Vulkan step failures print their detailed logs. In-source zimg builds remove
+generated files before configuration so a failed build cannot leave object
+files for another architecture. They then reapply the MinGW header-name fix
+because successful-package cleanup restores the shared checkout. CI retains
+every ExternalProject step log and FFmpeg's compiler/linker configuration probes.
 
 ### CI
 

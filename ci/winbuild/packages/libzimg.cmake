@@ -8,7 +8,10 @@ ExternalProject_Add(libzimg
     GIT_CLONE_FLAGS "--filter=tree:0"
     GIT_SUBMODULES ""
     UPDATE_COMMAND ""
-    CONFIGURE_COMMAND ${EXEC} sed -i "s/Windows.h/windows.h/g" <SOURCE_DIR>/src/zimg/common/arm/cpuinfo_arm.cpp
+    # Failed in-source builds bypass install cleanup and can retain objects
+    # from another architecture.
+    CONFIGURE_COMMAND ${EXEC} git -C <SOURCE_DIR> clean -dfx
+    COMMAND ${EXEC} sed -i "s/Windows.h/windows.h/g" <SOURCE_DIR>/src/zimg/common/arm/cpuinfo_arm.cpp
     COMMAND bash -c "rm -rf <SOURCE_DIR>/graphengine"
     COMMAND bash -c "ln -s ${src_graphengine} <SOURCE_DIR>/graphengine"
     COMMAND ${EXEC} <SOURCE_DIR>/autogen.sh && CONF=1 <SOURCE_DIR>/configure

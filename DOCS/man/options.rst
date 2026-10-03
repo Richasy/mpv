@@ -5749,6 +5749,35 @@ Cache
 
     This option also triggers when playback is restarted after seeking.
 
+``--decoder-stall-recovery-timeout=<seconds>``
+    Detect a non-advancing playback timestamp after playback has started on a
+    forward-playing network stream (default: 5). User pause, cache buffering,
+    pending seeks, and unavailable timestamps suspend the observation window.
+    Set to 0 to disable detection and recovery.
+
+    An eligible stall attempts an exact seek to the current position to flush
+    the playback pipeline. This is not proof of a decoder fault: audio output,
+    video output, and demuxing can also prevent the playback clock advancing.
+    No output device, decoder preference, or media URL is changed.
+
+    Each attempt logs a bounded ``playback_stall`` snapshot with audio/video
+    status, timestamps, queued frames/samples, cache state, and seek state.
+    Queue counts and video timestamps are not proof of displayed pixels.
+    Diagnostics contain no media URL, headers, device name, or media content.
+    Sustained recovery is logged at info level; exhausted recovery is logged
+    once at error level. These records obey the selected log level.
+
+``--decoder-stall-recovery-attempts=<count>``
+    Maximum automatic flush seeks before recovery is exhausted (default: 3,
+    range: 0-100). Set to 0 to disable detection and recovery. After exhaustion
+    playback stays open for manual control, without repeated automatic seeks.
+
+    A seek, missing timestamp, pause, or a few newly decoded frames does not
+    replenish the budget. It resets on a new file, or after one uninterrupted
+    observation window has both elapsed and advanced the playback timestamp by
+    at least ``--decoder-stall-recovery-timeout`` seconds. Slow playback can
+    therefore take longer to confirm recovery.
+
 ``--demuxer-cache-unlink-files=<immediate|whendone|no>``
     Whether or when to unlink cache files (default: immediate). This affects
     cache files which are inherently temporary, and which make no sense to

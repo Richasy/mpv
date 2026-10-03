@@ -73,6 +73,13 @@ img_utils = static_library('img-utils', 'img_utils.c', include_directories: incd
                            dependencies: [libavcodec, libplacebo], objects: img_utils_objects)
 
 # The actual tests.
+decoder_stall = executable(
+    'decoder-stall', 'decoder_stall.c',
+    objects: libmpv.extract_objects('player/decoder_stall.c'),
+    include_directories: incdir,
+)
+test('decoder-stall', decoder_stall)
+
 chmap_files = [
     'audio/chmap_avchannel.c',
     'audio/chmap_sel.c',
@@ -312,6 +319,10 @@ if get_option('libmpv')
         endif
 
         if not meson.is_cross_build()
+            test('libmpv-decoder-stall', python,
+                 args: ['-B', files('libmpv_decoder_stall.py'),
+                        mpvlib.full_path()],
+                 depends: mpvlib, suite: 'libmpv-network', timeout: 45)
             test('libmpv-network-family', python,
                  args: [files('libmpv_network_family.py'), mpvlib.full_path()],
                  depends: mpvlib, suite: 'libmpv-network', timeout: 120)

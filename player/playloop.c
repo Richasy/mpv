@@ -36,6 +36,7 @@
 #include "common/stats.h"
 #include "demux/demux.h"
 #include "demux/packet_pool.h"
+#include "filters/f_async_queue.h"
 #include "filters/f_decoder_wrapper.h"
 #include "filters/filter_internal.h"
 #include "input/input.h"
@@ -1185,101 +1186,79 @@ static void handle_playback_time(struct MPContext *mpctx)
     }
 }
 
-// Watchdog for the "playback restart completed but playback_pts never
-// advances" failure mode that can occur on flaky HTTP streams: after a
-// reconnect, the demuxer keeps reading packets and the playloop keeps
-// running, but the decoder pipeline (often a hwdec) silently accepts
-// packets without ever producing a second output frame. From mpv's point
-// of view nothing is wrong -- core-idle is false, paused_for_cache is
-// false, no underrun is reported -- but the user sees a frozen first
-// frame while bandwidth meters tick.
-//
-// Recovery is the same trick a human user performs to "unstick" mpv in
-// this situation: seek to the current playback position. That tears
-// down decoder state via reset_playback_state() and forces the next
-// keyframe to be re-decoded, which almost always breaks the deadlock.
-//
-// Triggering criteria are deliberately conservative:
-//   - the feature is enabled (timeout > 0, attempts > 0)
-//   - restart_complete is true (we saw at least one decoded frame)
-//   - no user pause and no paused_for_cache (mpv itself thinks it should
-//     be playing)
-//   - no pending seek (don't fight a real seek the user just issued)
-//   - not stop_play, not fully EOF
-//   - the stream is a network stream (local files don't suffer from this
-//     pattern and we never want to surprise-seek on a local file)
-//   - playback_pts has a real value but hasn't advanced in
-//     decoder_stall_recovery_timeout seconds
-//   - we haven't already used up decoder_stall_recovery_attempts seeks
-//
-// The recovery counter only resets when playback_pts actually moves
-// forward (so a successful recovery hands the user a fresh budget for
-// the next incident), not on every reset_playback_state() -- otherwise
-// our own recovery seek would reset the counter and we'd loop forever.
+static void log_decoder_stall(struct MPContext *mpctx,
+                              struct mp_decoder_stall_result result)
+{
+    const char *event = "seek";
+    int level = MSGL_WARN;
+    if (result.action == MP_DECODER_STALL_RECOVERED) {
+        event = "recovered";
+        level = MSGL_INFO;
+    } else if (result.action == MP_DECODER_STALL_EXHAUSTED) {
+        event = "exhausted";
+        level = MSGL_ERR;
+    }
+    if (!mp_msg_test(mpctx->log, level))
+        return;
+
+    // Copy core and queue state; do not wait for a stalled output driver.
+    struct demux_reader_state cache;
+    demux_get_reader_state(mpctx->demuxer, &cache);
+    struct ao_chain *audio = mpctx->ao_chain;
+    struct vo_chain *video = mpctx->vo_chain;
+    int64_t audio_samples = audio && audio->ao_queue
+        ? mp_async_queue_get_samples(audio->ao_queue) : -1;
+    MP_MSG(mpctx, level,
+           "playback_stall event=%s attempt=%d/%d stalled_seconds=%.3f "
+           "playback_pts=%g video_pts=%g audio_written_pts=%g "
+           "video_status=%s audio_status=%s restart_complete=%d "
+           "paused=%d paused_for_cache=%d seek_type=%d hrseek=%d "
+           "video_queued=%d video_frames_queued=%"PRId64" "
+           "video_underrun=%d audio_underrun=%d audio_eof=%d "
+           "audio_queue_samples=%"PRId64" av_difference=%g video_wait=%g "
+           "cache_percent=%d cache_seconds=%g cache_audio_seconds=%g "
+           "cache_video_seconds=%g cache_bytes=%"PRId64" "
+           "cache_bytes_per_second=%"PRIu64" cache_idle=%d cache_eof=%d "
+           "cache_underrun=%d stream_error=%d seekable=%d\n",
+           event, result.attempts,
+           mpctx->opts->decoder_stall_recovery_attempts, result.stalled_for,
+           mpctx->playback_pts, mpctx->video_pts,
+           audio ? audio->last_out_pts : MP_NOPTS_VALUE,
+           mp_status_str(mpctx->video_status),
+           mp_status_str(mpctx->audio_status), mpctx->restart_complete,
+           mpctx->paused, mpctx->paused_for_cache, mpctx->seek.type,
+           mpctx->hrseek_active, mpctx->num_next_frames, mpctx->shown_vframes,
+           video && video->underrun, audio && audio->ao_underrun,
+           audio && audio->out_eof, audio_samples, mpctx->last_av_difference,
+           mpctx->time_frame, mpctx->cache_buffer, cache.ts_info.duration,
+           cache.ts_per_stream[STREAM_AUDIO].duration,
+           cache.ts_per_stream[STREAM_VIDEO].duration, cache.fw_bytes,
+           cache.bytes_per_second, cache.idle, cache.eof, cache.underrun,
+           cache.stream_error, mpctx->demuxer->seekable);
+}
+
 static void handle_decoder_stall_recovery(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
-
-    if (opts->decoder_stall_recovery_timeout <= 0 ||
-        opts->decoder_stall_recovery_attempts <= 0)
-        return;
-
     bool eligible = mpctx->restart_complete &&
                     !mpctx->stop_play &&
                     mpctx->seek.type == MPSEEK_NONE &&
                     !mpctx->paused &&
+                    mpctx->play_dir > 0 &&
                     !(mpctx->video_status >= STATUS_EOF &&
                       mpctx->audio_status >= STATUS_EOF) &&
-                    mpctx->demuxer && mpctx->demuxer->is_network;
-
-    double pts = mpctx->playback_pts;
-    if (!eligible || pts == MP_NOPTS_VALUE) {
-        mpctx->stall_baseline_time = 0;
-        mpctx->stall_baseline_pts = MP_NOPTS_VALUE;
-        return;
-    }
-
-    double now = mp_time_sec();
-    double timeout = opts->decoder_stall_recovery_timeout;
-
-    // (Re)start the observation window when:
-    //   - we don't yet have one (baseline_time <= 0), OR
-    //   - playback_pts moved forward since the snapshot (real progress).
-    bool advanced = mpctx->stall_baseline_pts == MP_NOPTS_VALUE ||
-                    pts > mpctx->stall_baseline_pts;
-    if (mpctx->stall_baseline_time <= 0 || advanced) {
-        if (advanced)
-            mpctx->stall_recovery_count = 0;
-        mpctx->stall_baseline_pts = pts;
-        mpctx->stall_baseline_time = now;
-        mp_set_timeout(mpctx, timeout);
-        return;
-    }
-
-    double stuck_for = now - mpctx->stall_baseline_time;
-    if (stuck_for < timeout) {
-        mp_set_timeout(mpctx, timeout - stuck_for);
-        return;
-    }
-
-    if (mpctx->stall_recovery_count >= opts->decoder_stall_recovery_attempts)
-        return;
-
-    MP_WARN(mpctx, "Decoder stalled at pts=%g for %.2fs (restart complete, "
-            "network stream, not paused); issuing flush seek to current "
-            "position (attempt %d/%d).\n",
-            pts, stuck_for,
-            mpctx->stall_recovery_count + 1,
-            opts->decoder_stall_recovery_attempts);
-
-    mpctx->stall_recovery_count++;
-    // Restart the window so reset_playback_state's pts=MP_NOPTS_VALUE
-    // (which will land us in the "no baseline" branch on the next tick)
-    // is followed by exactly one fresh `timeout` wait, not two.
-    mpctx->stall_baseline_time = now;
-
-    queue_seek(mpctx, MPSEEK_ABSOLUTE, pts, MPSEEK_EXACT, 0);
-    mp_set_timeout(mpctx, timeout);
+                    mpctx->demuxer && mpctx->demuxer->is_network &&
+                    mpctx->playback_pts != MP_NOPTS_VALUE;
+    struct mp_decoder_stall_result result = mp_decoder_stall_check(
+        &mpctx->decoder_stall, mp_time_sec(), mpctx->playback_pts, eligible,
+        opts->decoder_stall_recovery_timeout,
+        opts->decoder_stall_recovery_attempts);
+    if (result.action != MP_DECODER_STALL_NONE)
+        log_decoder_stall(mpctx, result);
+    if (result.action == MP_DECODER_STALL_SEEK)
+        queue_seek(mpctx, MPSEEK_ABSOLUTE, mpctx->playback_pts, MPSEEK_EXACT, 0);
+    if (result.next_check >= 0)
+        mp_set_timeout(mpctx, result.next_check);
 }
 
 // We always make sure audio and video buffers are filled before actually

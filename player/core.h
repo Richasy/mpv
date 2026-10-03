@@ -33,6 +33,7 @@
 #include "video/out/vo.h"
 #include "osdep/als.h"
 #include "demux/stheader.h"
+#include "decoder_stall.h"
 
 // definitions used internally by the core player code
 
@@ -450,15 +451,7 @@ typedef struct MPContext {
     int cache_buffer;
     double cache_update_pts;
 
-    // Decoder stall watchdog: snapshot of playback_pts at the start of the
-    // current "should-be-progressing" window, and the timestamp of that
-    // snapshot. baseline_time <= 0 means the window has not started yet.
-    // stall_recovery_count tracks consecutive recovery seeks that have NOT
-    // yet been followed by a pts advance; it resets when pts moves forward
-    // and on each new file load.
-    double stall_baseline_pts;
-    double stall_baseline_time;
-    int stall_recovery_count;
+    struct mp_decoder_stall decoder_stall;
 
     // Set after showing warning about decoding being too slow for realtime
     // playback rate. Used to avoid showing it multiple times.

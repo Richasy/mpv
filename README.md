@@ -91,8 +91,10 @@ The script will patch `mpv.cmake` to point to this fork, build the LLVM toolchai
 Vulkan-Headers and the Vulkan Loader are refreshed before configuration. The
 Loader source and its architecture-specific ExternalProject state are removed
 together so cached stamps cannot bypass the pinned static-linking patch.
-Vulkan step failures print their detailed logs, and CI retains download,
-configure, build, and install logs in its failure artifacts.
+Vulkan step failures print their detailed logs. In-source zimg builds reapply
+the MinGW header-name fix during configuration because successful-package
+cleanup restores the shared checkout between architectures. CI retains every
+ExternalProject step log, including dependency build and install failures.
 
 ### CI
 

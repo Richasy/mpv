@@ -239,15 +239,8 @@ jobs:
           name: build-logs-${{ matrix.name }}
           path: |
             ${{ env.BUILD_DIR }}/toolchain/llvm-libcxx-prefix/src/llvm-libcxx-stamp/*.log
-            ${{ env.BUILD_DIR }}/packages/mpv-prefix/src/mpv-stamp/*.log
+            ${{ env.BUILD_DIR }}/packages/*-prefix/src/*-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/mpv-prefix/src/mpv-build/meson-logs/*.txt
-            ${{ env.BUILD_DIR }}/packages/ffmpeg-prefix/src/ffmpeg-stamp/*.log
-            ${{ env.BUILD_DIR }}/packages/davs2-prefix/src/davs2-stamp/*.log
-            ${{ env.BUILD_DIR }}/packages/uavs3d-prefix/src/uavs3d-stamp/*.log
-            ${{ env.BUILD_DIR }}/packages/vulkan-prefix/src/vulkan-stamp/*.log
-            ${{ env.BUILD_DIR }}/packages/curl-prefix/src/curl-stamp/*.log
-            ${{ env.BUILD_DIR }}/packages/mbedtls-prefix/src/mbedtls-stamp/*.log
-            ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-stamp/*.log
             ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-build/CMakeFiles/CMakeOutput.log
             ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-build/CMakeFiles/CMakeError.log
           retention-days: 7

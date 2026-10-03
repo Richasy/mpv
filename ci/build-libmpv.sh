@@ -171,6 +171,11 @@ build() {
     rm -rf "$BUILD_DIR/packages/vulkan-header-prefix/src/vulkan-header-stamp" 2>/dev/null || true
     rm -rf "$BUILD_DIR/packages/vulkan-header-prefix/src/vulkan-header-build" 2>/dev/null || true
 
+    # A retained Loader checkout can lose its static-linking patch while old
+    # ExternalProject stamps still suppress the patch step.
+    log "Removing Vulkan Loader cache to reapply the pinned static-loader patch..."
+    rm -rf -- "$SRC_PACKAGES/vulkan" "$BUILD_DIR/packages/vulkan-prefix"
+
     # Force ffmpeg re-clone to pick up new configure options (e.g. --enable-whisper)
     log "Removing ffmpeg source cache to force re-clone..."
     rm -rf "$SRC_PACKAGES/ffmpeg" 2>/dev/null || true

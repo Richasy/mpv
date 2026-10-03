@@ -88,6 +88,12 @@ bash ci/build-libmpv.sh all
 
 The script will patch `mpv.cmake` to point to this fork, build the LLVM toolchain (first run only), compile all dependencies, and produce `libmpv-2.dll` in `$OUTPUT_DIR/$TARGET_ARCH/`.
 
+Vulkan-Headers and the Vulkan Loader are refreshed before configuration. The
+Loader source and its architecture-specific ExternalProject state are removed
+together so cached stamps cannot bypass the pinned static-linking patch.
+Vulkan step failures print their detailed logs, and CI retains download,
+configure, build, and install logs in its failure artifacts.
+
 ### CI
 
 The GitHub Actions workflow (`.github/workflows/libmpv.yml`) is configured for

@@ -1804,10 +1804,20 @@ def test_truncated_seek_response(mpv, server, role):
         assert state.failed_track == (VIDEO if role == "video" else AUDIO)
         assert state.failure == TRANSPORT
         assert detail.origin == ORIGIN_BODY_LENGTH
+        transfer = [int(value) for value in prop(
+            mpv, handle, "rodel-dash-transfer").split(" ")]
+        assert len(transfer) == 13 and transfer[0] == 1
+        assert transfer[1] == generation and transfer[2] == state.failed_track
+        assert transfer[3] == detail.response_count and transfer[4] == 206
+        assert transfer[5] != 0 and transfer[6] == 1
+        assert transfer[7] > transfer[8] and transfer[11:] == [1, 0]
+        first_transfer = transfer[:]
         assert len(server.requests_for(role)) > before
         count = len(server.requests_for(role))
         time.sleep(0.2)
         assert len(server.requests_for(role)) == count, "Truncated response was retried"
+        assert [int(value) for value in prop(
+            mpv, handle, "rodel-dash-transfer").split(" ")] == first_transfer
 
 
 def main():

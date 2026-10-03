@@ -36,6 +36,8 @@ struct mp_dash_source_state {
     uint32_t validated_ranges;
     mpv_dash_source_status status;
     mpv_dash_failure_detail failure_detail;
+    struct mp_dash_transfer_diagnostic failure_transfer;
+    bool has_failure_transfer;
 };
 
 static _Atomic uint64_t dash_generation_seed;
@@ -273,6 +275,41 @@ static bool set_failure(struct mp_dash_source_state *state,
         state->failure_detail.response_count = state->status.audio_responses;
     }
     return true;
+}
+
+void mp_dash_source_fail_transfer(struct mpv_global *global,
+                                  mpv_dash_source_failure failure,
+                                  mpv_dash_failure_origin origin,
+                                  struct mp_dash_transfer_diagnostic diagnostic)
+{
+    struct mp_dash_source_state *state = global->dash_source;
+    if (diagnostic.track != MPV_DASH_TRACK_VIDEO &&
+        diagnostic.track != MPV_DASH_TRACK_AUDIO)
+        return;
+    mp_mutex_lock(&state->lock);
+    bool first = set_failure(state, diagnostic.track, failure, origin);
+    if (first) {
+        diagnostic.generation = state->status.generation;
+        diagnostic.response_count = state->failure_detail.response_count;
+        diagnostic.http_status = state->failure_detail.http_status;
+        state->failure_transfer = diagnostic;
+        state->has_failure_transfer = true;
+    }
+    mp_mutex_unlock(&state->lock);
+    if (first)
+        signal_failure(state);
+}
+
+bool mp_dash_source_transfer_snapshot(struct mpv_global *global,
+                                      struct mp_dash_transfer_diagnostic *out)
+{
+    struct mp_dash_source_state *state = global->dash_source;
+    mp_mutex_lock(&state->lock);
+    bool available = state->has_failure_transfer;
+    if (available)
+        *out = state->failure_transfer;
+    mp_mutex_unlock(&state->lock);
+    return available;
 }
 
 void mp_dash_source_fail_with_origin(struct mpv_global *global,
@@ -591,5 +628,13 @@ void mp_dash_source_range_validated(struct mpv_global *global,
 bool mp_dash_source_has_validated_range(struct mpv_global *global,
                                         mpv_dash_track_kind track)
 { (void)global; (void)track; return false; }
+void mp_dash_source_fail_transfer(struct mpv_global *global,
+                                  mpv_dash_source_failure failure,
+                                  mpv_dash_failure_origin origin,
+                                  struct mp_dash_transfer_diagnostic diagnostic)
+{ (void)global; (void)failure; (void)origin; (void)diagnostic; }
+bool mp_dash_source_transfer_snapshot(struct mpv_global *global,
+                                      struct mp_dash_transfer_diagnostic *out)
+{ (void)global; (void)out; return false; }
 
 #endif

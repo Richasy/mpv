@@ -4205,6 +4205,24 @@ static int mp_property_cwd(void *ctx, struct m_property *prop,
     return M_PROPERTY_NOT_IMPLEMENTED;
 }
 
+static int mp_property_dash_transfer(void *ctx, struct m_property *prop,
+                                     int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    struct mp_dash_transfer_diagnostic d;
+    if (!mp_dash_source_transfer_snapshot(mpctx->global, &d))
+        return M_PROPERTY_UNAVAILABLE;
+    char *value = talloc_asprintf(NULL,
+        "1 %" PRIu64 " %d %" PRIu32 " %d %d %d %" PRIu64 " %" PRIu64
+        " %" PRIu64 " %" PRIu64 " %d %d",
+        d.generation, d.track, d.response_count, d.http_status, d.curl_code,
+        d.length_known, d.expected, d.received, d.request_start, d.request_end,
+        d.headers_ok, d.aborted);
+    int result = m_property_strdup_ro(action, arg, value);
+    talloc_free(value);
+    return result;
+}
+
 static int mp_property_current_watch_later_dir(void *ctx, struct m_property *prop,
                                                int action, void *arg)
 {
@@ -5042,6 +5060,7 @@ static const struct m_property mp_properties_base[] = {
     {"demuxer-cache-idle", mp_property_demuxer_cache_idle},
     {"demuxer-start-time", mp_property_demuxer_start_time},
     {"demuxer-cache-state", mp_property_demuxer_cache_state},
+    {"rodel-dash-transfer", mp_property_dash_transfer},
     {"cache-buffering-state", mp_property_cache_buffering},
     {"paused-for-cache", mp_property_paused_for_cache},
     {"demuxer-via-network", mp_property_demuxer_is_network},

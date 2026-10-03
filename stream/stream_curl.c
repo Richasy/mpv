@@ -1115,6 +1115,18 @@ static void on_done(struct priv *p, CURLcode code)
 {
     bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
 
+    struct mp_dash_transfer_diagnostic diagnostic = {
+        .track = p->dash_kind,
+        .curl_code = code,
+        .length_known = p->dash_response_length_known,
+        .expected = p->dash_response_length,
+        .received = p->request_received,
+        .request_start = p->request_start,
+        .request_end = p->request_end,
+        .headers_ok = p->dash_headers_ok,
+        .aborted = aborted,
+    };
+
     if (p->dash_kind && mp_dash_source_terminal(p->global)) {
         finish_dash_terminal(p);
         return;
@@ -1122,7 +1134,8 @@ static void on_done(struct priv *p, CURLcode code)
     if (!p->probed) {
         // Connection died before any headers arrived.
         if (p->dash_kind && !aborted && !mp_dash_source_terminal(p->global))
-            mp_dash_source_fail(p->global, p->dash_kind, MPV_DASH_FAILURE_TRANSPORT);
+            mp_dash_source_fail_transfer(p->global, MPV_DASH_FAILURE_TRANSPORT,
+                MPV_DASH_ORIGIN_OTHER, diagnostic);
         if (code != CURLE_OK && !aborted && !p->dash_kind)
             log_curl_error(p, "error", code);
         mp_mutex_lock(&p->mtx);
@@ -1139,11 +1152,12 @@ static void on_done(struct priv *p, CURLcode code)
          mp_dash_source_terminal(p->global)))
     {
         if (!aborted && !mp_dash_source_terminal(p->global))
-            mp_dash_source_fail_with_origin(p->global, p->dash_kind,
+            mp_dash_source_fail_transfer(p->global,
                 MPV_DASH_FAILURE_TRANSPORT,
                 p->dash_response_length_known &&
                     p->request_received != p->dash_response_length ?
-                    MPV_DASH_ORIGIN_BODY_LENGTH : MPV_DASH_ORIGIN_OTHER);
+                    MPV_DASH_ORIGIN_BODY_LENGTH : MPV_DASH_ORIGIN_OTHER,
+                diagnostic);
         mp_mutex_lock(&p->mtx);
         p->head = p->tail = p->count = 0;
         p->stream_error = true;

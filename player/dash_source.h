@@ -27,6 +27,21 @@ struct mp_dash_track_config {
     bool allow_loopback_http;
 };
 
+struct mp_dash_transfer_diagnostic {
+    uint64_t generation;
+    uint32_t response_count;
+    int track;
+    int http_status;
+    int curl_code;
+    bool length_known;
+    uint64_t expected;
+    uint64_t received;
+    uint64_t request_start;
+    uint64_t request_end;
+    bool headers_ok;
+    bool aborted;
+};
+
 void mp_dash_source_init(struct mpv_global *global, struct MPContext *mpctx);
 int mp_dash_source_validate(const mpv_dash_source *source);
 int mp_dash_source_begin(struct mpv_global *global, const mpv_dash_source *source);
@@ -59,5 +74,11 @@ void mp_dash_source_range_validated(struct mpv_global *global,
                                     mpv_dash_track_kind track);
 bool mp_dash_source_has_validated_range(struct mpv_global *global,
                                         mpv_dash_track_kind track);
+void mp_dash_source_fail_transfer(struct mpv_global *global,
+                                  mpv_dash_source_failure failure,
+                                  mpv_dash_failure_origin origin,
+                                  struct mp_dash_transfer_diagnostic diagnostic);
+bool mp_dash_source_transfer_snapshot(struct mpv_global *global,
+                                      struct mp_dash_transfer_diagnostic *out);
 
 #endif

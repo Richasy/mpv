@@ -57,6 +57,9 @@ enum mp_curl_dash_test_command {
     MP_CURL_DASH_TEST_ADDED_AFTER_STOP = 6,
     MP_CURL_DASH_TEST_AUDIO_WINDOW = 7,
     MP_CURL_DASH_TEST_VIDEO_WINDOW = 8,
+    MP_CURL_DASH_TEST_COMPLETE_RECV_ERROR = 9,
+    MP_CURL_DASH_TEST_ABORT_WAITING = 10,
+    MP_CURL_DASH_TEST_OTHER_TRACK_RISK = 11,
 };
 
 int mp_curl_dash_test_control(struct mpv_global *global, int command, int value);

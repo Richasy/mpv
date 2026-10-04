@@ -177,6 +177,8 @@ struct curl_ctx {
     int test_added_after_stop;
     int test_window_role;
     int test_window_end;
+    int test_complete_error_role;
+    struct priv *test_waiting;
 #endif
 };
 
@@ -261,6 +263,13 @@ struct cmd {
 static void start_request(struct priv *p);
 static void on_done(struct priv *p, CURLcode code);
 
+static bool dash_request_stopped(struct priv *p)
+{
+    return p->dash_kind &&
+        (atomic_load_explicit(&p->aborted, memory_order_relaxed) ||
+         mp_dash_source_terminal(p->global));
+}
+
 static void run_cmd(void *arg)
 {
     struct cmd *c = arg;
@@ -278,7 +287,7 @@ static void run_cmd(void *arg)
         }
         break;
     case CMD_UNPAUSE:
-        if (c->p->dash_kind && mp_dash_source_terminal(c->p->global))
+        if (dash_request_stopped(c->p))
             break;
         // The consumer freed enough buffer space. Clear the pause flag and
         // resume the transfer.
@@ -476,6 +485,29 @@ int mp_curl_dash_test_control(struct mpv_global *global, int command, int value)
                                 MPV_DASH_TRACK_AUDIO : MPV_DASH_TRACK_VIDEO;
         ctx->test_window_end = value;
         break;
+    case MP_CURL_DASH_TEST_COMPLETE_RECV_ERROR:
+        if (value != MPV_DASH_TRACK_VIDEO && value != MPV_DASH_TRACK_AUDIO)
+            result = -1;
+        else
+            ctx->test_complete_error_role = value;
+        break;
+    case MP_CURL_DASH_TEST_ABORT_WAITING:
+        if (!ctx->test_waiting)
+            result = -1;
+        else
+            atomic_store(&ctx->test_waiting->aborted, true);
+        break;
+    case MP_CURL_DASH_TEST_OTHER_TRACK_RISK:
+        if (!ctx->test_waiting ||
+            (value != MPV_DASH_TRACK_VIDEO && value != MPV_DASH_TRACK_AUDIO) ||
+            value == ctx->test_waiting->dash_kind)
+        {
+            result = -1;
+        } else {
+            mp_dash_source_response(global, value, 412,
+                MPV_DASH_FAILURE_HTTP_RISK, MPV_DASH_ORIGIN_OTHER);
+        }
+        break;
     default:
         result = -1;
         break;
@@ -487,7 +519,7 @@ int mp_curl_dash_test_control(struct mpv_global *global, int command, int value)
 static void dash_test_before_continuation(struct priv *p)
 {
     // Only a test build and an explicit loopback source can pause the real
-    // CURLE_OK continuation path; release is bounded if the test fails.
+    // continuation path; release is bounded if the test fails.
     if (!p->dash_kind || !p->dash.allow_loopback_http ||
         strncmp(p->url, "http://127.0.0.1:", 17))
         return;
@@ -497,6 +529,7 @@ static void dash_test_before_continuation(struct priv *p)
     if (ctx->test_armed && ctx->test_role == p->dash_kind) {
         ctx->test_armed = false;
         ctx->test_entered = true;
+        ctx->test_waiting = p;
         ctx->test_success_branches++;
         mp_cond_broadcast(&ctx->test_cond);
         int64_t deadline = mp_time_ns_add(mp_time_ns(), 10);
@@ -504,6 +537,7 @@ static void dash_test_before_continuation(struct priv *p)
                !mp_cond_timedwait_until(&ctx->test_cond, &ctx->test_lock, deadline))
         {
         }
+        ctx->test_waiting = NULL;
     }
     mp_mutex_unlock(&ctx->test_lock);
 }
@@ -555,6 +589,9 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
                            mp_dash_source_terminal(p->global))))
         return CURL_WRITEFUNC_ERROR;
 
+    if (atomic_load_explicit(&p->aborted, memory_order_relaxed))
+        return CURL_WRITEFUNC_ERROR;
+
     if (p->dash_kind && p->request_end &&
         (p->request_start >= p->request_end ||
          p->request_received > p->request_end - p->request_start ||
@@ -575,9 +612,6 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
                                         MPV_DASH_ORIGIN_INVALID_PARTIAL_RANGE);
         return CURL_WRITEFUNC_ERROR;
     }
-
-    if (atomic_load_explicit(&p->aborted, memory_order_relaxed))
-        return CURL_WRITEFUNC_ERROR;
 
     mp_mutex_lock(&p->mtx);
 
@@ -614,6 +648,17 @@ static const char *header_value(CURL *c, const char *name)
     if (curl_easy_header(c, name, 0, CURLH_HEADER, -1, &h) == CURLHE_OK)
         return h->value;
     return NULL;
+}
+
+static bool dash_identity_encoding(CURL *curl)
+{
+    struct curl_header *header = NULL;
+    CURLHcode result = curl_easy_header(curl, "Content-Encoding", 0,
+                                       CURLH_HEADER, -1, &header);
+    if (result == CURLHE_MISSING)
+        return true;
+    return result == CURLHE_OK && header->amount == 1 &&
+           (!header->value[0] || !strcasecmp(header->value, "identity"));
 }
 
 static void parse_content_range(CURL *c, int64_t *out_start, int64_t *out_total)
@@ -790,8 +835,7 @@ static bool dash_content_range(struct priv *p, uint64_t *length, int64_t *total)
                           &content_length) != CURLE_OK ||
         (content_length >= 0 && (uint64_t)content_length != end - start + 1))
         return false;
-    const char *encoding = header_value(p->curl, "Content-Encoding");
-    if (encoding && encoding[0] && strcasecmp(encoding, "identity"))
+    if (!dash_identity_encoding(p->curl))
         return false;
     *length = end - start + 1;
     *total = size;
@@ -826,10 +870,13 @@ static size_t dash_header_callback(struct priv *p, struct bstr line, size_t byte
 {
     if (mp_dash_source_terminal(p->global))
         return 0;
+    bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
     if (bstr_startswith0(line, "HTTP/")) {
         bstr rest;
         int space = bstrchr(line, ' ');
         if (space < 0) {
+            if (aborted)
+                return 0;
             mp_dash_source_fail_with_origin(p->global, p->dash_kind,
                 MPV_DASH_FAILURE_HTTP_STATUS, MPV_DASH_ORIGIN_MALFORMED_STATUS);
             return 0;
@@ -840,12 +887,17 @@ static size_t dash_header_callback(struct priv *p, struct bstr line, size_t byte
             rest.start[2] < '0' || rest.start[2] > '9' ||
             (rest.len > 3 && rest.start[3] != ' '))
         {
+            if (aborted)
+                return 0;
             mp_dash_source_fail_with_origin(p->global, p->dash_kind,
                 MPV_DASH_FAILURE_HTTP_STATUS, MPV_DASH_ORIGIN_MALFORMED_STATUS);
             return 0;
         }
         int status = (rest.start[0] - '0') * 100 +
                      (rest.start[1] - '0') * 10 + rest.start[2] - '0';
+        // Keep observed auth/risk, not ordinary failures of a canceled consumer.
+        if (aborted && status != 401 && status != 403 && status != 412)
+            return 0;
         if (status >= 100 && status < 200 && !p->dash_status_seen &&
             p->dash_interim_count++ < 8)
         {
@@ -882,6 +934,8 @@ static size_t dash_header_callback(struct priv *p, struct bstr line, size_t byte
         mp_dash_source_response(p->global, p->dash_kind, status, failure, origin);
         return failure == MPV_DASH_FAILURE_NONE ? bytes : 0;
     }
+    if (aborted)
+        return 0;
     if (line.len)
         return bytes;
     if (p->dash_interim_headers) {
@@ -1017,7 +1071,7 @@ static bool is_recoverable_error(CURLcode code)
 
 static void start_request(struct priv *p)
 {
-    if (p->dash_kind && mp_dash_source_terminal(p->global)) {
+    if (dash_request_stopped(p)) {
 #ifdef MPV_DASH_TEST_HOOKS
         dash_test_record_continuation(p, false);
 #endif
@@ -1081,13 +1135,13 @@ static void start_request(struct priv *p)
         p->dash_response_length_known = false;
         p->dash_response_length = 0;
     }
-    if (p->dash_kind && mp_dash_source_terminal(p->global)) {
+    if (dash_request_stopped(p)) {
         finish_dash_terminal(p);
         return;
     }
     p->active = true;
     curl_multi_add_handle(p->ctx->multi, p->curl);
-    if (p->dash_kind && mp_dash_source_terminal(p->global)) {
+    if (dash_request_stopped(p)) {
 #ifdef MPV_DASH_TEST_HOOKS
         dash_test_record_continuation(p, true);
 #endif
@@ -1111,8 +1165,58 @@ static void log_curl_error(struct priv *p, const char *what, CURLcode code)
     }
 }
 
+static bool resume_dash_request(struct priv *p, CURLcode code)
+{
+    if (!p->dash_kind || dash_request_stopped(p) || !p->dash_headers_ok ||
+        !p->seekable || !is_recoverable_error(code) ||
+        p->retry_count >= p->opts->max_retries ||
+        !p->dash_response_length_known || !p->request_received ||
+        p->request_received >= p->dash_response_length || p->content_size <= 0)
+        return false;
+
+    struct curl_header *transfer = NULL;
+    if (!dash_identity_encoding(p->curl) ||
+        curl_easy_header(p->curl, "Transfer-Encoding", 0,
+                         CURLH_HEADER, -1, &transfer) != CURLHE_MISSING)
+        return false;
+
+    uint64_t total = p->content_size;
+    if (p->request_start >= total ||
+        p->request_received >= total - p->request_start ||
+        (p->request_end &&
+         (p->request_start >= p->request_end ||
+          p->request_received >= p->request_end - p->request_start)))
+        return false;
+
+    // The ring retains these identity bytes. Resume after the producer's
+    // accepted bytes, not the consumer cursor or a past-size EOF shortcut.
+    p->request_start += p->request_received;
+    p->request_received = 0;
+    p->retry_count++;
+    MP_WARN(p, "DASH transfer interrupted (curl %d), resuming (#%d) at %" PRIu64 "\n",
+            code, p->retry_count, p->request_start);
+#ifdef MPV_DASH_TEST_HOOKS
+    dash_test_before_continuation(p);
+#endif
+    start_request(p);
+    return true;
+}
+
 static void on_done(struct priv *p, CURLcode code)
 {
+#ifdef MPV_DASH_TEST_HOOKS
+    if (p->dash_kind && p->dash.allow_loopback_http &&
+        !strncmp(p->url, "http://127.0.0.1:", 17) &&
+        (code == CURLE_OK || code == CURLE_PARTIAL_FILE))
+    {
+        mp_mutex_lock(&p->ctx->test_lock);
+        if (p->ctx->test_complete_error_role == p->dash_kind) {
+            p->ctx->test_complete_error_role = 0;
+            code = CURLE_RECV_ERROR;
+        }
+        mp_mutex_unlock(&p->ctx->test_lock);
+    }
+#endif
     bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
 
     struct mp_dash_transfer_diagnostic diagnostic = {
@@ -1127,7 +1231,7 @@ static void on_done(struct priv *p, CURLcode code)
         .aborted = aborted,
     };
 
-    if (p->dash_kind && mp_dash_source_terminal(p->global)) {
+    if (dash_request_stopped(p)) {
         finish_dash_terminal(p);
         return;
     }
@@ -1144,6 +1248,9 @@ static void on_done(struct priv *p, CURLcode code)
         mp_mutex_unlock(&p->mtx);
         return;
     }
+
+    if (resume_dash_request(p, code))
+        return;
 
     if (p->dash_kind &&
         (!p->dash_headers_ok || code != CURLE_OK ||

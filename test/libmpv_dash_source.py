@@ -16,6 +16,7 @@ import ctypes
 from datetime import datetime, timezone
 import faulthandler
 import gc
+import gzip
 import http.server
 import os
 from pathlib import Path
@@ -47,6 +48,7 @@ MARKER = b"private-local-test"
 TEST_ARM, TEST_WAIT, TEST_RELEASE, TEST_SUCCESS_BRANCHES, \
     TEST_BLOCKED_CONTINUATIONS, TEST_ADDED_AFTER_STOP = range(1, 7)
 TEST_AUDIO_WINDOW, TEST_VIDEO_WINDOW = 7, 8
+TEST_COMPLETE_RECV_ERROR, TEST_ABORT_WAITING, TEST_OTHER_TRACK_RISK = 9, 10, 11
 
 
 class Range(ctypes.Structure):
@@ -317,6 +319,10 @@ class Server(http.server.ThreadingHTTPServer):
         self.deny_code = 412
         self.arm_failure = None
         self.truncate_range_role = None
+        self.disconnect_role = None
+        self.disconnect_attempts = 0
+        self.disconnect_bytes = 32768
+        self.wrong_total_role = None
         self.arm_code = 412
         self.full_body_roles = set()
         self.no_range_advertisement = set()
@@ -326,6 +332,8 @@ class Server(http.server.ThreadingHTTPServer):
         self.full_body_types = {}
         self.full_body_lengths = {}
         self.full_body_encodings = {}
+        self.duplicate_identity_encoding_roles = set()
+        self.range_encodings = {}
         self.full_body_with_range = set()
         self.content_length_conflict_roles = set()
         self.redirect_hits = 0
@@ -450,6 +458,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if role not in self.server.no_range_advertisement:
                     self.send_header("Accept-Ranges", "bytes")
                 if role in self.server.full_body_encodings:
+                    if role in self.server.duplicate_identity_encoding_roles:
+                        self.send_header("Content-Encoding", "identity")
                     self.send_header(
                         "Content-Encoding", self.server.full_body_encodings[role])
                 if role in self.server.full_body_with_range:
@@ -465,13 +475,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_header("Content-Type", f"{role}/mp4")
                 self.send_header("Accept-Ranges", "bytes")
+                if role in self.server.range_encodings:
+                    self.send_header("Content-Encoding", "identity")
+                    self.send_header("Content-Encoding", self.server.range_encodings[role])
                 actual_start = start + 1 if self.server.bad_range == role else start
+                total = len(data) + int(self.server.wrong_total_role == role)
                 self.send_header(
-                    "Content-Range", f"bytes {actual_start}-{end}/{len(data)}"
+                    "Content-Range", f"bytes {actual_start}-{end}/{total}"
                 )
                 self.send_header("Content-Length", str(end - start + 1))
             self.send_header("Connection", "close")
             self.end_headers()
+            if (role == self.server.disconnect_role and
+                len(self.server.requests_for(role)) <= self.server.disconnect_attempts and
+                (media_candidate or code == 206)):
+                payload = body if media_candidate else data[start:end + 1]
+                cut = min(self.server.disconnect_bytes, max(0, len(payload) - 1))
+                self.wfile.write(payload[:cut])
+                self.wfile.flush()
+                return
             if code == 206:
                 if self.server.truncate_range_role == role and start > 0:
                     self.wfile.write(data[start:start + min(32, end - start)])
@@ -804,8 +826,8 @@ def assert_private(mpv, handle):
             raise AssertionError(f"Property {name} exposed media URL")
 
 
-def assert_headers(server):
-    for role in ("video", "audio"):
+def assert_headers(server, roles=("video", "audio")):
+    for role in roles:
         requests = server.requests_for(role)
         if not requests:
             raise AssertionError(f"No HTTP Range response for {role}")
@@ -1720,8 +1742,9 @@ def test_consumer_window(mpv, tracks, end_offset, length_known=True,
             if playable:
                 await_event(mpv, handle, FILE_LOADED)
                 assert snapshot(mpv, handle).phase == BOUND
-                assert snapshot(mpv, handle).audio_http_status == code
-                assert range_capability(mpv, handle).audio_validated_206 == 0
+                assert server.requests_for("audio")[0][2] == code
+                if range_capability(mpv, handle).audio_validated_206:
+                    assert any(request[2] == 206 for request in server.requests_for("audio"))
                 command(mpv, handle, "stop")
                 await_event(mpv, handle, END_FILE)
             else:
@@ -1734,7 +1757,12 @@ def test_consumer_window(mpv, tracks, end_offset, length_known=True,
                 assert not prop(mpv, handle, "audio-out-params/samplerate")
             assert server.requests_for("audio")[0][7] == \
                 f"bytes=0-{end_offset - 1}"
-        assert len(server.requests_for("audio")) == 1
+        if playable:
+            for request in server.requests_for("audio"):
+                bounds = re.fullmatch(r"bytes=(\d+)-(\d+)", request[7])
+                assert bounds and 0 <= int(bounds[1]) <= int(bounds[2]) < end_offset
+        else:
+            assert len(server.requests_for("audio")) == 1
 
 
 def test_late_status(mpv, server, role, code, failure):
@@ -1820,12 +1848,217 @@ def test_truncated_seek_response(mpv, server, role):
             mpv, handle, "rodel-dash-transfer").split(" ")] == first_transfer
 
 
+def test_interrupted_transfer(mpv, server, role, full_body=True,
+                              rejection=None, force_receive_error=False):
+    server.disconnect_role = role
+    server.disconnect_attempts = 1
+    if rejection is not None and rejection not in ("compressed", "duplicate-encoding"):
+        server.disconnect_bytes = 1
+    if full_body:
+        server.full_body_roles.add(role)
+    expected_requests = 2
+    if rejection == "budget":
+        server.disconnect_attempts = 100
+        server.disconnect_bytes = 1
+        expected_requests = 3
+    elif rejection == "unseekable":
+        server.no_range_advertisement.add(role)
+        expected_requests = 1
+    elif rejection == "zero-progress":
+        server.disconnect_bytes = 0
+        expected_requests = 1
+    elif rejection == "unknown-total":
+        server.full_body_lengths[role] = None
+        expected_requests = 1
+    elif rejection in ("compressed", "duplicate-encoding"):
+        server.full_body_payloads[role] = gzip.compress(server.tracks[role], mtime=0)
+        server.full_body_encodings[role] = "gzip"
+        if rejection == "duplicate-encoding":
+            server.duplicate_identity_encoding_roles.add(role)
+        server.disconnect_bytes = 128
+        expected_requests = 1
+    elif rejection == "duplicate-range-encoding":
+        server.range_encodings[role] = "gzip"
+    elif rejection == "wrong-range":
+        server.bad_range = role
+    elif rejection == "wrong-total":
+        server.wrong_total_role = role
+    elif isinstance(rejection, int):
+        server.arm_failure = role
+        server.arm_code = rejection
+        server.release_error_body.clear()
+
+    with client(mpv, {"pause": "no", "speed": "4", "keep-open": "no",
+                      "curl-max-retries": "2",
+                      "demuxer-lavf-o": "use_mfra_for=0"}) as handle:
+        if force_receive_error:
+            track = VIDEO if role == "video" else AUDIO
+            assert mpv.mpv_dash_test_control(handle, TEST_COMPLETE_RECV_ERROR, track) == 0
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        generation = snapshot(mpv, handle).generation
+        loaded = False
+        max_position = 0.0
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            event = mpv.mpv_wait_event(handle, 0.02).contents
+            if event.event_id == LOG_MESSAGE:
+                message = ctypes.cast(event.data, ctypes.POINTER(LogMessage)).contents
+                assert MARKER not in ctypes.string_at(message.text)
+            if event.event_id == FILE_LOADED:
+                loaded = True
+            if event.event_id == END_FILE:
+                reason = ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents.reason
+                state = snapshot(mpv, handle)
+                assert state.generation == generation
+                if rejection is None:
+                    assert reason == 0 and not state.failure, \
+                        ("Recoverable body interruption stopped playback", reason, state.failure)
+                    assert loaded and max_position >= 16, max_position
+                else:
+                    assert reason == END_ERROR and state.phase == FAILED
+                    if rejection == 412:
+                        assert state.failure == RISK
+                    elif rejection in (401, 403):
+                        assert state.failure == AUTH
+                    elif rejection in (200, "wrong-range", "wrong-total", "duplicate-range-encoding"):
+                        assert state.failure == HTTP_RANGE
+                    else:
+                        assert state.failure == TRANSPORT
+                break
+            position = prop(mpv, handle, "time-pos")
+            if position:
+                max_position = max(max_position, float(position))
+        else:
+            raise AssertionError("Interrupted transfer did not settle within 15 seconds")
+        requests = server.requests_for(role)
+        if rejection is None:
+            assert len(requests) >= expected_requests, \
+                [(request[1], request[2]) for request in requests]
+        else:
+            assert len(requests) == expected_requests, \
+                (rejection, [(request[1], request[2]) for request in requests])
+        if expected_requests > 1:
+            assert requests[1][1] == server.disconnect_bytes, \
+                "Continuation did not start at the next received byte"
+            assert requests[1][1] > 0, "Recovery reopened the source at zero"
+        count = len(server.requests)
+        time.sleep(0.2)
+        assert len(server.requests) == count, "Requests continued after settlement"
+        assert_private(mpv, handle)
+    assert_headers(server, roles=tuple(role for role in ("video", "audio")
+                                       if server.requests_for(role)))
+
+
+def test_recovery_interleave(mpv, server, role, action):
+    server.full_body_roles.update(("audio", "video"))
+    server.disconnect_role = role
+    server.disconnect_attempts = 0 if action == "seek" else 1
+    server.disconnect_bytes = 8192
+    track = VIDEO if role == "video" else AUDIO
+    with client(mpv, {"pause": "yes" if action == "seek" else "no", "speed": "4",
+                      "demuxer-lavf-o": "use_mfra_for=0"}) as handle:
+        control = mpv.mpv_dash_test_control
+        if action != "seek":
+            assert control(handle, TEST_ARM, track) == 0
+        errors = []
+        seek = None
+        try:
+            source = source_for(server)
+            assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+            if action == "seek":
+                await_event(mpv, handle, FILE_LOADED)
+                server.disconnect_attempts = 100
+                assert control(handle, TEST_ARM, track) == 0
+                command(mpv, handle, "seek", "12", "absolute+exact")
+            mpv.mpv_wait_event(handle, 0)
+            assert control(handle, TEST_WAIT, 8000) == 1, \
+                ("Recovery did not reach its continuation fence",
+                 snapshot(mpv, handle).phase, snapshot(mpv, handle).failure,
+                 [(request[1], request[2]) for request in server.requests_for(role)])
+            count = len(server.requests)
+            role_count = len(server.requests_for(role))
+            generation = snapshot(mpv, handle).generation
+            if action == "stop":
+                command(mpv, handle, "stop")
+                assert snapshot(mpv, handle).phase == STOPPED
+            elif action == "abort":
+                assert control(handle, TEST_ABORT_WAITING, 0) == 0
+            elif action == "other-risk":
+                other = AUDIO if track == VIDEO else VIDEO
+                assert control(handle, TEST_OTHER_TRACK_RISK, other) == 0
+                assert snapshot(mpv, handle).failure == RISK
+            elif action == "seek":
+                server.disconnect_attempts = 0
+                def request_seek():
+                    try:
+                        command(mpv, handle, "seek", "1", "absolute+exact")
+                    except AssertionError as error:
+                        errors.append(error)
+                seek = threading.Thread(target=request_seek, daemon=True)
+                seek.start()
+                time.sleep(0.05)
+            assert control(handle, TEST_RELEASE, 0) == 0
+            if seek:
+                seek.join(8)
+                assert not seek.is_alive() and not errors, errors
+                confirm_position(mpv, handle, 1, generation,
+                                 lambda: command(mpv, handle, "seek", "1", "absolute+exact"))
+                assert snapshot(mpv, handle).phase == BOUND
+                command(mpv, handle, "stop")
+            else:
+                deadline = time.monotonic() + 5
+                while control(handle, TEST_BLOCKED_CONTINUATIONS, 0) < 1 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert control(handle, TEST_BLOCKED_CONTINUATIONS, 0) >= 1
+                assert control(handle, TEST_ADDED_AFTER_STOP, 0) == 0
+                time.sleep(0.2)
+                if action == "abort":
+                    assert len(server.requests_for(role)) == role_count, \
+                        "Aborted stream submitted a new GET"
+                else:
+                    assert len(server.requests) == count, "Retired recovery submitted a new GET"
+                command(mpv, handle, "stop")
+        finally:
+            control(handle, TEST_RELEASE, 0)
+            if seek:
+                seek.join(8)
+
+
+def test_complete_body_receive_error(mpv, server, role):
+    server.full_body_roles.update(("audio", "video"))
+    track = VIDEO if role == "video" else AUDIO
+    with client(mpv, {"pause": "no", "speed": "4"}) as handle:
+        assert mpv.mpv_dash_test_control(handle, TEST_COMPLETE_RECV_ERROR, track) == 0
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            event = mpv.mpv_wait_event(handle, 0.02).contents
+            if event.event_id != END_FILE:
+                continue
+            assert ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents.reason == END_ERROR
+            state = snapshot(mpv, handle)
+            assert state.phase == FAILED and state.failure == TRANSPORT
+            transfer = [int(value) for value in prop(mpv, handle, "rodel-dash-transfer").split()]
+            assert transfer[2] == track and transfer[5] == 56
+            assert transfer[7] == transfer[8] > 0
+            count = len(server.requests_for(role))
+            assert count == failure_detail(mpv, handle).response_count
+            time.sleep(0.2)
+            assert len(server.requests_for(role)) == count, \
+                "Complete non-OK response submitted another request"
+            return
+        raise AssertionError("Complete body with non-OK transfer became a successful EOF")
+
+
 def main():
     scheduler = len(sys.argv) == 3 and sys.argv[2] == "--scheduler"
     controls = len(sys.argv) == 3 and sys.argv[2] == "--controls"
-    if not (len(sys.argv) == 2 or scheduler or controls):
+    recovery = len(sys.argv) == 3 and sys.argv[2] == "--recovery"
+    if not (len(sys.argv) == 2 or scheduler or controls or recovery):
         raise SystemExit("usage: python test/libmpv_dash_source.py "
-                         "build/local-libmpv/x86_64 [--scheduler|--controls]")
+                         "build/local-libmpv/x86_64 [--scheduler|--controls|--recovery]")
     runtime = Path(sys.argv[1]).resolve()
     directory = runtime / f"dash-generated-{os.getpid()}"
     if not runtime.is_dir() or not (runtime / "libmpv-2.dll").is_file():
@@ -1851,6 +2084,17 @@ def main():
                           flush=True)
                     with serve(tracks) as server:
                         test_exact_on_done_stop(mpv, server, role)
+                    for action in ("stop", "abort", "other-risk", "seek"):
+                        print(f"[dash] recovery continuation {role}: {action}", flush=True)
+                        with serve(tracks) as server:
+                            test_recovery_interleave(mpv, server, role, action)
+                    with serve(tracks) as server:
+                        test_complete_body_receive_error(mpv, server, role)
+                    with serve(tracks) as server:
+                        test_interrupted_transfer(mpv, server, role, force_receive_error=True)
+                    with serve(tracks) as server:
+                        test_interrupted_transfer(mpv, server, role, rejection="unknown-total",
+                                                  force_receive_error=True)
                 with serve(tracks) as server:
                     test_risk_latched_before_stop(mpv, server)
                     print("[dash] consumer byte-window, no body past end", flush=True)
@@ -1870,6 +2114,20 @@ def main():
             assert RangeCapability.source_generation.offset == 8
             assert RangeCapability.video_validated_206.offset == 16
             assert RangeCapability.audio_validated_206.offset == 20
+            if recovery:
+                for role in ("audio", "video"):
+                    for full_body in (True, False):
+                        print(f"[dash] interrupted {role}, full-body={full_body}", flush=True)
+                        with serve(tracks) as server:
+                            test_interrupted_transfer(mpv, server, role, full_body)
+                    for rejection in ("budget", "unseekable", "zero-progress",
+                                      "compressed", "duplicate-encoding", "duplicate-range-encoding", "wrong-range",
+                                      "wrong-total", 200, 401, 403, 412):
+                        print(f"[dash] recovery rejection {role}: {rejection}", flush=True)
+                        with serve(tracks) as server:
+                            test_interrupted_transfer(mpv, server, role, rejection=rejection)
+                print("DASH_NATIVE_RECOVERY_PASS", flush=True)
+                return
             if controls:
                 print("[dash] complete same-instance native controls", flush=True)
                 with serve(tracks) as server:

@@ -122,6 +122,7 @@ struct priv {
     int64_t vsync_duration_qpc;
     int64_t last_submit_qpc;
     HRESULT present_result;
+    bool last_swap_succeeded;
 
     // Composition mode: cache the monitor currently hosting the host HWND so
     // we can notify the core (VO_EVENT_WIN_STATE) when it changes.
@@ -306,6 +307,7 @@ static void d3d11_swap_buffers(struct ra_swapchain *sw)
 {
     struct priv *p = sw->priv;
 
+    p->last_swap_succeeded = false;
     if (FAILED(p->present_result))
         return;
 
@@ -316,6 +318,7 @@ static void d3d11_swap_buffers(struct ra_swapchain *sw)
     p->last_submit_qpc = perf_count.QuadPart;
 
     HRESULT hr = IDXGISwapChain_Present(p->swapchain, p->opts->sync_interval, 0);
+    p->last_swap_succeeded = hr == S_OK;
     if (sw->ctx->opts.composition)
         vo_display_surface_present_frame(sw->ctx->vo->extra.display_surface,
                                          hr == S_OK ? p->swapchain : NULL);
@@ -326,6 +329,12 @@ static void d3d11_swap_buffers(struct ra_swapchain *sw)
         if (sw->ctx->opts.composition)
             vo_w32_swapchain(sw->ctx->vo, NULL);
     }
+}
+
+static bool d3d11_last_swap_succeeded(struct ra_swapchain *sw)
+{
+    struct priv *p = sw->priv;
+    return p->last_swap_succeeded;
 }
 
 static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
@@ -749,6 +758,7 @@ static const struct ra_swapchain_fns d3d11_swapchain = {
     .start_frame  = d3d11_start_frame,
     .submit_frame = d3d11_submit_frame,
     .swap_buffers = d3d11_swap_buffers,
+    .last_swap_succeeded = d3d11_last_swap_succeeded,
     .get_vsync    = d3d11_get_vsync,
 };
 

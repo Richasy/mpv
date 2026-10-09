@@ -27,6 +27,7 @@
 #include <stdbool.h>
 
 #include "video/img_format.h"
+#include "video/out/frame_result.h"
 #include "common/common.h"
 #include "options/options.h"
 #include "osdep/threads.h"
@@ -240,6 +241,8 @@ struct vo_extra {
 };
 
 struct vo_frame {
+    // Request an explicit per-frame backend processing receipt (not pixels).
+    bool require_receipt;
     // If > 0, realtime when frame should be shown, in mp_time_ns() units.
     // If 0, present immediately.
     int64_t pts;
@@ -423,6 +426,10 @@ struct vo_driver {
      */
     void (*flip_page)(struct vo *vo);
 
+    // Optional. An unknown result cannot complete an owned paused refresh.
+    enum mp_frame_result (*get_frame_result)(struct vo *vo, uint64_t frame_id);
+    bool (*supports_frame_receipt)(struct vo *vo);
+
     /*
      * Return presentation feedback. The implementation should not touch fields
      * it doesn't support; the info fields are preinitialized to neutral values.
@@ -540,7 +547,9 @@ int vo_control(struct vo *vo, int request, void *data);
 void vo_control_async(struct vo *vo, int request, void *data);
 bool vo_is_ready_for_frame(struct vo *vo, int64_t next_pts);
 bool vo_is_visible(struct vo *vo);
-void vo_queue_frame(struct vo *vo, struct vo_frame *frame);
+uint64_t vo_queue_frame(struct vo *vo, struct vo_frame *frame);
+enum mp_frame_result vo_get_frame_result(struct vo *vo, uint64_t frame_id);
+bool vo_supports_frame_receipt(struct vo *vo);
 void vo_wait_frame(struct vo *vo);
 void vo_wait_on_vo(struct vo *vo, bool wait);
 bool vo_still_displaying(struct vo *vo);

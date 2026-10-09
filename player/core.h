@@ -33,6 +33,7 @@
 #include "video/out/vo.h"
 #include "osdep/als.h"
 #include "demux/stheader.h"
+#include "player/paused_refresh.h"
 
 // definitions used internally by the core player code
 
@@ -91,6 +92,7 @@ struct seek_params {
     enum seek_precision exact;
     double amount;
     unsigned flags; // MPSEEK_FLAG_*
+    int64_t refresh_id, refresh_epoch, refresh_revision;
 };
 
 // Information about past video frames that have been sent to the VO.
@@ -375,6 +377,7 @@ typedef struct MPContext {
     bool hrseek_backstep;   // go to frame before seek target
     double hrseek_pts;
     struct seek_params current_seek;
+    struct mp_paused_refresh paused_refresh;
     bool ab_loop_clip;      // clip to the "b" part of an A-B loop if available
     // AV sync: the next frame should be shown when the audio out has this
     // much (in seconds) buffered data left. Increased when more data is
@@ -769,6 +772,9 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track);
 int reinit_video_filters(struct MPContext *mpctx);
 void write_video(struct MPContext *mpctx);
 void mp_force_video_refresh(struct MPContext *mpctx);
+struct mp_refresh_source mp_refresh_source_state(struct MPContext *mpctx);
+bool mp_request_paused_refresh(struct MPContext *mpctx, int64_t id,
+                              double saved_position);
 void uninit_video_out(struct MPContext *mpctx);
 void uninit_video_chain(struct MPContext *mpctx);
 double calc_average_frame_duration(struct MPContext *mpctx);

@@ -74,6 +74,7 @@ static bool recreate_video_filters(struct MPContext *mpctx)
 
 int reinit_video_filters(struct MPContext *mpctx)
 {
+    mp_refresh_cancel(&mpctx->paused_refresh);
     struct vo_chain *vo_c = mpctx->vo_chain;
 
     if (!vo_c)
@@ -98,6 +99,8 @@ static void vo_chain_reset_state(struct vo_chain *vo_c)
 
 void reset_video_state(struct MPContext *mpctx)
 {
+    if (mpctx->paused_refresh.phase == MP_REFRESH_APPLIED)
+        mp_refresh_cancel(&mpctx->paused_refresh);
     if (mpctx->vo_chain) {
         vo_chain_reset_state(mpctx->vo_chain);
         struct track *t = mpctx->vo_chain->track;
@@ -162,6 +165,7 @@ static void vo_chain_uninit(struct vo_chain *vo_c)
 
 void uninit_video_chain(struct MPContext *mpctx)
 {
+    mp_refresh_cancel(&mpctx->paused_refresh);
     if (mpctx->vo_chain) {
         reset_video_state(mpctx);
         vo_chain_uninit(mpctx->vo_chain);
@@ -1268,6 +1272,7 @@ void write_video(struct MPContext *mpctx)
     int req = vo_get_num_req_frames(mpctx->video_out);
     mp_assert(req >= 1 && req <= VO_MAX_REQ_FRAMES);
     struct vo_frame dummy = {
+        .require_receipt = mpctx->current_seek.refresh_id != 0,
         .pts = pts,
         .duration = -1,
         .still = mpctx->step_frames > 0,
@@ -1298,7 +1303,7 @@ void write_video(struct MPContext *mpctx)
     mpctx->osd_force_update = true;
     update_osd_msg(mpctx);
 
-    vo_queue_frame(vo, frame);
+    uint64_t frame_id = vo_queue_frame(vo, frame);
 
     check_framedrop(mpctx, vo_c);
 
@@ -1310,8 +1315,13 @@ void write_video(struct MPContext *mpctx)
     if (mpctx->video_status < STATUS_PLAYING) {
         mpctx->video_status = STATUS_READY;
         // After a seek, make sure to wait until the first frame is visible.
-        if (!opts->video_latency_hacks) {
+        if (!opts->video_latency_hacks || mpctx->current_seek.refresh_id) {
             vo_wait_frame(vo);
+            struct seek_params seek = mpctx->current_seek;
+            mp_refresh_frame_done(&mpctx->paused_refresh, seek.refresh_id,
+                                  seek.refresh_epoch, seek.refresh_revision,
+                                  vo_get_frame_result(vo, frame_id) ==
+                                      MP_FRAME_SUCCEEDED);
             MP_VERBOSE(mpctx, "first video frame after restart shown\n");
         }
     }

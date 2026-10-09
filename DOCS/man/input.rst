@@ -288,6 +288,43 @@ with the ``expand-properties`` prefix. See `Input Command Prefixes`_.
 List of Input Commands
 ----------------------
 
+``rodel-paused-refresh <request-id> <saved-position>``
+    Queue a single owned absolute very-exact refresh of a paused video frame.
+    The positive signed 64-bit ID must exceed every previously admitted ID on
+    this player, including IDs used for previous files. Admission requires an
+    initialized, explicitly paused, seekable, non-sparse video, no EOF or stop,
+    and no pending or active seek/restart. The saved position must be finite,
+    nonnegative, and equal to the actual ``time-pos`` within one microsecond.
+    Rejection reports command failure and does not change pause or position.
+
+    Command success means admission, not completion. Read ``rodel-seek-state``
+    for the owned result. This command never unpauses, replays EOF, or steps
+    frames. Ordinary seeks and automatic filter refreshes retain their existing
+    behavior and supersede the owned request. Reset, video filter/chain
+    reconfiguration, unpause, EOF, stop, shutdown, and file changes invalidate
+    ownership. Completion requires this exact seek to have been applied, its
+    exact submitted VO frame ID to have an explicit successful backend
+    processing result, no VO drop, and its own playback restart to have
+    completed while paused with no new pending seek. A frame wait returning
+    proves neither processing success nor physical presentation.
+
+    Backends without explicit processing/error feedback reject owned refreshes.
+    Currently supported: ``null`` (null-output processing only), ``libmpv``
+    software rendering, and ``gpu-next`` with explicit D3D11 swap feedback.
+    Libmpv render dequeue, skipped rendering, renderer failure, render/swap
+    timeout, GPU render/submit/swap failure, reset, or unknown feedback cannot
+    complete a receipt. A late result after failure cannot resurrect it.
+    Automatic refresh also revokes ownership when it coalesces with an already
+    pending owned seek; the queued seek's ordinary execution parameters remain
+    unchanged. Apply mutations first, drain their automatic seek, then admit a
+    fresh owned ID.
+
+    A client-message FIFO barrier alone does not drain an automatic seek:
+    first wait until both ``pending`` and ``active`` are false in a known
+    ``rodel-seek-state`` snapshot, then recheck admission. The command performs
+    the final check on the player thread. No additional event-wait protocol is
+    needed; property readback is authoritative, not generic seek/restart events.
+
 Commands with parameters have the parameter name enclosed in ``<`` / ``>``.
 Don't add those to the actual command. Optional arguments are enclosed in
 ``[`` / ``]``. If you don't pass them, they will be set to a default value.
@@ -2795,6 +2832,37 @@ Property list
     will immediately play the next file (or exit or enter idle mode), and in
     these cases the ``eof-reached`` property will logically be cleared
     immediately after it's set.
+
+``rodel-seek-state``
+    Read-only, constant-size node map (version 1), available even without a
+    loaded file. Contains no media identity, path, URL, headers or pointers.
+
+    ``known`` is false without an initialized source or after counter
+    exhaustion; an unknown snapshot must not be treated as a drained source.
+    ``pending`` includes a queued seek that the traditional ``seeking``
+    property does not cover. ``active`` includes the current seek or incomplete
+    playback restart. ``source-epoch`` changes at file start and teardown;
+    ``seek-revision`` advances on seek admission, queued ordinary/automatic
+    seeks, explicit seek cancellation and source transitions. Neither signed
+    64-bit counter wraps.
+
+    ``state`` is ``unknown``, ``requested``, ``applied``, ``completed`` or
+    ``canceled`` for the last owned slot. ``owner-epoch`` and ``owner-revision``
+    identify its admitted operation. ``position`` is actual ``time-pos``, or
+    a null node if unknown. Each of ``last-requested``, ``last-applied``,
+    ``last-completed`` and ``last-canceled`` contains ``id`` and
+    ``saved-position``. An absent receipt has ID zero and null position.
+    Receipt positions record the admitted invariant, not a predicted output
+    position. The actual output position is independently readable.
+
+    Receipts are bounded historical records and survive file transitions.
+    Consumers must match ID, owner/source epoch, owner/seek revision and the
+    current ``completed`` state; a historical ``last-completed`` alone is not
+    success. A newer cancellation takes precedence. Completion proves specific
+    native backend-processing/restart ownership, not physical display pixels,
+    GPU fence completion or audible output.
+    Readback does not change playback. Polling this property is supported;
+    clients must not infer completion from an unrelated restart event.
 
 ``seeking``
     Whether the player is currently seeking, or otherwise trying to restart

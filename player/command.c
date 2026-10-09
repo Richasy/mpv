@@ -1614,6 +1614,58 @@ static int mp_property_seeking(void *ctx, struct m_property *prop,
     return m_property_bool_ro(action, arg, !mpctx->restart_complete);
 }
 
+static void add_refresh_receipt(struct mpv_node *node, const char *name,
+                                struct mp_refresh_receipt receipt)
+{
+    struct mpv_node *entry = node_map_add(node, name, MPV_FORMAT_NODE_MAP);
+    node_map_add_int64(entry, "id", receipt.id);
+    if (receipt.id)
+        node_map_add_double(entry, "saved-position", receipt.position);
+    else
+        node_map_add(entry, "saved-position", MPV_FORMAT_NONE);
+}
+
+static int mp_property_rodel_seek_state(void *ctx, struct m_property *prop,
+                                        int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    switch (action) {
+    case M_PROPERTY_GET_TYPE:
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
+        return M_PROPERTY_OK;
+    case M_PROPERTY_GET: {
+        struct mp_refresh_source source = mp_refresh_source_state(mpctx);
+        // Validate a copy: reading the property cannot alter playback or admit
+        // work. A stopped/EOF source must not advertise a live completion.
+        struct mp_paused_refresh s = mpctx->paused_refresh;
+        mp_refresh_validate(&s, source);
+        struct mpv_node node;
+        node_init(&node, MPV_FORMAT_NODE_MAP, NULL);
+        bool known = source.initialized && s.source_epoch && !s.exhausted;
+        node_map_add_int64(&node, "version", 1);
+        node_map_add_flag(&node, "known", known);
+        node_map_add_flag(&node, "pending", source.pending);
+        node_map_add_flag(&node, "active", source.active);
+        node_map_add_int64(&node, "source-epoch", s.source_epoch);
+        node_map_add_int64(&node, "seek-revision", s.revision);
+        node_map_add_int64(&node, "owner-epoch", s.owner_epoch);
+        node_map_add_int64(&node, "owner-revision", s.owner_revision);
+        node_map_add_string(&node, "state", mp_refresh_phase_name(s.phase));
+        if (known && isfinite(source.position) && source.position >= 0)
+            node_map_add_double(&node, "position", source.position);
+        else
+            node_map_add(&node, "position", MPV_FORMAT_NONE);
+        add_refresh_receipt(&node, "last-requested", s.requested);
+        add_refresh_receipt(&node, "last-applied", s.applied);
+        add_refresh_receipt(&node, "last-completed", s.completed);
+        add_refresh_receipt(&node, "last-canceled", s.canceled);
+        *(struct mpv_node *)arg = node;
+        return M_PROPERTY_OK;
+    }
+    }
+    return M_PROPERTY_NOT_IMPLEMENTED;
+}
+
 static int mp_property_whisper_loading(void *ctx, struct m_property *prop,
                                        int action, void *arg)
 {
@@ -5045,6 +5097,7 @@ static const struct m_property mp_properties_base[] = {
     {"core-idle", mp_property_core_idle},
     {"eof-reached", mp_property_eof_reached},
     {"seeking", mp_property_seeking},
+    {"rodel-seek-state", mp_property_rodel_seek_state},
     {"whisper-loading", mp_property_whisper_loading},
     {"whisper-ai-translate", mp_property_whisper_ai_translate},
     {"whisper-ai-translate-status", mp_property_whisper_ai_translate_status},
@@ -6404,6 +6457,13 @@ static void cmd_seek(void *p)
         mpctx->add_osd_seek_info |= OSD_SEEK_INFO_BAR;
     if (cmd->seek_msg_osd)
         mpctx->add_osd_seek_info |= OSD_SEEK_INFO_TEXT;
+}
+
+static void cmd_rodel_paused_refresh(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    cmd->success = mp_request_paused_refresh(cmd->mpctx, cmd->args[0].v.i64,
+                                            cmd->args[1].v.d);
 }
 
 static void cmd_revert_seek(void *p)
@@ -7947,6 +8007,9 @@ static void cmd_notify_property(void *p)
 
 const struct mp_cmd_def mp_cmds[] = {
     { "ignore", cmd_ignore, .is_ignore = true, .is_noisy = true, },
+    { "rodel-paused-refresh", cmd_rodel_paused_refresh,
+        { {"request-id", OPT_INT64(v.i64)},
+          {"saved-position", OPT_DOUBLE(v.d)} } },
 
     { "seek", cmd_seek,
         {

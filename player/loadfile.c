@@ -1832,6 +1832,7 @@ static void play_current_file(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
 
+    mp_refresh_new_source(&mpctx->paused_refresh);
     mp_assert(mpctx->stop_play);
     mpctx->stop_play = 0;
 
@@ -2196,6 +2197,7 @@ terminate_playback:
         uninit_audio_out(mpctx);
 
     mpctx->playback_initialized = false;
+    mp_refresh_new_source(&mpctx->paused_refresh);
 
     uninit_demuxer(mpctx);
 

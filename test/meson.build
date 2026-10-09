@@ -229,6 +229,12 @@ d3d11_adapter = executable('d3d11-adapter',
                            include_directories: incdir)
 test('d3d11-adapter', d3d11_adapter)
 
+paused_refresh = executable('paused-refresh', 'paused_refresh.c',
+                            objects: libmpv.extract_objects(
+                                'player/paused_refresh.c', 'video/out/frame_result.c'),
+                            include_directories: incdir, dependencies: libm)
+test('paused-refresh', paused_refresh)
+
 if features['d3d-hwaccel']
     d3d11vpp_vsr_policy = executable(
         'd3d11vpp-vsr-policy',
@@ -291,6 +297,14 @@ if get_option('libmpv')
         shared = true
     endif
     if shared
+        test('libmpv-paused-refresh', python,
+             args: [files('libmpv_paused_refresh.py'), mpvlib.full_path(),
+                    join_paths(outdir, 'paused-refresh')],
+             depends: mpvlib, suite: 'libmpv', timeout: 60)
+        test('libmpv-paused-refresh-render', python,
+             args: [files('libmpv_paused_refresh_render.py'), mpvlib.full_path(),
+                    join_paths(outdir, 'paused-refresh-render')],
+             depends: mpvlib, suite: 'libmpv', timeout: 60)
         exe = executable('libmpv-lifetime', sources: 'libmpv_lifetime.c',
                          include_directories: incdir_public)
         test('libmpv-lifetime', exe, depends: mpvlib, suite: 'libmpv')

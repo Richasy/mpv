@@ -161,14 +161,23 @@ double get_track_seek_offset(struct MPContext *mpctx, struct track *track)
 
 void issue_refresh_seek(struct MPContext *mpctx, enum seek_precision min_prec)
 {
-    // let queued seeks execute at a slightly later point
+    // Keep the queued seek's execution parameters, but an automatic refresh
+    // supersedes its ownership just as repeating a current seek does.
     if (mpctx->seek.type) {
+        mp_refresh_supersede_seek(&mpctx->paused_refresh,
+                                  &mpctx->seek.refresh_id,
+                                  &mpctx->seek.refresh_epoch,
+                                  &mpctx->seek.refresh_revision);
         mp_wakeup_core(mpctx);
         return;
     }
     // repeat currently ongoing seeks
     if (mpctx->current_seek.type) {
         mpctx->seek = mpctx->current_seek;
+        mp_refresh_supersede_seek(&mpctx->paused_refresh,
+                                  &mpctx->seek.refresh_id,
+                                  &mpctx->seek.refresh_epoch,
+                                  &mpctx->seek.refresh_revision);
         mp_wakeup_core(mpctx);
         return;
     }

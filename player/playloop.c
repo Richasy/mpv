@@ -167,6 +167,8 @@ void set_pause_state(struct MPContext *mpctx, bool user_pause)
 {
     struct MPOpts *opts = mpctx->opts;
 
+    if (!user_pause)
+        mp_refresh_cancel(&mpctx->paused_refresh);
     opts->pause = user_pause;
 
     bool internal_paused = get_internal_paused(mpctx);
@@ -252,7 +254,7 @@ static void update_sparse_video(struct MPContext *mpctx)
 }
 
 // Clear some playback-related fields on file loading or after seeks.
-void reset_playback_state(struct MPContext *mpctx)
+static void reset_playback_state_internal(struct MPContext *mpctx)
 {
     mp_filter_reset(mpctx->filter_root);
 
@@ -294,6 +296,51 @@ void reset_playback_state(struct MPContext *mpctx)
 
     update_internal_pause_state(mpctx);
     update_core_idle_state(mpctx);
+}
+
+void reset_playback_state(struct MPContext *mpctx)
+{
+    mp_refresh_cancel(&mpctx->paused_refresh);
+    reset_playback_state_internal(mpctx);
+}
+
+struct mp_refresh_source mp_refresh_source_state(struct MPContext *mpctx)
+{
+    return (struct mp_refresh_source){
+        .initialized = mpctx->playback_initialized,
+        .paused = mpctx->opts->pause && mpctx->paused,
+        .eof = mpctx->video_status == STATUS_EOF,
+        .seekable = mpctx->demuxer && mpctx->demuxer->seekable &&
+                    !mp_dash_source_seek_blocked(mpctx->global),
+        .video = mpctx->vo_chain && !mpctx->vo_chain->is_sparse &&
+                 vo_supports_frame_receipt(mpctx->video_out),
+        .stopped = mpctx->stop_play != KEEP_PLAYING,
+        .pending = mpctx->seek.type != MPSEEK_NONE,
+        .active = mpctx->playback_initialized &&
+                  (!mpctx->restart_complete || mpctx->current_seek.type),
+        .position = get_playback_time(mpctx),
+    };
+}
+
+bool mp_request_paused_refresh(struct MPContext *mpctx, int64_t id,
+                              double saved_position)
+{
+    struct mp_paused_refresh *s = &mpctx->paused_refresh;
+    if (!mp_refresh_admit(s, mp_refresh_source_state(mpctx), id, saved_position))
+        return false;
+
+    // Do not coalesce with ordinary seeks. Admission and this assignment both
+    // run on the player thread, with no command/event interleaving.
+    mpctx->seek = (struct seek_params){
+        .type = MPSEEK_ABSOLUTE,
+        .exact = MPSEEK_VERY_EXACT,
+        .amount = saved_position,
+        .refresh_id = id,
+        .refresh_epoch = s->owner_epoch,
+        .refresh_revision = s->owner_revision,
+    };
+    mp_wakeup_core(mpctx);
+    return true;
 }
 
 static double calculate_framestep_pts(MPContext *mpctx, double current_time,
@@ -443,7 +490,7 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
     if (!(seek.flags & MPSEEK_FLAG_NOFLUSH))
         clear_audio_output_buffers(mpctx);
 
-    reset_playback_state(mpctx);
+    reset_playback_state_internal(mpctx);
 
     demux_block_reading(mpctx->demuxer, false);
     for (int t = 0; t < mpctx->num_tracks; t++) {
@@ -488,6 +535,8 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
     update_ab_loop_clip(mpctx);
 
     mpctx->current_seek = seek;
+    mp_refresh_apply(&mpctx->paused_refresh, seek.refresh_id,
+                     seek.refresh_epoch, seek.refresh_revision);
     redraw_subs(mpctx);
 }
 
@@ -499,6 +548,8 @@ void queue_seek(struct MPContext *mpctx, enum seek_type type, double amount,
         return;
 
     struct seek_params *seek = &mpctx->seek;
+    mp_refresh_supersede_seek(&mpctx->paused_refresh, &seek->refresh_id,
+                              &seek->refresh_epoch, &seek->refresh_revision);
 
     mp_wakeup_core(mpctx);
 
@@ -542,6 +593,7 @@ void execute_queued_seek(struct MPContext *mpctx)
 {
     if (mpctx->seek.type) {
         if (mp_dash_source_seek_blocked(mpctx->global)) {
+            mp_refresh_cancel(&mpctx->paused_refresh);
             mpctx->seek = (struct seek_params){0};
             return;
         }
@@ -566,6 +618,9 @@ void execute_queued_seek(struct MPContext *mpctx)
                 return;
         }
         mp_seek(mpctx, mpctx->seek);
+        if (mpctx->seek.refresh_id &&
+            mpctx->paused_refresh.phase == MP_REFRESH_REQUESTED)
+            mp_refresh_cancel(&mpctx->paused_refresh);
         mpctx->seek = (struct seek_params){0};
     }
 }
@@ -1346,6 +1401,10 @@ static void handle_playback_restart(struct MPContext *mpctx)
     }
 
     if (!mpctx->restart_complete) {
+        struct seek_params seek = mpctx->current_seek;
+        mp_refresh_complete(&mpctx->paused_refresh,
+                            mp_refresh_source_state(mpctx), seek.refresh_id,
+                            seek.refresh_epoch, seek.refresh_revision);
         mpctx->hrseek_active = false;
         mpctx->restart_complete = true;
         mpctx->current_seek = (struct seek_params){0};
@@ -1467,6 +1526,7 @@ static void handle_clipboard_updates(struct MPContext *mpctx)
 
 void run_playloop(struct MPContext *mpctx)
 {
+    mp_refresh_validate(&mpctx->paused_refresh, mp_refresh_source_state(mpctx));
     if (encode_lavc_didfail(mpctx->encode_lavc_ctx)) {
         mpctx->stop_play = PT_ERROR;
         return;
@@ -1602,6 +1662,7 @@ void run_playloop(struct MPContext *mpctx)
     write_video(mpctx);
 
     handle_playback_restart(mpctx);
+    mp_refresh_validate(&mpctx->paused_refresh, mp_refresh_source_state(mpctx));
 
     handle_playback_time(mpctx);
 

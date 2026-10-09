@@ -172,6 +172,7 @@ struct vo_internal {
     int req_frames;                 // VO's requested value of num_frames
     int frame_refs;                 // max frames the VO may reference at once
     uint64_t current_frame_id;
+    struct mp_frame_receipt frame_receipt;
 
     double display_fps;
     double reported_display_fps;
@@ -696,6 +697,7 @@ void vo_control_async(struct vo *vo, int request, void *data)
 static void forget_frames(struct vo *vo)
 {
     struct vo_internal *in = vo->in;
+    mp_frame_receipt_invalidate(&in->frame_receipt);
     in->hasframe = false;
     in->hasframe_rendered = false;
     in->drop_count = 0;
@@ -874,7 +876,7 @@ bool vo_is_visible(struct vo *vo)
 // Direct the VO thread to put the currently queued image on the screen.
 // vo_is_ready_for_frame() must have returned true before this call.
 // Ownership of frame is handed to the vo.
-void vo_queue_frame(struct vo *vo, struct vo_frame *frame)
+uint64_t vo_queue_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct vo_internal *in = vo->in;
     mp_mutex_lock(&in->lock);
@@ -882,11 +884,32 @@ void vo_queue_frame(struct vo *vo, struct vo_frame *frame)
            (!in->current_frame || in->current_frame->num_vsyncs < 1));
     in->hasframe = true;
     frame->frame_id = ++(in->current_frame_id);
+    uint64_t frame_id = frame->frame_id;
+    if (frame->require_receipt)
+        mp_frame_receipt_begin(&in->frame_receipt, frame_id);
     in->frame_queued = frame;
     in->wakeup_pts = frame->display_synced
                    ? 0 : frame->pts + MPMAX(frame->duration, 0);
     wakeup_locked(vo);
     mp_mutex_unlock(&in->lock);
+    return frame_id;
+}
+
+enum mp_frame_result vo_get_frame_result(struct vo *vo, uint64_t frame_id)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    enum mp_frame_result result =
+        mp_frame_receipt_get(&in->frame_receipt, frame_id);
+    mp_mutex_unlock(&in->lock);
+    return result;
+}
+
+bool vo_supports_frame_receipt(struct vo *vo)
+{
+    return vo && vo->driver->get_frame_result &&
+           (!vo->driver->supports_frame_receipt ||
+            vo->driver->supports_frame_receipt(vo));
 }
 
 // If a frame is currently being rendered (or queued), wait until it's done.
@@ -938,6 +961,8 @@ static bool render_frame(struct vo *vo)
 
     frame = vo_frame_ref(in->current_frame);
     mp_assert(frame);
+    uint64_t frame_id = frame->frame_id;
+    bool require_receipt = frame->require_receipt;
 
     if (frame->display_synced) {
         frame->pts = 0;
@@ -988,6 +1013,9 @@ static bool render_frame(struct vo *vo)
     in->expecting_vsync = use_vsync;
 
     if (in->dropped_frame) {
+        if (require_receipt)
+            mp_frame_receipt_finish(&in->frame_receipt, frame_id,
+                                    MP_FRAME_UNKNOWN, true);
         in->drop_count += 1;
         wakeup_core(vo);
     } else {
@@ -1030,8 +1058,14 @@ static bool render_frame(struct vo *vo)
 
         stats_time_end(in->stats, "video-flip");
 
+        enum mp_frame_result backend = MP_FRAME_UNKNOWN;
+        if (require_receipt && vo->driver->get_frame_result)
+            backend = vo->driver->get_frame_result(vo, frame_id);
         mp_mutex_lock(&in->lock);
         in->dropped_frame = prev_drop_count < vo->in->drop_count;
+        if (require_receipt)
+            mp_frame_receipt_finish(&in->frame_receipt, frame_id, backend,
+                                    in->dropped_frame || !in->visible);
         in->rendering = false;
 
         update_vsync_timing_after_swap(vo, &vsync);

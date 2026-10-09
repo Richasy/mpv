@@ -179,6 +179,8 @@ sources = files(
     'player/misc.c',
     'player/osd.c',
     'player/playloop.c',
+    'player/paused_refresh.c',
+    'video/out/frame_result.c',
     'player/screenshot.c',
     'player/scripting.c',
     'player/sub.c',

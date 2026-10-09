@@ -87,6 +87,12 @@ may not be populated with meaningful values until the relevant subsystems have
 initialized. Rather than retrieving these properties at the top of scripts, you
 should use ``mp.observe_property`` or read them within event handlers.
 
+On Windows, if the embedding process prohibits dynamic code, LuaJIT starts in
+interpreter mode before any built-in or external script executes. mpv does not
+relax process or thread protection. Scripts in this environment must not
+re-enable JIT compilation or request FFI callbacks that require executable
+memory. Lua execution in processes without this restriction is unchanged.
+
 When the player quits, all scripts will be asked to terminate. This happens via
 a ``shutdown`` event, which by default will make the event loop return. If your
 script got into an endless loop, mpv will probably behave fine during playback,

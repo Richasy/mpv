@@ -172,6 +172,32 @@ commit alongside the mpv and FFmpeg commits in `build-info.txt`.
 | Disc playback | Adopt DVD/HDMV/BD-J menu support and local ISO probing; remote DVD ISO playback shares the menu-aware initialization path. Keep public angle properties 1-based after upstream makes Blu-ray stream controls 1-based too. DVD-Audio requires libdvdread 7.1.1 or newer; BD-J additionally requires a usable Java runtime and libbluray.jar. |
 | Network playback | Include stricter HTTP range-response handling, encrypted nested-stream support, and cancellation of obsolete blocking demux reads. Keep byte-range LRU caching, expiring-redirect recovery, and fatal stream-error reporting. |
 
+For direct-title Blu-ray playback, including ISO and BDMV inputs, selecting a
+real audio or PGS subtitle track refreshes playback at the current position.
+The disc demuxer cannot backfill its partially seekable read-ahead queue, so
+retaining that queue would leave the new track waiting for future timestamps.
+This recovery is independent of `demuxer-cache-preserve-on-track-switch` and
+uses the normal player seek/reset path. Selected PGS subtitles receive the
+same ten-second packet preroll as ordinary subtitle track selection. Pause
+state and queued user seeks are retained; interactive navigation, menus,
+still frames, virtual subtitles, and ordinary container switches are unchanged.
+Direct-title seek timestamps are anchored at the actual Blu-ray index landing
+before the inner demuxer reads ahead, avoiding a forward position jump during
+the refresh.
+
+`meson test -C <build> disc-track-switch` covers recovery scheduling and its
+navigation, source, pause, and pending-seek guards. The headless runtime
+regression authors a temporary synthetic ISO with two audio and two PGS tracks,
+fills at least 18 seconds of forward cache, and requires new audio or the
+current subtitle cue within three seconds. It also checks MKV/MP4 controls:
+
+```text
+python test\libmpv_disc_tracks.py <libmpv-2.dll> --tsmuxer <tsMuxeR.exe>
+```
+
+The runtime regression requires FFmpeg and the tsMuxeR CLI. Its child processes
+use null video/audio outputs and bounded deadlines, without private services.
+
 The Rodel.Player contract remains `libmpv-2.dll` with client API 2.7, retained
 `mpv_acquire_d3d11_composition_surface` /
 `mpv_release_d3d11_composition_surface`, `MPV_EVENT_TRACK_FAILED = 26`, and the

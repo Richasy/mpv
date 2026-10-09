@@ -27,6 +27,7 @@
 
 #include "stream/stream.h"
 #include "demux/demux.h"
+#include "demux/stheader.h"
 #include "sub/dec_sub.h"
 #include "sub/osd.h"
 #include "sub/osd_state.h"
@@ -81,6 +82,22 @@ static bool is_dvd_sub_track(struct track *t)
            strcmp(t->stream->codec->codec, "dvd_subtitle") == 0;
 }
 
+static bool is_bluray_stream(struct stream *s)
+{
+    if (!s || !s->info || !s->info->name)
+        return false;
+    const char *name = s->info->name;
+    return strcmp(name, "bd") == 0 || strcmp(name, "bdmv/bluray") == 0 ||
+           strcmp(name, "iso/bluray") == 0;
+}
+
+static bool is_pgs_track(struct track *track)
+{
+    return track && track->type == STREAM_SUB && track->stream &&
+           track->stream->codec && track->stream->codec->codec &&
+           strcmp(track->stream->codec->codec, "hdmv_pgs_subtitle") == 0;
+}
+
 static struct disc_nav_state *get_state(struct MPContext *mpctx)
 {
     if (!mpctx->disc_nav)
@@ -120,12 +137,50 @@ struct stream *disc_nav_get_stream(struct MPContext *mpctx)
         return NULL;
     const char *n = s->info->name;
     if (strcmp(n, "dvdnav") == 0 || strcmp(n, "ifo_dvdnav") == 0 ||
-        strcmp(n, "iso/dvdnav") == 0 || strcmp(n, "bd") == 0 ||
-        strcmp(n, "bdmv/bluray") == 0 || strcmp(n, "iso/bluray") == 0)
+        strcmp(n, "iso/dvdnav") == 0 || is_bluray_stream(s))
     {
         return s;
     }
     return NULL;
+}
+
+bool disc_nav_refresh_track(struct MPContext *mpctx, struct track *track)
+{
+    if (!mpctx->playback_initialized || mpctx->play_dir != 1 ||
+        !track || !track->selected || !track->stream || track->is_external ||
+        track->demuxer != mpctx->demuxer || !mpctx->demuxer ||
+        !mpctx->demuxer->partially_seekable || !mpctx->demuxer->seekable ||
+        (track->type != STREAM_AUDIO && !is_pgs_track(track)) ||
+        get_current_time(mpctx) == MP_NOPTS_VALUE)
+    {
+        return false;
+    }
+
+    struct stream *stream = disc_nav_get_stream(mpctx);
+    if (!is_bluray_stream(stream))
+        return false;
+
+    struct stream_nav_state nav = {0};
+    if (stream_control(stream, STREAM_CTRL_GET_NAV_STATE, &nav) < 1) {
+        MP_WARN(mpctx, "Cannot refresh disc tracks without navigation state.\n");
+        return false;
+    }
+    if (nav.nav_active || nav.menu_active || nav.still_active ||
+        nav.drain_pending)
+    {
+        return false;
+    }
+
+    // The disc demuxer cannot backfill a track within its read-ahead queues.
+    // Reset all decoder clocks through the player seek path instead.
+    MP_VERBOSE(mpctx, "Refreshing disc track selection at playback time %f\n",
+               get_current_time(mpctx));
+    issue_refresh_seek(mpctx, MPSEEK_EXACT);
+    for (int n = 0; n < num_ptracks[STREAM_SUB]; n++) {
+        if (is_pgs_track(mpctx->current_track[n][STREAM_SUB]))
+            mpctx->seek.flags |= MPSEEK_FLAG_SUBPREROLL;
+    }
+    return true;
 }
 
 bool disc_nav_mouse_pos_to_src(struct MPContext *mpctx, int src_w, int src_h,
@@ -471,9 +526,7 @@ void disc_nav_update(struct MPContext *mpctx)
     // at 1s intervals even at pause, but that's not enough for fluid button
     // navigation. So, we always drive the VM at least at 20Hz.
     if (have && mpctx->demuxer) {
-        bool bd_idle = (strcmp(s->info->name, "bd") == 0 ||
-                        strcmp(s->info->name, "bdmv/bluray") == 0 ||
-                        strcmp(s->info->name, "iso/bluray") == 0) &&
+        bool bd_idle = is_bluray_stream(s) &&
                        (still || (mpctx->video_status == STATUS_EOF &&
                                   mpctx->audio_status == STATUS_EOF));
         if (bd_idle || (nav.menu_active && mpctx->paused)) {
@@ -511,9 +564,7 @@ void disc_nav_update(struct MPContext *mpctx)
     sync_current_edition(mpctx, s, &nav);
     sync_disc_track_selection(mpctx, s, &nav);
 
-    bool is_bd = strcmp(s->info->name, "bd") == 0 ||
-                 strcmp(s->info->name, "bdmv/bluray") == 0 ||
-                 strcmp(s->info->name, "iso/bluray") == 0;
+    bool is_bd = is_bluray_stream(s);
     bool visible = nav.menu_active &&
                    (is_bd || (mp_rect_w(nav.hl.rect) > 0 && mp_rect_h(nav.hl.rect) > 0));
 

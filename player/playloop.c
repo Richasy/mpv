@@ -376,12 +376,21 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
         if (hr_seek_very_exact)
             hr_seek_offset = MPMAX(hr_seek_offset, 0.5); // arbitrary
         for (int n = 0; n < mpctx->num_tracks; n++) {
+            struct track *track = mpctx->tracks[n];
             double offset = 0;
-            if (!mpctx->tracks[n]->is_external)
-                offset += get_track_seek_offset(mpctx, mpctx->tracks[n]);
+            if (!track->is_external) {
+                offset += get_track_seek_offset(mpctx, track);
+                if ((seek.flags & MPSEEK_FLAG_SUBPREROLL) &&
+                    track->selected && track->type == STREAM_SUB)
+                {
+                    offset -= SUBTITLE_SEEK_PREROLL;
+                }
+            }
             hr_seek_offset = MPMAX(hr_seek_offset, -offset);
         }
         demux_pts -= hr_seek_offset * play_dir;
+        if (seek.flags & MPSEEK_FLAG_SUBPREROLL)
+            demux_pts = MPMAX(demux_pts, get_start_time(mpctx, 1));
         demux_flags = (demux_flags | SEEK_HR) & ~SEEK_FORWARD;
         // For HR seeks in backward playback mode, the correct seek rounding
         // direction is forward instead of backward.

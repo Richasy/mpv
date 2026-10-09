@@ -442,6 +442,7 @@ static void sync_streams(struct demuxer *demuxer)
 }
 
 static void refresh_disc_metadata(struct demuxer *demuxer);
+static void reset_pts(struct demuxer *demuxer);
 
 static void d_seek(demuxer_t *demuxer, double seek_pts, int flags)
 {
@@ -540,6 +541,12 @@ static void d_seek(demuxer_t *demuxer, double seek_pts, int flags)
     TA_FREEP(&p->pending_pkt);
 
     p->seek_reinit = true;
+    if (p->is_bd && have_nav && !nav.nav_active && !resync && !bd_jump) {
+        // Anchor the first packet at the actual index landing, before lavf
+        // reads ahead and advances bd_tell_time() to a later packet.
+        reset_pts(demuxer);
+        refresh_disc_metadata(demuxer);
+    }
 }
 
 static void reset_pts(demuxer_t *demuxer)

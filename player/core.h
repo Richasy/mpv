@@ -85,7 +85,10 @@ enum seek_precision {
 enum seek_flags {
     MPSEEK_FLAG_DELAY = 1 << 0, // give player chance to coalesce multiple seeks
     MPSEEK_FLAG_NOFLUSH = 1 << 1, // keeping remaining data for seamless loops
+    MPSEEK_FLAG_SUBPREROLL = 1 << 2, // recover an already active disc subtitle
 };
+
+#define SUBTITLE_SEEK_PREROLL 10.0
 
 struct seek_params {
     enum seek_type type;
@@ -748,6 +751,7 @@ void disc_nav_update(struct MPContext *mpctx);
 void disc_nav_reset(struct MPContext *mpctx);
 void disc_nav_destroy(struct MPContext *mpctx);
 struct stream *disc_nav_get_stream(struct MPContext *mpctx);
+bool disc_nav_refresh_track(struct MPContext *mpctx, struct track *track);
 bool disc_nav_mouse_pos_to_src(struct MPContext *mpctx, int src_w, int src_h,
                                int *out_x, int *out_y);
 

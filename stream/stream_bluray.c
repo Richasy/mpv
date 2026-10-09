@@ -1022,6 +1022,9 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
             // the player tracks the disc author's defaults on a plain-title
             // playback.
             *st = (struct stream_nav_state){
+                .still_active = b->still_active,
+                .discontinuity_id = b->discontinuity_id,
+                .drain_pending = b->resync_owed,
                 .no_audio = no_audio,
                 .active_audio_id = audio_pid,
                 .active_sub_id = sub_pid,
@@ -1104,6 +1107,24 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
     }
 
     return STREAM_UNSUPPORTED;
+}
+
+int stream_bluray_test_plain_nav_state(struct stream_nav_state *state)
+{
+    struct bluray_priv_s priv = {
+        .still_active = true,
+        .resync_owed = true,
+        .discontinuity_id = 7,
+    };
+    struct stream stream = {
+        .priv = &priv,
+        .control = bluray_stream_control,
+        .log = mp_null_log,
+    };
+    mp_mutex_init(&priv.overlay_lock);
+    int result = stream_control(&stream, STREAM_CTRL_GET_NAV_STATE, state);
+    mp_mutex_destroy(&priv.overlay_lock);
+    return result;
 }
 
 static const char *aacs_strerr(int err)

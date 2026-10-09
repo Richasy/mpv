@@ -185,6 +185,16 @@ subtitle_timing = executable(
 )
 test('subtitle-timing', subtitle_timing)
 
+disc_track_switch = executable(
+    'disc-track-switch',
+    'disc_track_switch.c',
+    include_directories: incdir,
+    objects: libmpv.extract_all_objects(recursive: true),
+    dependencies: dependencies,
+    override_options: ['b_ndebug=false'],
+)
+test('disc-track-switch', disc_track_switch)
+
 if features['libass']
     subtitle_ass_translation = executable(
         'subtitle-ass-translation',
@@ -329,6 +339,15 @@ if get_option('libmpv')
             test('libmpv-network-cursors', python,
                  args: [files('libmpv_network_cursors.py'), mpvlib.full_path()],
                  depends: mpvlib, suite: 'libmpv-network', timeout: 300)
+            tsmuxer = find_program('tsMuxeR', required: false)
+            disc_ffmpeg = find_program('ffmpeg', required: false)
+            if features['libbluray'] and tsmuxer.found() and disc_ffmpeg.found()
+                test('libmpv-disc-tracks', python,
+                     args: ['-B', files('libmpv_disc_tracks.py'),
+                            mpvlib.full_path(), '--tsmuxer', tsmuxer,
+                            '--ffmpeg', disc_ffmpeg],
+                     depends: mpvlib, suite: 'libmpv-disc', timeout: 180)
+            endif
         endif
     endif
 endif

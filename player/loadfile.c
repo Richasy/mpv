@@ -467,7 +467,7 @@ void reselect_demux_stream(struct MPContext *mpctx, struct track *track,
     if (pts != MP_NOPTS_VALUE) {
         pts += get_track_seek_offset(mpctx, track);
         if (track->type == STREAM_SUB)
-            pts -= 10.0;
+            pts -= SUBTITLE_SEEK_PREROLL;
     }
     if (refresh_only)
         demuxer_refresh_track(track->demuxer, track->stream, pts);
@@ -870,6 +870,9 @@ void mp_switch_track_n(struct MPContext *mpctx, int order, enum stream_type type
     } else if (type == STREAM_SUB && order >= 0 && order <= 2) {
         reinit_sub(mpctx, track);
     }
+
+    if (flags & FLAG_MARK_SELECTION)
+        disc_nav_refresh_track(mpctx, track);
 
     mp_notify(mpctx, MP_EVENT_TRACK_SWITCHED, NULL);
     mp_wakeup_core(mpctx);

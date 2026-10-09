@@ -412,6 +412,9 @@ char *mp_url_escape(void *talloc_ctx, const char *s, const char *ok);
 // stream_memory.c
 struct stream *stream_memory_open(struct mpv_global *global, void *data, int len);
 
+// stream_bluray.c: exercise the real plain-title snapshot in native tests.
+int stream_bluray_test_plain_nav_state(struct stream_nav_state *state);
+
 // stream_concat.c
 struct stream *stream_concat_open(struct mpv_global *global, struct mp_cancel *c,
                                   struct stream **streams, int num_streams);

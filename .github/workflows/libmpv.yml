@@ -19,6 +19,14 @@ on:
           - azure
           - both
         default: github
+      runner:
+        description: 'Runner selection (auto uses the Beijing-time schedule)'
+        type: choice
+        options:
+          - auto
+          - new
+          - legacy
+        default: auto
 
 concurrency:
   group: ${{ github.workflow }}-shared-native-build
@@ -49,15 +57,32 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
       - id: select-runner
+        env:
+          RUNNER_SELECTION: ${{ inputs.runner }}
         run: |
-          hour=$(TZ=Asia/Shanghai date +%H)
-          # Beijing 06:00-14:59 uses the legacy runner; do not fall back if busy.
-          if (( 10#$hour >= 6 && 10#$hour < 15 )); then
-            label=mpv-build-legacy
-          else
-            label=mpv-build-wsl-cpc-anran-fhr6h
-          fi
-          echo "Beijing hour $hour: $label"
+          case "${RUNNER_SELECTION:-auto}" in
+            new)
+              label=mpv-build-wsl-cpc-anran-fhr6h
+              ;;
+            legacy)
+              label=mpv-build-legacy
+              ;;
+            auto)
+              hour=$(TZ=Asia/Shanghai date +%H)
+              # Beijing 06:00-14:59 uses the legacy runner; do not fall back if busy.
+              if (( 10#$hour >= 6 && 10#$hour < 15 )); then
+                label=mpv-build-legacy
+              else
+                label=mpv-build-wsl-cpc-anran-fhr6h
+              fi
+              echo "Beijing hour $hour"
+              ;;
+            *)
+              echo "::error::Unknown native runner selection."
+              exit 1
+              ;;
+          esac
+          echo "Runner selection ${RUNNER_SELECTION:-auto}: $label"
           echo "label=$label" >> "$GITHUB_OUTPUT"
 
   build:

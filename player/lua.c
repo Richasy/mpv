@@ -50,6 +50,10 @@
 #include "client.h"
 #include "mpv/client.h"
 
+#if HAVE_WIN32_DESKTOP
+#include "osdep/windows_utils.h"
+#endif
+
 // List of builtin modules and their contents as strings.
 // All these are generated from player/lua/*.lua
 static const char * const builtin_lua_scripts[][2] = {
@@ -386,6 +390,25 @@ static int run_lua(lua_State *L)
     lua_pop(L, 1); // -
 
     luaL_openlibs(L);
+
+#if HAVE_WIN32_DESKTOP
+    PROCESS_MITIGATION_DYNAMIC_CODE_POLICY policy = {0};
+    if (!GetProcessMitigationPolicy(GetCurrentProcess(), ProcessDynamicCodePolicy,
+                                    &policy, sizeof(policy))) {
+        return luaL_error(L, "Reading the process dynamic-code policy failed (%d).",
+                          (int)GetLastError());
+    }
+    if (policy.ProhibitDynamicCode) {
+        // LuaJIT otherwise terminates the process when a hot loop needs executable memory.
+        lua_getglobal(L, "jit"); // jit
+        if (lua_istable(L, -1)) {
+            lua_getfield(L, -1, "off"); // jit off
+            lua_call(L, 0, 0); // jit
+            MP_VERBOSE(ctx, "Using the Lua interpreter under dynamic-code protection.\n");
+        }
+        lua_pop(L, 1); // -
+    }
+#endif
 
     // used by get_ctx()
     lua_pushlightuserdata(L, ctx); // ctx

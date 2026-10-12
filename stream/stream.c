@@ -20,6 +20,7 @@
 #include <limits.h>
 
 #include <assert.h>
+#include <libavutil/error.h>
 
 #include "osdep/io.h"
 
@@ -39,6 +40,7 @@
 #include "osdep/timer.h"
 #include "stream.h"
 #include "cache_lru.h"
+#include "network.h"
 
 #include "options/m_option.h"
 #include "options/m_config.h"
@@ -211,8 +213,7 @@ const struct m_sub_options stream_conf = {
         .lru_cache_bucket = 64 * 1024,
         // 16 KiB per-miss byte target: large enough to absorb mp4 sample
         // table scans (~1-2 KiB step) on connections where a single TCP
-        // recv only returns 1-4 KiB, small enough to keep worst-case
-        // per-fetch latency bounded on per-GET-throttled CDNs.
+        // recv only returns 1-4 KiB. Additional reads only drain buffered data.
         .lru_cache_min_fetch = 16 * 1024,
         // 4 MiB tail prefetch window pulled in on each miss in the last
         // 64 MiB of the file. Empirically this covers the moov atom of
@@ -470,6 +471,11 @@ static int stream_create_instance(const stream_info_t *sinfo,
     s->info = sinfo;
     s->autoprobed = !args->sinfo;
     s->cancel = args->cancel;
+    s->read_deadline_parent = args->read_deadline_parent;
+    struct mp_network_opts *net_opts =
+        mp_get_config_group(s, s->global, &mp_network_conf);
+    s->network_timeout = net_opts->timeout;
+    talloc_free(net_opts);
     s->open_offset = args->open_offset;
     s->url = talloc_strdup(s, url);
     s->path = talloc_strdup(s, path);
@@ -650,6 +656,7 @@ struct stream *stream_open_lru_cursor(struct stream *s,
         .flags = s->mode | s->stream_origin,
         .sinfo = s->info,
         .open_offset = pos,
+        .read_deadline_parent = s,
         .lru_cursor = true,
         .log_parent = s->log,
         .log_name = name,
@@ -683,6 +690,31 @@ stream_t *open_output_stream(const char *filename, struct mpv_global *global)
 // following network stream fails mid-stream (see stream_read_unbuffered).
 #define STREAM_MID_STREAM_REOPEN_ATTEMPTS 3
 
+int64_t stream_get_io_deadline(struct stream *s)
+{
+    if (s->read_deadline_parent)
+        return stream_get_io_deadline(s->read_deadline_parent);
+    if (s->read_deadline)
+        return s->read_deadline;
+    return s->network_timeout > 0
+        ? mp_time_ns_add(mp_time_ns(), s->network_timeout) : 0;
+}
+
+bool stream_read_deadline_expired(struct stream *s)
+{
+    int64_t deadline = stream_get_io_deadline(s);
+    return deadline && mp_time_ns() >= deadline;
+}
+
+void stream_note_read_progress(struct stream *s)
+{
+    if (s->read_deadline_parent) {
+        stream_note_read_progress(s->read_deadline_parent);
+    } else if (s->read_deadline && s->network_timeout > 0) {
+        s->read_deadline = mp_time_ns_add(mp_time_ns(), s->network_timeout);
+    }
+}
+
 // One read attempt at the current logical position through whichever path is
 // active (LRU cache or direct backend). Returns bytes read (0 on EOF / error /
 // cancel); does not advance s->pos or touch s->eof -- the caller does that.
@@ -706,7 +738,7 @@ static int stream_read_backend(stream_t *s, void *buf, int len)
 // s->buffer, but into buf[0..len] instead.
 // Returns 0 on error or EOF, and length of bytes read on success.
 // Partial reads are possible, even if EOF is not reached.
-static int stream_read_unbuffered(stream_t *s, void *buf, int len)
+static int stream_read_unbuffered_impl(stream_t *s, void *buf, int len)
 {
     mp_assert(len >= 0);
     if (len <= 0)
@@ -731,6 +763,7 @@ static int stream_read_unbuffered(stream_t *s, void *buf, int len)
     for (int attempt = 0;
          res <= 0 && s->error != 0 && s->reconnect && !s->broken
              && !mp_cancel_test(s->cancel)
+             && !stream_read_deadline_expired(s)
              && attempt < STREAM_MID_STREAM_REOPEN_ATTEMPTS;
          attempt++)
     {
@@ -738,8 +771,15 @@ static int stream_read_unbuffered(stream_t *s, void *buf, int len)
         // expired link that a fresh reopen fixes instantly); back off on
         // later attempts. mp_cancel_wait() (unlike mp_cancel_test) is not
         // NULL-safe and returns true if cancelled, so guard s->cancel.
-        if (attempt > 0 && s->cancel && mp_cancel_wait(s->cancel, (double)attempt))
-            break;
+        if (attempt > 0 && s->cancel) {
+            int64_t deadline = stream_get_io_deadline(s);
+            double delay = attempt;
+            if (deadline)
+                delay = MPMIN(delay, MP_TIME_NS_TO_S(deadline - mp_time_ns()));
+            if (mp_cancel_wait(s->cancel, MPMAX(delay, 0)) ||
+                stream_read_deadline_expired(s))
+                break;
+        }
 
         MP_WARN(s, "network read failed at pos %" PRId64 " (err=%d); reopening "
                 "source to refresh the redirect/link (attempt %d/%d)\n",
@@ -767,6 +807,10 @@ static int stream_read_unbuffered(stream_t *s, void *buf, int len)
     }
 
     if (res <= 0) {
+        if (!mp_cancel_test(s->cancel) && stream_read_deadline_expired(s)) {
+            s->error = AVERROR(ETIMEDOUT);
+            MP_WARN(s, "Network data wait exhausted its timeout budget.\n");
+        }
         s->eof = 1;
         return 0;
     }
@@ -776,6 +820,16 @@ static int stream_read_unbuffered(stream_t *s, void *buf, int len)
     s->pos += res;
     s->total_unbuffered_read_bytes += res;
     return res;
+}
+
+static int stream_read_unbuffered(stream_t *s, void *buf, int len)
+{
+    int64_t previous = s->read_deadline;
+    if (s->is_network && !previous)
+        s->read_deadline = stream_get_io_deadline(s);
+    int result = stream_read_unbuffered_impl(s, buf, len);
+    s->read_deadline = previous;
+    return result;
 }
 
 // Ask for having at most "forward" bytes ready to read in the buffer.

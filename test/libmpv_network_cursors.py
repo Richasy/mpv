@@ -515,6 +515,7 @@ def run_client(library, url, options, pcm_path, count):
 
         command("loadfile", url)
         eof_time = pump(90, "eof")
+        command("set", "pause", "yes")
 
         texts = []
         for n in range(count):

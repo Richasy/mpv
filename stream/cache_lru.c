@@ -8,7 +8,7 @@
  *     short bounded fill_buffer loop within a single backend connection if
  *     min_fetch_size > 0. The cache is latency-transparent: a miss costs at
  *     most one backend round-trip plus, in the bounded-loop case, a few
- *     extra TCP recv() syscalls on the same connection (no new TLS).
+ *     buffered reads on the same connection (no new network wait).
  *   - One bucket per bucket-index. A bucket caches a contiguous byte range
  *     [start_offset, start_offset+valid_size) where start_offset lies inside
  *     [bidx*bucket_size, (bidx+1)*bucket_size). The range never crosses a
@@ -29,9 +29,10 @@
  *   tables in moov, ~1-2 KiB per step) therefore observed almost-100% miss
  *   rates with the rev-3 cache.
  *
- *   Rev 4 reintroduces a fill loop but with hard bounds: an explicit byte
+ *   The fill loop has hard bounds: an explicit byte
  *   target (default 16 KiB, configurable via --stream-lru-cache-min-fetch)
- *   AND a per-fetch iteration cap (LRU_MAX_FETCH_ITERS). The byte target
+ *   AND a per-fetch iteration cap (LRU_MAX_FETCH_ITERS). After the first
+ *   read, it only drains bytes already buffered by the backend. The byte target
  *   is intentionally much smaller than bucket_size, so the worst-case
  *   per-fetch latency stays bounded even on the throttled CDNs that broke
  *   the old aggressive loop. Setting min_fetch_size to 0 restores rev-3
@@ -97,8 +98,7 @@
 #define LRU_MAX_BUCKET_SIZE       (1u * 1024u * 1024u)
 
 // Hard cap on fill_buffer iterations per fetch_at() call, regardless of the
-// configured min_fetch target. Stops a misbehaving / extremely slow backend
-// from inflating any single miss into an unbounded latency hit.
+// configured min_fetch target. Additional reads must also be ready immediately.
 #define LRU_MAX_FETCH_ITERS       8
 
 // Self-disable after this many consecutive backend failures, so that a dead
@@ -300,7 +300,7 @@ static void bucket_touch(struct stream_lru_cache *c, struct bucket_entry *e)
 // same backend connection (no extra seek, no extra TLS handshake) when
 // c->min_fetch_size > 0. The loop stops as soon as the cumulative bytes
 // read reach c->min_fetch_size, the iteration cap (LRU_MAX_FETCH_ITERS)
-// is hit, or the backend signals EOF / error / cancel.
+// is hit, no buffered bytes are ready, or the backend signals EOF/error/cancel.
 
 static void cache_drop_bidx(struct stream_lru_cache *c, uint64_t bidx)
 {
@@ -445,11 +445,14 @@ static bool cursor_seek(struct stream_lru_cache *c, struct lru_cursor *cur,
 // a backend error the cursor's position is unknown. Never seeks.
 static bool cursor_pull(struct stream_lru_cache *c, struct stream *s,
                         struct lru_cursor *cur, int64_t target,
-                        int64_t file_size)
+                        int64_t file_size, bool speculative)
 {
     struct stream *backend = cur->backend;
     while (cur->pos < target) {
         if (mp_cancel_test(s->cancel))
+            return false;
+        if (speculative &&
+            (!backend->read_ready || !backend->read_ready(backend)))
             return false;
         uint64_t bidx = (uint64_t)cur->pos >> c->bucket_shift;
         int64_t bucket_end = ((int64_t)bidx << c->bucket_shift)
@@ -479,6 +482,7 @@ static bool cursor_pull(struct stream_lru_cache *c, struct stream *s,
             return false;
         }
         cur->pos += chunk;
+        stream_note_read_progress(s);
         c->bytes_read_from_backend += chunk;
         uint32_t valid = (uint32_t)(cur->pos - e->start_offset);
         if (valid > e->valid_size)
@@ -514,7 +518,7 @@ static struct lru_cursor *cursor_for(struct stream_lru_cache *c,
     }
     if (closest) {
         int64_t gap = pos - closest->pos;
-        if (gap == 0 || cursor_pull(c, s, closest, pos, file_size)) {
+        if (gap == 0 || cursor_pull(c, s, closest, pos, file_size, false)) {
             if (gap > 0) {
                 c->read_throughs++;
                 c->read_through_bytes += gap;
@@ -611,12 +615,10 @@ static struct bucket_entry *fetch_at(struct stream_lru_cache *c,
 
     // Bounded fill loop. With min_fetch_size == 0 this degenerates to the
     // legacy single-shot fetch (one fill_buffer per miss). With min_fetch_size
-    // > 0 we keep pumping fill_buffer on the SAME backend connection until
+    // > 0 we keep draining buffered bytes on the SAME backend connection until
     // either we've accumulated at least min_fetch_size bytes, hit the hard
     // iteration cap, the backend returns 0/error/EOF, or the stream is
-    // cancelled. All extra iterations share the original seek + TLS
-    // handshake -- they are just additional TCP recv() calls on a connection
-    // we already paid the latency for.
+    // cancelled. Optional batching must not wait for another network read.
     int target = c->min_fetch_size ? (int)c->min_fetch_size : 1;
     if (target > max_want)
         target = max_want;
@@ -625,6 +627,8 @@ static struct bucket_entry *fetch_at(struct stream_lru_cache *c,
     // Each retry follows the loss of one additional connection or the single
     // reopen of a dead one, so the bound only guards against surprises.
     for (int attempt = 0; attempt <= STREAM_LRU_MAX_CURSORS + 1; attempt++) {
+        if (stream_read_deadline_expired(s))
+            return NULL;
         struct lru_cursor *cur = cursor_for(c, s, pos, file_size);
         if (!cur)
             return NULL;
@@ -665,10 +669,13 @@ static struct bucket_entry *fetch_at(struct stream_lru_cache *c,
                 break;
             }
             got += chunk;
+            stream_note_read_progress(s);
 
             if (got >= target)
                 break;
             if (iters >= LRU_MAX_FETCH_ITERS)
+                break;
+            if (!backend->read_ready || !backend->read_ready(backend))
                 break;
         }
 
@@ -1021,7 +1028,7 @@ int stream_lru_cache_read(struct stream_lru_cache *c, struct stream *s,
     c->bytes_served += copy;
     s->error = 0;
 
-    // Tail prefetch (after data is safely copied to the caller buffer, so
+    // Opportunistic tail prefetch (after data is safely copied to the caller buffer, so
     // any eviction triggered by prefetch inserts cannot corrupt our return).
     // Re-triggered on EVERY miss whose pos falls in the tail region. The
     // natural rate limiter is cache coverage itself: once a 4 MiB window
@@ -1032,7 +1039,7 @@ int stream_lru_cache_read(struct stream_lru_cache *c, struct stream *s,
     //
     // fetch_at left the cursor right behind the fresh data, which is
     // exactly where the prefetch wants to continue: no extra seek, no extra
-    // TLS handshake.
+    // TLS handshake. Stop as soon as the backend would need network I/O.
     if (c->tail_prefetch_size > 0
         && file_size > 0
         && pos >= file_size - (int64_t)c->tail_threshold
@@ -1042,7 +1049,7 @@ int stream_lru_cache_read(struct stream_lru_cache *c, struct stream *s,
         int64_t pf_target = pos + (int64_t)c->tail_prefetch_size;
         if (pf_target > file_size)
             pf_target = file_size;
-        bool done = cursor_pull(c, s, used, pf_target, file_size)
+        bool done = cursor_pull(c, s, used, pf_target, file_size, true)
                     || used->pos >= file_size;
         MP_VERBOSE(c, "lru_cache: tail prefetch %s at pos=%" PRId64
                       " (file_size=%" PRId64 ", target=%u bytes)\n",

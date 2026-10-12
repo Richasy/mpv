@@ -339,6 +339,12 @@ if get_option('libmpv')
             test('libmpv-network-cursors', python,
                  args: [files('libmpv_network_cursors.py'), mpvlib.full_path()],
                  depends: mpvlib, suite: 'libmpv-network', timeout: 300)
+            wait_args = ['-B', files('libmpv_network_wait.py'), mpvlib.full_path()]
+            if not features['libcurl']
+                wait_args += '--lavf-only'
+            endif
+            test('libmpv-network-wait', python, args: wait_args,
+                 depends: mpvlib, suite: 'libmpv-network', timeout: 90)
             tsmuxer = find_program('tsMuxeR', required: false)
             disc_ffmpeg = find_program('ffmpeg', required: false)
             if features['libbluray'] and tsmuxer.found() and disc_ffmpeg.found()

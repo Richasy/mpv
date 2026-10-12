@@ -5838,14 +5838,17 @@ Cache
     power of two between 4KiB and 1MiB.
 
 ``--stream-lru-cache-min-fetch=<bytesize>``
-    Bytes to read on one connection before a cache miss returns (default:
-    16KiB). ``0`` returns after a single read call.
+    Target bytes to collect on one connection for a cache miss (default:
+    16KiB). After the first read, only immediately available backend-buffered
+    bytes are collected: this target never adds another network wait before
+    delivering existing data. ``0`` returns after a single read call.
 
 ``--stream-lru-cache-tail-prefetch=<bytesize>``, ``--stream-lru-cache-tail-threshold=<bytesize>``
     A cache miss within the last ``--stream-lru-cache-tail-threshold`` bytes
     of the file (default: 64MiB) reads ``--stream-lru-cache-tail-prefetch``
-    bytes ahead (default: 4MiB), which covers the moov atom of an mp4 that
-    stores it at the end in one request. ``0`` disables the prefetch.
+    bytes ahead (default: 4MiB), opportunistically draining buffered data.
+    It stops before another network wait, so fetching optional metadata does
+    not delay the completed read. ``0`` disables the prefetch.
 
 ``--stream-lru-cache-cursors=<1-4>``
     Number of network connections the byte-range cache may use for one stream
@@ -5863,7 +5866,8 @@ Cache
     A cache miss at most this far ahead of one of the stream's connections is
     reached by reading forward on that connection instead of seeking, which
     over HTTP would cost a new connection (default: 4MiB). The bytes read on
-    the way are cached. ``0`` always seeks.
+    the way are cached. Actual forward progress renews the network data-wait
+    budget; opening or retrying a connection without data does not. ``0`` always seeks.
 
 ``--vd-queue-enable=<yes|no>, --ad-queue-enable``
     Enable running the video/audio decoder on a separate thread (default: no).
@@ -5990,6 +5994,13 @@ Network
     at least HTTP. The special value 0 uses the FFmpeg defaults. If a
     protocol is used which does not support timeouts, this option is silently
     ignored.
+
+    HTTP streams using FFmpeg or libcurl also bound a blocking open, seek,
+    or data wait with this timeout. A logical read shares its data-wait budget
+    across byte-cache connections and retries; successfully reading bytes
+    renews it. Expiration is a network error, not user cancellation or EOF.
+    ``0`` disables this additional deadline and retains backend defaults.
+    This is not a total playback or startup deadline.
 
     The FFmpeg HTTP stream backend emits ``network_io`` diagnostics through
     the owning stream's logger. Verbose logging records open and byte-seek

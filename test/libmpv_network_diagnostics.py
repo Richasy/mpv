@@ -22,7 +22,7 @@ def integer(tag, value, width=1):
     return element(tag, value.to_bytes(width, "big"))
 
 
-def matroska_fixture():
+def matroska_fixture(include_seek_head=True, seconds=10, chunk_seconds=10):
     header = element(
         "1a45dfa3",
         integer("4286", 1)
@@ -36,7 +36,7 @@ def matroska_fixture():
     info = element(
         "1549a966",
         integer("2ad7b1", 1000000, 3)
-        + element("4489", struct.pack(">d", 10000)),
+        + element("4489", struct.pack(">d", seconds * 1000)),
     )
     track = element(
         "ae",
@@ -52,10 +52,16 @@ def matroska_fixture():
         ),
     )
     tracks = element("1654ae6b", track)
-    cluster = element(
-        "1f43b675",
-        integer("e7", 0) + element("a3", b"\x81\x00\x00\x80" + bytes(160000)),
+    cluster = b"".join(
+        element(
+            "1f43b675",
+            integer("e7", start * 1000, 4)
+            + element("a3", b"\x81\x00\x00\x80" + bytes(16000 * chunk_seconds)),
+        )
+        for start in range(0, seconds, chunk_seconds)
     )
+    if not include_seek_head:
+        return header + element("18538067", info + tracks + cluster), None
     cues = element("1c53bb6b", b"")
     tags = element("1254c367", b"")
 
@@ -157,7 +163,13 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
 
         # Headers succeed; only the remote tail body is held until the native
         # logger proves a pending operation or the cancellation case finishes.
-        if start >= self.server.tail_offset and path in ("/stall", "/cancel"):
+        held_tail = path in ("/stall", "/cancel") and end >= self.server.tail_offset
+        body_start = start
+        if held_tail:
+            if start < self.server.tail_offset:
+                self.wfile.write(media[start : self.server.tail_offset])
+                self.wfile.flush()
+            body_start = max(start, self.server.tail_offset)
             gate = (
                 self.server.release_stall
                 if path == "/stall"
@@ -170,7 +182,10 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
                 self.close_connection = True
                 return
         try:
-            self.wfile.write(media[start : end + 1])
+            body_end = end + 1
+            if path == "/reuse-media":
+                body_end = min(body_end, self.server.tail_offset)
+            self.wfile.write(media[body_start : body_end])
         except (BrokenPipeError, ConnectionResetError):
             # Stopping a native client intentionally abandons its response.
             pass

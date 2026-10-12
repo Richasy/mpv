@@ -3100,9 +3100,12 @@ static int read_block(demuxer_t *demuxer, int64_t end, struct block_info *block)
 
     res = 1;
 exit:
+    if (s->error)
+        res = -1;
     if (res <= 0)
         free_block(block);
-    stream_seek_skip(s, endpos);
+    if (!s->error)
+        stream_seek_skip(s, endpos);
     return res;
 }
 
@@ -3308,6 +3311,8 @@ static int read_next_block_into_queue(demuxer_t *demuxer)
     mkv_demuxer_t *mkv_d = (mkv_demuxer_t *) demuxer->priv;
     stream_t *s = demuxer->stream;
     struct block_info block = {0};
+    if (s->error)
+        return -1;
 
     while (1) {
         while (stream_tell(s) < mkv_d->cluster_end) {
@@ -3363,6 +3368,10 @@ static int read_next_block_into_queue(demuxer_t *demuxer)
         }
 
     find_next_cluster:
+        // Resynchronization is for malformed media, not a failed transport.
+        // Retrying parser reads here would discard the exhausted I/O budget.
+        if (s->error)
+            return -1;
         mkv_d->cluster_end = 0;
         for (;;) {
             mkv_d->cluster_start = stream_tell(s);

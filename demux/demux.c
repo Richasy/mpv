@@ -2700,6 +2700,9 @@ static bool read_packet(struct demux_internal *in)
     bool eof = true;
     if (demux->desc->read_packet && !demux_read_interrupted(demux))
         eof = !demux->desc->read_packet(demux, &pkt);
+    if (eof && demux->stream && demux->stream->error &&
+        !demux_read_interrupted(demux))
+        demux->stream_error = true;
 
     mp_mutex_lock(&in->lock);
     update_cache(in);

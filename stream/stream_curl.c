@@ -815,6 +815,7 @@ static void setup_curl(struct priv *p)
     bool identity = p->start_offset > 0 || p->request_end > 0;
     curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, identity ? "identity" : "");
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_FAILONERROR, 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, (long)p->opts->max_redirects);
     curl_easy_setopt(c, CURLOPT_HTTP_VERSION, (long)p->opts->http_version);
     curl_easy_setopt(c, CURLOPT_HSTS_CTRL, (long)CURLHSTS_ENABLE);
@@ -881,12 +882,23 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
     if (max_len <= 0)
         return 0;
 
+    int64_t deadline = stream_get_io_deadline(s);
+    bool timed_out = false;
     mp_mutex_lock(&p->mtx);
 
     while (p->count == 0 && !p->stream_eof && !p->stream_error &&
            !atomic_load_explicit(&p->aborted, memory_order_relaxed))
     {
-        mp_cond_wait(&p->cond, &p->mtx);
+        if (deadline && mp_time_ns() >= deadline) {
+            p->stream_error = true;
+            p->error_code = CURLE_OPERATION_TIMEDOUT;
+            timed_out = true;
+            break;
+        }
+        if (deadline)
+            mp_cond_timedwait_until(&p->cond, &p->mtx, deadline);
+        else
+            mp_cond_wait(&p->cond, &p->mtx);
     }
 
     size_t copy = MPMIN((size_t)max_len, p->count);
@@ -906,6 +918,10 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
 
     mp_mutex_unlock(&p->mtx);
 
+    if (timed_out) {
+        cmd_sync(p, CMD_REMOVE, 0, false);
+        MP_WARN(s, "Network data wait exhausted its timeout budget.\n");
+    }
     if (unpause)
         cmd_async(p, CMD_UNPAUSE);
 
@@ -925,6 +941,15 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
     }
 
     return copy;
+}
+
+static bool curl_read_ready(struct stream *s)
+{
+    struct priv *p = s->priv;
+    mp_mutex_lock(&p->mtx);
+    bool ready = p->count > 0;
+    mp_mutex_unlock(&p->mtx);
+    return ready;
 }
 
 static int curl_seek(struct stream *s, int64_t pos)
@@ -1045,13 +1070,28 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     setup_curl(p);
     mp_cancel_set_cb(s->cancel, on_cancel, p);
 
+    int64_t deadline = stream_get_io_deadline(s);
     cmd_sync(p, CMD_ADD, 0, false);
 
     mp_mutex_lock(&p->mtx);
-    while (!p->probed && !atomic_load_explicit(&p->aborted, memory_order_relaxed))
-        mp_cond_wait(&p->cond, &p->mtx);
+    bool timed_out = false;
+    while (!p->probed && !atomic_load_explicit(&p->aborted, memory_order_relaxed)) {
+        if (deadline && mp_time_ns() >= deadline) {
+            timed_out = true;
+            break;
+        }
+        if (deadline)
+            mp_cond_timedwait_until(&p->cond, &p->mtx, deadline);
+        else
+            mp_cond_wait(&p->cond, &p->mtx);
+    }
     mp_mutex_unlock(&p->mtx);
 
+    if (timed_out) {
+        cmd_sync(p, CMD_REMOVE, 0, false);
+        MP_WARN(s, "Network open exhausted its timeout budget.\n");
+        return STREAM_ERROR;
+    }
     if (!p->stream_ok || atomic_load(&p->aborted))
         return STREAM_ERROR;
 
@@ -1071,6 +1111,7 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     s->streaming = true;
     s->fast_skip = true;
     s->fill_buffer = curl_fill_buffer;
+    s->read_ready = curl_read_ready;
     s->seek = p->seekable ? curl_seek : NULL;
     s->get_size = curl_get_size;
     s->control = curl_control;

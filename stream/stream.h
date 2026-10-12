@@ -226,6 +226,8 @@ typedef struct stream {
 
     // Read
     int (*fill_buffer)(struct stream *s, void *buffer, int max_len);
+    // True only when fill_buffer can return buffered bytes without network I/O.
+    bool (*read_ready)(struct stream *s);
     // Write
     int (*write_buffer)(struct stream *s, void *buffer, int len);
     // Seek
@@ -258,6 +260,9 @@ typedef struct stream {
     // is the backend's error code (e.g. an AVERROR), or a non-zero sentinel
     // when no specific code is available; any non-zero value means error.
     int error;
+    double network_timeout;
+    int64_t read_deadline;
+    struct stream *read_deadline_parent;
     // Terminal failure flag. Set when an in-place backend reopen
     // (s->reconnect) failed, or succeeded but left the backend cursor detached
     // from s->pos and it could not be realigned. The backend is then unusable
@@ -362,6 +367,9 @@ int stream_read_peek(stream_t *s, void *buf, int buf_size);
 void stream_drop_buffers(stream_t *s);
 void stream_rebase_position(stream_t *s);
 int64_t stream_get_size(stream_t *s);
+int64_t stream_get_io_deadline(struct stream *s);
+bool stream_read_deadline_expired(struct stream *s);
+void stream_note_read_progress(struct stream *s);
 
 struct mpv_global;
 
@@ -384,6 +392,7 @@ struct stream_open_args {
     const stream_info_t *sinfo; // NULL = autoprobe, otherwise force stream impl.
     void *special_arg;          // specific to impl., use only with sinfo
     int64_t open_offset;        // see stream.open_offset
+    struct stream *read_deadline_parent;
     // Additional connection of an LRU-cached stream: never gets a cache of
     // its own and logs as log_name below log_parent.
     bool lru_cursor;

@@ -69,6 +69,9 @@ struct lavf_priv {
     int64_t next_slow_report;
     int slow_reports;
     bool report_operation;
+    int64_t deadline;
+    int64_t bytes_read;
+    bool timed_out;
 };
 
 static void begin_io(struct lavf_priv *p, const char *operation,
@@ -82,6 +85,10 @@ static void begin_io(struct lavf_priv *p, const char *operation,
     p->operation_offset = offset;
     p->operation_size = size;
     p->operation_started = mp_time_ns();
+    p->deadline = strcmp(operation, "close")
+        ? stream_get_io_deadline(p->stream) : 0;
+    p->timed_out = false;
+    p->bytes_read = p->avio ? p->avio->bytes_read : 0;
     p->next_slow_report = p->operation_started + MP_TIME_S_TO_NS(15);
     p->slow_reports = 0;
     p->report_operation = report;
@@ -92,13 +99,21 @@ static void begin_io(struct lavf_priv *p, const char *operation,
     }
 }
 
-static void end_io(struct lavf_priv *p, int64_t result, bool failure)
+static int64_t end_io(struct lavf_priv *p, int64_t result, bool failure)
 {
     if (!p->network_diagnostics)
-        return;
+        return result;
 
     int64_t elapsed = mp_time_ns() - p->operation_started;
     bool cancelled = mp_cancel_test(p->stream->cancel);
+    if (p->timed_out && !cancelled) {
+        if (result < 0)
+            result = AVERROR(ETIMEDOUT);
+        if (p->avio && p->avio->error == AVERROR_EXIT)
+            p->avio->error = AVERROR(ETIMEDOUT);
+        p->stream->error = AVERROR(ETIMEDOUT);
+        failure = true;
+    }
     int avio_error = p->avio ? p->avio->error : 0;
     bool eof = p->avio && p->avio->eof_reached;
     int error = result < 0 ? (int)result : avio_error;
@@ -115,6 +130,13 @@ static void end_io(struct lavf_priv *p, int64_t result, bool failure)
                eof, cancelled, MP_TIME_NS_TO_MS(elapsed));
     }
     p->operation = NULL;
+    return result;
+}
+
+static bool read_ready(struct stream *s)
+{
+    struct lavf_priv *p = s->priv;
+    return p && p->avio && p->avio->buf_ptr < p->avio->buf_end;
 }
 
 static void report_slow_io(struct lavf_priv *p)
@@ -155,8 +177,8 @@ static int fill_buffer(stream_t *s, void *buffer, int max_len)
         return -1;
     begin_io(p, "read", avio_tell(avio), max_len, p->report_next_read);
     int r = avio_read_partial(avio, buffer, max_len);
-    end_io(p, r, (r < 0 && r != AVERROR_EOF) ||
-                (avio->error && avio->error != AVERROR_EOF));
+    r = end_io(p, r, (r < 0 && r != AVERROR_EOF) ||
+                    (avio->error && avio->error != AVERROR_EOF));
     p->report_next_read = false;
     if (r <= 0) {
         // Distinguish a real I/O error from a clean EOF. avio->error is set
@@ -165,13 +187,10 @@ static int fill_buffer(stream_t *s, void *buffer, int max_len)
         // Without this propagation, callers see the same return value for
         // EOF and error, and a mid-stream HTTP 403 (e.g. expired CDN ticket)
         // gets silently treated as natural end-of-file by demux_lavf.
-        if (avio->error) {
+        if (avio->error && avio->error != AVERROR_EOF) {
             s->error = avio->error;
-        } else if (r < 0) {
-            // r itself is an AVERROR; AVERROR_EOF is benign, anything else
-            // is treated as an error.
-            if (r != AVERROR_EOF)
-                s->error = r;
+        } else {
+            s->error = r < 0 && r != AVERROR_EOF ? r : 0;
         }
         return -1;
     }
@@ -209,7 +228,7 @@ static int seek(stream_t *s, int64_t newpos)
         MP_VERBOSE(s, "stream_lavf seek to %" PRId64 "\n", newpos);
     begin_io(p, "seek", newpos, 0, moved);
     int64_t r = avio_seek(avio, newpos, SEEK_SET);
-    end_io(p, r, r < 0);
+    r = end_io(p, r, r < 0);
     p->report_next_read |= moved;
     if (r < 0) {
         // Record the error so a subsequent fill_buffer that returns short
@@ -294,7 +313,7 @@ static int control(stream_t *s, int cmd, void *arg)
         struct stream_avseek *c = arg;
         begin_io(p, "time-seek", -1, 0, true);
         int64_t r = avio_seek_time(avio, c->stream_index, c->timestamp, c->flags);
-        end_io(p, r, r < 0);
+        r = end_io(p, r, r < 0);
         p->report_next_read = true;
         if (r >= 0) {
             s->error = 0;
@@ -344,6 +363,20 @@ static int interrupt_cb(void *ctx)
     bool cancelled = mp_cancel_test(stream->cancel);
     if (!cancelled)
         report_slow_io(stream->priv);
+    struct lavf_priv *p = stream->priv;
+    if (!cancelled && p && p->operation && p->avio &&
+        p->avio->bytes_read > p->bytes_read)
+    {
+        p->bytes_read = p->avio->bytes_read;
+        stream_note_read_progress(stream);
+        p->deadline = stream_get_io_deadline(stream);
+    }
+    if (!cancelled && p && p->network_diagnostics && p->operation &&
+        p->deadline && mp_time_ns() >= p->deadline)
+    {
+        p->timed_out = true;
+        return 1;
+    }
     return cancelled;
 }
 
@@ -643,7 +676,7 @@ static int open_f(stream_t *stream)
     begin_io(p, "open", open_offset, 0, true);
     int err = avio_open2(&avio, filename, flags, &cb, &dict);
     p->avio = avio;
-    end_io(p, err, err < 0);
+    err = end_io(p, err, err < 0);
     if (err == AVERROR(EIO) && ranged_open && !mp_cancel_test(stream->cancel)) {
         // A server that ignores the range of the first request answers from
         // the beginning, which the http protocol reports as EIO. Open from
@@ -657,7 +690,7 @@ static int open_f(stream_t *stream)
         begin_io(p, "open", 0, 0, true);
         err = avio_open2(&avio, filename, flags, &cb, &dict);
         p->avio = avio;
-        end_io(p, err, err < 0);
+        err = end_io(p, err, err < 0);
     }
     av_dict_free(&plain_dict);
     if (err < 0) {
@@ -690,6 +723,7 @@ static int open_f(stream_t *stream)
     stream->seekable = avio->seekable & AVIO_SEEKABLE_NORMAL;
     stream->seek = stream->seekable ? seek : NULL;
     stream->fill_buffer = fill_buffer;
+    stream->read_ready = read_ready;
     stream->write_buffer = write_buffer;
     stream->get_size = get_size;
     stream->control = control;

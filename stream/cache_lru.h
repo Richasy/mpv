@@ -118,6 +118,13 @@ int stream_lru_cache_read(struct stream_lru_cache *c, struct stream *s,
 // by cursor 0 seeks it first.
 void stream_lru_cache_invalidate_backend_pos(struct stream_lru_cache *c);
 
+// Retain cached bytes but retire additional connections before reopening
+// the original source. Those connections may still use a stale redirect.
+void stream_lru_cache_prepare_reconnect(struct stream_lru_cache *c);
+
+// Record the byte position guaranteed by a successful backend reconnect.
+void stream_lru_cache_finish_reconnect(struct stream_lru_cache *c, int64_t pos);
+
 // Returns true if the cache has self-disabled due to repeated backend
 // failures. In that case the caller should fall back to direct backend reads.
 bool stream_lru_cache_is_disabled(struct stream_lru_cache *c);

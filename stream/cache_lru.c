@@ -924,6 +924,22 @@ void stream_lru_cache_invalidate_backend_pos(struct stream_lru_cache *c)
         c->cursors[0].pos = -1;
 }
 
+void stream_lru_cache_prepare_reconnect(struct stream_lru_cache *c)
+{
+    if (!c)
+        return;
+    cursor_close_extra(c);
+    c->cursors[0].pos = -1;
+}
+
+void stream_lru_cache_finish_reconnect(struct stream_lru_cache *c, int64_t pos)
+{
+    if (!c)
+        return;
+    c->cursors[0].pos = pos;
+    c->backend_reconnects++;
+}
+
 bool stream_lru_cache_is_disabled(struct stream_lru_cache *c)
 {
     return c && c->disabled;

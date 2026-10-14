@@ -694,10 +694,13 @@ int64_t stream_get_io_deadline(struct stream *s)
 {
     if (s->read_deadline_parent)
         return stream_get_io_deadline(s->read_deadline_parent);
-    if (s->read_deadline)
-        return s->read_deadline;
-    return s->network_timeout > 0
-        ? mp_time_ns_add(mp_time_ns(), s->network_timeout) : 0;
+    int64_t deadline = s->read_deadline;
+    if (!deadline && s->network_timeout > 0)
+        deadline = mp_time_ns_add(mp_time_ns(), s->network_timeout);
+    if (s->read_recovery_deadline)
+        deadline = deadline ? MPMIN(deadline, s->read_recovery_deadline) :
+                              s->read_recovery_deadline;
+    return deadline;
 }
 
 bool stream_read_deadline_expired(struct stream *s)
@@ -712,6 +715,19 @@ void stream_note_read_progress(struct stream *s)
         stream_note_read_progress(s->read_deadline_parent);
     } else if (s->read_deadline && s->network_timeout > 0) {
         s->read_deadline = mp_time_ns_add(mp_time_ns(), s->network_timeout);
+    }
+}
+
+static void stream_begin_read_recovery(struct stream *s)
+{
+    if (s->read_deadline_parent) {
+        stream_begin_read_recovery(s->read_deadline_parent);
+    } else if (s->network_timeout > 0 && !s->read_recovery_deadline) {
+        // Recovery gets one fixed window, shared by all reconnects and cursors.
+        // Internal transport progress must not keep a failing read alive forever.
+        s->read_recovery_deadline =
+            mp_time_ns_add(mp_time_ns(), s->network_timeout);
+        s->read_deadline = s->read_recovery_deadline;
     }
 }
 
@@ -746,6 +762,10 @@ static int stream_read_unbuffered_impl(stream_t *s, void *buf, int len)
 
     int res = stream_read_backend(s, buf, len);
 
+    if (res <= 0 && s->error && s->reconnect && !s->broken &&
+        !mp_cancel_test(s->cancel))
+        stream_begin_read_recovery(s);
+
     // Mid-stream recovery for redirect-following network streams (typical
     // case: Emby/Jellyfin issuing a 302 to a cloud-drive direct link, e.g.
     // 123pan). A *hard* transport error (s->error != 0, as opposed to a clean
@@ -758,7 +778,7 @@ static int stream_read_unbuffered_impl(stream_t *s, void *buf, int len)
     // Bounded attempts with a short growing backoff so we never hammer a
     // backend that may already be throttling us.
     //
-    // s->reconnect is only set for HTTP-like network backends (stream_lavf),
+    // s->reconnect is only set for recoverable HTTP-like network backends,
     // so local files and non-network streams skip this entirely.
     for (int attempt = 0;
          res <= 0 && s->error != 0 && s->reconnect && !s->broken
@@ -786,6 +806,9 @@ static int stream_read_unbuffered_impl(stream_t *s, void *buf, int len)
                 s->pos, s->error, attempt + 1,
                 STREAM_MID_STREAM_REOPEN_ATTEMPTS);
 
+        if (s->lru_cache)
+            stream_lru_cache_prepare_reconnect(s->lru_cache);
+
         if (s->reconnect(s, s->pos) != STREAM_OK) {
             // The backend is left unusable (stream_lavf nulls priv on a failed
             // reopen, or it could not reach s->pos). Mark the stream broken so
@@ -795,12 +818,10 @@ static int stream_read_unbuffered_impl(stream_t *s, void *buf, int len)
             break;
         }
 
-        // The reopened backend sits at s->pos. Cached bucket payloads remain
-        // valid (same file content at the same offsets); the LRU cache only
-        // forgets where its own backend was, so its next miss seeks it there
-        // (a no-op at s->pos).
+        // Cached bytes remain valid, and the reopened backend is exactly at
+        // s->pos. Do not seek it again: curl would start another HTTP request.
         if (s->lru_cache)
-            stream_lru_cache_invalidate_backend_pos(s->lru_cache);
+            stream_lru_cache_finish_reconnect(s->lru_cache, s->pos);
         s->error = 0;
 
         res = stream_read_backend(s, buf, len);
@@ -825,10 +846,12 @@ static int stream_read_unbuffered_impl(stream_t *s, void *buf, int len)
 static int stream_read_unbuffered(stream_t *s, void *buf, int len)
 {
     int64_t previous = s->read_deadline;
+    int64_t previous_recovery = s->read_recovery_deadline;
     if (s->is_network && !previous)
         s->read_deadline = stream_get_io_deadline(s);
     int result = stream_read_unbuffered_impl(s, buf, len);
     s->read_deadline = previous;
+    s->read_recovery_deadline = previous_recovery;
     return result;
 }
 

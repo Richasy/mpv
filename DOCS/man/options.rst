@@ -5997,8 +5997,13 @@ Network
 
     HTTP streams using FFmpeg or libcurl also bound a blocking open, seek,
     or data wait with this timeout. A logical read shares its data-wait budget
-    across byte-cache connections and retries; successfully reading bytes
-    renews it. Expiration is a network error, not user cancellation or EOF.
+    across byte-cache connections; successfully reading bytes renews it.
+    After a recoverable HTTP read failure, mpv can reopen the original URL
+    at the current byte offset. Recovery gets one additional window of this
+    length, shared by all retries and byte-cache connections. Internal
+    transport progress does not extend that recovery window; delivering
+    bytes to the reader completes recovery and restores the normal budget.
+    Expiration of recovery is a network error, not user cancellation or EOF.
     ``0`` disables this additional deadline and retains backend defaults.
     This is not a total playback or startup deadline.
 

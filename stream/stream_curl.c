@@ -961,6 +961,8 @@ static int curl_seek(struct stream *s, int64_t pos)
     return 1;
 }
 
+static int curl_reconnect(struct stream *s, int64_t pos);
+
 static int64_t curl_get_size(struct stream *s)
 {
     struct priv *p = s->priv;
@@ -1133,20 +1135,27 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     // touched. The stream layer makes the final call based on seekability, a
     // known file size and --stream-lru-cache.
     //
-    // We intentionally do NOT set s->reconnect: curl always restarts from the
-    // original url with CURLOPT_FOLLOWLOCATION, so every cache miss already
-    // re-resolves the redirect to a fresh link -- the lavf-style in-place
-    // reopen is unnecessary here. We also skip capped sub-range opens
-    // (request_end != 0, e.g. lavf nested IO fetching HLS byte-range segments):
+    // Recovery reopens the original URL and validates the new ranged response.
+    // Skip capped sub-range opens (e.g. nested HLS byte-range segments):
     // those are short-lived, read forward and would only waste a cache buffer
     // each. FTP pays no redirect cost, so it is left out too.
     if (s->mode == STREAM_READ && s->seekable && p->request_end == 0 &&
         p->scheme->proto == MP_CURL_PROTO_HTTP)
     {
+        s->reconnect = curl_reconnect;
         s->wants_lru_cache = true;
     }
 
     return STREAM_OK;
+}
+
+static int curl_reconnect(struct stream *s, int64_t pos)
+{
+    curl_close(s);
+    talloc_free(s->priv);
+    s->priv = NULL;
+    struct stream_open_args args = {.open_offset = pos};
+    return curl_open(s, &args);
 }
 
 static bool curl_has_proto(bstr scheme)

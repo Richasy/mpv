@@ -262,6 +262,7 @@ typedef struct stream {
     int error;
     double network_timeout;
     int64_t read_deadline;
+    int64_t read_recovery_deadline;
     struct stream *read_deadline_parent;
     // Terminal failure flag. Set when an in-place backend reopen
     // (s->reconnect) failed, or succeeded but left the backend cursor detached

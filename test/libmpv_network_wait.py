@@ -3,13 +3,16 @@
 
 """Loopback regressions for data-wait budgets and latency-transparent caching."""
 
+import array
 import contextlib
 import ctypes
 import http.server
 import json
+from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -27,7 +30,11 @@ STOP = 2
 ERROR = 4
 WAIT_BUDGET = 1.5
 CASES = ("min-fetch", "tail-prefetch", "timeout", "retry", "mkv-error",
-         "zero-timeout", "progress", "progress-seek", "healthy")
+         "zero-timeout", "progress", "progress-seek", "healthy",
+         "recover-direct", "recover-owner", "recover-cursor",
+         "recover-timeout", "recover-cancel", "recover-bad-range",
+         "recover-progress", "recover-twice")
+RECOVERY_OFFSET = 320000
 
 
 class Server(http.server.ThreadingHTTPServer):
@@ -40,10 +47,22 @@ class Server(http.server.ThreadingHTTPServer):
             include_seek_head=False, seconds=100, chunk_seconds=1)
         if mode == "progress-seek":
             self.media = bytes(1600000)
+        if mode.startswith("recover-"):
+            samples = array.array("h", ((n * 7919) % 60001 - 30000
+                                       for n in range(800000)))
+            if sys.byteorder != "little":
+                samples.byteswap()
+            self.media = samples.tobytes()
         self.release = threading.Event()
         self.held = threading.Event()
+        self.recovery_held = threading.Event()
         self.lock = threading.Lock()
         self.requests = 0
+        self.origins = 0
+        self.ranges = []
+        self.stalls = 0
+        self.stalled_at = None
+        self.origins_at_stall = None
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -54,6 +73,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         server = self.server
+        recovery = server.mode.startswith("recover-")
+        if recovery and self.path == "/origin":
+            with server.lock:
+                server.origins += 1
+                origin = server.origins
+            self.send_response(302)
+            self.send_header("Location", f"/signed/{origin}")
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            return
         with server.lock:
             server.requests += 1
             request = server.requests
@@ -80,6 +111,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if start > end:
             self.send_error(416)
             return
+        stall = False
+        retry_stall = False
+        recovery_request = False
+        if recovery:
+            with server.lock:
+                server.ranges.append((self.path, start))
+                recovery_request = server.stalls > 0
+                if start >= RECOVERY_OFFSET or server.mode == "recover-progress":
+                    stall = server.stalls < (
+                        2 if server.mode == "recover-twice" else 1)
+                    retry_stall = not stall and server.mode in (
+                        "recover-timeout", "recover-cancel")
+                    server.stalls += 1
+            if recovery_request and server.mode in (
+                    "recover-bad-range", "recover-progress"):
+                start = 0
+                range_header = None
         self.send_response(206 if range_header else 200)
         self.send_header("Content-Type", "video/x-matroska")
         self.send_header("Accept-Ranges", "bytes")
@@ -94,18 +142,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 prefix = 4096
             else:
                 prefix = 65536
+            if server.mode == "recover-progress":
+                prefix = 4096 if recovery_request else RECOVERY_OFFSET + 65536
+            if (server.mode == "timeout" and request > 1) or retry_stall:
+                prefix = 0
             offset = min(end + 1, start + prefix)
             self.wfile.write(media[start:offset])
             self.wfile.flush()
             server.held.set()
 
+            if stall or retry_stall:
+                if stall:
+                    if server.stalled_at is None:
+                        server.stalled_at = time.monotonic()
+                        server.origins_at_stall = server.origins
+                else:
+                    server.recovery_held.set()
+                if not server.release.wait(12):
+                    return
             if server.mode in ("retry", "mkv-error"):
                 return
-            if server.mode not in ("healthy", "progress", "progress-seek"):
+            if not recovery and server.mode not in (
+                    "healthy", "progress", "progress-seek"):
                 if not server.release.wait(12):
                     return
             while offset <= end:
-                chunk = 1024 if server.mode == "progress-seek" else 16384
+                slow_progress = server.mode == "recover-progress" and recovery_request
+                chunk = 1024 if server.mode == "progress-seek" or slow_progress else 16384
                 next_offset = min(end + 1, offset + chunk)
                 self.wfile.write(media[offset:next_offset])
                 self.wfile.flush()
@@ -113,6 +176,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if server.mode == "progress" and server.release.wait(0.03):
                     break
                 if server.mode == "progress-seek" and server.release.wait(0.04):
+                    break
+                if slow_progress and server.release.wait(0.04):
                     break
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
@@ -135,6 +200,9 @@ def serve(mode):
 
 
 def run_case(library, backend, mode):
+    if mode.startswith("recover-"):
+        run_recovery_case(library, backend, mode)
+        return
     with serve(mode) as server, contextlib.ExitStack() as stack:
         mpv = load_libmpv(stack, library)
         options = {
@@ -255,6 +323,130 @@ def run_case(library, backend, mode):
             server.release.set()
         print(json.dumps({"case": mode, "backend": backend, "result": "PASS",
                           "requests": server.requests}), flush=True)
+
+
+def run_recovery_case(library, backend, mode):
+    if mode == "recover-progress" and backend == "curl":
+        print("SKIP curl/recover-progress: exercises FFmpeg internal forward seek",
+              flush=True)
+        return
+    with serve(mode) as server, contextlib.ExitStack() as stack, \
+            tempfile.TemporaryDirectory(prefix="mpv-read-recovery-") as directory:
+        mpv = load_libmpv(stack, library)
+        pcm_path = str(Path(directory, "audio.pcm"))
+        options = {
+            "ao": "pcm", "ao-pcm-file": pcm_path, "ao-pcm-waveheader": "no",
+            "audio-samplerate": "8000", "audio-channels": "mono",
+            "audio-format": "s16", "pause": "yes", "keep-open": "no",
+            "sid": "no", "cache": "no", "demuxer-readahead-secs": "0",
+            "demuxer-max-bytes": "32KiB", "demuxer-max-back-bytes": "0",
+            "demuxer": "rawaudio", "demuxer-rawaudio-rate": "8000",
+            "demuxer-rawaudio-channels": "mono",
+            "demuxer-rawaudio-format": "s16le", "stream-buffer-size": "4KiB",
+            "stream-lru-cache-cursors": "1" if mode == "recover-owner" else "2",
+            "stream-lru-cache-read-through": "0",
+            "stream-lru-cache-tail-prefetch": "0",
+            "network-timeout": str(WAIT_BUDGET),
+            "curl-enabled": "yes" if backend == "curl" else "no",
+            "stream-lavf-o": (
+                "reconnect=1,reconnect_on_network_error=1,"
+                "reconnect_on_http_error=502,reconnect_delay_max=30"),
+        }
+        if mode == "recover-direct":
+            options["stream-lru-cache"] = "0"
+        if mode == "recover-progress":
+            options["stream-lru-cache"] = "0"
+            options["stream-lavf-o"] = (
+                "reconnect=0,reconnect_on_network_error=0,short_seek_size=1048576")
+        client = create_client(stack, mpv, options)
+        lines = []
+
+        def pump(seconds, until):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                event = mpv.mpv_wait_event(client, 0.02).contents
+                if event.event_id == EVENT_LOG_MESSAGE:
+                    message = ctypes.cast(event.data, ctypes.POINTER(LogMessage)).contents
+                    text = message.text.decode("utf-8", errors="replace").rstrip()
+                    lines.append(text)
+                if event.event_id == EVENT_END_FILE:
+                    end = ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents
+                    result = (end.reason, end.error)
+                    if until != EVENT_END_FILE:
+                        raise RuntimeError(f"Unexpected end-file {result}\n"
+                                           + "\n".join(lines[-20:]))
+                    return result
+                if callable(until) and until():
+                    return None
+                if event.event_id == until:
+                    return None
+            raise TimeoutError(f"Recovery did not reach {until}\n"
+                               + "\n".join(lines[-20:]))
+
+        run_command(mpv, client, "loadfile",
+                    f"http://127.0.0.1:{server.server_port}/origin")
+        try:
+            pump(4, FILE_LOADED)
+            run_command(mpv, client, "seek",
+                        str(RECOVERY_OFFSET / 16000), "absolute+exact")
+            run_command(mpv, client, "set", "pause", "no")
+            if mode == "recover-cancel":
+                pump(4, server.recovery_held.is_set)
+                started = time.monotonic()
+                run_command(mpv, client, "stop")
+                result = pump(1, EVENT_END_FILE)
+                if result[0] != STOP or time.monotonic() - started > 1:
+                    raise RuntimeError(f"Recovery cancellation failed: {result}")
+            else:
+                result = pump(6, EVENT_END_FILE)
+                expected = ERROR if mode in (
+                    "recover-timeout", "recover-bad-range", "recover-progress") else EOF
+                if result[0] != expected or (expected == ERROR and result[1] >= 0):
+                    raise RuntimeError(f"Expected reason {expected}, got {result}\n"
+                                       + "\n".join(lines[-20:]))
+                if mode in ("recover-timeout", "recover-progress"):
+                    elapsed = time.monotonic() - server.stalled_at
+                    if not 2 * WAIT_BUDGET - 0.2 <= elapsed <= 2 * WAIT_BUDGET + 0.8:
+                        raise RuntimeError(f"Recovery budget was not bounded: {elapsed}")
+        finally:
+            run_command(mpv, client, "stop")
+            server.release.set()
+
+        positions = [
+            int(match[1]) for line in lines
+            if (match := re.search(r"network read failed at pos (\d+).*reopening",
+                                   line))
+        ]
+        if not positions or not server.stalled_at:
+            raise RuntimeError(f"Fixture did not exercise source recovery; "
+                               f"ranges={server.ranges}, stalled={server.stalled_at}\n"
+                               + "\n".join(lines[-25:]))
+        refreshed = [start for path, start in server.ranges
+                     if int(path.rsplit("/", 1)[-1]) > server.origins_at_stall]
+        if not refreshed or refreshed[0] != positions[0] or \
+                server.origins <= server.origins_at_stall:
+            raise RuntimeError(f"Recovery did not reopen the original URL at "
+                               f"{positions}; ranges={server.ranges}")
+        if mode == "recover-twice" and (
+                len(positions) != 2 or positions[1] <= positions[0]):
+            raise RuntimeError(f"Delivered progress did not reset recovery: {positions}")
+        if mode in ("recover-cursor", "recover-timeout", "recover-cancel") and not any(
+                "connection 1 failed to read" in line for line in lines):
+            raise RuntimeError("Fixture did not exercise an additional cursor")
+        if mode == "recover-progress" and not any(
+                "operation=seek" in line and "result=-138" in line for line in lines):
+            raise RuntimeError("Fixture did not expire an internally progressing seek\n"
+                               + "\n".join(line for line in lines if any(
+                                   part in line for part in
+                                   ("network_io", "reopen", "seek to", "failed"))))
+        if mode not in ("recover-timeout", "recover-cancel",
+                        "recover-bad-range", "recover-progress"):
+            pcm = Path(pcm_path).read_bytes()
+            if pcm != server.media[RECOVERY_OFFSET:]:
+                raise RuntimeError(f"Recovered PCM differs ({len(pcm)} bytes)")
+        print(json.dumps({"case": mode, "backend": backend, "result": "PASS",
+                          "requests": server.requests, "reopenOffsets": positions}),
+              flush=True)
 
 
 def main():

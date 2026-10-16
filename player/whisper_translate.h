@@ -46,6 +46,8 @@ struct wt_openai_config {
                                 // Hard-clamped to <= 5000 ms and enforced as
                                 // one monotonic total request deadline.
     int max_tokens;             // 0 means: don't send max_tokens; <0 means default (128)
+    const char *api;            // NULL/"chat" or explicit "responses"; never inferred from URL/model.
+    const char *reasoning_effort; // optional Responses reasoning effort selected by the caller.
 };
 
 // Translator status snapshot, filled by whisper_translator_get_status().

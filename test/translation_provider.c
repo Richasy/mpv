@@ -15,6 +15,7 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <inttypes.h>
 #include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -29,6 +30,7 @@
 #include "mpv_talloc.h"
 #include "misc/bstr.h"
 #include "osdep/threads.h"
+#include "osdep/timer.h"
 #include "player/whisper_translate_test.h"
 #include "test_utils.h"
 
@@ -895,6 +897,86 @@ static void test_openai_request_shape(void)
     assert_false(request->disable_cookies);
     assert_int_equal(request->timeout_ms, 1234);
 
+    talloc_free(tmp);
+    whisper_translator_destroy(&translator);
+    destroy_transport(&transport);
+}
+
+static void test_responses_request_and_output(void)
+{
+    struct fake_clock clock;
+    init_clock(&clock, 2600, 0);
+    struct fake_transport transport;
+    init_transport(&transport);
+    add_text_plan(&transport, 200, NULL,
+        "{\"status\":\"completed\",\"output\":["
+        "{\"type\":\"reasoning\",\"summary\":[]},"
+        "{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\","
+        "\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"},"
+        "{\"type\":\"output_text\",\"text\":\" world.\"}]}]}");
+    const char *invalid[] = {
+        "{\"status\":\"incomplete\",\"output\":[]}",
+        "{\"status\":\"failed\",\"output\":[]}",
+        "{\"status\":\"completed\",\"output\":[]}",
+        "{\"status\":\"completed\",\"output\":["
+        "{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\","
+        "\"content\":[{\"type\":\"refusal\",\"refusal\":\"no\"}]}]}",
+        "{\"status\":\"completed\",\"output\":["
+        "{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"incomplete\","
+        "\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}]}",
+        "{\"status\":\"completed\",\"output\":["
+        "{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\","
+        "\"content\":[{\"type\":\"output_text\",\"text\":42}]}]}",
+        "{\"choices\":[{\"message\":{\"content\":\"wrong protocol\"}}]}",
+    };
+    for (int n = 0; n < MP_ARRAY_SIZE(invalid); n++)
+        add_text_plan(&transport, 200, NULL, invalid[n]);
+    add_text_plan(&transport, 400, NULL,
+                  "{\"error\":{\"message\":\"fixture failure\"}}");
+    struct wt_test_hooks hooks = {
+        .transport = fake_http,
+        .transport_ctx = &transport,
+        .monotonic_ms = fake_monotonic_ms,
+        .unix_ms = fake_unix_ms,
+        .clock_ctx = &clock,
+    };
+    struct wt_openai_config config = {
+        .endpoint = "https://127.0.0.1:9443/custom",
+        .model = "fixture-model",
+        .source_lang = "en",
+        .target_lang = "ko",
+        .system_prompt = "fixed prompt",
+        .timeout_ms = 1234,
+        .max_tokens = 64,
+        .api = "responses",
+        .reasoning_effort = "low",
+    };
+    struct whisper_translator *translator =
+        whisper_translator_create_for_test(
+            NULL, WT_PROVIDER_OPENAI, NULL, NULL, &config, &hooks);
+    mp_require(translator);
+    void *tmp = talloc_new(NULL);
+    struct wt_call_result result;
+    whisper_translate_call(translator, tmp, "Hello.\nGood morning.", &result);
+    assert_string_equal(result.translated, "Hello world.");
+    assert_string_equal(transport.requests[0].path, "/custom");
+    assert_string_equal(transport.requests[0].body,
+        "{\"model\":\"fixture-model\",\"stream\":false,"
+        "\"instructions\":\"fixed prompt\",\"input\":\"Hello.\\nGood morning.\","
+        "\"store\":false,\"max_output_tokens\":64,"
+        "\"reasoning\":{\"effort\":\"low\"}}");
+    for (int n = 0; n < MP_ARRAY_SIZE(invalid); n++) {
+        set_monotonic_ms(&clock, (int64_t)(n + 1) * 60000);
+        whisper_translate_call(translator, tmp, "cue", &result);
+        mp_require(!result.translated);
+        mp_require(result.error[0]);
+    }
+    set_monotonic_ms(&clock, 600000);
+    whisper_translate_call(translator, tmp, "cue", &result);
+    mp_require(!result.translated);
+    assert_int_equal(result.http_status, 400);
+    assert_string_equal(result.error, "openai: HTTP 400");
+    assert_int_equal(transport.calls, 9);
     talloc_free(tmp);
     whisper_translator_destroy(&translator);
     destroy_transport(&transport);
@@ -2063,6 +2145,7 @@ static void run_offline_tests(void)
     test_bing_strict_response_validation();
     test_openai_strict_response_validation();
     test_openai_request_shape();
+    test_responses_request_and_output();
     test_input_bounds_and_languages();
     test_transport_failures();
     test_common_rate_limit();
@@ -2149,9 +2232,55 @@ static int run_live_smoke(enum wt_provider provider)
     return valid ? 0 : 1;
 }
 
+static int run_live_ai_smoke(void)
+{
+    struct wt_openai_config config = {
+        .endpoint = getenv("MPV_TRANSLATION_TEST_ENDPOINT"),
+        .model = getenv("MPV_TRANSLATION_TEST_MODEL"),
+        .api_key = getenv("MPV_TRANSLATION_TEST_API_KEY"),
+        .api = getenv("MPV_TRANSLATION_TEST_API"),
+        .reasoning_effort = getenv("MPV_TRANSLATION_TEST_REASONING_EFFORT"),
+        .source_lang = "en",
+        .target_lang = "ko",
+        .system_prompt = "Translate into Korean. Return only the translation.",
+        .timeout_ms = 5000,
+        .max_tokens = 0,
+    };
+    struct whisper_translator *translator =
+        whisper_translator_create_openai(NULL, NULL, &config);
+    if (!translator) {
+        puts("AI translation fixture configuration failed");
+        return 1;
+    }
+    void *tmp = talloc_new(NULL);
+    struct wt_call_result result;
+    int64_t start = mp_time_ns();
+    whisper_translate_call(
+        translator, tmp, "Good morning. The train will arrive soon.", &result);
+    bool valid = result.http_status == 200 && result.translated &&
+        contains_korean_text(result.translated);
+    printf("AI_TRANSLATION_LIVE_RESULT http=%d translated=%s elapsed_ms=%"PRId64"\n",
+           result.http_status, valid ? "yes" : "no",
+           (mp_time_ns() - start) / 1000000);
+    if (!valid)
+        printf("AI_TRANSLATION_LIVE_FAILURE %s\n", result.error);
+    talloc_free(tmp);
+    whisper_translator_destroy(&translator);
+    return valid ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
+    mp_time_init();
     configure_process_local_failure_policy();
+    if (argc == 2 && strcmp(argv[1], "--live-ai") == 0)
+        return run_live_ai_smoke();
+    if (argc == 2 && strcmp(argv[1], "--responses-selftest") == 0) {
+        test_openai_request_shape();
+        test_responses_request_and_output();
+        puts("MPV_TRANSLATION_RESPONSES_SELFTEST_OK_V1");
+        return 0;
+    }
     if (argc == 1) {
         run_offline_tests();
         return 0;
@@ -2173,6 +2302,6 @@ int main(int argc, char **argv)
 
     fprintf(stderr,
             "usage: translation-provider "
-            "[--selftest|--live-google|--live-bing]\n");
+            "[--selftest|--responses-selftest|--live-ai|--live-google|--live-bing]\n");
     return 2;
 }

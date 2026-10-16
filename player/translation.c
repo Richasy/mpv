@@ -1581,7 +1581,8 @@ static int parse_common_config(void *parent, const char *json,
     }
     static const char *const ai_keys[] = {
         "endpoint", "model", "api_key", "source_lang", "target_lang",
-        "system_prompt", "context_size", "max_tokens", "timeout_ms", NULL,
+        "system_prompt", "context_size", "max_tokens", "timeout_ms",
+        "api", "reasoning_effort", NULL,
     };
     for (int n = 0; n < ai->u.list->num; n++) {
         if (!known_key(ai->u.list->keys[n], ai_keys)) {
@@ -1609,6 +1610,18 @@ static int parse_common_config(void *parent, const char *json,
         optional_string(parent, ai, "system_prompt", error);
     if (out->ai.system_prompt == (char *)-1)
         return -1;
+    out->ai.api = optional_string(parent, ai, "api", error);
+    if (out->ai.api == (char *)-1)
+        return -1;
+    out->ai.reasoning_effort =
+        optional_string(parent, ai, "reasoning_effort", error);
+    if (out->ai.reasoning_effort == (char *)-1)
+        return -1;
+    if (out->ai.api && strcmp(out->ai.api, "chat") != 0 &&
+        strcmp(out->ai.api, "responses") != 0) {
+        set_error(error, "ai.api must be chat or responses");
+        return -1;
+    }
 
     if (!out->ai.endpoint || !out->ai.endpoint[0] ||
         !out->ai.model || !out->ai.model[0])
@@ -1839,6 +1852,8 @@ static bool parse_legacy_ai(void *parent, const char *json,
     config->source_lang = LEGACY_STRING("source_lang");
     config->target_lang = LEGACY_STRING("target_lang");
     config->system_prompt = LEGACY_STRING("system_prompt");
+    config->api = LEGACY_STRING("api");
+    config->reasoning_effort = LEGACY_STRING("reasoning_effort");
     config->context_size = LEGACY_INTEGER("context_size", 0);
     config->timeout_ms = LEGACY_INTEGER("timeout_ms", 0);
     config->max_tokens = LEGACY_INTEGER("max_tokens", -1);

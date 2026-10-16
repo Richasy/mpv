@@ -3547,12 +3547,22 @@ Property list
         Required object for the ``ai`` provider and null or absent for the
         other providers. It accepts ``endpoint``, ``model``, ``api_key``,
         ``source_lang``, ``target_lang``, ``system_prompt``, ``context_size``,
-        ``max_tokens``, and ``timeout_ms``. ``endpoint`` and ``model`` are
+        ``max_tokens``, ``timeout_ms``, ``api``, and ``reasoning_effort``.
+        ``endpoint`` and ``model`` are
         required. Nested language values override the common language values.
         ``context_size`` remains accepted for compatibility but is ignored
         because requests are stateless. ``system_prompt`` intentionally keeps
         the field spelling used by ``whisper-ai-translate``. Reading the
         property masks a non-empty ``api_key``.
+
+        ``api`` explicitly selects ``chat`` (the backward-compatible default)
+        or ``responses``. No endpoint or model-name detection is performed.
+        The caller supplies the complete matching endpoint. Chat requests retain
+        the compatible-service ``thinking`` extension. Responses requests use
+        ``instructions``, ``input``, and ``store=false``; ``max_tokens`` maps to
+        ``max_output_tokens`` and an optional caller-selected ``reasoning_effort``
+        maps to ``reasoning.effort``. Only completed assistant ``output_text``
+        content is returned; incomplete, refused, or empty output fails.
 
     ``limits``
         Optional object using the existing ``whisper-translate-limits`` field

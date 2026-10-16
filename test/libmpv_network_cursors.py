@@ -26,6 +26,9 @@ costs a full redirect chain. The cases verify:
 - curl-cancel: with the libcurl backend, stopping playback promptly
   interrupts a read that waits for a held response on the stream's own
   connection after an additional connection was opened.
+- curl-unknown-range: short responses with an unknown total size continue
+  byte-exactly until a terminal 416, but a premature 416 that reports more
+  data is a playback error.
 
 The curl cases are skipped when libmpv has no libcurl backend.
 """
@@ -264,8 +267,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             start = int(match[1])
             if match[2]:
                 end = min(end, int(match[2]))
-            if start > end:
-                self.reply_empty(416)
+            if start > end or (server.range_mode == "bad-eof" and
+                               start >= SHORT_RANGE):
+                total = "*" if server.range_mode == "unknown-eof" else len(media)
+                with server.lock:
+                    server.range_eofs.append((start, total))
+                self.reply_empty(416, [("Content-Range", f"bytes */{total}")])
                 return
             if server.short_range:
                 end = min(end, start + server.short_range - 1)
@@ -282,7 +289,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(end - start + 1))
         self.send_header("Accept-Ranges", "bytes")
         if requested:
-            self.send_header("Content-Range", f"bytes {start}-{end}/{len(media)}")
+            total = "*" if server.range_mode else len(media)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
         self.end_headers()
         server.set_active(self.connection_id, True)
         try:
@@ -316,11 +324,13 @@ class Server(http.server.ThreadingHTTPServer):
         self.exclusive = False
         self.reset()
 
-    def reset(self, exclusive=False, short_range=0, hold_at=None):
+    def reset(self, exclusive=False, short_range=0, hold_at=None, range_mode=None):
         with self.lock:
             self.exclusive = exclusive
             self.short_range = short_range
             self.hold_at = hold_at
+            self.range_mode = range_mode
+            self.range_eofs = []
             self.held = threading.Event()
             self.release = threading.Event()
             self.connection_count = getattr(self, "connection_count", 0)
@@ -565,6 +575,38 @@ def run_stop_client(library, url, options):
         print(json.dumps({"latency": latency, "opened": opened}), flush=True)
 
 
+def run_range_client(library, url, pcm_path):
+    with contextlib.ExitStack() as stack:
+        mpv = load_libmpv(stack, library)
+        client = create_client(stack, mpv, {
+            **CURL,
+            "ao": "pcm",
+            "ao-pcm-file": pcm_path,
+            "ao-pcm-waveheader": "no",
+            "audio-format": "s16",
+            "audio-samplerate": str(AUDIO_RATE),
+            "audio-channels": "stereo",
+            "keep-open": "no",
+            "sid": "no",
+            "cache": "no",
+            "stream-lru-cache": "0",
+            "demuxer": "rawaudio",
+            "demuxer-rawaudio-rate": str(AUDIO_RATE),
+            "demuxer-rawaudio-channels": "stereo",
+            "demuxer-rawaudio-format": "s16le",
+        })
+        run_command(mpv, client, "loadfile", url)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            event = mpv.mpv_wait_event(client, 0.05).contents
+            if event.event_id == EVENT_END_FILE:
+                end = ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents
+                print(json.dumps({"reason": end.reason, "error": end.error}),
+                      flush=True)
+                return
+        raise TimeoutError("Unknown-size range playback did not finish")
+
+
 def run_case(library, server, media, name, options, **server_modes):
     server.reset(**server_modes)
     url = f"http://127.0.0.1:{server.server_port}/origin/media.mp4"
@@ -656,10 +698,49 @@ def curl_available(library):
 def check_curl_short_range(library, server, media):
     log, _, requests, _ = run_case(library, server, media, "curl-short-range",
                                    CURL, short_range=SHORT_RANGE)
-    if not any("connection 0 returned no data" in line for line in log):
-        raise RuntimeError("curl-short-range: the stream's own connection never "
-                           "reached the end of a shortened range\n" + "\n".join(log))
+    if not any(request[2] == SHORT_RANGE for request in requests):
+        raise RuntimeError("curl-short-range: no continuation after the first "
+                           "shortened range\n" + "\n".join(log))
     print(f"PASS cursors/curl-short-range ({len(requests)} requests)", flush=True)
+
+
+def check_curl_unknown_ranges(library, media):
+    for mode in ("unknown", "unknown-eof", "bad-eof"):
+        with serve(media.pcm) as server, \
+                tempfile.TemporaryDirectory(prefix="mpv-unknown-range-") as directory:
+            server.reset(short_range=SHORT_RANGE, range_mode=mode)
+            pcm_path = str(Path(directory, "audio.pcm"))
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--range-child",
+                 library, f"http://127.0.0.1:{server.server_port}/cdn/media.mp4",
+                 pcm_path],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode:
+                raise RuntimeError(f"curl-{mode}: {result.stdout}{result.stderr}")
+            report = json.loads(result.stdout.strip().splitlines()[-1])
+            pcm = Path(pcm_path).read_bytes()
+            with server.lock:
+                terminals = list(server.range_eofs)
+                starts = [request[2] for request in server.requests]
+            if not terminals or starts[0] != 0:
+                raise RuntimeError(f"curl-{mode}: missing range/416 coverage")
+            if mode == "bad-eof":
+                if report["reason"] != 4 or report["error"] >= 0:
+                    raise RuntimeError(f"curl-{mode}: expected playback error, "
+                                       f"got {report}")
+                if any(start >= total for start, total in terminals):
+                    raise RuntimeError(f"curl-{mode}: 416 was not premature")
+            else:
+                if report["reason"] != 0 or report["error"] != 0:
+                    raise RuntimeError(f"curl-{mode}: expected normal EOF, got {report}")
+                if pcm != media.pcm:
+                    raise RuntimeError(f"curl-{mode}: decoded audio differs "
+                                       f"({len(pcm)} of {len(media.pcm)} bytes)")
+                if len(starts) < 2 or any(start != len(media.pcm)
+                                          for start, _ in terminals):
+                    raise RuntimeError(f"curl-{mode}: did not read through the end")
+            print(f"PASS cursors/curl-{mode}", flush=True)
 
 
 def check_curl_cancel(library, server, media):
@@ -717,6 +798,7 @@ def main(library):
         check_exclusive(library, server, media)
         if curl_available(library):
             check_curl_short_range(library, server, media)
+            check_curl_unknown_ranges(library, media)
             check_curl_cancel(library, server, media)
         else:
             print("SKIP cursors/curl-* (libmpv has no libcurl backend)", flush=True)
@@ -728,6 +810,8 @@ if __name__ == "__main__":
                    sys.argv[5], int(sys.argv[6]))
     elif len(sys.argv) == 5 and sys.argv[1] == "--stop-child":
         run_stop_client(sys.argv[2], sys.argv[3], json.loads(sys.argv[4]))
+    elif len(sys.argv) == 5 and sys.argv[1] == "--range-child":
+        run_range_client(sys.argv[2], sys.argv[3], sys.argv[4])
     elif len(sys.argv) == 2:
         main(str(Path(sys.argv[1]).resolve(strict=True)))
     else:

@@ -32,6 +32,10 @@ API changes
 
 ::
 
+ --- mpv 0.42.0 ---
+ 2.8    - add MPV_RENDER_API_TYPE_D3D11 render API backend, along with
+          MPV_RENDER_PARAM_D3D11_INIT_PARAMS and MPV_RENDER_PARAM_D3D11_FBO,
+          and a new render_d3d11.h header (upstream API 2.6).
  --- mpv 0.41.0 ---
  2.7    - add mpv_acquire_d3d11_composition_surface(),
           mpv_release_d3d11_composition_surface(), and

@@ -17,6 +17,7 @@
 
 #include <assert.h>
 #include <float.h>
+#include <inttypes.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -1891,6 +1892,12 @@ static void reinit_scaler(struct gl_video *p, struct scaler *scaler,
     float *weights = talloc_array(NULL, float, lut_size * stride);
     mp_compute_lut(scaler->kernel, lut_size, stride, weights);
 
+    for (int n = 0; n < lut_size; n++) {
+        float *row = weights + n * stride;
+        for (int i = size; i < stride; i++)
+            row[i] = row[i - num_components];
+    }
+
     bool use_1d = scaler->kernel->polar && (p->ra->caps & RA_CAP_TEX_1D);
 
     struct ra_tex_params lut_params = {
@@ -3088,7 +3095,7 @@ static void pass_dither(struct gl_video *p, const struct ra_fbo *fbo)
     // screen. The superfluous bits will be used for rounding according to the
     // dither matrix. The precision of the source implicitly decides how many
     // dither patterns can be visible.
-    int dither_quantization = (1 << dst_depth) - 1;
+    uint32_t dither_quantization = UINT32_MAX >> (32 - dst_depth);
     int dither_size = p->dither_texture->params.w;
 
     gl_sc_uniform_texture(p->sc, "dither", p->dither_texture);
@@ -3111,7 +3118,8 @@ static void pass_dither(struct gl_video *p, const struct ra_fbo *fbo)
     }
 
     GLSL(float dither_value = texture(dither, dither_pos).r;)
-    GLSLF("color = floor(color * %d.0 + dither_value + 0.5 / %d.0) * 1.0/%d.0;\n",
+    GLSLF("color = floor(color * %" PRIu32 ".0 + dither_value + 0.5 / %d.0) * "
+          "1.0/%" PRIu32 ".0;\n",
           dither_quantization, dither_size * dither_size, dither_quantization);
 }
 

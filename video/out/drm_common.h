@@ -34,6 +34,7 @@ enum {
     DRM_OPTS_FORMAT_XRGB2101010,
     DRM_OPTS_FORMAT_XBGR8888,
     DRM_OPTS_FORMAT_XBGR2101010,
+    DRM_OPTS_FORMAT_RGB565,
     DRM_OPTS_FORMAT_YUYV,
 };
 
@@ -147,6 +148,7 @@ struct vo_drm_state {
     char *card_path;
     int card_no;
     int fd;
+    int wakeup_pipe[2];
 
     uint32_t crtc_id;
     uint32_t height;

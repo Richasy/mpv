@@ -97,6 +97,7 @@ ExternalProject_Add_Step(mpv copy-binary
     COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/include/mpv/stream_cb.h    ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv/stream_cb.h
     COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/include/mpv/render.h       ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv/render.h
     COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/include/mpv/render_gl.h    ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv/render_gl.h
+    COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/include/mpv/render_d3d11.h ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv/render_d3d11.h
     COMMENT "Copying mpv binaries and manual"
 )
 

@@ -332,6 +332,7 @@ static void queue_flip(struct ra_ctx *ctx, struct gbm_frame *frame)
     if (ret)
         MP_WARN(ctx->vo, "Failed to commit atomic request: %s\n", mp_strerror(ret));
     drm->waiting_for_flip = !ret;
+    p->allow_modeset = !ret;
 
     drmModeAtomicFree(atomic_ctx->request);
     atomic_ctx->request = drmModeAtomicAlloc();
@@ -552,7 +553,8 @@ static pl_color_space_t drm_egl_preferred_csp(struct ra_ctx *ctx)
 static bool drm_egl_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
 {
     struct priv *p = ctx->priv;
-    p->allow_modeset = vo_drm_set_color(ctx->vo, &params->color);
+    struct pl_color_space sdr = pl_color_space_srgb;
+    p->allow_modeset |= vo_drm_set_color(ctx->vo, params ? &params->color : &sdr);
     return true;
 }
 
@@ -591,6 +593,10 @@ static bool drm_egl_init(struct ra_ctx *ctx)
     case DRM_OPTS_FORMAT_XBGR8888:
         argb_format = GBM_FORMAT_ABGR8888;
         xrgb_format = GBM_FORMAT_XBGR8888;
+        break;
+    case DRM_OPTS_FORMAT_RGB565:
+        argb_format = GBM_FORMAT_RGB565;
+        xrgb_format = GBM_FORMAT_RGB565;
         break;
     default:
         if (drm->opts->drm_format != DRM_OPTS_FORMAT_XRGB8888) {

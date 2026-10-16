@@ -439,6 +439,10 @@ static int filter_and_add(struct sd *sd, struct demux_packet *pkt)
                       floor(pkt->duration * 1000 + 1e-6));
     if (!ctx->is_converted)
         mp_ass_clip_whisper_cues(track, old_n_events, sd->codec->codec_profile);
+    if (pkt != orig_pkt)
+        talloc_free(pkt);
+    // the seen and animated state is kept on the original packet
+    pkt = orig_pkt;
 
     // This bookkeeping only has any practical use for ASS subs
     // over a VO with no video.
@@ -468,9 +472,6 @@ static int filter_and_add(struct sd *sd, struct demux_packet *pkt)
             }
         }
     }
-
-    if (pkt != orig_pkt)
-        talloc_free(pkt);
     return old_n_events;
 }
 

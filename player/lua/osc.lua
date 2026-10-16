@@ -153,6 +153,9 @@ local user_opts = {
     maximize_mbtn_left_command = "cycle ${?fullscreen==yes:fullscreen}${!fullscreen==yes:window-maximized}",
     maximize_mbtn_mid_command = "",
     maximize_mbtn_right_command = "",
+
+    seekbar_wheel_down_command = "seek -10",
+    seekbar_wheel_up_command = "seek 10",
     -- luacheck: pop
 }
 
@@ -1943,7 +1946,7 @@ local function bar_layout(direction, slim)
 
 
     -- Menu
-    geo = { x = osc_geo.x + padX + 4, y = line1, an = 4, w = 18, h = math.abs(line2 - line1) }
+    geo = { x = osc_geo.x + padX + 4, y = line1, an = 4, w = 18, h = 26 }
     lo = add_layout("menu")
     lo.geometry = geo
     lo.style = osc_styles.topButtonsBar
@@ -2011,7 +2014,7 @@ local function bar_layout(direction, slim)
 
     -- Playback control buttons
     geo = { x = osc_geo.x + padX + padwc_l, y = line2, an = 4,
-            w = buttonW, h = osc_geo.h - math.abs(line2 - line1)}
+            w = buttonW, h = 30}
     lo = add_layout("play_pause")
     lo.geometry = geo
     lo.style = osc_styles.smallButtonsBar
@@ -2594,9 +2597,9 @@ local function osc_init()
 
     if user_opts.scrollcontrols then
         ne.eventresponder["wheel_up_press"] =
-            function () mp.commandv("osd-auto", "seek",  10) end
+            function () mp.command(user_opts.seekbar_wheel_up_command) end
         ne.eventresponder["wheel_down_press"] =
-            function () mp.commandv("osd-auto", "seek", -10) end
+            function () mp.command(user_opts.seekbar_wheel_down_command) end
     end
 
 

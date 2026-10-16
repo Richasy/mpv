@@ -45,7 +45,6 @@
 
 enum {
     RENDERER_AUTO,
-    RENDERER_D3D9,
     RENDERER_D3D11,
 };
 
@@ -62,7 +61,6 @@ const struct m_sub_options angle_conf = {
     .opts = (const struct m_option[]) {
         {"angle-renderer", OPT_CHOICE(renderer,
             {"auto", RENDERER_AUTO},
-            {"d3d9", RENDERER_D3D9},
             {"d3d11", RENDERER_D3D11})},
         {"angle-d3d11-warp", OPT_CHOICE(d3d11_warp,
             {"auto", -1},
@@ -98,6 +96,10 @@ struct priv {
     ID3D11Device *d3d11_device;
     ID3D11DeviceContext *d3d11_context;
     ID3D11Texture2D *d3d11_backbuffer;
+
+    // Debug interfaces (--gpu-debug)
+    IDXGIDebug *debug;
+    IDXGIInfoQueue *iqueue;
 
     EGLConfig egl_config;
     EGLDisplay egl_display;
@@ -211,7 +213,13 @@ static void d3d11_device_destroy(struct ra_ctx *ctx)
         eglReleaseDeviceANGLE(p->egl_device);
     p->egl_device = 0;
 
+    SAFE_RELEASE(p->d3d11_context);
     SAFE_RELEASE(p->d3d11_device);
+
+    if (p->debug)
+        mp_d3d11_report_live_objects(ctx->vo->log, p->debug, p->iqueue);
+    SAFE_RELEASE(p->debug);
+    SAFE_RELEASE(p->iqueue);
 }
 
 static bool d3d11_device_create(struct ra_ctx *ctx)
@@ -221,6 +229,7 @@ static bool d3d11_device_create(struct ra_ctx *ctx)
     struct angle_opts *o = p->opts;
 
     struct d3d11_device_opts device_opts = {
+        .debug = ctx->opts.debug,
         .allow_warp = o->d3d11_warp != 0,
         .force_warp = o->d3d11_warp == 1,
         .max_feature_level = o->d3d11_feature_level,
@@ -231,6 +240,9 @@ static bool d3d11_device_create(struct ra_ctx *ctx)
                                         &p->d3d11_device, NULL))
         return false;
     ID3D11Device_GetImmediateContext(p->d3d11_device, &p->d3d11_context);
+
+    if (ID3D11Device_GetCreationFlags(p->d3d11_device) & D3D11_CREATE_DEVICE_DEBUG)
+        mp_d3d11_get_debug_interfaces(vo->log, &p->debug, &p->iqueue);
 
     PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT =
         (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
@@ -308,44 +320,6 @@ static bool d3d11_swapchain_surface_create(struct ra_ctx *ctx)
 fail:
     d3d11_swapchain_surface_destroy(ctx);
     return false;
-}
-
-static void d3d9_device_destroy(struct ra_ctx *ctx)
-{
-    struct priv *p = ctx->priv;
-
-    if (p->egl_display)
-        eglTerminate(p->egl_display);
-    p->egl_display = EGL_NO_DISPLAY;
-}
-
-static bool d3d9_device_create(struct ra_ctx *ctx)
-{
-    struct priv *p = ctx->priv;
-    struct vo *vo = ctx->vo;
-
-    PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT =
-        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
-    if (!eglGetPlatformDisplayEXT) {
-        MP_FATAL(vo, "Missing EGL_EXT_platform_base\n");
-        return false;
-    }
-
-    EGLint display_attributes[] = {
-        EGL_PLATFORM_ANGLE_TYPE_ANGLE,
-            EGL_PLATFORM_ANGLE_TYPE_D3D9_ANGLE,
-        EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE,
-            EGL_PLATFORM_ANGLE_DEVICE_TYPE_HARDWARE_ANGLE,
-        EGL_NONE,
-    };
-    p->egl_display = eglGetPlatformDisplayEXT(EGL_PLATFORM_ANGLE_ANGLE,
-        EGL_DEFAULT_DISPLAY, display_attributes);
-    if (p->egl_display == EGL_NO_DISPLAY) {
-        MP_FATAL(vo, "Couldn't get display\n");
-        return false;
-    }
-
-    return true;
 }
 
 static void egl_window_surface_destroy(struct ra_ctx *ctx)
@@ -453,11 +427,7 @@ static void angle_uninit(struct ra_ctx *ctx)
 
     context_destroy(ctx);
 
-    // Uninit the EGL device implementation that is being used
-    if (p->d3d11_device)
-        d3d11_device_destroy(ctx);
-    else
-        d3d9_device_destroy(ctx);
+    d3d11_device_destroy(ctx);
 
     vo_w32_uninit(ctx->vo);
 }
@@ -520,6 +490,7 @@ static void angle_swap_buffers(struct ra_ctx *ctx)
     } else {
         egl_swap_buffers(ctx);
     }
+    mp_d3d11_debug_marker(ctx->vo->log, p->iqueue, "after swap");
 }
 
 
@@ -551,16 +522,6 @@ static bool angle_init(struct ra_ctx *ctx)
             context_ok = context_init(ctx);
             if (!context_ok)
                 d3d11_device_destroy(ctx);
-        }
-    }
-    if ((!context_ok && !o->renderer) || o->renderer == RENDERER_D3D9) {
-        context_ok = d3d9_device_create(ctx);
-        if (context_ok) {
-            MP_VERBOSE(vo, "Using Direct3D 9\n");
-
-            context_ok = context_init(ctx);
-            if (!context_ok)
-                d3d9_device_destroy(ctx);
         }
     }
     if (!context_ok)

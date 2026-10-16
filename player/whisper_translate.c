@@ -80,6 +80,8 @@ struct whisper_translator {
     char *oa_system_prompt;     // already-rendered final string (or "")
     int   oa_timeout_ms;        // hard-clamped <= WT_MAX_TIMEOUT_MS at init
     int   oa_max_tokens;
+    bool  oa_responses;
+    char *oa_reasoning_effort;
 
     wt_http_transport_fn transport;
     void *transport_ctx;
@@ -2451,6 +2453,23 @@ static char *oa_build_request_body(void *talloc_ctx,
     node_map_add_string(&root, "model", tr->oa_model);
     node_map_add_flag(&root, "stream", false);
 
+    if (tr->oa_responses) {
+        const char *prompt = tr->oa_system_prompt && tr->oa_system_prompt[0]
+            ? tr->oa_system_prompt
+            : oa_render_fallback_prompt(tmp, tr->target_lang);
+        node_map_add_string(&root, "instructions", prompt);
+        node_map_add_string(&root, "input", text);
+        node_map_add_flag(&root, "store", false);
+        if (tr->oa_max_tokens > 0)
+            node_map_add_int64(&root, "max_output_tokens", tr->oa_max_tokens);
+        if (tr->oa_reasoning_effort && tr->oa_reasoning_effort[0]) {
+            struct mpv_node *reasoning = node_map_add(
+                &root, "reasoning", MPV_FORMAT_NODE_MAP);
+            node_map_add_string(reasoning, "effort", tr->oa_reasoning_effort);
+        }
+        goto serialize;
+    }
+
     struct mpv_node *messages = node_map_add(&root, "messages",
                                               MPV_FORMAT_NODE_ARRAY);
 
@@ -2491,6 +2510,7 @@ static char *oa_build_request_body(void *talloc_ctx,
         node_map_add_string(th, "type", "disabled");
     }
 
+serialize:;
     char *out = NULL;
     int n = json_write(&out, &root);
     char *result = NULL;
@@ -2536,6 +2556,79 @@ static char *oa_extract_content(void *talloc_ctx, struct mp_log *log,
     }
     talloc_free(tmp);
     return out;
+}
+
+static char *oa_extract_response(void *talloc_ctx, const char *response,
+                                 struct wt_call_result *result)
+{
+    void *tmp = talloc_new(NULL);
+    struct mpv_node root = {0};
+    char *text = NULL;
+    if (!parse_json_document(tmp, response, &root) ||
+        root.format != MPV_FORMAT_NODE_MAP)
+    {
+        set_err(result, "openai: invalid responses JSON");
+        goto done;
+    }
+    struct mpv_node *status = node_map_get(&root, "status");
+    if (!status || status->format != MPV_FORMAT_STRING ||
+        strcmp(status->u.string, "completed") != 0)
+    {
+        set_err(result, "openai: response not completed");
+        goto done;
+    }
+    struct mpv_node *output = node_map_get(&root, "output");
+    if (!output || output->format != MPV_FORMAT_NODE_ARRAY)
+        goto invalid;
+    text = talloc_strdup(tmp, "");
+    for (int n = 0; n < output->u.list->num; n++) {
+        struct mpv_node *item = &output->u.list->values[n];
+        if (item->format != MPV_FORMAT_NODE_MAP)
+            goto invalid;
+        struct mpv_node *type = node_map_get(item, "type");
+        if (!type || type->format != MPV_FORMAT_STRING)
+            goto invalid;
+        if (strcmp(type->u.string, "message") != 0)
+            continue;
+        struct mpv_node *role = node_map_get(item, "role");
+        struct mpv_node *item_status = node_map_get(item, "status");
+        struct mpv_node *content = node_map_get(item, "content");
+        if (!role || role->format != MPV_FORMAT_STRING ||
+            strcmp(role->u.string, "assistant") != 0 ||
+            !item_status || item_status->format != MPV_FORMAT_STRING ||
+            strcmp(item_status->u.string, "completed") != 0 ||
+            !content || content->format != MPV_FORMAT_NODE_ARRAY)
+            goto invalid;
+        for (int i = 0; i < content->u.list->num; i++) {
+            struct mpv_node *part = &content->u.list->values[i];
+            if (part->format != MPV_FORMAT_NODE_MAP)
+                goto invalid;
+            struct mpv_node *part_type = node_map_get(part, "type");
+            if (!part_type || part_type->format != MPV_FORMAT_STRING)
+                goto invalid;
+            if (strcmp(part_type->u.string, "refusal") == 0) {
+                set_err(result, "openai: response refused");
+                goto done;
+            }
+            if (strcmp(part_type->u.string, "output_text") != 0)
+                goto invalid;
+            struct mpv_node *value = node_map_get(part, "text");
+            if (!value || value->format != MPV_FORMAT_STRING)
+                goto invalid;
+            text = talloc_asprintf_append(text, "%s", value->u.string);
+        }
+    }
+    if (!text[0])
+        goto invalid;
+    text = talloc_strdup(talloc_ctx, text);
+    talloc_free(tmp);
+    return text;
+
+invalid:
+    set_err(result, "openai: invalid responses output");
+done:
+    talloc_free(tmp);
+    return NULL;
 }
 
 static char *translate_openai(struct whisper_translator *tr,
@@ -2589,9 +2682,12 @@ static char *translate_openai(struct whisper_translator *tr,
         return NULL;
     }
 
-    char *content = oa_extract_content(talloc_ctx, tr->log, response);
+    char *content = tr->oa_responses
+        ? oa_extract_response(talloc_ctx, response, out)
+        : oa_extract_content(talloc_ctx, tr->log, response);
     if (!content || !content[0]) {
-        set_err(out, "openai: empty content");
+        if (!tr->oa_responses)
+            set_err(out, "openai: empty content");
         talloc_free(content);
         talloc_free(tmp);
         return NULL;
@@ -2657,6 +2753,12 @@ static bool configure_openai(struct whisper_translator *tr,
     {
         return false;
     }
+    if (cfg->api && strcmp(cfg->api, "chat") != 0 &&
+        strcmp(cfg->api, "responses") != 0)
+        return false;
+    tr->oa_responses = cfg->api && strcmp(cfg->api, "responses") == 0;
+    tr->oa_reasoning_effort = talloc_strdup(
+        tr, cfg->reasoning_effort ? cfg->reasoning_effort : "");
     if (!parse_endpoint_url(tr, cfg->endpoint,
                             &tr->oa_scheme, &tr->oa_host,
                             &tr->oa_port, &tr->oa_path,

@@ -821,6 +821,17 @@ static void test_config_and_source_policy(void)
         "\"rpm_limit\":0,\"session_request_limit\":0}}";
     assert_true(mp_translation_validate_common_config(valid, &error));
     mp_require(!error);
+    assert_true(mp_translation_validate_common_config(
+        "{\"provider\":\"ai\",\"target_lang\":\"zh\",\"ai\":{"
+        "\"endpoint\":\"https://127.0.0.1/custom\",\"model\":\"fixture\","
+        "\"api\":\"responses\",\"reasoning_effort\":\"low\"}}", &error));
+    mp_require(!error);
+    assert_false(mp_translation_validate_common_config(
+        "{\"provider\":\"ai\",\"target_lang\":\"zh\",\"ai\":{"
+        "\"endpoint\":\"https://127.0.0.1/custom\",\"model\":\"fixture\","
+        "\"api\":\"automatic\"}}", &error));
+    talloc_free(error);
+    error = NULL;
     char *masked = mp_translation_mask_config(NULL, valid);
     mp_require(strstr(masked, "secret") == NULL);
     mp_require(strstr(masked, "***") != NULL);

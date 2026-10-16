@@ -72,7 +72,7 @@ Combined build and verification scope
 -------------------------------------
 
 FFmpeg source: https://github.com/Richasy/FFmpeg.git
-FFmpeg revision: 2163d44e1107b1690a2e61735101d232ac82a50e
+FFmpeg revision: 72c9b4c68d1d54f85f62337c0a2a327ce3d9a082
 
 FFmpeg is configured with --enable-gpl, --enable-version3,
 --enable-libdavs2, and --enable-libuavs3d. GPL-2.0.txt and GPL-3.0.txt

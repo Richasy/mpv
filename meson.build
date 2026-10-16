@@ -200,6 +200,7 @@ sources = files(
     'stream/cookies.c',
     'stream/network.c',
     'stream/stream.c',
+    'stream/stream_aes_ctr.c',
     'stream/stream_avdevice.c',
     'stream/stream_cb.c',
     'stream/stream_concat.c',
@@ -245,6 +246,7 @@ sources = files(
     'video/out/dither.c',
     'video/out/dr_helper.c',
     'video/out/filter_kernels.c',
+    'video/out/terminal_swapchain.c',
     'video/out/gpu/context.c',
     'video/out/gpu/error_diffusion.c',
     'video/out/gpu/hwdec.c',
@@ -751,11 +753,11 @@ endif
 lua = dependency('', required: false)
 lua_opt = get_option('lua')
 if lua_opt != 'disabled'
-    lua_version = [['lua', ['>=5.1.0', '<5.3.0']], # generic lua.pc
+    lua_version = [['luajit', '>= 2.0.0'],
+                   ['lua', ['>=5.1.0', '<5.3.0']], # generic lua.pc
                    ['lua52', '>= 5.2.0'],
                    ['lua5.2', '>= 5.2.0'],
                    ['lua-5.2', '>= 5.2.0'],
-                   ['luajit', '>= 2.0.0'],
                    ['lua51', '>= 5.1.0'],
                    ['lua5.1', '>= 5.1.0'],
                    ['lua-5.1', '>= 5.1.0']]
@@ -814,10 +816,8 @@ if features['uchardet']
     dependencies += uchardet
 endif
 
-vapoursynth = dependency('vapoursynth-script', version: '>= 56', required: false)
-if not vapoursynth.found()
-    vapoursynth = dependency('vapoursynth', version: '>= 56', required: get_option('vapoursynth'))
-endif
+vapoursynth = dependency('vapoursynth-script', 'vapoursynth', version: '>= 56',
+                         required: get_option('vapoursynth'))
 features += {'vapoursynth': vapoursynth.found()}
 if features['vapoursynth']
     dependencies += vapoursynth.partial_dependency(compile_args: true, includes: true)
@@ -1083,7 +1083,8 @@ d3d11 = get_option('d3d11').require(
 features += {'d3d11': d3d11.allowed()}
 if features['d3d11']
     sources += files('video/out/d3d11/context.c',
-                     'video/out/d3d11/ra_d3d11.c')
+                     'video/out/d3d11/ra_d3d11.c',
+                     'video/out/d3d11/libmpv_d3d11.c')
 endif
 
 wayland = {
@@ -1355,7 +1356,7 @@ vulkan_opt = get_option('vulkan').require(
     error_message: 'libplacebo compiled without vulkan support!',
 )
 # libplacebo/ffmpeg public headers depend on Vulkan 1.3
-vulkan = dependency('vulkan', version: '>= 1.3.238', required: vulkan_opt)
+vulkan = dependency('vulkan', version: '>= 1.4.309', required: vulkan_opt)
 features += {'vulkan': vulkan.found() and (vulkan.type_name() == 'internal' or
                        cc.has_header_symbol('vulkan/vulkan_core.h',
                                             'VK_VERSION_1_3',
@@ -1950,7 +1951,8 @@ if get_option('libmpv')
                  description: 'mpv media player client library')
 
     headers = ['include/mpv/client.h', 'include/mpv/render.h',
-               'include/mpv/render_gl.h', 'include/mpv/stream_cb.h']
+               'include/mpv/render_d3d11.h', 'include/mpv/render_gl.h',
+               'include/mpv/stream_cb.h']
     install_headers(headers, subdir: 'mpv')
 
     # Allow projects to build with libmpv by cloning into ./subprojects/mpv

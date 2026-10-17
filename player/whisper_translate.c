@@ -43,6 +43,7 @@
 
 #define WT_DEFAULT_TIMEOUT_MS     5000
 #define WT_MAX_TIMEOUT_MS         5000
+#define WT_MAX_OPENAI_TIMEOUT_MS  30000
 #define WT_DEFAULT_MAX_TOKENS     128
 #define WT_BACKOFF_FAIL_THRESHOLD 5
 #define WT_BACKOFF_BASE_MS        5000
@@ -78,7 +79,7 @@ struct whisper_translator {
     char *oa_model;
     char *oa_api_key;           // may be ""
     char *oa_system_prompt;     // already-rendered final string (or "")
-    int   oa_timeout_ms;        // hard-clamped <= WT_MAX_TIMEOUT_MS at init
+    int   oa_timeout_ms;        // bounded by WT_MAX_OPENAI_TIMEOUT_MS at init
     int   oa_max_tokens;
     bool  oa_responses;
     char *oa_reasoning_effort;
@@ -86,6 +87,7 @@ struct whisper_translator {
     wt_http_transport_fn transport;
     void *transport_ctx;
     wt_clock_fn monotonic_ms;
+    atomic_bool cancelled;
     wt_clock_fn unix_ms;
     void *clock_ctx;
     atomic_int fail_request_close;
@@ -1194,10 +1196,20 @@ static DWORD remaining_timeout_ms(int64_t deadline_ms, int64_t now_ms)
 static bool async_wait_operation(
     struct wt_async_request *ctx, enum wt_async_signal expected)
 {
-    DWORD wait = remaining_timeout_ms(
-        ctx->deadline_ms,
-        translator_monotonic_ms(ctx->translator));
-    DWORD wait_result = WaitForSingleObject(ctx->operation_event, wait);
+    DWORD wait_result;
+    for (;;) {
+        if (atomic_load_explicit(&ctx->translator->cancelled, memory_order_acquire)) {
+            EnterCriticalSection(&ctx->lock);
+            async_finish_locked(ctx, WT_HTTP_FAILURE_CANCELLED);
+            LeaveCriticalSection(&ctx->lock);
+            return false;
+        }
+        DWORD wait = remaining_timeout_ms(
+            ctx->deadline_ms, translator_monotonic_ms(ctx->translator));
+        wait_result = WaitForSingleObject(ctx->operation_event, MPMIN(wait, 100));
+        if (wait_result != WAIT_TIMEOUT || wait <= 100)
+            break;
+    }
     EnterCriticalSection(&ctx->lock);
     if (wait_result != WAIT_OBJECT_0) {
         async_finish_locked(
@@ -1493,6 +1505,11 @@ static void winhttp_transport_impl(
     };
     if (out_receipt)
         *out_receipt = NULL;
+
+    if (atomic_load_explicit(&tr->cancelled, memory_order_acquire)) {
+        response->failure = WT_HTTP_FAILURE_CANCELLED;
+        return;
+    }
 
     int timeout_ms = request->timeout_ms > 0
         ? request->timeout_ms : WT_MAX_TIMEOUT_MS;
@@ -1920,6 +1937,9 @@ static bool perform_http(struct whisper_translator *tr, void *talloc_ctx,
         return false;
     case WT_HTTP_FAILURE_TIMEOUT:
         set_err(out, "%s: request timed out", name);
+        return false;
+    case WT_HTTP_FAILURE_CANCELLED:
+        set_err(out, "%s: request cancelled", name);
         return false;
     case WT_HTTP_FAILURE_CLOSE:
         set_err(out, "%s: request close failed", name);
@@ -2731,6 +2751,7 @@ static struct whisper_translator *translator_alloc(
     tr->clock_ctx = NULL;
     mp_mutex_init(&tr->state_lock);
     atomic_init(&tr->refcount, 1);
+    atomic_init(&tr->cancelled, false);
     atomic_init(&tr->fail_request_close, 0);
     atomic_init(&tr->fail_connection_close, 0);
     atomic_init(&tr->fail_session_close, 0);
@@ -2774,7 +2795,7 @@ static bool configure_openai(struct whisper_translator *tr,
     int timeout = cfg->timeout_ms > 0
         ? cfg->timeout_ms : WT_DEFAULT_TIMEOUT_MS;
     tr->oa_timeout_ms =
-        timeout < WT_MAX_TIMEOUT_MS ? timeout : WT_MAX_TIMEOUT_MS;
+        timeout < WT_MAX_OPENAI_TIMEOUT_MS ? timeout : WT_MAX_OPENAI_TIMEOUT_MS;
     if (cfg->max_tokens == 0) {
         tr->oa_max_tokens = 0;
     } else if (cfg->max_tokens < 0) {
@@ -3074,10 +3095,19 @@ void whisper_translate_test_winhttp_call_body(
     case WT_HTTP_FAILURE_TIMEOUT:
         set_err(out, "google: request timed out");
         break;
+    case WT_HTTP_FAILURE_CANCELLED:
+        set_err(out, "google: request cancelled");
+        break;
     case WT_HTTP_FAILURE_CLOSE:
         set_err(out, "google: request close failed");
         break;
     }
+}
+
+void whisper_translator_cancel(struct whisper_translator *tr)
+{
+    if (tr)
+        atomic_store_explicit(&tr->cancelled, true, memory_order_release);
 }
 
 void whisper_translate_test_winhttp_call(

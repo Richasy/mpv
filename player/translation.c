@@ -949,6 +949,10 @@ void mp_translation_destroy(struct mp_translation **ptr)
     *ptr = NULL;
 
     atomic_store(&translation->terminate, true);
+    mp_mutex_lock(&translation->state_lock);
+    if (translation->backend && translation->backend_ops.cancel)
+        translation->backend_ops.cancel(translation->backend);
+    mp_mutex_unlock(&translation->state_lock);
     mp_mutex_lock(&translation->pending_lock);
     mp_cond_broadcast(&translation->pending_cv);
     mp_mutex_unlock(&translation->pending_lock);
@@ -1012,8 +1016,12 @@ static bool replace_backend_locked(
         translation->source_generation[n]++;
     mp_mutex_unlock(&translation->state_lock);
 
-    if (old_backend && old_ops.release)
-        old_ops.release(old_backend);
+    if (old_backend) {
+        if (old_ops.cancel)
+            old_ops.cancel(old_backend);
+        if (old_ops.release)
+            old_ops.release(old_backend);
+    }
     return true;
 }
 
@@ -1713,11 +1721,17 @@ static void native_backend_status(void *ctx, struct wt_status *out)
     whisper_translator_get_status(ctx, out);
 }
 
+static void native_backend_cancel(void *ctx)
+{
+    whisper_translator_cancel(ctx);
+}
+
 static const struct mp_translation_backend_ops native_backend_ops = {
     .acquire = native_backend_acquire,
     .release = native_backend_release,
     .call = native_backend_call,
     .get_status = native_backend_status,
+    .cancel = native_backend_cancel,
 };
 
 static struct whisper_translator *create_native_backend(
@@ -2047,6 +2061,8 @@ char *mp_translation_get_legacy_status(
     node_map_add_flag(&root, "enabled", status.enabled);
     node_map_add_flag(&root, "paused", status.paused);
     node_map_add_int64(&root, "fail_count", status.fail_count);
+    node_map_add_int64(&root, "pending", mp_translation_pending_count(
+        translation, MP_TRANSLATION_SOURCE_WHISPER));
     node_map_add_int64(&root, "retry_after_ms", status.retry_after_ms);
     node_map_add_string(&root, "last_error", status.last_error);
     node_map_add_int64(&root, "session_req_used", session_requests);

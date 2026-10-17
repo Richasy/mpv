@@ -43,7 +43,7 @@ struct wt_openai_config {
                                 // translator stateless and safely callable
                                 // from multiple worker threads in parallel.
     int timeout_ms;             // per-request timeout; <=0 means default.
-                                // Hard-clamped to <= 5000 ms and enforced as
+                                // Hard-clamped to <= 30000 ms and enforced as
                                 // one monotonic total request deadline.
     int max_tokens;             // 0 means: don't send max_tokens; <0 means default (128)
     const char *api;            // NULL/"chat" or explicit "responses"; never inferred from URL/model.
@@ -82,6 +82,9 @@ struct whisper_translator *whisper_translator_create_openai(
 
 // Destroy a translator instance, closing WinHTTP handles.
 void whisper_translator_destroy(struct whisper_translator **tr);
+
+// Interrupt outstanding transport waits without releasing acquired references.
+void whisper_translator_cancel(struct whisper_translator *tr);
 
 // Per-call result of whisper_translate_call(). Caller does NOT need to free
 // any field individually; `translated` is a talloc child of the talloc_ctx

@@ -135,6 +135,7 @@ enum loopback_mode {
     LOOPBACK_STALL_NO_READ,
     LOOPBACK_OVERLAP_STALL,
     LOOPBACK_BODY,
+    LOOPBACK_DELAYED_AI,
 };
 
 struct loopback_server {
@@ -254,7 +255,21 @@ static MP_THREAD_VOID run_loopback_server(void *opaque)
             server->second_request_had_cookie =
                 received && request_has_cookie(request);
 
-        if (received && server->mode == LOOPBACK_STALL) {
+        if (received && server->mode == LOOPBACK_DELAYED_AI) {
+            if (WaitForSingleObject(server->release_event, 6000) == WAIT_TIMEOUT) {
+                static const char body[] =
+                    "{\"choices\":[{\"message\":{\"content\":\"translated\"}}],"
+                    "\"status\":\"completed\",\"output\":[{\"type\":\"message\","
+                    "\"role\":\"assistant\",\"status\":\"completed\","
+                    "\"content\":[{\"type\":\"output_text\",\"text\":\"translated\"}]}]}";
+                char headers[128];
+                int length = snprintf(headers, sizeof(headers),
+                    "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n"
+                    "Connection: close\r\n\r\n", (unsigned)(sizeof(body) - 1));
+                send_all(client, headers, length);
+                send_all(client, body, sizeof(body) - 1);
+            }
+        } else if (received && server->mode == LOOPBACK_STALL) {
             WaitForSingleObject(server->release_event, 5000);
         } else if (received && server->mode == LOOPBACK_SLOW_DRIP) {
             static const char headers[] =
@@ -1201,6 +1216,47 @@ static void test_production_transport_total_deadline(void)
         wait_for_session_finalization(&session_receipt);
         assert_int_equal(
             whisper_translate_test_active_async_requests(), 0);
+    }
+}
+
+static void test_openai_configured_deadline_and_retirement(void)
+{
+    const char *apis[] = {"chat", "responses"};
+    for (int n = 0; n < MP_ARRAY_SIZE(apis); n++) {
+        for (int cancelled = 0; cancelled < 2; cancelled++) {
+            struct loopback_server server;
+            init_loopback_server(&server, LOOPBACK_DELAYED_AI);
+            char endpoint[128];
+            snprintf(endpoint, sizeof(endpoint), "http://127.0.0.1:%d/ai", server.port);
+            struct wt_openai_config config = {
+                .endpoint = endpoint,
+                .model = "fixture",
+                .target_lang = "zh",
+                .timeout_ms = 30000,
+                .api = apis[n],
+            };
+            struct whisper_translator *translator =
+                whisper_translator_create_openai(NULL, NULL, &config);
+            mp_require(translator);
+            struct call_thread call = {.translator = translator, .text = "Hello."};
+            mp_thread thread;
+            assert_int_equal(mp_thread_create(&thread, call_translate, &call), 0);
+            assert_int_equal(WaitForSingleObject(server.accepted_event, 5000), WAIT_OBJECT_0);
+            int64_t started = GetTickCount64();
+            if (cancelled)
+                whisper_translator_cancel(translator);
+            mp_thread_join(thread);
+            if (cancelled) {
+                assert_true(GetTickCount64() - started < 1500);
+                assert_string_equal(call.result.error, "openai: request cancelled");
+                assert_false(call.result.translated);
+            } else {
+                assert_string_equal(call.result.translated, "translated");
+            }
+            whisper_translator_destroy(&translator);
+            destroy_call(&call);
+            destroy_loopback_server(&server);
+        }
     }
 }
 
@@ -2279,6 +2335,11 @@ int main(int argc, char **argv)
         test_openai_request_shape();
         test_responses_request_and_output();
         puts("MPV_TRANSLATION_RESPONSES_SELFTEST_OK_V1");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--openai-deadline-selftest") == 0) {
+        test_openai_configured_deadline_and_retirement();
+        puts("MPV_TRANSLATION_OPENAI_DEADLINE_SELFTEST_OK_V1");
         return 0;
     }
     if (argc == 1) {

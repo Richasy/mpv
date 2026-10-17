@@ -92,6 +92,7 @@ struct mp_translation_backend_ops {
     void (*call)(void *ctx, void *talloc_ctx, const char *text,
                  struct wt_call_result *out);
     void (*get_status)(void *ctx, struct wt_status *out);
+    void (*cancel)(void *ctx);
 };
 
 typedef void (*mp_translation_wakeup_fn)(void *ctx);

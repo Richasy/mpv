@@ -1965,8 +1965,24 @@ void whisper_lookahead_set_ai_translate(struct MPContext *mpctx,
 char *whisper_lookahead_get_ai_translate_status(struct MPContext *mpctx,
                                                 void *ta_parent)
 {
-    return mp_translation_get_legacy_status(
-        mpctx->translation, ta_parent);
+    void *tmp = talloc_new(NULL);
+    char *status = mp_translation_get_legacy_status(mpctx->translation, tmp);
+    struct mpv_node root = {0};
+    char *cursor = status;
+    char *serialized = NULL;
+    char *result = NULL;
+    if (status && json_parse(tmp, &root, &cursor, MAX_JSON_DEPTH) >= 0 &&
+        root.format == MPV_FORMAT_NODE_MAP)
+    {
+        struct whisper_lookahead *wl = mpctx->whisper_lookahead;
+        node_map_add_int64(&root, "translated",
+                          wl ? wl->translations_injected : 0);
+        if (json_write(&serialized, &root) >= 0)
+            result = talloc_strdup(ta_parent, serialized);
+    }
+    talloc_free(serialized);
+    talloc_free(tmp);
+    return result;
 }
 
 int whisper_lookahead_set_translate_limits(struct MPContext *mpctx,

@@ -16,10 +16,12 @@
  */
 
 #include <inttypes.h>
+#include <errno.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include <curl/curl.h>
 
@@ -81,6 +83,11 @@ struct curl_opts {
     int http_version;
     int max_redirects;
     int max_retries;
+    int prefer_family;
+    bool http_keepalive;
+    bool retry_http_429;
+    bool respect_retry_after;
+    double retry_delay_max;
     double connect_timeout;
     int64_t buffer_size;
     int64_t max_request_size;
@@ -112,6 +119,12 @@ const struct m_sub_options curl_conf = {
             )},
         {"max-redirects", OPT_INT(max_redirects), M_RANGE(0, 100)},
         {"max-retries", OPT_INT(max_retries), M_RANGE(0, 100)},
+        {"prefer-family", OPT_CHOICE(prefer_family,
+            {"auto", 0}, {"ipv4", 1}, {"ipv6", 2})},
+        {"http-keepalive", OPT_BOOL(http_keepalive)},
+        {"retry-http-429", OPT_BOOL(retry_http_429)},
+        {"respect-retry-after", OPT_BOOL(respect_retry_after)},
+        {"retry-delay-max", OPT_DOUBLE(retry_delay_max), M_RANGE(0, 600)},
         {"connect-timeout", OPT_DOUBLE(connect_timeout), M_RANGE(0, 600)},
         {"buffer-size", OPT_BYTE_SIZE(buffer_size),
             M_RANGE(2 * CURL_MAX_WRITE_SIZE, M_MAX_MEM_BYTES)},
@@ -126,6 +139,9 @@ const struct m_sub_options curl_conf = {
         .http_version = CURL_HTTP_VERSION_NONE,
         .max_redirects = 16,
         .max_retries = 5,
+        .http_keepalive = true,
+        .respect_retry_after = true,
+        .retry_delay_max = 30,
         .connect_timeout = 30,
         .buffer_size = 4 << 20, // 4 MiB
         .max_request_size = 0,
@@ -163,6 +179,7 @@ struct curl_ctx {
     struct mp_dispatch_queue *dispatch;
     CURLM *multi;
     bool exit;
+    struct priv *retries;
 
     // Set when libcurl cannot be used anymore.
     const char *error;
@@ -199,6 +216,12 @@ struct priv {
     bool finished;             // current request has reached EOF
     int64_t reply_end;         // inclusive end of the reply's byte range, -1 if none
     bool reply_rejected;       // reply is unusable, its body is dropped
+    bool retry_http;
+    double retry_after;
+    int64_t open_deadline;
+    int64_t retry_deadline;
+    int64_t retry_at;
+    struct priv *retry_next;
 
     // Probe state. Set on the curl thread read by curl_open after.
     bool probed;
@@ -239,6 +262,49 @@ struct cmd {
 static void start_request(struct priv *p);
 static void on_done(struct priv *p, CURLcode code);
 
+static void remove_retry(struct priv *p)
+{
+    struct priv **next = &p->ctx->retries;
+    while (*next) {
+        if (*next == p) {
+            *next = p->retry_next;
+            p->retry_next = NULL;
+            p->retry_at = 0;
+            return;
+        }
+        next = &(*next)->retry_next;
+    }
+}
+
+static void start_pending_retries(struct curl_ctx *ctx)
+{
+    struct priv **next = &ctx->retries;
+    int64_t now = mp_time_ns();
+    while (*next) {
+        struct priv *p = *next;
+        if (atomic_load(&p->aborted) || p->retry_at <= now) {
+            *next = p->retry_next;
+            p->retry_next = NULL;
+            p->retry_at = 0;
+            if (!atomic_load(&p->aborted))
+                start_request(p);
+        } else {
+            next = &p->retry_next;
+        }
+    }
+}
+
+static int retry_poll_timeout(struct curl_ctx *ctx)
+{
+    int timeout = 1000;
+    int64_t now = mp_time_ns();
+    for (struct priv *p = ctx->retries; p; p = p->retry_next) {
+        int64_t remaining = MPMAX(p->retry_at - now, 0);
+        timeout = MPMIN(timeout, (remaining + 999999) / 1000000);
+    }
+    return timeout;
+}
+
 static void run_cmd(void *arg)
 {
     struct cmd *c = arg;
@@ -249,6 +315,7 @@ static void run_cmd(void *arg)
         start_request(c->p);
         break;
     case CMD_REMOVE:
+        remove_retry(c->p);
         if (c->p->active) {
             MP_TRACE(c->p, "removing curl handle\n");
             curl_multi_remove_handle(ctx->multi, c->p->curl);
@@ -265,6 +332,7 @@ static void run_cmd(void *arg)
         curl_easy_pause(c->p->curl, CURLPAUSE_CONT);
         break;
     case CMD_SEEK:
+        remove_retry(c->p);
         MP_TRACE(c->p, "seeking to %" PRIu64 "\n", c->pos);
         if (c->p->active) {
             curl_multi_remove_handle(ctx->multi, c->p->curl);
@@ -281,6 +349,7 @@ static void run_cmd(void *arg)
         c->p->request_start = c->pos;
         c->p->request_received = 0;
         c->p->retry_count = 0;
+        c->p->retry_deadline = 0;
         c->p->finished = false;
         start_request(c->p);
         break;
@@ -361,6 +430,7 @@ static MP_THREAD_VOID curl_thread(void *arg)
         }
 
         mp_dispatch_queue_process(ctx->dispatch, 0);
+        start_pending_retries(ctx);
 
         // Stop early to avoid delays, this happens only when player is closing.
         if (ctx->exit)
@@ -386,7 +456,7 @@ static MP_THREAD_VOID curl_thread(void *arg)
             on_done(p, msg->data.result);
         }
 
-        curl_multi_poll(ctx->multi, NULL, 0, 1000, NULL);
+        curl_multi_poll(ctx->multi, NULL, 0, retry_poll_timeout(ctx), NULL);
     }
 
     if (ctx->multi) {
@@ -510,6 +580,23 @@ static void parse_content_range(CURL *c, int64_t *out_start, int64_t *out_end,
         *out_end = v;
 }
 
+static double retry_after_seconds(struct priv *p)
+{
+    const char *value = header_value(p->curl, "Retry-After");
+    if (!value)
+        return -1;
+    char *end;
+    errno = 0;
+    long long seconds = strtoll(value, &end, 10);
+    if (value != end && !*end && !errno && seconds >= 0)
+        return seconds;
+    time_t date = curl_getdate(value, NULL);
+    if (date != (time_t)-1)
+        return MPMAX(difftime(date, time(NULL)), 0);
+    MP_WARN(p, "Ignoring an invalid Retry-After header.\n");
+    return -1;
+}
+
 static void finalize_probe(struct priv *p)
 {
     if (mp_msg_test(p->log, MSGL_DEBUG)) {
@@ -586,6 +673,13 @@ static void on_http_header(struct priv *p, struct bstr line)
     int64_t range_start, range_end, range_total;
     parse_content_range(p->curl, &range_start, &range_end, &range_total);
     p->reply_end = resp == 206 ? range_end : -1;
+
+    if (resp == 429 && p->opts->retry_http_429) {
+        p->retry_http = true;
+        p->retry_after = retry_after_seconds(p);
+        p->reply_rejected = true;
+        return;
+    }
 
     if (p->probed) {
         check_http_reply(p, resp, range_start, range_total);
@@ -795,6 +889,8 @@ static void start_request(struct priv *p)
     p->request_received = 0;
     p->reply_end = -1;
     p->reply_rejected = false;
+    p->retry_http = false;
+    p->retry_after = -1;
     CURLMcode mres = curl_multi_add_handle(p->ctx->multi, p->curl);
     if (mres != CURLM_OK) {
         MP_ERR(p, "Failed to start the request: %s\n", curl_multi_strerror(mres));
@@ -818,9 +914,43 @@ static void log_curl_error(struct priv *p, const char *what, CURLcode code)
     }
 }
 
+static bool schedule_http_retry(struct priv *p)
+{
+    if (p->retry_count >= p->opts->max_retries)
+        return false;
+    double delay = p->retry_count ? ldexp(1, p->retry_count) - 1 : 0;
+    if (p->opts->respect_retry_after && p->retry_after >= 0)
+        delay = p->retry_after;
+    if (delay > p->opts->retry_delay_max)
+        return false;
+    int64_t now = mp_time_ns();
+    if (!p->retry_deadline && p->net_opts->timeout > 0)
+        p->retry_deadline = mp_time_ns_add(now, p->net_opts->timeout);
+    int64_t deadline = p->probed ? p->retry_deadline : p->open_deadline;
+    int64_t retry_at = mp_time_ns_add(now, delay);
+    if (deadline && retry_at >= deadline)
+        return false;
+    p->retry_count++;
+    p->retry_at = retry_at;
+    p->retry_next = p->ctx->retries;
+    p->ctx->retries = p;
+    MP_WARN(p, "HTTP 429, retrying (#%d) in %.3f seconds at offset %" PRIu64 "\n",
+            p->retry_count, delay, p->request_start);
+    return true;
+}
+
 static void on_done(struct priv *p, CURLcode code)
 {
     bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
+
+    if (p->retry_http && !aborted) {
+        if (schedule_http_retry(p))
+            return;
+        MP_ERR(p, "HTTP error 429; retry count or wait budget exhausted.\n");
+        mp_mutex_lock(&p->mtx);
+        p->error_code = CURLE_HTTP_RETURNED_ERROR;
+        mp_mutex_unlock(&p->mtx);
+    }
 
     if (!p->probed) {
         // Connection died before any headers arrived.
@@ -855,6 +985,7 @@ static void on_done(struct priv *p, CURLcode code)
 
     if (code == CURLE_OK && !aborted) {
         p->retry_count = 0;
+        p->retry_deadline = 0;
 
         // A reply may end before the requested range does: servers cap their
         // replies, and with an unknown file size only a 416 marks the end.
@@ -972,6 +1103,19 @@ static bool setup_curl(struct priv *p)
         SETOPT(CURLOPT_HSTS_CTRL, (long)CURLHSTS_ENABLE);
     SETOPT(CURLOPT_TCP_KEEPALIVE, 1L);
     SETOPT(CURLOPT_CONNECTTIMEOUT_MS, (long)(p->opts->connect_timeout * 1000));
+    if (p->scheme->proto == MP_CURL_PROTO_HTTP) {
+        SETOPT(CURLOPT_FRESH_CONNECT, p->opts->http_keepalive ? 0L : 1L);
+        SETOPT(CURLOPT_FORBID_REUSE, p->opts->http_keepalive ? 0L : 1L);
+    }
+    if (p->opts->prefer_family) {
+#if defined(CURL_IPRESOLVE_V4_PREFERRED) && defined(CURL_IPRESOLVE_V6_PREFERRED)
+        SETOPT(CURLOPT_IPRESOLVE, p->opts->prefer_family == 1 ?
+               CURL_IPRESOLVE_V4_PREFERRED : CURL_IPRESOLVE_V6_PREFERRED);
+#else
+        MP_ERR(p, "This libcurl build cannot prefer an address family while retaining fallback.\n");
+        return false;
+#endif
+    }
 
     const char *ua = p->net_opts->useragent;
     if (!ua || !ua[0])
@@ -1240,6 +1384,7 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
         mp_cancel_set_cb(s->cancel, on_cancel, p);
 
     int64_t deadline = stream_get_io_deadline(s);
+    p->open_deadline = deadline;
     cmd_sync(p, CMD_ADD, 0, false);
 
     mp_mutex_lock(&p->mtx);

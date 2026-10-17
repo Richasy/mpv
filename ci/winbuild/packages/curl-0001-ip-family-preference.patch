@@ -1,0 +1,45 @@
+diff --git a/include/curl/curl.h b/include/curl/curl.h
+--- a/include/curl/curl.h
++++ b/include/curl/curl.h
+@@ -2326,10 +2326,12 @@
+ /* Below here follows defines for the CURLOPT_IPRESOLVE option. If a host
+    name resolves addresses using more than one IP protocol version, this
+    option might be handy to force libcurl to use a specific IP version. */
+ #define CURL_IPRESOLVE_WHATEVER 0L /* default, uses addresses to all IP
+                                      versions that your system allows */
+ #define CURL_IPRESOLVE_V4       1L /* uses only IPv4 addresses/connections */
+ #define CURL_IPRESOLVE_V6       2L /* uses only IPv6 addresses/connections */
++#define CURL_IPRESOLVE_V4_PREFERRED 3L /* IPv4 first, retaining IPv6 fallback */
++#define CURL_IPRESOLVE_V6_PREFERRED 4L /* IPv6 first, retaining IPv4 fallback */
+ 
+   /* Convenient "aliases" */
+ #define CURLOPT_RTSPHEADER CURLOPT_HTTPHEADER
+diff --git a/lib/setopt.c b/lib/setopt.c
+--- a/lib/setopt.c
++++ b/lib/setopt.c
+@@ -833,10 +833,10 @@
+     else
+       s->max_filesize = arg;
+     break;
+   case CURLOPT_IPRESOLVE:
+-    if((arg < CURL_IPRESOLVE_WHATEVER) || (arg > CURL_IPRESOLVE_V6))
++    if((arg < CURL_IPRESOLVE_WHATEVER) || (arg > CURL_IPRESOLVE_V6_PREFERRED))
+       result = CURLE_BAD_FUNCTION_ARGUMENT;
+     else
+       s->ipver = (unsigned char)arg;
+     break;
+   case CURLOPT_CONNECT_ONLY:
+diff --git a/lib/cf-ip-happy.c b/lib/cf-ip-happy.c
+--- a/lib/cf-ip-happy.c
++++ b/lib/cf-ip-happy.c
+@@ -358,7 +358,9 @@
+   bs->tunnel_transport = tunnel_transport;
+   bs->attempt_delay_ms = attempt_delay_ms;
+   bs->max_concurrent = max_concurrent;
+-  bs->last_attempt_ai_family = AF_INET; /* so AF_INET6 is next */
++  bs->last_attempt_ai_family =
++    data->set.ipver == CURL_IPRESOLVE_V4_PREFERRED ?
++    AF_INET6 : AF_INET;
+   return CURLE_OK;
+ }
+ 

@@ -6098,7 +6098,33 @@ TLS/connection diagnostics), set ``--msg-level=curl=trace``.
     Number of times a single seekable transfer may be transparently
     re-attempted after a recoverable error (timeout, connection drop,
     HTTP/2 stream reset, ...) before the stream gives up (default: 5).
-    Non-seekable transfers cannot be retried and ignore this option.
+    HTTP 429 retries also use this limit, including before the initial open
+    completes. Other failures of non-seekable transfers cannot be retried.
+
+``--curl-prefer-family=<auto|ipv4|ipv6>``
+    Prefer one address family without disabling the other (default: ``auto``).
+    The bundled libcurl retains its normal Happy Eyeballs connection racing,
+    including after redirects and for nested HLS/DASH requests. Changing this
+    file-local option keeps connections from a different preference out of the
+    reuse pool. An unpatched system libcurl reports an explicit error when a
+    non-automatic preference is requested.
+
+``--curl-http-keepalive=<yes|no>``
+    Reuse HTTP connections (default: ``yes``). ``no`` both avoids existing
+    pooled connections and prevents new connections from returning to the pool.
+
+``--curl-retry-http-429=<yes|no>``
+    Retry rate-limited HTTP requests (default: ``no``), preserving the requested
+    byte offset. Waiting does not block unrelated transfers on the curl worker.
+
+``--curl-respect-retry-after=<yes|no>``
+    Honor seconds and HTTP-date forms of Retry-After when retrying HTTP 429
+    (default: ``yes``). Missing or invalid values use bounded exponential
+    backoff. Cancellation and network timeout remain authoritative.
+
+``--curl-retry-delay-max=<seconds>``
+    Maximum permitted retry delay (default: 30, range 0-600). A Retry-After
+    beyond this limit or the remaining timeout fails instead of retrying early.
 
 ``--curl-connect-timeout=<seconds>``
     TCP/TLS connect timeout in seconds (default: 30, range 0-600). 0 lets

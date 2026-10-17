@@ -29,6 +29,7 @@ BASE_LAVF_OPTIONS = "reconnect=0,reconnect_on_network_error=0"
 # stream_lavf reports options that no protocol consumed after a successful open.
 UNSUPPORTED = "Could not set AVOption prefer_family="
 SKIP = 77
+BACKEND = "lavf"
 
 
 class Event(ctypes.Structure):
@@ -78,7 +79,7 @@ def wait_for(mpv, client, wanted, messages, unsupported, timeout=10):
     raise TimeoutError(f"Native media did not reach {wanted}\n" + "".join(messages))
 
 
-def run_client(library, url, preference, expected):
+def run_client(library, url, preference, expected, backend):
     with contextlib.ExitStack() as stack:
         if os.name == "nt":
             stack.enter_context(os.add_dll_directory(str(Path(library).parent)))
@@ -117,7 +118,7 @@ def run_client(library, url, preference, expected):
             "ytdl": "no",
             "tls-verify": "no",
             "network-timeout": "5",
-            "curl-enabled": "no",
+            "curl-enabled": "yes" if backend == "curl" else "no",
             "stream-lavf-o": BASE_LAVF_OPTIONS,
         }
         for name, value in options.items():
@@ -128,13 +129,14 @@ def run_client(library, url, preference, expected):
             raise RuntimeError("Native initialization failed")
 
         # The same per-file form the player uses: loadfile <url> <flags> <index> <options>.
-        per_file = f"stream-lavf-o-append=prefer_family={preference}".encode()
+        per_file = (f"curl-prefer-family={preference}" if backend == "curl" else
+                    f"stream-lavf-o-append=prefer_family={preference}").encode()
         command = (ctypes.c_char_p * 6)(b"loadfile", url.encode(), b"replace", b"-1", per_file, None)
         if mpv.mpv_command(client, command) < 0:
             raise RuntimeError("Native load command failed")
         messages = []
         unsupported = []
-        loads = expected in ("loaded", "probe")
+        loads = expected in ("loaded", "probe", "switch")
         end = wait_for(mpv, client, "loaded" if loads else expected, messages, unsupported)
         if expected == "failed" and (end.reason != 4 or end.error != -13):
             raise RuntimeError(
@@ -145,15 +147,25 @@ def run_client(library, url, preference, expected):
             if mpv.mpv_command(client, stop) < 0:
                 raise RuntimeError("Native stop command failed")
             wait_for(mpv, client, "ended", messages, unsupported)
+        if expected == "switch":
+            command = (ctypes.c_char_p * 6)(
+                b"loadfile", url.encode(), b"replace", b"-1",
+                b"curl-prefer-family=ipv6", None)
+            if mpv.mpv_command(client, command) < 0:
+                raise RuntimeError("The replacement file command failed")
+            end = wait_for(mpv, client, "failed", messages, unsupported)
+            if end.reason != 4 or end.error != -13:
+                raise RuntimeError("The replacement did not reach the IPv6 rejection")
 
-        value = mpv.mpv_get_property_string(client, b"stream-lavf-o")
+        property_name = b"curl-prefer-family" if backend == "curl" else b"stream-lavf-o"
+        value = mpv.mpv_get_property_string(client, property_name)
         if not value:
             raise RuntimeError("stream-lavf-o could not be read after the file ended")
         try:
             restored = ctypes.string_at(value).decode()
         finally:
             mpv.mpv_free(value)
-        if "prefer_family" in restored:
+        if "prefer_family" in restored or (backend == "curl" and restored != "auto"):
             raise RuntimeError(f"The per-file preference leaked past its file: {restored}")
         if expected == "probe" and unsupported:
             raise SystemExit(SKIP)
@@ -291,7 +303,7 @@ def supports_preference(library, url):
     """Load an IPv4 literal, where the order is moot, and look for an unconsumed option."""
     result = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), "--child",
-         library, url, "ipv4", "probe"],
+         library, url, "ipv4", "probe", BACKEND],
         capture_output=True, text=True, timeout=30,
     )
     if result.returncode == SKIP:
@@ -305,7 +317,7 @@ def run_case(library, name, url, preference, expected, servers, hit):
     before = [server.requests for server in servers]
     result = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), "--child",
-         library, url, preference, expected],
+         library, url, preference, expected, BACKEND],
         capture_output=True, text=True, timeout=30,
     )
     counts = [server.requests - count for server, count in zip(servers, before)]
@@ -314,7 +326,7 @@ def run_case(library, name, url, preference, expected, servers, hit):
     observed = [count > 0 for count in counts]
     if observed != hit:
         raise RuntimeError(f"{name}: requests {counts} did not match {hit}")
-    print(f"PASS {name}", flush=True)
+    print(f"PASS {BACKEND}/{name}", flush=True)
 
 
 def main(library):
@@ -348,6 +360,9 @@ def main(library):
                          (v4, v6), [True, False])
                 run_case(library, f"{scheme}/ipv6-first", url, "ipv6", "failed",
                          (v4, v6), [False, True])
+                if BACKEND == "curl":
+                    run_case(library, f"{scheme}/per-file-family", url, "ipv4", "switch",
+                             (v4, v6), [True, True])
             with ipv6_only(media, context) as v6:
                 url = f"{scheme}://localhost:{v6.server_port}/media.wav"
                 run_case(library, f"{scheme}/ipv4-first-fallback", url, "ipv4", "loaded",
@@ -355,9 +370,13 @@ def main(library):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 6 and sys.argv[1] == "--child":
+    if len(sys.argv) == 7 and sys.argv[1] == "--child":
         run_client(*sys.argv[2:])
-    elif len(sys.argv) == 2:
+    elif len(sys.argv) in (2, 3):
+        if len(sys.argv) == 3:
+            if sys.argv[2] != "--curl":
+                raise SystemExit("Expected --curl")
+            BACKEND = "curl"
         main(str(Path(sys.argv[1]).resolve(strict=True)))
     else:
         raise SystemExit("usage: libmpv_network_family.py <libmpv shared library>")

@@ -209,11 +209,7 @@ build() {
     rm -rf "$BUILD_DIR/packages/amf-headers-prefix/src/amf-headers-stamp" 2>/dev/null || true
     rm -rf "$BUILD_DIR/${ARCH}-w64-mingw32/include/AMF" 2>/dev/null || true
 
-    # Force curl re-clone (newly enabled mpv dep for the stream_curl backend).
-    # Wiping the whole curl-prefix avoids stale ExternalProject step definitions
-    # lingering from earlier runs (e.g. a removed PATCH_COMMAND) and tracks
-    # curl.git master cleanly. mbedtls (curl's TLS backend) is left cached; it
-    # is pinned to a fixed tag and builds deterministically.
+    # Reapply the pinned curl address-family preference patch on every build.
     log "Removing curl cache to force re-clone..."
     rm -rf "$SRC_PACKAGES/curl" 2>/dev/null || true
     rm -rf "$BUILD_DIR/packages/curl-prefix" 2>/dev/null || true
@@ -380,6 +376,7 @@ collect() {
 
     local MPV_BUILD_COMMIT="${MPV_COMMIT:-unknown}"
     local FFMPEG_BUILD_COMMIT="unknown"
+    local CURL_BUILD_COMMIT="unknown"
     local LIBPLACEBO_BUILD_COMMIT="unknown"
     local DAVS2_BUILD_COMMIT="unknown"
     local UAVS3D_BUILD_COMMIT="unknown"
@@ -392,6 +389,9 @@ collect() {
     fi
     if git -C "$SRC_PACKAGES/ffmpeg" rev-parse HEAD >/dev/null 2>&1; then
         FFMPEG_BUILD_COMMIT=$(git -C "$SRC_PACKAGES/ffmpeg" rev-parse HEAD)
+    fi
+    if git -C "$SRC_PACKAGES/curl" rev-parse HEAD >/dev/null 2>&1; then
+        CURL_BUILD_COMMIT=$(git -C "$SRC_PACKAGES/curl" rev-parse HEAD)
     fi
     if git -C "$SRC_PACKAGES/libplacebo" rev-parse HEAD >/dev/null 2>&1; then
         LIBPLACEBO_BUILD_COMMIT=$(git -C "$SRC_PACKAGES/libplacebo" rev-parse HEAD)
@@ -427,6 +427,8 @@ collect() {
     cat > "$ARCH_OUTPUT/build-info.txt" <<EOF
 mpv_commit=$MPV_BUILD_COMMIT
 ffmpeg_commit=$FFMPEG_BUILD_COMMIT
+curl_commit=$CURL_BUILD_COMMIT
+curl_ip_preference_patch_sha256=$(sha256sum "$WINBUILD_DIR/packages/curl-0001-ip-family-preference.patch" | awk '{print $1}')
 libplacebo_commit=$LIBPLACEBO_BUILD_COMMIT
 davs2_commit=$DAVS2_BUILD_COMMIT
 uavs3d_commit=$UAVS3D_BUILD_COMMIT

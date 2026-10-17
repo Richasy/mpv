@@ -341,6 +341,16 @@ if get_option('libmpv')
             test('libmpv-network-family', python,
                  args: [files('libmpv_network_family.py'), mpvlib.full_path()],
                  depends: mpvlib, suite: 'libmpv-network', timeout: 120)
+            if features['libcurl']
+                test('libmpv-curl-network-family', python,
+                     args: [files('libmpv_network_family.py'),
+                            mpvlib.full_path(), '--curl'],
+                     depends: mpvlib, suite: 'libmpv-network', timeout: 120)
+                test('libmpv-curl-settings', python,
+                     args: ['-B', files('libmpv_curl_settings.py'),
+                            mpvlib.full_path()],
+                     depends: mpvlib, suite: 'libmpv-network', timeout: 120)
+            endif
             test('libmpv-network-cursors', python,
                  args: [files('libmpv_network_cursors.py'), mpvlib.full_path()],
                  depends: mpvlib, suite: 'libmpv-network', timeout: 300)

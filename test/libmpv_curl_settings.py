@@ -392,6 +392,7 @@ def child_range_retry(library, url, pcm_path):
         mpv = load_libmpv(stack, library)
         client = create_client(stack, mpv, options(**{
             "ao": "pcm",
+            "keep-open": "no",
             "ao-pcm-file": pcm_path,
             "ao-pcm-waveheader": "no",
             "audio-format": "s16",
@@ -401,8 +402,12 @@ def child_range_retry(library, url, pcm_path):
             "curl-retry-http-429": "yes",
             "curl-max-retries": "1",
         }))
-        load_complete(mpv, client, url)
-        print(json.dumps({"bytes": Path(pcm_path).stat().st_size}), flush=True)
+        run_command(mpv, client, "loadfile", url)
+        wait_event(mpv, client, EVENT_FILE_LOADED)
+        end = wait_event(mpv, client, "end")
+        if end["reason"] != 0 or end["error"] < 0:
+            raise RuntimeError(f"Range retry did not finish normally: {end}")
+    print(json.dumps({"bytes": Path(pcm_path).stat().st_size}), flush=True)
 
 
 def child_isolation(library, base):

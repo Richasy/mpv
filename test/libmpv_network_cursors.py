@@ -507,7 +507,8 @@ def run_client(library, url, options, pcm_path, count):
                 if event.event_id == EVENT_LOG_MESSAGE:
                     message = ctypes.cast(event.data, ctypes.POINTER(LogMessage)).contents
                     text = message.text.decode("utf-8", errors="replace")
-                    if "lru_cache:" in text or "reopen" in text:
+                    if ("lru_cache:" in text or "reopen" in text
+                            or text.startswith("curl_request ")):
                         lines.append(text.rstrip())
                 elif event.event_id == EVENT_END_FILE:
                     end = ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents

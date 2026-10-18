@@ -6079,6 +6079,27 @@ implementation instead.
 To inspect libcurl's debug output (requests, response headers,
 TLS/connection diagnostics), set ``--msg-level=curl=trace``.
 
+At the normal ``info`` level, ``curl_request`` records identify each request
+within a native client, including additional byte-range connections and retries.
+They report the requested offset, numeric HTTP/proxy status, response range,
+redirect and new-connection counts, first body delivery, and libcurl's DNS,
+connection, TLS, pre-transfer, first-byte, redirect, and total timings in
+milliseconds. These are cumulative libcurl timing markers, not independent
+phase durations; redirects and connection reuse affect their interpretation.
+A zero timing may describe an unfinished phase or a reused connection; ``-1``
+means that a value was unavailable. ``curl_result=-1`` means that no completion
+result exists for that event. ``http_version`` is libcurl's numeric
+``CURL_HTTP_VERSION_*`` constant, not a decimal HTTP version number.
+
+No-progress requests emit at most three ``pending`` warnings: after 15 seconds
+without progress, then at 30-second intervals. ``headers`` and ``body`` distinguish
+waiting for final response headers from waiting for body data. Consumer-side
+buffer pauses suppress pending warnings and resuming starts a fresh idle period.
+Elapsed/total time can still include buffer pauses and is not a throughput
+measurement. These summaries contain no URL, host/IP address, header value,
+filename, cookie, or credential. Trace output remains separate and can contain
+sensitive request details.
+
 ``--curl-enabled=<yes|no>``
     Enable the libcurl-based network backend (default: ``yes``).
 

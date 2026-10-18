@@ -180,6 +180,7 @@ struct curl_ctx {
     CURLM *multi;
     bool exit;
     struct priv *retries;
+    uint64_t next_request_id;
 
     // Set when libcurl cannot be used anymore.
     const char *error;
@@ -223,6 +224,17 @@ struct priv {
     int64_t retry_at;
     struct priv *retry_next;
 
+    uint64_t diagnostic_id;
+    uint64_t diagnostic_offset;
+    int64_t diagnostic_started;
+    int64_t diagnostic_progress;
+    int64_t diagnostic_next_report;
+    int diagnostic_reports;
+    bool diagnostic_headers;
+    bool diagnostic_body;
+    int64_t diagnostic_range_start;
+    int64_t diagnostic_range_total;
+
     // Probe state. Set on the curl thread read by curl_open after.
     bool probed;
     bool stream_ok;
@@ -261,6 +273,70 @@ struct cmd {
 
 static void start_request(struct priv *p);
 static void on_done(struct priv *p, CURLcode code);
+
+static double diagnostic_time(struct priv *p, CURLINFO info)
+{
+    curl_off_t value;
+    return curl_easy_getinfo(p->curl, info, &value) == CURLE_OK
+        ? (double)value / 1000 : -1;
+}
+
+static long diagnostic_long(struct priv *p, CURLINFO info)
+{
+    long value;
+    return curl_easy_getinfo(p->curl, info, &value) == CURLE_OK ? value : -1;
+}
+
+// Curl-thread only. Never query or format addresses, headers, or error buffers.
+static void report_request(struct priv *p, const char *event, int result)
+{
+    if (!p->diagnostic_id)
+        return;
+    bool pending = !strcmp(event, "pending");
+    int level = pending || result > 0 ? MSGL_WARN : MSGL_INFO;
+    if (!mp_msg_test(p->log, level))
+        return;
+
+    mp_mutex_lock(&p->mtx);
+    size_t buffered = p->count;
+    bool paused = p->paused;
+    mp_mutex_unlock(&p->mtx);
+    int64_t now = mp_time_ns();
+    mp_msg(p->log, level,
+           "curl_request %s id=%"PRIu64" offset=%"PRIu64
+           " retry=%d status=%ld proxy_status=%ld http_version=%ld"
+           " redirects=%ld new_connections=%ld range_start=%"PRId64
+           " range_total=%"PRId64" received=%"PRIu64" buffered=%zu"
+           " paused=%d cancelled=%d rejected=%d headers=%d body=%d"
+           " curl_result=%d elapsed_ms=%.3f idle_ms=%.3f"
+           " dns_ms=%.3f connect_ms=%.3f tls_ms=%.3f pretransfer_ms=%.3f"
+           " first_byte_ms=%.3f redirect_ms=%.3f total_ms=%.3f report=%d/3\n",
+           event, p->diagnostic_id, p->diagnostic_offset, p->retry_count,
+           diagnostic_long(p, CURLINFO_RESPONSE_CODE),
+           diagnostic_long(p, CURLINFO_HTTP_CONNECTCODE),
+           diagnostic_long(p, CURLINFO_HTTP_VERSION),
+           diagnostic_long(p, CURLINFO_REDIRECT_COUNT),
+           diagnostic_long(p, CURLINFO_NUM_CONNECTS),
+           p->diagnostic_range_start, p->diagnostic_range_total,
+           p->request_received, buffered, paused, atomic_load(&p->aborted),
+           p->reply_rejected, p->diagnostic_headers, p->diagnostic_body, result,
+           MP_TIME_NS_TO_MS(now - p->diagnostic_started),
+           MP_TIME_NS_TO_MS(now - p->diagnostic_progress),
+           diagnostic_time(p, CURLINFO_NAMELOOKUP_TIME_T),
+           diagnostic_time(p, CURLINFO_CONNECT_TIME_T),
+           diagnostic_time(p, CURLINFO_APPCONNECT_TIME_T),
+           diagnostic_time(p, CURLINFO_PRETRANSFER_TIME_T),
+           diagnostic_time(p, CURLINFO_STARTTRANSFER_TIME_T),
+           diagnostic_time(p, CURLINFO_REDIRECT_TIME_T),
+           diagnostic_time(p, CURLINFO_TOTAL_TIME_T), p->diagnostic_reports);
+}
+
+static void note_request_progress(struct priv *p)
+{
+    p->diagnostic_progress = mp_time_ns();
+    p->diagnostic_next_report =
+        p->diagnostic_progress + MP_TIME_S_TO_NS(15);
+}
 
 static void remove_retry(struct priv *p)
 {
@@ -315,8 +391,11 @@ static void run_cmd(void *arg)
         start_request(c->p);
         break;
     case CMD_REMOVE:
+        if (c->p->retry_at)
+            report_request(c->p, "retry_removed", -1);
         remove_retry(c->p);
         if (c->p->active) {
+            report_request(c->p, "removed", -1);
             MP_TRACE(c->p, "removing curl handle\n");
             curl_multi_remove_handle(ctx->multi, c->p->curl);
             c->p->active = false;
@@ -329,12 +408,16 @@ static void run_cmd(void *arg)
         MP_TRACE(c->p, "resuming curl transfer\n");
         c->p->paused = false;
         mp_mutex_unlock(&c->p->mtx);
+        note_request_progress(c->p);
         curl_easy_pause(c->p->curl, CURLPAUSE_CONT);
         break;
     case CMD_SEEK:
+        if (c->p->retry_at)
+            report_request(c->p, "retry_seek", -1);
         remove_retry(c->p);
         MP_TRACE(c->p, "seeking to %" PRIu64 "\n", c->pos);
         if (c->p->active) {
+            report_request(c->p, "seek", -1);
             curl_multi_remove_handle(ctx->multi, c->p->curl);
             c->p->active = false;
         }
@@ -533,6 +616,11 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
 
     mp_cond_broadcast(&p->cond);
     mp_mutex_unlock(&p->mtx);
+    note_request_progress(p);
+    if (!p->diagnostic_body) {
+        p->diagnostic_body = true;
+        report_request(p, "first_body", -1);
+    }
 
     return bytes;
 }
@@ -541,6 +629,18 @@ static int xferinfo_callback(void *userdata, curl_off_t dl_total, curl_off_t dl_
                              curl_off_t ul_total, curl_off_t ul_now)
 {
     struct priv *p = userdata;
+    if (p->diagnostic_reports < 3 &&
+        mp_time_ns() >= p->diagnostic_next_report)
+    {
+        mp_mutex_lock(&p->mtx);
+        bool paused = p->paused;
+        mp_mutex_unlock(&p->mtx);
+        if (!paused && !atomic_load(&p->aborted)) {
+            p->diagnostic_reports++;
+            p->diagnostic_next_report = mp_time_ns() + MP_TIME_S_TO_NS(30);
+            report_request(p, "pending", -1);
+        }
+    }
     return atomic_load_explicit(&p->aborted, memory_order_relaxed);
 }
 
@@ -673,6 +773,11 @@ static void on_http_header(struct priv *p, struct bstr line)
     int64_t range_start, range_end, range_total;
     parse_content_range(p->curl, &range_start, &range_end, &range_total);
     p->reply_end = resp == 206 ? range_end : -1;
+    p->diagnostic_headers = true;
+    p->diagnostic_range_start = range_start;
+    p->diagnostic_range_total = range_total;
+    note_request_progress(p);
+    report_request(p, "headers", -1);
 
     if (resp == 429 && p->opts->retry_http_429) {
         p->retry_http = true;
@@ -898,6 +1003,20 @@ static void start_request(struct priv *p)
         return;
     }
     p->active = true;
+    p->diagnostic_id = ++p->ctx->next_request_id;
+    p->diagnostic_offset = start;
+    p->diagnostic_started = mp_time_ns();
+    p->diagnostic_reports = 0;
+    p->diagnostic_headers = false;
+    p->diagnostic_body = false;
+    p->diagnostic_range_start = -1;
+    p->diagnostic_range_total = -1;
+    note_request_progress(p);
+    MP_INFO(p, "curl_request begin id=%"PRIu64" offset=%"PRIu64
+            " ranged=%d retry=%d connect_timeout_s=%.3f"
+            " network_timeout_s=%.3f\n",
+            p->diagnostic_id, start, ranged, p->retry_count,
+            p->opts->connect_timeout, p->net_opts->timeout);
 }
 
 static void log_curl_error(struct priv *p, const char *what, CURLcode code)
@@ -941,6 +1060,7 @@ static bool schedule_http_retry(struct priv *p)
 
 static void on_done(struct priv *p, CURLcode code)
 {
+    report_request(p, "end", code);
     bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
 
     if (p->retry_http && !aborted) {

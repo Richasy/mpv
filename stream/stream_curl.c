@@ -246,6 +246,7 @@ struct priv {
     size_t buffer_size;
     size_t head, tail, count;
     bool paused;         // write callback paused due to a full buffer
+    bool request_pending; // continuation waits for consumer demand
     bool stream_eof;     // producer has delivered all data
     bool stream_error;   // unrecoverable error
     CURLcode error_code; // CURLcode behind stream_error (CURLE_OK if none)
@@ -273,6 +274,14 @@ struct cmd {
 
 static void start_request(struct priv *p);
 static void on_done(struct priv *p, CURLcode code);
+
+static void defer_request(struct priv *p)
+{
+    mp_mutex_lock(&p->mtx);
+    p->request_pending = true;
+    mp_cond_broadcast(&p->cond);
+    mp_mutex_unlock(&p->mtx);
+}
 
 static double diagnostic_time(struct priv *p, CURLINFO info)
 {
@@ -427,6 +436,7 @@ static void run_cmd(void *arg)
         c->p->paused = false;
         c->p->stream_eof = false;
         c->p->stream_error = false;
+        c->p->request_pending = false;
         mp_cond_broadcast(&c->p->cond);
         mp_mutex_unlock(&c->p->mtx);
         c->p->request_start = c->pos;
@@ -1118,7 +1128,7 @@ static void on_done(struct priv *p, CURLcode code)
         bool past_size = p->content_size > 0 && p->request_start >= p->content_size;
         bool past_end = p->request_end > 0 && p->request_start >= p->request_end;
         if (p->seekable && p->reply_end >= 0 && !past_size && !past_end) {
-            start_request(p);
+            defer_request(p);
             return;
         }
 
@@ -1139,7 +1149,7 @@ static void on_done(struct priv *p, CURLcode code)
         p->retry_count++;
         MP_WARN(p, "%s, retrying (#%d) from %" PRIu64 "\n",
                 curl_easy_strerror(code), p->retry_count, p->request_start);
-        start_request(p);
+        defer_request(p);
         return;
     }
 
@@ -1321,6 +1331,13 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
             p->error_code = CURLE_OPERATION_TIMEDOUT;
             timed_out = true;
             break;
+        }
+        if (p->request_pending) {
+            p->request_pending = false;
+            mp_mutex_unlock(&p->mtx);
+            cmd_sync(p, CMD_ADD, 0, false);
+            mp_mutex_lock(&p->mtx);
+            continue;
         }
         if (deadline)
             mp_cond_timedwait_until(&p->cond, &p->mtx, deadline);

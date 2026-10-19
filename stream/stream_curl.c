@@ -793,6 +793,7 @@ static void on_http_header(struct priv *p, struct bstr line)
 
     if (!is_http_success(resp)) {
         MP_ERR(p, "HTTP error %ld\n", resp);
+        p->reply_rejected = true;
         goto done;
     }
 
@@ -800,6 +801,7 @@ static void on_http_header(struct priv *p, struct bstr line)
     if (p->start_offset > 0 && range_start != p->start_offset) {
         MP_ERR(p, "Server ignored range request at offset %" PRId64 "\n",
                p->start_offset);
+        p->reply_rejected = true;
         goto done;
     }
 
@@ -872,6 +874,9 @@ static size_t header_callback(char *buffer, size_t size, size_t nitems, void *us
     switch (p->scheme->proto) {
     case MP_CURL_PROTO_HTTP:
         on_http_header(p, line);
+        // Reject unusable replies now, even if their body never arrives.
+        if (p->reply_rejected)
+            return CURL_WRITEFUNC_ERROR;
         break;
     case MP_CURL_PROTO_FTP:
         probe_ftp(p, line);

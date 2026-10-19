@@ -6157,6 +6157,12 @@ sensitive request details.
     network thread from the consumer (default: 4 MiB, minimum: 32 KiB).
     Lower values may reduce in-flight data and reduce latency.
 
+    Short-response continuations and recoverable transport retries start when
+    the consumer needs more data, not merely because the preceding transfer
+    ended. Buffered bytes remain available during a pause; resuming continues
+    at the next missing byte. The current request still fills this buffer
+    asynchronously. This does not override HTTP 429 or ``Retry-After``.
+
 ``--curl-max-request-size=<bytes>``
     For seekable streams, split the transfer into Range requests of at most
     this size (default: 0, i.e. one open-ended request for the whole stream).

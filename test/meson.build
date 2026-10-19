@@ -354,6 +354,10 @@ if get_option('libmpv')
                      args: ['-B', files('libmpv_curl_diagnostics.py'),
                             mpvlib.full_path()],
                      depends: mpvlib, suite: 'libmpv-network', timeout: 180)
+                test('libmpv-curl-paused-requests', python,
+                     args: ['-B', files('libmpv_curl_paused_requests.py'),
+                            mpvlib.full_path(), '--verify'],
+                     depends: mpvlib, suite: 'libmpv-network', timeout: 120)
             endif
             test('libmpv-network-cursors', python,
                  args: [files('libmpv_network_cursors.py'), mpvlib.full_path()],

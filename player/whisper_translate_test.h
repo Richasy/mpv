@@ -61,6 +61,8 @@ struct wt_http_request {
 
 struct wt_http_response {
     enum wt_http_failure failure;
+    unsigned long native_error;
+    unsigned long tls_error_flags;
     bool http_issued;
     int http_status;
     const char *retry_after;

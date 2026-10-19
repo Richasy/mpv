@@ -13,3 +13,14 @@ the fixed `translate_a/single` JSON form protocol and `azure` now names Bing's
 credential-free Edge JSON protocol rather than the retired Edge-auth flow;
 both use strict bounded responses, a 5000-code-point per-cue application bound,
 and translator-wide `Retry-After`/failure cooldown admission
+
+OpenAI-compatible translation now uses Windows automatic system-proxy
+resolution for remote endpoints, including the Responses API. Localhost and
+loopback IP literals remain direct; proxy settings for media playback are
+independent of translation. There is no direct retry after a proxy failure.
+Failed HTTP requests log the provider/API, transport stage, numeric Windows
+error and fixed reason, TLS failure flags, HTTP status, proxy mode, elapsed
+time, request deadline, retry delay, and response byte count. These failure
+diagnostics exclude endpoint URLs, credentials, request/response bodies, and
+subtitle text. Per-call results retain the Windows error and TLS flags without
+changing existing textual error classifications.

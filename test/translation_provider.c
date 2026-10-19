@@ -25,6 +25,7 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <winhttp.h>
 #include <werapi.h>
 
 #include "mpv_talloc.h"
@@ -43,6 +44,8 @@ struct fake_clock {
 
 struct response_plan {
     enum wt_http_failure failure;
+    unsigned long native_error;
+    unsigned long tls_error_flags;
     bool http_issued;
     int http_status;
     const char *retry_after;
@@ -544,6 +547,8 @@ static void fake_http(void *ctx, void *talloc_ctx,
     }
     *response = (struct wt_http_response){
         .failure = plan->failure,
+        .native_error = plan->native_error,
+        .tls_error_flags = plan->tls_error_flags,
         .http_issued = plan->http_issued,
         .http_status = plan->http_status,
         .retry_after = plan->retry_after,
@@ -997,6 +1002,67 @@ static void test_responses_request_and_output(void)
     destroy_transport(&transport);
 }
 
+static void test_openai_proxy_routing(void)
+{
+    const struct {
+        const char *endpoint;
+        enum wt_http_proxy_mode proxy_mode;
+    } cases[] = {
+        {"http://localhost:11434/ai", WT_HTTP_PROXY_NONE},
+        {"https://LOCALHOST.:9443/ai", WT_HTTP_PROXY_NONE},
+        {"http://127.0.0.1:11434/ai", WT_HTTP_PROXY_NONE},
+        {"http://127.12.34.56:11434/ai", WT_HTTP_PROXY_NONE},
+        {"http://[::1]:11434/ai", WT_HTTP_PROXY_NONE},
+        {"http://[::ffff:127.0.0.1]:11434/ai", WT_HTTP_PROXY_NONE},
+        {"https://api.example.com/v1/responses", WT_HTTP_PROXY_DEFAULT},
+        {"http://localhost.example.com/ai", WT_HTTP_PROXY_DEFAULT},
+        {"http://192.168.1.10:11434/ai", WT_HTTP_PROXY_DEFAULT},
+        {"http://[2001:db8::1]/ai", WT_HTTP_PROXY_DEFAULT},
+    };
+    const char *apis[] = {"chat", "responses"};
+    for (int api = 0; api < MP_ARRAY_SIZE(apis); api++) {
+        for (int n = 0; n < MP_ARRAY_SIZE(cases); n++) {
+            struct fake_clock clock;
+            init_clock(&clock, 2600, 0);
+            struct fake_transport transport;
+            init_transport(&transport);
+            add_text_plan(&transport, 200, NULL,
+                api == 0
+                    ? "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"
+                    : "{\"status\":\"completed\",\"output\":["
+                      "{\"type\":\"message\",\"role\":\"assistant\","
+                      "\"status\":\"completed\",\"content\":["
+                      "{\"type\":\"output_text\",\"text\":\"ok\"}]}]}");
+            struct wt_test_hooks hooks = {
+                .transport = fake_http,
+                .transport_ctx = &transport,
+                .monotonic_ms = fake_monotonic_ms,
+                .unix_ms = fake_unix_ms,
+                .clock_ctx = &clock,
+            };
+            struct wt_openai_config config = {
+                .endpoint = cases[n].endpoint,
+                .model = "fixture",
+                .target_lang = "zh",
+                .api = apis[api],
+            };
+            struct whisper_translator *translator =
+                whisper_translator_create_for_test(
+                    NULL, WT_PROVIDER_OPENAI, NULL, NULL, &config, &hooks);
+            mp_require(translator);
+            void *tmp = talloc_new(NULL);
+            struct wt_call_result result;
+            whisper_translate_call(translator, tmp, "cue", &result);
+            assert_string_equal(result.translated, "ok");
+            assert_int_equal(transport.calls, 1);
+            assert_int_equal(transport.requests[0].proxy_mode, cases[n].proxy_mode);
+            talloc_free(tmp);
+            whisper_translator_destroy(&translator);
+            destroy_transport(&transport);
+        }
+    }
+}
+
 static char *make_emoji_text(void *parent, int count)
 {
     char *text = talloc_array(parent, char, (size_t)count * 4 + 1);
@@ -1180,6 +1246,97 @@ static void test_transport_failures(void)
     talloc_free(tmp);
     whisper_translator_destroy(&translator);
     destroy_transport(&transport);
+}
+
+static void test_transport_native_error_details(void)
+{
+    const struct {
+        enum wt_http_failure failure;
+        unsigned long native_error;
+        unsigned long tls_error_flags;
+        int http_status;
+        const char *error;
+    } cases[] = {
+        {WT_HTTP_FAILURE_SEND, ERROR_WINHTTP_NAME_NOT_RESOLVED, 0, 0,
+         "google: request send failed"},
+        {WT_HTTP_FAILURE_SEND, ERROR_WINHTTP_SECURE_FAILURE,
+         WINHTTP_CALLBACK_STATUS_FLAG_CERT_CN_INVALID, 0,
+         "google: request send failed"},
+        {WT_HTTP_FAILURE_RECEIVE, ERROR_WINHTTP_CONNECTION_ERROR, 0, 0,
+         "google: response receive failed"},
+        {WT_HTTP_FAILURE_READ, ERROR_WINHTTP_CONNECTION_ERROR, 0, 200,
+         "google: response read failed"},
+    };
+    for (int n = 0; n < MP_ARRAY_SIZE(cases); n++) {
+        struct fake_clock clock;
+        init_clock(&clock, 4000, 0);
+        struct fake_transport transport;
+        init_transport(&transport);
+        add_plan(&transport, cases[n].failure, true, cases[n].http_status,
+                 NULL, NULL, 0, false);
+        transport.plans[0].native_error = cases[n].native_error;
+        transport.plans[0].tls_error_flags = cases[n].tls_error_flags;
+        add_text_plan(&transport, 200, NULL, "[[[\"ok\"]]]");
+        struct whisper_translator *translator = create_translator(
+            WT_PROVIDER_GOOGLE, "auto", "ko", &transport, &clock);
+        mp_require(translator);
+        void *tmp = talloc_new(NULL);
+        struct wt_call_result result;
+        whisper_translate_call(translator, tmp, "cue", &result);
+        assert_false(result.translated);
+        assert_true(result.http_issued);
+        assert_int_equal(result.http_status, cases[n].http_status);
+        assert_int_equal(result.native_error, cases[n].native_error);
+        assert_int_equal(result.tls_error_flags, cases[n].tls_error_flags);
+        assert_string_equal(result.error, cases[n].error);
+        whisper_translate_call(translator, tmp, "next", &result);
+        assert_string_equal(result.translated, "ok");
+        assert_int_equal(result.native_error, ERROR_SUCCESS);
+        assert_int_equal(result.tls_error_flags, 0);
+        talloc_free(tmp);
+        whisper_translator_destroy(&translator);
+        destroy_transport(&transport);
+    }
+}
+
+static void test_production_transport_connection_failure(void)
+{
+    WSADATA data;
+    assert_int_equal(WSAStartup(MAKEWORD(2, 2), &data), 0);
+    SOCKET reserved = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    mp_require(reserved != INVALID_SOCKET);
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    assert_int_equal(
+        bind(reserved, (struct sockaddr *)&address, sizeof(address)), 0);
+    int address_length = sizeof(address);
+    assert_int_equal(getsockname(
+        reserved, (struct sockaddr *)&address, &address_length), 0);
+    struct wt_test_winhttp_client *client =
+        whisper_translate_test_winhttp_create(ntohs(address.sin_port), 5000, true);
+    mp_require(client);
+    struct wt_test_session_receipt *session_receipt =
+        whisper_translate_test_winhttp_session_receipt(client);
+    mp_require(session_receipt);
+    void *tmp = talloc_new(NULL);
+    struct wt_call_result result;
+    struct wt_test_finalization_receipt *receipt = NULL;
+    whisper_translate_test_winhttp_call(client, tmp, &result, &receipt);
+    assert_false(result.translated);
+    assert_true(result.http_issued);
+    assert_int_equal(result.http_status, 0);
+    assert_int_equal(result.native_error, ERROR_WINHTTP_CANNOT_CONNECT);
+    assert_int_equal(result.tls_error_flags, 0);
+    assert_string_equal(result.error, "google: request send failed");
+    whisper_translate_test_winhttp_destroy(&client);
+    wait_for_finalization(&receipt);
+    wait_for_session_finalization(&session_receipt);
+    assert_int_equal(whisper_translate_test_active_async_requests(), 0);
+    talloc_free(tmp);
+    closesocket(reserved);
+    WSACleanup();
 }
 
 static void test_production_transport_total_deadline(void)
@@ -2202,8 +2359,10 @@ static void run_offline_tests(void)
     test_openai_strict_response_validation();
     test_openai_request_shape();
     test_responses_request_and_output();
+    test_openai_proxy_routing();
     test_input_bounds_and_languages();
     test_transport_failures();
+    test_transport_native_error_details();
     test_common_rate_limit();
     test_retry_after_date_default_and_saturation();
     test_zero_retry_after_serialized_probe();
@@ -2220,6 +2379,7 @@ static void run_vm_selftests(void)
     run_offline_tests();
     test_cleanup_service_init_retry();
     test_shared_library_cleanup_service_lifetime();
+    test_production_transport_connection_failure();
     test_production_transport_total_deadline();
     test_production_transport_cookie_policy();
     test_production_transport_overlapping_cleanup();
@@ -2331,6 +2491,13 @@ int main(int argc, char **argv)
     configure_process_local_failure_policy();
     if (argc == 2 && strcmp(argv[1], "--live-ai") == 0)
         return run_live_ai_smoke();
+    if (argc == 2 && strcmp(argv[1], "--proxy-selftest") == 0) {
+        test_openai_proxy_routing();
+        test_transport_native_error_details();
+        test_production_transport_connection_failure();
+        puts("MPV_TRANSLATION_PROXY_SELFTEST_OK_V1");
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--responses-selftest") == 0) {
         test_openai_request_shape();
         test_responses_request_and_output();
@@ -2363,6 +2530,6 @@ int main(int argc, char **argv)
 
     fprintf(stderr,
             "usage: translation-provider "
-            "[--selftest|--responses-selftest|--live-ai|--live-google|--live-bing]\n");
+            "[--selftest|--proxy-selftest|--responses-selftest|--live-ai|--live-google|--live-bing]\n");
     return 2;
 }

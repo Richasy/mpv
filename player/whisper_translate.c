@@ -25,6 +25,8 @@
 #include <stdatomic.h>
 #include <limits.h>
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <winhttp.h>
 
@@ -67,8 +69,8 @@ struct whisper_translator {
     enum wt_provider provider;
     char *source_lang;
     char *target_lang;
-    HINTERNET session;          // shared session for google/azure (default proxy)
-    HINTERNET session_noproxy;  // dedicated NO_PROXY session for openai (loopback safe)
+    HINTERNET session;          // provider-selected system/default proxy session
+    HINTERNET session_noproxy;  // direct session for loopback services
 
     // OpenAI-only (immutable after init)
     char *oa_scheme;            // "http" | "https"
@@ -76,6 +78,7 @@ struct whisper_translator {
     int   oa_port;
     char *oa_path;              // request path including query
     bool  oa_is_secure;
+    enum wt_http_proxy_mode oa_proxy_mode;
     char *oa_model;
     char *oa_api_key;           // may be ""
     char *oa_system_prompt;     // already-rendered final string (or "")
@@ -436,6 +439,24 @@ static bool parse_endpoint_url(void *parent, const char *url,
 
 // --- HTTP request helpers ---
 
+static bool endpoint_is_loopback(const char *host)
+{
+    if (_stricmp(host, "localhost") == 0 ||
+        _stricmp(host, "localhost.") == 0)
+        return true;
+
+    struct in_addr ipv4;
+    if (InetPtonA(AF_INET, host, &ipv4) == 1)
+        return (ntohl(ipv4.s_addr) >> 24) == 127;
+
+    struct in6_addr ipv6;
+    if (InetPtonA(AF_INET6, host, &ipv6) == 1) {
+        return IN6_IS_ADDR_LOOPBACK(&ipv6) ||
+            (IN6_IS_ADDR_V4MAPPED(&ipv6) && ipv6.s6_addr[12] == 127);
+    }
+    return false;
+}
+
 enum wt_translator_release_result {
     WT_TRANSLATOR_RELEASE_SHARED,
     WT_TRANSLATOR_RELEASE_DESTROYED,
@@ -504,6 +525,7 @@ struct wt_async_request {
     enum wt_http_failure pending_failure;
     enum wt_async_signal signal;
     DWORD request_error;
+    DWORD tls_error_flags;
     DWORD data_available;
     DWORD read_complete;
     int http_status;
@@ -861,6 +883,7 @@ static bool close_pre_request_handles(
             translator, request, connection,
             WT_TEST_CLOSE_REQUEST, error);
         response->failure = WT_HTTP_FAILURE_CLOSE;
+        response->native_error = error;
         return false;
     }
     if (connection &&
@@ -872,6 +895,7 @@ static bool close_pre_request_handles(
             translator, NULL, connection,
             WT_TEST_CLOSE_CONNECTION, error);
         response->failure = WT_HTTP_FAILURE_CLOSE;
+        response->native_error = error;
         return false;
     }
     return true;
@@ -1365,6 +1389,10 @@ static void CALLBACK winhttp_status_callback(
             ctx->signal = WT_ASYNC_SIGNAL_REQUEST_ERROR;
             SetEvent(ctx->operation_event);
             break;
+        case WINHTTP_CALLBACK_STATUS_SECURE_FAILURE:
+            if (status_info && status_info_length == sizeof(DWORD))
+                ctx->tls_error_flags |= *(DWORD *)status_info;
+            break;
         }
     }
     LeaveCriticalSection(&ctx->lock);
@@ -1474,6 +1502,8 @@ static void async_copy_response(
 {
     EnterCriticalSection(&ctx->lock);
     response->failure = ctx->failure;
+    response->native_error = ctx->request_error;
+    response->tls_error_flags = ctx->tls_error_flags;
     response->http_issued = ctx->issued;
     response->http_status = ctx->http_status;
     if (ctx->retry_after)
@@ -1534,8 +1564,9 @@ static void winhttp_transport_impl(
     HINTERNET connection = WinHttpConnect(
         session, host, request->port, 0);
     if (!connection) {
+        response->native_error = GetLastError();
         mp_warn(tr->log, "translate: WinHttpConnect failed (%lu)\n",
-                GetLastError());
+                response->native_error);
         talloc_free(tmp);
         return;
     }
@@ -1544,8 +1575,9 @@ static void winhttp_transport_impl(
         connection, method, path, NULL, WINHTTP_NO_REFERER,
         WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!handle) {
+        response->native_error = GetLastError();
         mp_warn(tr->log, "translate: WinHttpOpenRequest failed (%lu)\n",
-                GetLastError());
+                response->native_error);
         close_pre_request_handles(
             tr, NULL, connection, response);
         talloc_free(tmp);
@@ -1567,17 +1599,22 @@ static void winhttp_transport_impl(
     bool setup_ok =
         WinHttpSetOption(handle, WINHTTP_OPTION_DISABLE_FEATURE,
                          &disabled_features, sizeof(disabled_features));
+    DWORD setup_error = setup_ok ? ERROR_SUCCESS : GetLastError();
     if (consume_injected_close_failure(&tr->fail_setup))
         setup_ok = false;
     if (setup_ok && headers) {
         setup_ok = WinHttpAddRequestHeaders(
             handle, headers, (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+        if (!setup_ok)
+            setup_error = GetLastError();
     }
     DWORD_PTR context = (DWORD_PTR)ctx;
     if (setup_ok) {
         setup_ok = WinHttpSetOption(
             handle, WINHTTP_OPTION_CONTEXT_VALUE,
             &context, sizeof(context));
+        if (!setup_ok)
+            setup_error = GetLastError();
     }
 
     DWORD callback_flags =
@@ -1586,12 +1623,14 @@ static void winhttp_transport_impl(
         WINHTTP_CALLBACK_FLAG_DATA_AVAILABLE |
         WINHTTP_CALLBACK_FLAG_READ_COMPLETE |
         WINHTTP_CALLBACK_FLAG_REQUEST_ERROR |
+        WINHTTP_CALLBACK_FLAG_SECURE_FAILURE |
         WINHTTP_CALLBACK_FLAG_HANDLES;
     if (!setup_ok ||
         WinHttpSetStatusCallback(
             handle, winhttp_status_callback, callback_flags, 0) ==
         WINHTTP_INVALID_STATUS_CALLBACK)
     {
+        response->native_error = setup_ok ? GetLastError() : setup_error;
         response->failure = WT_HTTP_FAILURE_SETUP;
         DWORD close_error = ERROR_SUCCESS;
         if (close_native_handle(
@@ -1603,6 +1642,7 @@ static void winhttp_transport_impl(
             async_finalize_unbound(ctx);
         } else {
             response->failure = WT_HTTP_FAILURE_CLOSE;
+            response->native_error = close_error;
             InterlockedExchange(&ctx->owner_active, 0);
             async_retain_orphan(
                 ctx, WT_TEST_CLOSE_REQUEST, close_error);
@@ -1652,7 +1692,9 @@ static void winhttp_transport_impl(
                 WINHTTP_HEADER_NAME_BY_INDEX, &status_code,
                 &status_size, WINHTTP_NO_HEADER_INDEX))
         {
+            DWORD error = GetLastError();
             EnterCriticalSection(&ctx->lock);
+            ctx->request_error = error;
             async_finish_locked(ctx, WT_HTTP_FAILURE_STATUS);
             LeaveCriticalSection(&ctx->lock);
             complete = false;
@@ -1702,6 +1744,7 @@ static void winhttp_transport_impl(
         InterlockedExchange(&ctx->owner_active, 0);
     } else {
         response->failure = WT_HTTP_FAILURE_CLOSE;
+        response->native_error = close_error;
         response->http_status = 0;
         InterlockedExchange(&ctx->owner_active, 0);
         async_retain_orphan(
@@ -1891,6 +1934,42 @@ struct wt_http_observation {
     struct wt_retry_after retry_after;
 };
 
+static const char *http_failure_name(enum wt_http_failure failure)
+{
+    switch (failure) {
+    case WT_HTTP_FAILURE_NONE: return "http-status";
+    case WT_HTTP_FAILURE_SETUP: return "setup";
+    case WT_HTTP_FAILURE_SEND: return "send";
+    case WT_HTTP_FAILURE_RECEIVE: return "receive";
+    case WT_HTTP_FAILURE_STATUS: return "status";
+    case WT_HTTP_FAILURE_READ: return "read";
+    case WT_HTTP_FAILURE_TOO_LARGE: return "response-limit";
+    case WT_HTTP_FAILURE_TIMEOUT: return "deadline";
+    case WT_HTTP_FAILURE_CANCELLED: return "cancelled";
+    case WT_HTTP_FAILURE_CLOSE: return "close";
+    }
+    return "unknown";
+}
+
+static const char *http_native_error_name(unsigned long error)
+{
+    switch (error) {
+    case ERROR_SUCCESS: return "none";
+    case ERROR_WINHTTP_TIMEOUT: return "timeout";
+    case ERROR_WINHTTP_NAME_NOT_RESOLVED: return "name-not-resolved";
+    case ERROR_WINHTTP_CANNOT_CONNECT: return "cannot-connect";
+    case ERROR_WINHTTP_CONNECTION_ERROR: return "connection-error";
+    case ERROR_WINHTTP_SECURE_FAILURE: return "secure-failure";
+    case ERROR_WINHTTP_LOGIN_FAILURE: return "login-failure";
+    case ERROR_WINHTTP_AUTODETECTION_FAILED: return "proxy-autodetection-failed";
+    case ERROR_WINHTTP_UNABLE_TO_DOWNLOAD_SCRIPT: return "proxy-script-download-failed";
+    case ERROR_WINHTTP_BAD_AUTO_PROXY_SCRIPT: return "invalid-proxy-script";
+    case ERROR_WINHTTP_INVALID_SERVER_RESPONSE: return "invalid-server-response";
+    case ERROR_WINHTTP_OPERATION_CANCELLED: return "operation-cancelled";
+    }
+    return "other";
+}
+
 static bool perform_http(struct whisper_translator *tr, void *talloc_ctx,
                          const struct wt_http_request *request,
                          struct wt_call_result *out,
@@ -1898,11 +1977,14 @@ static bool perform_http(struct whisper_translator *tr, void *talloc_ctx,
                          char **response_body)
 {
     struct wt_http_response response = {0};
+    int64_t started_ms = translator_monotonic_ms(tr);
     tr->transport(tr->transport_ctx, talloc_ctx, request, &response);
     if (observation)
         observation->retry_after =
             parse_retry_after(tr, response.retry_after);
     if (out) {
+        out->native_error = response.native_error;
+        out->tls_error_flags = response.tls_error_flags;
         out->http_issued = response.http_issued;
         out->http_status =
             response.http_status >= 100 && response.http_status <= 599
@@ -1914,6 +1996,25 @@ static bool perform_http(struct whisper_translator *tr, void *talloc_ctx,
     }
 
     const char *name = provider_name(tr->provider);
+    if (response.failure != WT_HTTP_FAILURE_NONE || response.http_status != 200) {
+        mp_warn(tr->log,
+                "translate: request failed provider=%s api=%s stage=%s "
+                "native_error=%lu native_reason=%s tls_flags=0x%08lx "
+                "http_status=%d issued=%s proxy=%s secure=%s "
+                "elapsed_ms=%lld timeout_ms=%d retry_after_ms=%d response_bytes=%zu\n",
+                name, tr->provider == WT_PROVIDER_OPENAI
+                    ? (tr->oa_responses ? "responses" : "chat") : "provider",
+                http_failure_name(response.failure),
+                response.native_error, http_native_error_name(response.native_error),
+                response.tls_error_flags, response.http_status,
+                response.http_issued ? "yes" : "no",
+                request->proxy_mode == WT_HTTP_PROXY_NONE ? "direct"
+                    : tr->provider == WT_PROVIDER_OPENAI ? "system" : "default",
+                request->secure ? "yes" : "no",
+                (long long)(translator_monotonic_ms(tr) - started_ms),
+                request->timeout_ms, out ? out->retry_after_ms : 0,
+                response.body_len);
+    }
     switch (response.failure) {
     case WT_HTTP_FAILURE_NONE:
         break;
@@ -2693,7 +2794,7 @@ static char *translate_openai(struct whisper_translator *tr,
         .headers = headers,
         .body = body,
         .body_len = strlen(body),
-        .proxy_mode = WT_HTTP_PROXY_NONE,
+        .proxy_mode = tr->oa_proxy_mode,
         .timeout_ms = tr->oa_timeout_ms,
     };
     char *response = NULL;
@@ -2787,6 +2888,8 @@ static bool configure_openai(struct whisper_translator *tr,
     {
         return false;
     }
+    tr->oa_proxy_mode = endpoint_is_loopback(tr->oa_host)
+        ? WT_HTTP_PROXY_NONE : WT_HTTP_PROXY_DEFAULT;
 
     tr->oa_model = talloc_strdup(tr, cfg->model);
     tr->oa_api_key = talloc_strdup(tr, cfg->api_key ? cfg->api_key : "");
@@ -2881,18 +2984,17 @@ struct whisper_translator *whisper_translator_create_openai(
         return NULL;
     }
 
-    // Default-proxy session is unused for openai but kept NULL-safe.
-    // Use NO_PROXY for loopback / local services.
+    bool direct = tr->oa_proxy_mode == WT_HTTP_PROXY_NONE;
+    HINTERNET *session = direct ? &tr->session_noproxy : &tr->session;
     WCHAR *ua = utf8_to_wide(NULL, WT_OPENAI_USER_AGENT);
-    tr->session_noproxy = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_NO_PROXY,
-                                       WINHTTP_NO_PROXY_NAME,
-                                       WINHTTP_NO_PROXY_BYPASS,
-                                       WINHTTP_FLAG_ASYNC);
+    *session = WinHttpOpen(
+        ua, direct ? WINHTTP_ACCESS_TYPE_NO_PROXY : WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC);
     talloc_free(ua);
 
-    if (!tr->session_noproxy) {
-        mp_err(log, "translate: WinHttpOpen (NO_PROXY) failed (%lu)\n",
-               GetLastError());
+    if (!*session) {
+        mp_err(log, "translate: WinHttpOpen failed (proxy=%s, error=%lu)\n",
+               direct ? "direct" : "system", GetLastError());
         mp_mutex_destroy(&tr->state_lock);
         talloc_free(tr);
         return NULL;
@@ -2901,16 +3003,16 @@ struct whisper_translator *whisper_translator_create_openai(
     int recv_to = tr->oa_timeout_ms;
     if (recv_to < 1000) recv_to = 1000;
     if (!WinHttpSetTimeouts(
-            tr->session_noproxy, 5000, 5000, recv_to, recv_to))
+            *session, 5000, 5000, recv_to, recv_to))
     {
-        mp_err(log, "translate: WinHttpSetTimeouts (NO_PROXY) failed (%lu)\n",
-               GetLastError());
+        mp_err(log, "translate: WinHttpSetTimeouts failed (proxy=%s, error=%lu)\n",
+               direct ? "direct" : "system", GetLastError());
         DWORD close_error = ERROR_SUCCESS;
         if (close_native_handle(
                 tr, WT_TEST_CLOSE_SESSION,
-                tr->session_noproxy, &close_error))
+                *session, &close_error))
         {
-            tr->session_noproxy = NULL;
+            *session = NULL;
             mp_mutex_destroy(&tr->state_lock);
             talloc_free(tr);
         } else {
@@ -2923,9 +3025,9 @@ struct whisper_translator *whisper_translator_create_openai(
     }
 
     mp_info(log, "translate: created openai translator (model=%s, %s -> %s, "
-                 "timeout=%dms, %s://%s:%d%s)\n",
+                 "timeout=%dms, proxy=%s, %s://%s:%d%s)\n",
             tr->oa_model, tr->source_lang, tr->target_lang,
-            tr->oa_timeout_ms,
+            tr->oa_timeout_ms, direct ? "direct" : "system",
             tr->oa_scheme, tr->oa_host, tr->oa_port, tr->oa_path);
     return tr;
 }
@@ -3063,6 +3165,8 @@ void whisper_translate_test_winhttp_call_body(
         &response, receipt);
     out->http_issued = response.http_issued;
     out->http_status = response.http_status;
+    out->native_error = response.native_error;
+    out->tls_error_flags = response.tls_error_flags;
     out->rate_limited = response.http_status == 429;
     switch (response.failure) {
     case WT_HTTP_FAILURE_NONE:

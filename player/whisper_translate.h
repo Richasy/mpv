@@ -92,7 +92,9 @@ void whisper_translator_cancel(struct whisper_translator *tr);
 // and `error` is an inline buffer.
 struct wt_call_result {
     char *translated;        // success: talloc string. failure: NULL.
-    int   http_status;       // 0 if no HTTP was issued (e.g. backoff)
+    int   http_status;       // 0 when no valid HTTP response status was received
+    unsigned long native_error; // WinHTTP/Win32 error, 0 if none was reported
+    unsigned long tls_error_flags; // WINHTTP_CALLBACK_STATUS_SECURE_FAILURE flags
     bool  rate_limited;      // 429 / equivalent
     bool  http_issued;       // true once the HTTP send was attempted,
                              // including send/receive/read failures; false

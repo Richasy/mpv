@@ -23,7 +23,8 @@ import libmpv_network_cursors as cursors
 
 SECRET = "curl-diagnostic-private-marker"
 CASES = ("range", "headers", "body", "partial", "status", "wrong-range",
-         "retry-cancel", "cursors")
+         "retry-cancel", "cursors", "status-held", "wrong-range-held",
+         "retry-held")
 
 
 class Server(http.server.ThreadingHTTPServer):
@@ -35,6 +36,7 @@ class Server(http.server.ThreadingHTTPServer):
         self.mode = mode
         self.release = threading.Event()
         self.requests = []
+        self.rate_limited = False
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -61,10 +63,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         mode = self.server.mode
         if mode == "headers":
             self.server.release.wait(35)
-        if mode == "status":
+        if mode in ("status", "status-held"):
             self.send_response(502)
-            self.send_header("Content-Length", "0")
+            self.send_header("Content-Length", "100" if mode.endswith("-held") else "0")
             self.end_headers()
+            if mode.endswith("-held"):
+                self.wfile.flush()
+                self.server.release.wait(15)
+            return
+        if mode == "retry-held" and not self.server.rate_limited:
+            self.server.rate_limited = True
+            self.send_response(429)
+            self.send_header("Retry-After", "1")
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            self.wfile.flush()
+            self.server.release.wait(15)
             return
         if mode == "retry-cancel":
             self.send_response(429)
@@ -86,7 +100,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        wrong = mode == "wrong-range" and start > 0
+        wrong = mode in ("wrong-range", "wrong-range-held") and start > 0
         if wrong:
             start, end = 0, len(RANGE_WAV) - 1
         self.send_response(200 if wrong else 206)
@@ -98,6 +112,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Range",
                              f"bytes {start}-{end}/{len(RANGE_WAV)}")
         self.end_headers()
+        if wrong and mode == "wrong-range-held":
+            self.wfile.flush()
+            self.server.release.wait(15)
+            return
         if mode == "body":
             self.wfile.flush()
             self.server.release.wait(130)
@@ -165,11 +183,16 @@ def run_case(library, mode):
             options["network-timeout"] = "0"
         if mode == "retry-cancel":
             options["curl-retry-http-429"] = "yes"
+        if mode.endswith("-held"):
+            options["network-timeout"] = "5"
+        if mode == "retry-held":
+            options["curl-retry-http-429"] = "yes"
         client = create_client(stack, mpv, options)
         if mpv.mpv_request_log_messages(client, b"info") < 0:
             raise RuntimeError("Could not subscribe to info-level diagnostics")
         lines = []
         ends = []
+        request_times = []
 
         def pump(timeout, predicate, allow_timeout=False):
             deadline = time.monotonic() + timeout
@@ -181,6 +204,8 @@ def run_case(library, mode):
                     text = message.text.decode("utf-8", errors="strict").strip()
                     if text.startswith("curl_request "):
                         lines.append(text)
+                        if text.startswith("curl_request begin "):
+                            request_times.append(time.monotonic())
                 elif event.event_id == EVENT_END_FILE:
                     end = ctypes.cast(
                         event.data, ctypes.POINTER(EndFile)).contents
@@ -233,9 +258,10 @@ def run_case(library, mode):
                     raise RuntimeError(f"Retry cancellation changed: {ends}")
             else:
                 pump(12, lambda: bool(ends) and bool(records(lines, "end")))
-                if mode in ("status", "wrong-range") and ends[-1][0] != 4:
+                if mode in ("status", "wrong-range", "status-held",
+                            "wrong-range-held") and ends[-1][0] != 4:
                     raise RuntimeError(f"Error became a clean EOF: {ends}")
-                if mode in ("range", "partial") and ends[-1][0] != 0:
+                if mode in ("range", "partial", "retry-held") and ends[-1][0] != 0:
                     raise RuntimeError(f"Healthy/recovered playback failed: {ends}")
         finally:
             run_command(mpv, client, "stop")
@@ -279,12 +305,25 @@ def run_case(library, mode):
             if not any(int(row["curl_result"]) > 0
                        for row in records(lines, "end")):
                 raise RuntimeError("Missing failed-transfer result")
-        if mode == "status" and not any(
+        if mode in ("status", "status-held") and not any(
                 row["status"] == "502" for row in summaries):
             raise RuntimeError("Missing HTTP failure status")
-        if mode == "wrong-range" and not any(
+        if mode in ("wrong-range", "wrong-range-held") and not any(
                 row["rejected"] == "1" for row in records(lines, "end")):
             raise RuntimeError("Missing rejected-range result")
+        if mode.endswith("-held"):
+            rejected = [row for row in records(lines, "end")
+                        if row["rejected"] == "1"]
+            if not rejected or any(float(row["elapsed_ms"]) >= 1500
+                                   for row in rejected):
+                raise RuntimeError("Rejected headers waited for a held body")
+        if mode == "retry-held":
+            starts = records(lines, "begin")
+            rejected = records(lines, "end")[0]
+            if rejected["status"] != "429" or starts[1]["retry"] != "1":
+                raise RuntimeError("Held 429 did not preserve its retry")
+            if request_times[1] - request_times[0] < 1:
+                raise RuntimeError("Held 429 bypassed Retry-After")
         print(json.dumps({"case": mode, "result": "PASS",
                           "requests": len(begins)}), flush=True)
 

@@ -2194,6 +2194,13 @@ static void create_hotplug(struct MPContext *mpctx)
     }
 }
 
+void mp_enable_audio_hotplug(struct MPContext *mpctx)
+{
+    create_hotplug(mpctx);
+    // Creating the cache alone does not register the driver's listener.
+    ao_hotplug_get_device_list(mpctx->command_ctx->hotplug, mpctx->ao);
+}
+
 static int mp_property_audio_device(void *ctx, struct m_property *prop,
                                     int action, void *arg)
 {
@@ -8612,8 +8619,11 @@ void handle_command_updates(struct MPContext *mpctx)
 
     // This is a bit messy: ao_hotplug wakes up the player, and then we have
     // to recheck the state. Then the client(s) will read the property.
-    if (ctx->hotplug && ao_hotplug_check_update(ctx->hotplug))
+    if (ctx->hotplug && ao_hotplug_check_update(ctx->hotplug)) {
         mp_notify_property(mpctx, "audio-device-list");
+        if (mpctx->audio_output_retry_tid)
+            reload_audio_output(mpctx);
+    }
 
     // Depends on polling demuxer wakeup callback notifications.
     cache_dump_poll(mpctx);

@@ -192,6 +192,7 @@ static void kill_demuxers_reentrant(struct MPContext *mpctx,
 
 static void uninit_demuxer(struct MPContext *mpctx)
 {
+    mpctx->audio_output_retry_tid = 0;
     mpctx->thumbnail_generation++;
     for (int t = 0; t < STREAM_TYPE_COUNT; t++) {
         for (int r = 0; r < num_ptracks[t]; r++)
@@ -792,6 +793,13 @@ void mp_switch_track_n(struct MPContext *mpctx, int order, enum stream_type type
     mp_assert(type >= 0 && type < STREAM_TYPE_COUNT);
     mp_assert(order >= 0 && order < num_ptracks[type]);
 
+    if (type == STREAM_AUDIO && order == 0) {
+        if ((flags & FLAG_MARK_SELECTION) && mpctx->audio_output_retry_tid &&
+            mpctx->error_playing == MPV_ERROR_AO_INIT_FAILED)
+            mpctx->error_playing = 0;
+        mpctx->audio_output_retry_tid = 0;
+    }
+
     // Mark the current track selection as explicitly user-requested. (This is
     // different from auto-selection or disabling a track due to errors.)
     if (flags & FLAG_MARK_SELECTION)
@@ -920,6 +928,10 @@ bool mp_remove_track(struct MPContext *mpctx, struct track *track)
 {
     if (!track->is_external)
         return false;
+
+    if (track->type == STREAM_AUDIO &&
+        track->user_tid == mpctx->audio_output_retry_tid)
+        mpctx->audio_output_retry_tid = 0;
 
     mp_deselect_track(mpctx, track);
     if (track->selected)

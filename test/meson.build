@@ -334,6 +334,13 @@ if get_option('libmpv')
         endif
 
         if not meson.is_cross_build()
+            audio_ffmpeg = find_program('ffmpeg', required: false)
+            if audio_ffmpeg.found()
+                test('libmpv-audio-output-recovery', python,
+                     args: ['-B', files('libmpv_audio_output_recovery.py'),
+                            mpvlib.full_path(), '--ffmpeg', audio_ffmpeg],
+                     depends: mpvlib, timeout: 180)
+            endif
             test('libmpv-decoder-stall', python,
                  args: ['-B', files('libmpv_decoder_stall.py'),
                         mpvlib.full_path()],

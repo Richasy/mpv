@@ -369,6 +369,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
     struct ao_chain *ao_c = mpctx->ao_chain;
     mp_assert(ao_c);
     struct track *track = ao_c->track;
+    bool output_failed = false;
 
     mp_assert(ao_c->filter->ao_needs_update);
 
@@ -416,6 +417,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
         return 0;
     }
 
+    mp_enable_audio_hotplug(mpctx);
     uninit_audio_out(mpctx);
 
     int out_rate = mp_aframe_get_rate(out_fmt);
@@ -489,8 +491,12 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
 
         MP_ERR(mpctx, "Could not open/initialize audio device -> no sound.\n");
         mpctx->error_playing = MPV_ERROR_AO_INIT_FAILED;
+        output_failed = true;
         goto init_error;
     }
+
+    if (mpctx->error_playing == MPV_ERROR_AO_INIT_FAILED)
+        mpctx->error_playing = 0;
 
     char tmp[192];
     MP_INFO(mpctx, "AO: [%s] %s\n", ao_get_name(mpctx->ao),
@@ -522,6 +528,12 @@ init_error:
     uninit_audio_chain(mpctx);
     uninit_audio_out(mpctx);
     error_on_track(mpctx, track);
+    if (output_failed && track && !mpctx->stop_play &&
+        !opts->stop_playback_on_init_failure)
+    {
+        // Keep only output failures eligible for a device-change retry.
+        mpctx->audio_output_retry_tid = track->user_tid;
+    }
     return -1;
 }
 
@@ -810,6 +822,21 @@ static void ao_process(struct mp_filter *f)
 
 void reload_audio_output(struct MPContext *mpctx)
 {
+    int retry_tid = mpctx->audio_output_retry_tid;
+    if (retry_tid && !mpctx->stop_play) {
+        mpctx->audio_output_retry_tid = 0;
+        struct track *track = mp_track_by_tid(mpctx, STREAM_AUDIO, retry_tid);
+        if (track && !mpctx->current_track[0][STREAM_AUDIO]) {
+            MP_INFO(mpctx, "Retrying audio output for track %d.\n", retry_tid);
+            if (mpctx->error_playing == MPV_ERROR_AO_INIT_FAILED)
+                mpctx->error_playing = 0;
+            mp_switch_track(mpctx, STREAM_AUDIO, track, 0);
+            if (track->selected)
+                disc_nav_refresh_track(mpctx, track);
+        }
+        return;
+    }
+
     if (!mpctx->ao)
         return;
 

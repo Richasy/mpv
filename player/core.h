@@ -345,6 +345,7 @@ typedef struct MPContext {
     struct ao *ao;
     struct mp_aframe *ao_filter_fmt; // for weak gapless audio check
     struct ao_chain *ao_chain;
+    int audio_output_retry_tid;
 
     struct vo_chain *vo_chain;
 

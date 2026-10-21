@@ -262,6 +262,7 @@ typedef struct stream {
     int error;
     double network_timeout;
     int64_t read_deadline;
+    int64_t read_qualification_deadline;
     int64_t read_recovery_deadline;
     struct stream *read_deadline_parent;
     // Terminal failure flag. Set when an in-place backend reopen
@@ -367,6 +368,7 @@ int stream_read_partial(stream_t *s, void *buf, int buf_size);
 int stream_peek(stream_t *s, int forward_size);
 int stream_read_peek(stream_t *s, void *buf, int buf_size);
 void stream_drop_buffers(stream_t *s);
+void stream_reset_network_cursors(stream_t *s);
 void stream_rebase_position(stream_t *s);
 int64_t stream_get_size(stream_t *s);
 int64_t stream_get_io_deadline(struct stream *s);

@@ -430,9 +430,12 @@ def run_recovery_case(library, backend, mode):
         if mode == "recover-twice" and (
                 len(positions) != 2 or positions[1] <= positions[0]):
             raise RuntimeError(f"Delivered progress did not reset recovery: {positions}")
-        if mode in ("recover-cursor", "recover-timeout", "recover-cancel") and not any(
-                "connection 1 failed to read" in line for line in lines):
-            raise RuntimeError("Fixture did not exercise an additional cursor")
+        if mode in ("recover-cursor", "recover-timeout", "recover-cancel"):
+            # These cases seek the timeline before failing; interleaved cursor
+            # failures are covered by libmpv_network_cursors instead.
+            if not any("timeline seek retires" in line for line in lines) or any(
+                    "lru_cache: opened connection" in line for line in lines):
+                raise RuntimeError("Timeline recovery reused an old region cursor")
         if mode == "recover-progress" and not any(
                 "operation=seek" in line and "result=-138" in line for line in lines):
             raise RuntimeError("Fixture did not expire an internally progressing seek\n"

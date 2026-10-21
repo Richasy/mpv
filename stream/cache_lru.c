@@ -91,6 +91,7 @@
 #include "common/msg.h"
 #include "misc/thread_tools.h"
 #include "mpv_talloc.h"
+#include "osdep/timer.h"
 #include "stream.h"
 
 #define LRU_DEFAULT_BUCKET_SIZE   (64u * 1024u)
@@ -112,6 +113,11 @@
 // connections, and every further attempt would cost a round-trip.
 #define LRU_EXTRA_CURSOR_FAILURES 2
 
+// Idle responses must not impose a full network timeout on the active read.
+// Retry without speculative connections if concurrent transports stop making
+// progress, including after a valid response prefix.
+#define LRU_CONCURRENT_READ_TIMEOUT 5.0
+
 struct bucket_entry {
     uint64_t bucket_idx;            // (start_offset >> bucket_shift); also hash key
     int64_t  start_offset;          // first cached byte; in [bidx*bsz, (bidx+1)*bsz)
@@ -132,6 +138,7 @@ struct lru_cursor {
     int64_t  pos;                   // backend byte position; -1 = unknown
     uint64_t last_used;             // use_clock value of the latest use
     int      id;                    // stable number for diagnostics
+    bool     qualification_failed;
 };
 
 struct stream_lru_cache {
@@ -158,6 +165,7 @@ struct stream_lru_cache {
     uint64_t use_clock;
     int      next_cursor_id;
     int      extra_cursor_failures;
+    bool     restart_owner;
     bool     disabled;
     int      consecutive_failures;
 
@@ -372,10 +380,20 @@ static bool cursor_fallback(struct stream_lru_cache *c, const char *operation)
 static void cursor_failed(struct stream_lru_cache *c, struct lru_cursor *cur,
                           const char *operation)
 {
+    bool qualification_failed = cur->qualification_failed;
+    if (qualification_failed)
+        operation = "qualify read progress";
     MP_WARN(c, "lru_cache: connection %d failed to %s at pos=%" PRId64
                " (err=%d); closing it\n",
             cur->id, operation, cur->pos, cur->backend->error);
     cursor_close(c, cur);
+    if (qualification_failed) {
+        cursor_close_extra(c);
+        c->extra_cursor_failures = LRU_EXTRA_CURSOR_FAILURES;
+        MP_WARN(c, "lru_cache: additional transport stopped making progress;"
+                   " continuing with one\n");
+        return;
+    }
     if (++c->extra_cursor_failures >= LRU_EXTRA_CURSOR_FAILURES &&
         c->num_cursors > 1)
     {
@@ -404,6 +422,11 @@ static struct lru_cursor *cursor_open(struct stream_lru_cache *c,
             c->extra_cursor_failures++;
             MP_WARN(c, "lru_cache: could not open connection %d at pos=%"
                        PRId64 "\n", id, pos);
+            if (c->extra_cursor_failures >= LRU_EXTRA_CURSOR_FAILURES) {
+                cursor_close_extra(c);
+                MP_WARN(c, "lru_cache: additional connections keep failing;"
+                           " continuing with one\n");
+            }
         }
         return NULL;
     }
@@ -421,12 +444,31 @@ static struct lru_cursor *cursor_open(struct stream_lru_cache *c,
     return cur;
 }
 
+static bool cursor_reopen_owner(struct stream_lru_cache *c, struct stream *s,
+                                int64_t pos)
+{
+    mp_assert(c->num_cursors == 1 && s->reconnect);
+    if (s->reconnect(s, pos) != STREAM_OK) {
+        c->disabled = true;
+        s->broken = true;
+        if (!s->error)
+            s->error = -1;
+        MP_WARN(c, "lru_cache: owner reopen failed at pos=%" PRId64 "\n", pos);
+        return false;
+    }
+    stream_lru_cache_finish_reconnect(c, pos);
+    return true;
+}
+
 // Reposition cur at pos with a backend seek. A failure of the owner's
 // backend is reported through its s->error.
 static bool cursor_seek(struct stream_lru_cache *c, struct lru_cursor *cur,
                         int64_t pos)
 {
     struct stream *backend = cur->backend;
+    if (is_owner(c, cur) && c->num_cursors == 1 && backend->reconnect &&
+        c->extra_cursor_failures >= LRU_EXTRA_CURSOR_FAILURES)
+        return cursor_reopen_owner(c, backend, pos);
     MP_VERBOSE(c, "lru_cache: connection %d seek %" PRId64 " -> %" PRId64
                   "\n", cur->id, cur->pos, pos);
     if (!backend->seek || backend->seek(backend, pos) <= 0) {
@@ -436,6 +478,20 @@ static bool cursor_seek(struct stream_lru_cache *c, struct lru_cursor *cur,
     cur->pos = pos;
     c->backend_seeks++;
     return true;
+}
+
+static int cursor_read(struct stream_lru_cache *c, struct lru_cursor *cur,
+                       void *buffer, int size)
+{
+    struct stream *backend = cur->backend;
+    int64_t deadline = c->num_cursors > 1
+        ? mp_time_ns_add(mp_time_ns(), LRU_CONCURRENT_READ_TIMEOUT) : 0;
+    backend->read_qualification_deadline = deadline;
+    int result = backend->fill_buffer(backend, buffer, size);
+    cur->qualification_failed = result <= 0 && backend->error && deadline &&
+        mp_time_ns() >= deadline;
+    backend->read_qualification_deadline = 0;
+    return result;
 }
 
 // Read forward on cur until it reaches target, caching every byte read. A
@@ -471,9 +527,8 @@ static bool cursor_pull(struct stream_lru_cache *c, struct stream *s,
             e->start_offset = cur->pos;
         }
         int want = (int)(MPMIN(target, bucket_end) - cur->pos);
-        int chunk = backend->fill_buffer(backend,
-                                         e->data + (cur->pos - e->start_offset),
-                                         want);
+        int chunk = cursor_read(c, cur,
+                                e->data + (cur->pos - e->start_offset), want);
         if (chunk <= 0) {
             if (fresh)
                 talloc_free(e);
@@ -506,6 +561,19 @@ static struct lru_cursor *cursor_for(struct stream_lru_cache *c,
                                      struct stream *s, int64_t pos,
                                      int64_t file_size)
 {
+    if (c->restart_owner) {
+        c->restart_owner = false;
+        struct lru_cursor *cur = &c->cursors[0];
+        if (s->reconnect) {
+            if (!cursor_reopen_owner(c, s, pos))
+                return NULL;
+        } else if (!cursor_seek(c, cur, pos)) {
+            return NULL;
+        }
+        cursor_touch(c, cur);
+        return cur;
+    }
+
     // 1. A cursor at pos, or a short distance behind it.
     struct lru_cursor *closest = NULL;
     for (int i = 0; i < c->num_cursors; i++) {
@@ -550,7 +618,10 @@ static struct lru_cursor *cursor_for(struct stream_lru_cache *c,
     }
 
     // 3. Another connection, which a ranged request starts right at pos.
-    if (!cur && can_open_cursor(c)) {
+    bool tail_probe = c->num_cursors == 1 && !c->backend_seeks &&
+        !c->cursor_opens && file_size > (int64_t)c->tail_threshold &&
+        c->tail_threshold > 0 && pos >= file_size - (int64_t)c->tail_threshold;
+    if (!cur && !tail_probe && can_open_cursor(c)) {
         cur = cursor_open(c, s, pos);
         if (cur) {
             cursor_touch(c, cur);
@@ -661,7 +732,7 @@ static struct bucket_entry *fetch_at(struct stream_lru_cache *c,
                 stop_short = true;
                 break;
             }
-            int chunk = backend->fill_buffer(backend, dst + got, max_want - got);
+            int chunk = cursor_read(c, cur, dst + got, max_want - got);
             iters++;
             last_chunk = chunk;
             if (chunk <= 0) {
@@ -924,6 +995,17 @@ void stream_lru_cache_invalidate_backend_pos(struct stream_lru_cache *c)
         c->cursors[0].pos = -1;
 }
 
+void stream_lru_cache_reset_connections(struct stream_lru_cache *c)
+{
+    if (!c)
+        return;
+    MP_VERBOSE(c, "lru_cache: timeline seek retires %d region connections;"
+                  " retaining cached bytes\n", c->num_cursors);
+    cursor_close_extra(c);
+    c->cursors[0].pos = -1;
+    c->restart_owner = true;
+}
+
 void stream_lru_cache_prepare_reconnect(struct stream_lru_cache *c)
 {
     if (!c)
@@ -937,6 +1019,7 @@ void stream_lru_cache_finish_reconnect(struct stream_lru_cache *c, int64_t pos)
     if (!c)
         return;
     c->cursors[0].pos = pos;
+    c->restart_owner = false;
     c->backend_reconnects++;
 }
 

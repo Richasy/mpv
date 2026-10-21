@@ -77,7 +77,7 @@ struct stream_lru_cache_params {
     // the bucket we are about to return.
     uint32_t tail_prefetch;
     // Distance from the file end (in bytes) at which a miss is considered
-    // "tail" for prefetch purposes. Ignored when tail_prefetch is 0.
+    // "tail" for prefetch and initial metadata transport positioning.
     uint64_t tail_threshold;
     // Upper bound of concurrent backend connections, including the owning
     // stream's own backend. Clamped to [1, STREAM_LRU_MAX_CURSORS]; 1 keeps
@@ -117,6 +117,10 @@ int stream_lru_cache_read(struct stream_lru_cache *c, struct stream *s,
 // bookkeeping (an in-place reopen, STREAM_CTRL_AVSEEK). The next miss served
 // by cursor 0 seeks it first.
 void stream_lru_cache_invalidate_backend_pos(struct stream_lru_cache *c);
+
+// Retire transports from the previous timeline without discarding cached bytes.
+// The next cache miss reopens the owner before creating further region cursors.
+void stream_lru_cache_reset_connections(struct stream_lru_cache *c);
 
 // Retain cached bytes but retire additional connections before reopening
 // the original source. Those connections may still use a stale redirect.

@@ -20,6 +20,10 @@ costs a full redirect chain. The cases verify:
   connection after a bounded number of failures;
 - ranged-open: an additional connection starts right at the offset it serves,
   and the open-time probe of the file end costs no request from offset 0;
+- headers-only: a speculative cursor that receives headers without body
+  falls back to the owner without another speculative connection;
+- timeline-seek: a held response from the old timeline is closed before the
+  new target request, while cached bytes remain usable;
 - curl-short-range: with the libcurl backend, playback stays byte-exact when
   the server answers every open-ended range request with a shorter range,
   which libcurl reports as a clean end of the transfer;
@@ -41,6 +45,8 @@ import json
 import os
 from pathlib import Path
 import re
+import select
+import socket
 import struct
 import subprocess
 import sys
@@ -78,7 +84,7 @@ EXCLUSIVE_GRACE = 0.05
 SHORT_RANGE = 1024 * 1024
 # Audio bytes the stream's own connection delivers before its response is
 # held, enough to open the file and start playback.
-HOLD_AFTER = 256 * 1024
+HOLD_AFTER = 1024 * 1024
 # How quickly stopping must end a file whose read waits for a held response.
 STOP_LIMIT = 2.0
 # When the server releases a held response if stopping did not end the file.
@@ -278,11 +284,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 end = min(end, start + server.short_range - 1)
         with server.lock:
             server.requests.append((time.time(), self.connection_id, start))
+            header_hold = (server.headers_only and not server.header_stalled
+                           and server.header_region[0] <= start
+                           < server.header_region[1])
+            conflict = server.stall_concurrent and bool(
+                server.active - {self.connection_id})
+            if conflict:
+                server.header_conflicts += 1
+                header_hold = True
+            if header_hold:
+                server.header_stalled = True
+                server.held_start = start
         # Only a response that starts before the hold offset, i.e. the one
         # the stream's own connection reads the audio from, is held there.
         hold_at = server.hold_at
         held, release = server.held, server.release
-        hold = hold_at is not None and start < hold_at
+        hold = (hold_at is not None and start < hold_at
+                and (server.hold_initial or start > 0))
         time.sleep(CDN_LATENCY)
         self.send_response(206 if requested else 200)
         self.send_header("Content-Type", "video/mp4")
@@ -294,6 +312,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         server.set_active(self.connection_id, True)
         try:
+            if header_hold:
+                if server.header_prefix:
+                    self.wfile.write(media[start:start + server.header_prefix])
+                    start += server.header_prefix
+                held.set()
+                release.wait(60)
             view = memoryview(media)
             while start <= end:
                 size = min(65536, end + 1 - start)
@@ -301,7 +325,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     size = min(size, hold_at - start)
                 elif hold:
                     held.set()
-                    release.wait(60)
+                    deadline = time.monotonic() + 60
+                    while not release.is_set() and time.monotonic() < deadline:
+                        readable, _, _ = select.select([self.connection], [], [], 0.05)
+                        if not readable:
+                            continue
+                        try:
+                            disconnected = not self.connection.recv(1, socket.MSG_PEEK)
+                        except (ConnectionResetError, ConnectionAbortedError):
+                            disconnected = True
+                        if disconnected:
+                            with server.lock:
+                                server.old_close_request_count = len(server.requests)
+                            self.close_connection = True
+                            return
                     hold = False
                 self.wfile.write(view[start:start + size])
                 start += size
@@ -324,12 +361,23 @@ class Server(http.server.ThreadingHTTPServer):
         self.exclusive = False
         self.reset()
 
-    def reset(self, exclusive=False, short_range=0, hold_at=None, range_mode=None):
+    def reset(self, exclusive=False, short_range=0, hold_at=None, range_mode=None,
+              headers_only=False, header_prefix=0, header_region=(0, 0),
+              stall_concurrent=False, hold_initial=True):
         with self.lock:
             self.exclusive = exclusive
             self.short_range = short_range
             self.hold_at = hold_at
+            self.hold_initial = hold_initial
             self.range_mode = range_mode
+            self.headers_only = headers_only
+            self.header_stalled = False
+            self.header_prefix = header_prefix
+            self.header_region = header_region
+            self.held_start = None
+            self.stall_concurrent = stall_concurrent
+            self.header_conflicts = 0
+            self.old_close_request_count = None
             self.range_eofs = []
             self.held = threading.Event()
             self.release = threading.Event()
@@ -608,16 +656,62 @@ def run_range_client(library, url, pcm_path):
         raise TimeoutError("Unknown-size range playback did not finish")
 
 
+def run_seek_client(library, url, options):
+    with contextlib.ExitStack() as stack:
+        mpv = load_libmpv(stack, library)
+        client = create_client(stack, mpv, {
+            "ao": "null",
+            "pause": "yes",
+            "untimed": "no",
+            "cache-pause": "no",
+            "demuxer-max-bytes": "64KiB",
+            "demuxer-max-back-bytes": "0",
+            "demuxer-readahead-secs": "0",
+            "stream-buffer-size": "64KiB",
+            "demuxer": "rawaudio",
+            "demuxer-rawaudio-rate": str(AUDIO_RATE),
+            "demuxer-rawaudio-channels": "stereo",
+            "demuxer-rawaudio-format": "s16le",
+            **options,
+        })
+        run_command(mpv, client, "loadfile", url)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if mpv.mpv_wait_event(client, 0.05).contents.event_id == 8:
+                break
+        else:
+            raise TimeoutError("The paused seek fixture did not load")
+        if sys.stdin.readline() != "seek\n":
+            raise RuntimeError("The seek fixture was not admitted by its held-response gate")
+        run_command(mpv, client, "seek", "60", "absolute+exact")
+        run_command(mpv, client, "set", "pause", "no")
+        started = time.monotonic()
+        confirmed = None
+        while time.monotonic() - started < 6:
+            mpv.mpv_wait_event(client, 0.05)
+            position = get_property(mpv, client, "time-pos")
+            if (position is not None and 60 <= float(position) < 61
+                    and get_property(mpv, client, "seeking") == "no"
+                    and get_property(mpv, client, "paused-for-cache") == "no"):
+                confirmed = time.monotonic() - started
+                break
+        run_command(mpv, client, "stop")
+        print(json.dumps({"confirmedSeconds": confirmed}), flush=True)
+
+
 def run_case(library, server, media, name, options, **server_modes):
     server.reset(**server_modes)
     url = f"http://127.0.0.1:{server.server_port}/origin/media.mp4"
     with tempfile.TemporaryDirectory(prefix="mpv-network-cursors-") as directory:
         pcm_path = str(Path(directory, "audio.pcm"))
-        result = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()), "--child",
-             library, url, json.dumps(options), pcm_path, str(len(media.texts))],
-            capture_output=True, text=True, timeout=180,
-        )
+        try:
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--child",
+                 library, url, json.dumps(options), pcm_path, str(len(media.texts))],
+                capture_output=True, text=True, timeout=180,
+            )
+        finally:
+            server.release.set()
         if result.returncode:
             raise RuntimeError(f"{name}: {result.stdout}{result.stderr}")
         report = json.loads(result.stdout.strip().splitlines()[-1])
@@ -641,6 +735,8 @@ def run_case(library, server, media, name, options, **server_modes):
 
 def check_default(library, server, media):
     log, origins, requests, _ = run_case(library, server, media, "default", {})
+    if not any("peak_connections=2" in line for line in log):
+        raise RuntimeError("default: interleaved playback did not use both regions")
     if len(origins) > 4:
         raise RuntimeError(f"default: {len(origins)} redirect chains, expected at "
                            f"most 4\n" + "\n".join(log))
@@ -682,6 +778,67 @@ def check_exclusive(library, server, media):
     print(f"PASS cursors/exclusive ({refused} refused requests)", flush=True)
 
 
+def check_headers_only(library, server, media, options=None, prefix=0):
+    name = ("prefix-stall" if prefix else "headers-only") + (
+        "-curl" if options else "-lavf")
+    log, _, requests, _ = run_case(
+        library, server, media, name, options or {},
+        headers_only=True, header_prefix=prefix,
+        header_region=(media.subtitle_start, media.subtitle_end))
+    failed = [line for line in log if "failed to qualify read progress" in line]
+    opened = [line for line in log if "lru_cache: opened connection" in line]
+    tail = [request for request in requests
+            if server.held_start is not None
+            and server.held_start <= request[2] <= server.held_start + prefix]
+    if (len(failed) != 1 or len(opened) != 1 or len(tail) < 2
+            or tail[0][2] + prefix != tail[1][2]
+            or tail[1][0] - tail[0][0] >= 8):
+        raise RuntimeError(
+            f"{name}: failed={len(failed)} opened={len(opened)} "
+            f"tail={[(request[1], request[2]) for request in tail]}\n"
+            + "\n".join(log))
+    print(f"PASS cursors/{name} "
+          f"(owner recovered in {tail[1][0] - tail[0][0]:.3f}s)", flush=True)
+
+
+def check_timeline_seek(library, server, options=None):
+    server.reset(stall_concurrent=True, hold_at=128 * 1024)
+    url = f"http://127.0.0.1:{server.server_port}/origin/media.mp4"
+    process = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--seek-child",
+         library, url, json.dumps(options or {})],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True)
+    try:
+        if not server.held.wait(5):
+            raise RuntimeError("timeline-seek: the original response was not held")
+        with server.lock:
+            if len(server.active) != 1:
+                raise RuntimeError("timeline-seek: no exclusive active old response")
+        output, error = process.communicate("seek\n", timeout=20)
+    finally:
+        server.release.set()
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+    if process.returncode:
+        raise RuntimeError(f"timeline-seek: {output}{error}")
+    report = json.loads(output.strip().splitlines()[-1])
+    with server.lock:
+        conflicts = server.header_conflicts
+        requests = list(server.requests)
+        closed_after = server.old_close_request_count
+    targets = [request for request in requests
+               if request[2] == 60 * AUDIO_RATE * 4]
+    if (report["confirmedSeconds"] is None or report["confirmedSeconds"] >= 3
+            or conflicts or not targets or closed_after is None
+            or closed_after > requests.index(targets[0])):
+        raise RuntimeError(f"timeline-seek: {report}, conflicts={conflicts}")
+    backend = "curl" if options else "lavf"
+    print(f"PASS cursors/timeline-seek-{backend} "
+          f"({report['confirmedSeconds']:.3f}s, no retained response)", flush=True)
+
+
 def curl_available(library):
     """Whether libmpv has the libcurl HTTP backend."""
     with contextlib.ExitStack() as stack:
@@ -699,7 +856,8 @@ def curl_available(library):
 def check_curl_short_range(library, server, media):
     log, _, requests, _ = run_case(library, server, media, "curl-short-range",
                                    CURL, short_range=SHORT_RANGE)
-    if not any(request[2] == SHORT_RANGE for request in requests):
+    starts = {request[2] for request in requests if request[2] < media.audio_end}
+    if not any(start + SHORT_RANGE in starts for start in starts):
         raise RuntimeError("curl-short-range: no continuation after the first "
                            "shortened range\n" + "\n".join(log))
     print(f"PASS cursors/curl-short-range ({len(requests)} requests)", flush=True)
@@ -745,11 +903,11 @@ def check_curl_unknown_ranges(library, media):
 
 
 def check_curl_cancel(library, server, media):
-    server.reset(hold_at=media.audio_start + HOLD_AFTER)
+    server.reset(hold_at=media.audio_start + HOLD_AFTER, hold_initial=False)
     url = f"http://127.0.0.1:{server.server_port}/origin/media.mp4"
     process = subprocess.Popen(
         [sys.executable, str(Path(__file__).resolve()), "--stop-child",
-         library, url, json.dumps(CURL)],
+         library, url, json.dumps({**CURL, "sid": "1"})],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True,
     )
@@ -797,7 +955,13 @@ def main(library):
         check_default(library, server, media)
         check_legacy(library, server, media)
         check_exclusive(library, server, media)
+        check_headers_only(library, server, media)
+        check_headers_only(library, server, media, prefix=1)
+        check_timeline_seek(library, server)
         if curl_available(library):
+            check_headers_only(library, server, media, CURL)
+            check_headers_only(library, server, media, CURL, prefix=1)
+            check_timeline_seek(library, server, CURL)
             check_curl_short_range(library, server, media)
             check_curl_unknown_ranges(library, media)
             check_curl_cancel(library, server, media)
@@ -813,6 +977,8 @@ if __name__ == "__main__":
         run_stop_client(sys.argv[2], sys.argv[3], json.loads(sys.argv[4]))
     elif len(sys.argv) == 5 and sys.argv[1] == "--range-child":
         run_range_client(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif len(sys.argv) == 5 and sys.argv[1] == "--seek-child":
+        run_seek_client(sys.argv[2], sys.argv[3], json.loads(sys.argv[4]))
     elif len(sys.argv) == 2:
         main(str(Path(sys.argv[1]).resolve(strict=True)))
     else:

@@ -694,11 +694,13 @@ stream_t *open_output_stream(const char *filename, struct mpv_global *global)
 
 int64_t stream_get_io_deadline(struct stream *s)
 {
-    if (s->read_deadline_parent)
-        return stream_get_io_deadline(s->read_deadline_parent);
-    int64_t deadline = s->read_deadline;
+    int64_t deadline = s->read_deadline_parent
+        ? stream_get_io_deadline(s->read_deadline_parent) : s->read_deadline;
     if (!deadline && s->network_timeout > 0)
         deadline = mp_time_ns_add(mp_time_ns(), s->network_timeout);
+    if (s->read_qualification_deadline)
+        deadline = deadline ? MPMIN(deadline, s->read_qualification_deadline) :
+                              s->read_qualification_deadline;
     if (s->read_recovery_deadline)
         deadline = deadline ? MPMIN(deadline, s->read_recovery_deadline) :
                               s->read_recovery_deadline;
@@ -1116,6 +1118,12 @@ static bool stream_seek_unbuffered(stream_t *s, int64_t newpos)
                    elapsed * 1000.0, s->total_stream_seeks);
     }
     return true;
+}
+
+void stream_reset_network_cursors(stream_t *s)
+{
+    if (s)
+        stream_lru_cache_reset_connections(s->lru_cache);
 }
 
 bool stream_seek(stream_t *s, int64_t pos)

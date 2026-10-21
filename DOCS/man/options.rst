@@ -5860,7 +5860,16 @@ Cache
     connections start with a ranged request at the position they serve. If
     they fail, for instance because the server limits concurrent
     connections, playback continues on the stream's own connection. ``1``
-    uses a single connection.
+    uses a single connection. While multiple connections are retained, a read
+    that makes no progress for five seconds retries without the additional
+    connections. This also covers a response that delivers headers or a body
+    prefix and then stalls. The byte cache stays enabled; ordinary
+    ``--network-timeout`` behavior is preserved once only one connection remains.
+    A timeline seek retires the previous region's transports but retains cached
+    bytes. The next uncached read starts a fresh owner transport; ordinary
+    demuxer reads can then establish multiple region cursors again. An initial
+    file-end metadata probe repositions the owner rather than retaining an
+    unread file-head response alongside it.
 
 ``--stream-lru-cache-read-through=<bytesize>``
     A cache miss at most this far ahead of one of the stream's connections is

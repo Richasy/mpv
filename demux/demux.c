@@ -2902,8 +2902,10 @@ static void execute_seek(struct demux_internal *in)
 
     MP_VERBOSE(in, "execute seek (to %f flags %d)\n", pts, flags);
 
-    if (in->d_thread->desc->seek)
+    if (in->d_thread->desc->seek) {
+        stream_reset_network_cursors(in->d_thread->stream);
         in->d_thread->desc->seek(in->d_thread, pts, flags);
+    }
 
     MP_VERBOSE(in, "seek done\n");
 

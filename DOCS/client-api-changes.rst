@@ -37,6 +37,30 @@ API changes
           MPV_RENDER_PARAM_D3D11_INIT_PARAMS and MPV_RENDER_PARAM_D3D11_FBO,
           and a new render_d3d11.h header (upstream API 2.6).
  --- mpv 0.41.0 ---
+        - fix typed DASH seek admission to use both selected demuxers rather
+          than previously observed HTTP 206 responses. An initial 200 may
+          advertise byte ranges, as on the ordinary HTTP path; actual byte
+          positions, response validation and terminal failures remain enforced.
+          Range-capability flags remain observations with unchanged layout.
+          Asynchronous typed demux seek failures now terminate both tracks
+          instead of leaving a successful-looking video-only seek.
+ 2.11   - add mpv_dash_source_get_failure_detail() with a versioned,
+          generation-bound numeric first-failure origin. The existing v1
+          status and failure codes are unchanged (Richasy/mpv fork).
+ 2.10   - let ordinary typed DASH media responses reach the existing demuxer,
+          including unknown-length streams; only 401/403/412 and redirects
+          remain status-line terminal. A nonzero byte position or unsatisfied
+          consumer window still fails, and only verified 206 Content-Range
+          establishes seek capability (Richasy/mpv fork).
+ 2.9    - add mpv_dash_source_get_range_capability() with a versioned,
+          size-checked, per-track and source-generation-bound numeric result.
+          A full-body initial HTTP 200 may play but does not establish seek
+          capability; only a validated 206 Content-Range does (Richasy/mpv fork).
+ 2.8    - add mpv_dash_source_load(), mpv_dash_source_get_status(), and
+          mpv_dash_source_get_frame_status() with versioned, size-checked
+          mpv_dash_source, mpv_dash_source_status, and mpv_dash_frame_status
+          descriptors (Richasy/mpv fork addition). Accepted/queued does not
+          imply FILE_LOADED or a successfully presented video frame.
  2.7    - add mpv_acquire_d3d11_composition_surface(),
           mpv_release_d3d11_composition_surface(), and
           mpv_d3d11_composition_surface (Richasy/mpv fork addition).

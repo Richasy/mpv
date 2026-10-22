@@ -28,13 +28,23 @@
 
 struct priv {
     int64_t last_vsync;
+    uint64_t frame_id;
 
     double cfg_fps;
 };
 
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
+    struct priv *p = vo->priv;
+    p->frame_id = frame->frame_id;
     return VO_TRUE;
+}
+
+static enum mp_frame_result get_frame_result(struct vo *vo, uint64_t frame_id)
+{
+    struct priv *p = vo->priv;
+    return frame_id && frame_id == p->frame_id
+               ? MP_FRAME_SUCCEEDED : MP_FRAME_UNKNOWN;
 }
 
 static void flip_page(struct vo *vo)
@@ -95,6 +105,7 @@ const struct vo_driver video_out_null = {
     .control = control,
     .draw_frame = draw_frame,
     .flip_page = flip_page,
+    .get_frame_result = get_frame_result,
     .uninit = uninit,
     .priv_size = sizeof(struct priv),
     .options = (const struct m_option[]) {

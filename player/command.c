@@ -46,6 +46,7 @@
 #include "common/stats.h"
 #include "filters/f_decoder_wrapper.h"
 #include "command.h"
+#include "dash_source.h"
 #include "osdep/als.h"
 #include "osdep/threads.h"
 #include "osdep/timer.h"
@@ -834,6 +835,8 @@ static int mp_property_percent_pos(void *ctx, struct m_property *prop,
 
     switch (action) {
     case M_PROPERTY_SET: {
+        if (mp_dash_source_seek_blocked(mpctx->global))
+            return M_PROPERTY_UNAVAILABLE;
         double pos = *(double *)arg;
         queue_seek(mpctx, MPSEEK_FACTOR, pos / 100.0, MPSEEK_DEFAULT, 0);
         return M_PROPERTY_OK;
@@ -872,6 +875,8 @@ static int mp_property_time_pos(void *ctx, struct m_property *prop,
         return M_PROPERTY_UNAVAILABLE;
 
     if (action == M_PROPERTY_SET) {
+        if (mp_dash_source_seek_blocked(mpctx->global))
+            return M_PROPERTY_UNAVAILABLE;
         queue_seek(mpctx, MPSEEK_ABSOLUTE, *(double *)arg, MPSEEK_DEFAULT, 0);
         return M_PROPERTY_OK;
     }
@@ -969,6 +974,8 @@ static int mp_property_chapter(void *ctx, struct m_property *prop,
     }
     case M_PROPERTY_SWITCH:
     case M_PROPERTY_SET: ;
+        if (mp_dash_source_seek_blocked(mpctx->global))
+            return M_PROPERTY_UNAVAILABLE;
         mark_seek(mpctx);
         int step_all;
         if (action == M_PROPERTY_SWITCH) {
@@ -1613,6 +1620,58 @@ static int mp_property_seeking(void *ctx, struct m_property *prop,
     return m_property_bool_ro(action, arg, !mpctx->restart_complete);
 }
 
+static void add_refresh_receipt(struct mpv_node *node, const char *name,
+                                struct mp_refresh_receipt receipt)
+{
+    struct mpv_node *entry = node_map_add(node, name, MPV_FORMAT_NODE_MAP);
+    node_map_add_int64(entry, "id", receipt.id);
+    if (receipt.id)
+        node_map_add_double(entry, "saved-position", receipt.position);
+    else
+        node_map_add(entry, "saved-position", MPV_FORMAT_NONE);
+}
+
+static int mp_property_rodel_seek_state(void *ctx, struct m_property *prop,
+                                        int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    switch (action) {
+    case M_PROPERTY_GET_TYPE:
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
+        return M_PROPERTY_OK;
+    case M_PROPERTY_GET: {
+        struct mp_refresh_source source = mp_refresh_source_state(mpctx);
+        // Validate a copy: reading the property cannot alter playback or admit
+        // work. A stopped/EOF source must not advertise a live completion.
+        struct mp_paused_refresh s = mpctx->paused_refresh;
+        mp_refresh_validate(&s, source);
+        struct mpv_node node;
+        node_init(&node, MPV_FORMAT_NODE_MAP, NULL);
+        bool known = source.initialized && s.source_epoch && !s.exhausted;
+        node_map_add_int64(&node, "version", 1);
+        node_map_add_flag(&node, "known", known);
+        node_map_add_flag(&node, "pending", source.pending);
+        node_map_add_flag(&node, "active", source.active);
+        node_map_add_int64(&node, "source-epoch", s.source_epoch);
+        node_map_add_int64(&node, "seek-revision", s.revision);
+        node_map_add_int64(&node, "owner-epoch", s.owner_epoch);
+        node_map_add_int64(&node, "owner-revision", s.owner_revision);
+        node_map_add_string(&node, "state", mp_refresh_phase_name(s.phase));
+        if (known && isfinite(source.position) && source.position >= 0)
+            node_map_add_double(&node, "position", source.position);
+        else
+            node_map_add(&node, "position", MPV_FORMAT_NONE);
+        add_refresh_receipt(&node, "last-requested", s.requested);
+        add_refresh_receipt(&node, "last-applied", s.applied);
+        add_refresh_receipt(&node, "last-completed", s.completed);
+        add_refresh_receipt(&node, "last-canceled", s.canceled);
+        *(struct mpv_node *)arg = node;
+        return M_PROPERTY_OK;
+    }
+    }
+    return M_PROPERTY_NOT_IMPLEMENTED;
+}
+
 static int mp_property_whisper_loading(void *ctx, struct m_property *prop,
                                        int action, void *arg)
 {
@@ -2038,7 +2097,8 @@ static int mp_property_seekable(void *ctx, struct m_property *prop,
     MPContext *mpctx = ctx;
     if (!mpctx->demuxer)
         return M_PROPERTY_UNAVAILABLE;
-    return m_property_bool_ro(action, arg, mpctx->demuxer->seekable);
+    return m_property_bool_ro(action, arg, mpctx->demuxer->seekable &&
+                              !mp_dash_source_seek_blocked(mpctx->global));
 }
 
 static int mp_property_partially_seekable(void *ctx, struct m_property *prop,
@@ -4210,6 +4270,24 @@ static int mp_property_cwd(void *ctx, struct m_property *prop,
     return M_PROPERTY_NOT_IMPLEMENTED;
 }
 
+static int mp_property_dash_transfer(void *ctx, struct m_property *prop,
+                                     int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    struct mp_dash_transfer_diagnostic d;
+    if (!mp_dash_source_transfer_snapshot(mpctx->global, &d))
+        return M_PROPERTY_UNAVAILABLE;
+    char *value = talloc_asprintf(NULL,
+        "1 %" PRIu64 " %d %" PRIu32 " %d %d %d %" PRIu64 " %" PRIu64
+        " %" PRIu64 " %" PRIu64 " %d %d",
+        d.generation, d.track, d.response_count, d.http_status, d.curl_code,
+        d.length_known, d.expected, d.received, d.request_start, d.request_end,
+        d.headers_ok, d.aborted);
+    int result = m_property_strdup_ro(action, arg, value);
+    talloc_free(value);
+    return result;
+}
+
 static int mp_property_current_watch_later_dir(void *ctx, struct m_property *prop,
                                                int action, void *arg)
 {
@@ -5032,6 +5110,7 @@ static const struct m_property mp_properties_base[] = {
     {"core-idle", mp_property_core_idle},
     {"eof-reached", mp_property_eof_reached},
     {"seeking", mp_property_seeking},
+    {"rodel-seek-state", mp_property_rodel_seek_state},
     {"whisper-loading", mp_property_whisper_loading},
     {"whisper-ai-translate", mp_property_whisper_ai_translate},
     {"whisper-ai-translate-status", mp_property_whisper_ai_translate_status},
@@ -5047,6 +5126,7 @@ static const struct m_property mp_properties_base[] = {
     {"demuxer-cache-idle", mp_property_demuxer_cache_idle},
     {"demuxer-start-time", mp_property_demuxer_start_time},
     {"demuxer-cache-state", mp_property_demuxer_cache_state},
+    {"rodel-dash-transfer", mp_property_dash_transfer},
     {"cache-buffering-state", mp_property_cache_buffering},
     {"paused-for-cache", mp_property_paused_for_cache},
     {"demuxer-via-network", mp_property_demuxer_is_network},
@@ -5235,8 +5315,8 @@ static const char *const *const mp_event_property_change[] = {
     E(MPV_EVENT_END_FILE, "*"),
     E(MPV_EVENT_FILE_LOADED, "*"),
     E(MP_EVENT_CHANGE_ALL, "*"),
-    E(MP_EVENT_TRACKS_CHANGED, "track-list", "current-tracks"),
-    E(MP_EVENT_TRACK_SWITCHED, "track-list", "current-tracks"),
+    E(MP_EVENT_TRACKS_CHANGED, "track-list", "current-tracks", "seekable"),
+    E(MP_EVENT_TRACK_SWITCHED, "track-list", "current-tracks", "seekable"),
     E(MPV_EVENT_IDLE, "*"),
     E(MPV_EVENT_TICK, "time-pos", "audio-pts", "stream-pos", "avsync",
       "percent-pos", "time-remaining", "playtime-remaining", "playback-time",
@@ -6345,6 +6425,10 @@ static void cmd_seek(void *p)
         cmd->success = false;
         return;
     }
+    if (mp_dash_source_seek_blocked(mpctx->global)) {
+        cmd->success = false;
+        return;
+    }
 
     mark_seek(mpctx);
     switch (abs) {
@@ -6388,6 +6472,13 @@ static void cmd_seek(void *p)
         mpctx->add_osd_seek_info |= OSD_SEEK_INFO_TEXT;
 }
 
+static void cmd_rodel_paused_refresh(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    cmd->success = mp_request_paused_refresh(cmd->mpctx, cmd->args[0].v.i64,
+                                            cmd->args[1].v.d);
+}
+
 static void cmd_revert_seek(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
@@ -6395,6 +6486,10 @@ static void cmd_revert_seek(void *p)
     struct command_ctx *cmdctx = mpctx->command_ctx;
 
     if (!mpctx->playback_initialized) {
+        cmd->success = false;
+        return;
+    }
+    if (mp_dash_source_seek_blocked(mpctx->global)) {
         cmd->success = false;
         return;
     }
@@ -6558,6 +6653,10 @@ static void cmd_frame_step(void *p)
         cmd->success = false;
         return;
     }
+    if (mp_dash_source_seek_blocked(mpctx->global)) {
+        cmd->success = false;
+        return;
+    }
 
     if (flags == 1) {
         // frame-step command has on_updown set so it is called on both down
@@ -6679,6 +6778,10 @@ static void cmd_sub_step_seek(void *p)
     int track_ind = cmd->args[1].v.i;
 
     if (!mpctx->playback_initialized) {
+        cmd->success = false;
+        return;
+    }
+    if (!step && mp_dash_source_seek_blocked(mpctx->global)) {
         cmd->success = false;
         return;
     }
@@ -6992,6 +7095,10 @@ static void cmd_stop(void *p)
     struct mp_cmd_ctx *cmd = p;
     struct MPContext *mpctx = cmd->mpctx;
     int flags = cmd->args[0].v.i;
+    bool dash_source = mp_dash_source_active(mpctx->global) &&
+        ((mpctx->filename && !strcmp(mpctx->filename, MP_DASH_VIDEO_URL)) ||
+         (mpctx->playlist->current &&
+          !strcmp(mpctx->playlist->current->filename, MP_DASH_VIDEO_URL)));
 
     if (!(flags & 1))
         playlist_clear(mpctx->playlist);
@@ -7004,6 +7111,8 @@ static void cmd_stop(void *p)
 
     if (mpctx->stop_play != PT_QUIT)
         mpctx->stop_play = PT_STOP;
+    if (dash_source)
+        mp_dash_source_stopped(mpctx->global, false);
     mp_wakeup_core(mpctx);
 }
 
@@ -7911,6 +8020,9 @@ static void cmd_notify_property(void *p)
 
 const struct mp_cmd_def mp_cmds[] = {
     { "ignore", cmd_ignore, .is_ignore = true, .is_noisy = true, },
+    { "rodel-paused-refresh", cmd_rodel_paused_refresh,
+        { {"request-id", OPT_INT64(v.i64)},
+          {"saved-position", OPT_DOUBLE(v.d)} } },
 
     { "seek", cmd_seek,
         {

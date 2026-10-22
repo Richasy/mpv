@@ -13,6 +13,7 @@ struct mpv_global {
     struct stats_base *stats;
     struct demux_packet_pool *packet_pool;
     struct curl_ctx *curl;
+    struct mp_dash_source_state *dash_source;
 };
 
 #endif

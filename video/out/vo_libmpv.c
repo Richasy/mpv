@@ -90,6 +90,8 @@ struct mpv_render_context {
 
     // --- Protected by lock
     struct vo_frame *next_frame;    // next frame to draw
+    struct mp_frame_receipt frame_receipt;
+    uint64_t draw_receipt_id;
     int64_t present_count;          // incremented when next frame can be shown
     int64_t expected_flip_count;    // next vsync event for next_frame
     bool redrawing;                 // next_frame was a redraw request
@@ -143,6 +145,7 @@ void *get_mpv_render_param(mpv_render_param *params, mpv_render_param_type type,
 
 static void forget_frames(struct mpv_render_context *ctx, bool all)
 {
+    mp_frame_receipt_invalidate(&ctx->frame_receipt);
     mp_cond_broadcast(&ctx->video_wait);
     if (all) {
         talloc_free(ctx->cur_frame);
@@ -349,6 +352,10 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
         int err = ctx->renderer->fns->get_target_size(ctx->renderer, params,
                                                     &vp_w, &vp_h);
         if (err < 0) {
+            if (ctx->next_frame && ctx->next_frame->require_receipt)
+                mp_frame_receipt_report(&ctx->frame_receipt,
+                                        ctx->next_frame->frame_id,
+                                        MP_FRAME_FAILED);
             mp_mutex_unlock(&ctx->lock);
             return err;
         }
@@ -426,6 +433,19 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
 
     if (do_render)
         err = ctx->renderer->fns->render(ctx->renderer, params, frame);
+
+    // Taking next_frame out of the queue is not processing it. Record the
+    // actual render result before waking the owned-frame waiter; failures,
+    // SKIP_RENDERING and a late completion after timeout cannot become success.
+    if (frame->require_receipt) {
+        mp_mutex_lock(&ctx->lock);
+        mp_frame_receipt_report(&ctx->frame_receipt, frame->frame_id,
+                                do_render && err >= 0 && frame->current &&
+                                ctx->renderer->fns->reports_render_result
+                                    ? MP_FRAME_SUCCEEDED : MP_FRAME_FAILED);
+        mp_cond_broadcast(&ctx->video_wait);
+        mp_mutex_unlock(&ctx->lock);
+    }
 
     if (frame != &dummy)
         talloc_free(frame);
@@ -509,6 +529,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     mp_mutex_lock(&ctx->lock);
     mp_assert(!ctx->next_frame);
     ctx->next_frame = vo_frame_ref(frame);
+    ctx->draw_receipt_id = frame->require_receipt ? frame->frame_id : 0;
+    if (frame->require_receipt)
+        mp_frame_receipt_begin(&ctx->frame_receipt, frame->frame_id);
     ctx->expected_flip_count = ctx->flip_count + 1;
     ctx->redrawing = frame->redraw || !frame->current;
     mp_mutex_unlock(&ctx->lock);
@@ -524,6 +547,7 @@ static void flip_page(struct vo *vo)
     int64_t until = mp_time_ns() + MP_TIME_MS_TO_NS(200);
 
     mp_mutex_lock(&ctx->lock);
+    uint64_t receipt_id = ctx->draw_receipt_id;
 
     // Wait until frame was rendered
     while (ctx->next_frame) {
@@ -531,8 +555,22 @@ static void flip_page(struct vo *vo)
             if (ctx->next_frame) {
                 MP_VERBOSE(vo, "mpv_render_context_render() not being called "
                            "or stuck.\n");
+                mp_frame_receipt_report(&ctx->frame_receipt, receipt_id,
+                                        MP_FRAME_FAILED);
                 goto done;
             }
+        }
+    }
+
+    // The normal path only waits for dequeue. An owned receipt additionally
+    // requires the exact frame's renderer to finish, within the same deadline.
+    while (receipt_id &&
+           mp_frame_receipt_get(&ctx->frame_receipt, receipt_id) == MP_FRAME_PENDING)
+    {
+        if (mp_cond_timedwait_until(&ctx->video_wait, &ctx->lock, until)) {
+            mp_frame_receipt_report(&ctx->frame_receipt, receipt_id,
+                                    MP_FRAME_FAILED);
+            break;
         }
     }
 
@@ -551,6 +589,7 @@ static void flip_page(struct vo *vo)
             break;
         if (mp_cond_timedwait_until(&ctx->video_wait, &ctx->lock, until)) {
             MP_VERBOSE(vo, "mpv_render_report_swap() not being called.\n");
+            mp_frame_receipt_invalidate(&ctx->frame_receipt);
             goto done;
         }
     }
@@ -559,6 +598,7 @@ done:
 
     // Cleanup after the API user is not reacting, or is being unusually slow.
     if (ctx->next_frame) {
+        mp_frame_receipt_invalidate(&ctx->frame_receipt);
         talloc_free(ctx->cur_frame);
         ctx->cur_frame = ctx->next_frame;
         ctx->next_frame = NULL;
@@ -568,6 +608,23 @@ done:
     }
 
     mp_mutex_unlock(&ctx->lock);
+}
+
+static enum mp_frame_result get_frame_result(struct vo *vo, uint64_t frame_id)
+{
+    struct vo_priv *p = vo->priv;
+    struct mpv_render_context *ctx = p->ctx;
+    mp_mutex_lock(&ctx->lock);
+    enum mp_frame_result result =
+        mp_frame_receipt_get(&ctx->frame_receipt, frame_id);
+    mp_mutex_unlock(&ctx->lock);
+    return result;
+}
+
+static bool supports_frame_receipt(struct vo *vo)
+{
+    struct vo_priv *p = vo->priv;
+    return p->ctx->renderer->fns->reports_render_result;
 }
 
 static int query_format(struct vo *vo, int format)
@@ -758,6 +815,8 @@ const struct vo_driver video_out_libmpv = {
     .get_image_ts = get_image,
     .draw_frame = draw_frame,
     .flip_page = flip_page,
+    .get_frame_result = get_frame_result,
+    .supports_frame_receipt = supports_frame_receipt,
     .uninit = uninit,
     .priv_size = sizeof(struct vo_priv),
 };

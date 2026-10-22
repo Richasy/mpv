@@ -30,6 +30,29 @@ mpv /path/to/movie.iso
 
 The fork is maintained as a `libmpv` build target — it produces `libmpv-2.dll` for Windows x64 and arm64.
 
+### Owned paused-frame refresh
+
+`rodel-seek-state` exposes queued and current seek state and bounded owned
+receipts. `rodel-paused-refresh <positive-id> <actual-time-pos>` admits an
+absolute very-exact refresh only for a drained, paused, seekable video.
+Admission is not completion: read back the matching ID, source epoch,
+operation revision and `completed` state. Ordinary/automatic seeks and
+source/reset/reconfiguration changes invalidate ownership. No unpause,
+replay, frame-step, media-specific routing or credential handling is added.
+See `DOCS/man/input.rst` for the complete contract.
+
+The deterministic `paused-refresh` Meson test uses the production policy.
+`python test/libmpv_paused_refresh.py <built-library> <artifact-directory>`
+additionally exercises the actual DLL, read-only node entry and local seekable
+media with `vo=null`, `ao=null` and no GPU. Keep the complete built runtime
+directory together; DLL loading alone is not paused-refresh acceptance.
+`python test/libmpv_paused_refresh_render.py <built-library> <artifact-directory>`
+also exercises real libmpv software-render timeout/drop, render error, skipped
+rendering, late completion and exact-frame success, without a window or GPU.
+An owned receipt requires explicit per-frame backend processing feedback:
+queue/render flags becoming clear are not success. Unsupported backends reject
+the command; supported errors and unknown/drop results fail closed.
+
 ### Experimental DLSS neural rendering
 
 The Windows x64 `dlssnr` filter integrates experimental DLSSNR directly into

@@ -42,6 +42,7 @@
 #include "video/fmt-conversion.h"
 #include "video/mp_image.h"
 #include "video/out/placebo/ra_pl.h"
+#include "video/out/display_surface.h"
 #include "placebo/utils.h"
 #include "gpu/context.h"
 #include "gpu/hwdec.h"
@@ -149,6 +150,8 @@ struct priv {
     bool want_seek_reset;
     bool flush_cache;
     bool frame_pending;
+    uint64_t pending_video_frame_id;
+    struct mp_frame_receipt draw_receipt;
     bool paused;
 
     pl_options pars;
@@ -1338,6 +1341,8 @@ static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
+    mp_frame_receipt_begin(&p->draw_receipt, frame->frame_id);
+    p->pending_video_frame_id = 0;
     pl_options pars = p->pars;
     pl_gpu gpu = p->gpu;
     update_options(vo);
@@ -1770,6 +1775,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         MP_ERR(vo, "Failed rendering frame!\n");
         goto done;
     }
+    if (frame->current && mix.num_frames > 0)
+        p->pending_video_frame_id = frame->frame_id;
 
     struct pl_frame ref_frame;
     pl_frames_infer_mix(p->rr, &mix, &target, &ref_frame);
@@ -1810,13 +1817,43 @@ static void flip_page(struct vo *vo)
     struct priv *p = vo->priv;
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
 
+    uint64_t frame_id = p->pending_video_frame_id;
+    bool submitted = false;
     if (p->frame_pending) {
-        if (!pl_swapchain_submit_frame(p->sw))
+        if (!pl_swapchain_submit_frame(p->sw)) {
             MP_ERR(vo, "Failed presenting frame!\n");
+        } else if (p->pending_video_frame_id) {
+            submitted = true;
+            vo_display_surface_prepare_frame(vo->extra.display_surface,
+                                             p->pending_video_frame_id);
+        }
         p->frame_pending = false;
     }
+    p->pending_video_frame_id = 0;
 
     sw->fns->swap_buffers(sw);
+    // A successful submit is not a successful swap. Other contexts without
+    // explicit swap feedback remain unknown, never a success-shaped fallback.
+    enum mp_frame_result result = MP_FRAME_UNKNOWN;
+    if (!submitted || !frame_id) {
+        result = MP_FRAME_FAILED;
+    } else if (sw->fns->last_swap_succeeded) {
+        result = sw->fns->last_swap_succeeded(sw)
+                     ? MP_FRAME_SUCCEEDED : MP_FRAME_FAILED;
+    }
+    mp_frame_receipt_finish(&p->draw_receipt, p->draw_receipt.id, result, false);
+}
+
+static enum mp_frame_result get_frame_result(struct vo *vo, uint64_t frame_id)
+{
+    struct priv *p = vo->priv;
+    return mp_frame_receipt_get(&p->draw_receipt, frame_id);
+}
+
+static bool supports_frame_receipt(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    return p->ra_ctx->swapchain->fns->last_swap_succeeded != NULL;
 }
 
 static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
@@ -3021,6 +3058,8 @@ const struct vo_driver video_out_gpu_next = {
     .get_image_ts = get_image,
     .draw_frame = draw_frame,
     .flip_page = flip_page,
+    .get_frame_result = get_frame_result,
+    .supports_frame_receipt = supports_frame_receipt,
     .get_vsync = get_vsync,
     .wait_events = wait_events,
     .wakeup = wakeup,

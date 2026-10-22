@@ -168,9 +168,70 @@ static void test_acquire_is_atomic_with_loss(void)
     mp_mutex_destroy(&race.lock);
 }
 
+static void test_real_frame_requires_matching_successful_present(void)
+{
+    void *root = talloc_new(NULL);
+    struct vo_display_surface_state *state =
+        vo_display_surface_state_create(root);
+    struct fake_surface first = {.refs = 1};
+    struct fake_surface second = {.refs = 1};
+
+    vo_display_surface_prepare_frame(state, 1);
+    assert_false(vo_display_surface_present_frame(state, &first));
+    assert_int_equal(vo_display_surface_last_frame(state).serial, 0);
+
+    assert_true(vo_display_surface_publish(state, &first, retain_surface));
+    vo_display_surface_prepare_frame(state, 0);
+    assert_false(vo_display_surface_present_frame(state, &first));
+    vo_display_surface_prepare_frame(state, 1);
+    assert_int_equal(vo_display_surface_last_frame(state).serial, 0);
+    assert_false(vo_display_surface_present_frame(state, &second));
+    assert_false(vo_display_surface_present_frame(state, &first));
+
+    vo_display_surface_prepare_frame(state, 1);
+    assert_false(vo_display_surface_publish(state, &first, retain_surface));
+    assert_true(vo_display_surface_present_frame(state, &first));
+    struct vo_display_surface_frame_snapshot frame =
+        vo_display_surface_last_frame(state);
+    assert_int_equal(frame.epoch, 1);
+    assert_int_equal(frame.serial, 1);
+    assert_false(vo_display_surface_present_frame(state, &first));
+    assert_int_equal(vo_display_surface_last_frame(state).serial, 1);
+
+    vo_display_surface_prepare_frame(state, 2);
+    assert_true(vo_display_surface_publish(state, &second, retain_surface));
+    assert_int_equal(vo_display_surface_last_frame(state).epoch, 0);
+    assert_int_equal(vo_display_surface_last_frame(state).serial, 0);
+    assert_false(vo_display_surface_present_frame(state, &first));
+    vo_display_surface_prepare_frame(state, 3);
+    assert_true(vo_display_surface_present_frame(state, &second));
+    frame = vo_display_surface_last_frame(state);
+    assert_int_equal(frame.epoch, 2);
+    assert_int_equal(frame.serial, 2);
+
+    assert_true(vo_display_surface_publish(state, NULL, NULL));
+    assert_int_equal(vo_display_surface_last_frame(state).serial, 0);
+    vo_display_surface_prepare_frame(state, 4);
+    assert_false(vo_display_surface_present_frame(state, &second));
+    talloc_free(root);
+
+    root = talloc_new(NULL);
+    state = vo_display_surface_state_create(root);
+    struct fake_surface third = {.refs = 1};
+    assert_true(vo_display_surface_publish(state, &third, retain_surface));
+    vo_display_surface_prepare_frame(state, 1);
+    assert_true(vo_display_surface_present_frame(state, &third));
+    frame = vo_display_surface_last_frame(state);
+    assert_int_equal(frame.epoch, 1);
+    assert_int_equal(frame.serial, 3);
+    assert_true(vo_display_surface_publish(state, NULL, NULL));
+    talloc_free(root);
+}
+
 int main(void)
 {
     test_epoch_and_replacement();
     test_acquire_is_atomic_with_loss();
+    test_real_frame_requires_matching_successful_present();
     return 0;
 }

@@ -1,0 +1,2 @@
+add the read-only rodel-seek-state node property
+add rodel-paused-refresh for owned exact paused-frame refreshes

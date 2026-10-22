@@ -86,6 +86,46 @@ jobs:
           echo "Runner selection ${RUNNER_SELECTION:-auto}: $label"
           echo "label=$label" >> "$GITHUB_OUTPUT"
 
+  setup-local-feed:
+    if: ${{ !inputs.build_x64 && !inputs.build_arm64 && inputs.runner == 'new' }}
+    runs-on: [self-hosted, Linux, X64, mpv-build-wsl-cpc-anran-fhr6h]
+    env:
+      NATIVE_RELEASE_ROOT: ${{ vars.NATIVE_RELEASE_ROOT }}
+      WINDOWS_NATIVE_FEED_SOURCE: ${{ vars.WINDOWS_NATIVE_FEED_SOURCE }}
+    steps:
+      - name: Persist the single-directory Windows native feed mount
+        run: |
+          set -euo pipefail
+          if [[ ! "$NATIVE_RELEASE_ROOT" =~ ^/mnt/[a-zA-Z0-9._-]+$ ||
+                ! "$WINDOWS_NATIVE_FEED_SOURCE" =~ ^[a-zA-Z]:\\[a-zA-Z0-9._\\-]+$ ]]; then
+            echo "::error::Configure canonical Windows and WSL native feed roots."
+            exit 1
+          fi
+          if grep -Eq '^[[:space:]]*mountFsTab[[:space:]]*=[[:space:]]*false' /etc/wsl.conf; then
+            echo "::error::WSL fstab processing is disabled."
+            exit 1
+          fi
+          options="metadata,uid=$(id -u),gid=$(id -g)"
+          entry="$(printf '%s' "$WINDOWS_NATIVE_FEED_SOURCE" | sed 's/\\/\\\\/g') $NATIVE_RELEASE_ROOT drvfs $options 0 0"
+          sudo -n mkdir -p "$NATIVE_RELEASE_ROOT"
+          if ! mountpoint -q "$NATIVE_RELEASE_ROOT"; then
+            sudo -n mount -t drvfs "$WINDOWS_NATIVE_FEED_SOURCE" "$NATIVE_RELEASE_ROOT" -o "$options"
+          fi
+          if [ "$(findmnt -T "$NATIVE_RELEASE_ROOT" -no SOURCE)" != "$WINDOWS_NATIVE_FEED_SOURCE" ]; then
+            echo "::error::The native feed mount does not point to the configured Windows directory."
+            exit 1
+          fi
+          if ! sudo -n grep -Fxq -- "$entry" /etc/fstab; then
+            if sudo -n awk -v path="$NATIVE_RELEASE_ROOT" '$2 == path { found = 1 } END { exit !found }' /etc/fstab; then
+              echo "::error::A different persistent native feed mount already exists."
+              exit 1
+            fi
+            printf '%s\n' "$entry" | sudo -n tee -a /etc/fstab >/dev/null
+          fi
+          test -r "$NATIVE_RELEASE_ROOT/.native-feed-windows-probe"
+          test -w "$NATIVE_RELEASE_ROOT"
+          printf 'native-feed-wsl=%s\n' "$GITHUB_RUN_ID" > "$NATIVE_RELEASE_ROOT/.native-feed-wsl-probe"
+
   build:
     needs: prepare
     if: needs.prepare.outputs.matrix != '{"include":[]}'

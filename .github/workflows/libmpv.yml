@@ -8,13 +8,14 @@ on:
         type: boolean
         default: true
       build_arm64:
-        description: 'Build ARM64 (Azure uploads only)'
+        description: 'Build ARM64 (Azure or local release publication)'
         type: boolean
         default: false
       upload_target:
         description: 'Upload target'
         type: choice
         options:
+          - local
           - github
           - azure
           - both
@@ -39,27 +40,27 @@ jobs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       runner_label: ${{ steps.select-runner.outputs.label }}
     steps:
+      - uses: actions/checkout@v4
       - id: set-matrix
         run: |
-          entries=()
-          if [ "${{ inputs.build_x64 }}" = "true" ]; then
-            entries+=('{"arch":"x86_64","name":"x64"}')
-          fi
-          if [ "${{ inputs.build_arm64 }}" = "true" ]; then
-            if [ "${{ inputs.upload_target }}" = "azure" ] ||
-               [ "${{ inputs.upload_target }}" = "both" ]; then
-              entries+=('{"arch":"aarch64","name":"arm64"}')
-            else
-              echo "::notice::Skipping ARM64: it is built only for Azure uploads."
-            fi
-          fi
-          matrix="{\"include\":[$(IFS=,; echo "${entries[*]}")]}"
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          python3 ci/publish_native_release.py matrix \
+            --build-x64 "${{ inputs.build_x64 }}" \
+            --build-arm64 "${{ inputs.build_arm64 }}" \
+            --upload-target "${{ inputs.upload_target }}" >> "$GITHUB_OUTPUT"
 
       - id: select-runner
         env:
           RUNNER_SELECTION: ${{ inputs.runner }}
+          UPLOAD_TARGET: ${{ inputs.upload_target }}
+          NATIVE_RELEASE_ROOT: ${{ vars.NATIVE_RELEASE_ROOT }}
         run: |
+          if [ "$UPLOAD_TARGET" = local ]; then
+            if [ -z "$NATIVE_RELEASE_ROOT" ] || [ "$RUNNER_SELECTION" = legacy ]; then
+              echo "::error::Local publication requires NATIVE_RELEASE_ROOT on the new shared host."
+              exit 1
+            fi
+            RUNNER_SELECTION=new
+          fi
           case "${RUNNER_SELECTION:-auto}" in
             new)
               label=mpv-build-wsl-cpc-anran-fhr6h
@@ -103,8 +104,24 @@ jobs:
       TARGET_ARCH: ${{ matrix.arch }}
       MPV_REPO: https://github.com/Richasy/mpv.git
       MPV_COMMIT: ${{ github.sha }}
+      NATIVE_RELEASE_ROOT: ${{ vars.NATIVE_RELEASE_ROOT }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Test immutable local native publication
+        run: python3 -B -m unittest discover -s ci/tests -p test_native_release.py
+
+      - name: Validate shared native destination
+        if: inputs.upload_target == 'local'
+        run: |
+          test -d "$NATIVE_RELEASE_ROOT"
+          test -w "$NATIVE_RELEASE_ROOT"
+          case "$NATIVE_RELEASE_ROOT/" in
+            "$GITHUB_WORKSPACE/"*|"$RUNNER_TEMP/"*)
+              echo "::error::The native feed must live outside Actions checkout and temporary directories."
+              exit 1
+              ;;
+          esac
 
       - name: Test D3D11 adapter selector
         run: |
@@ -180,6 +197,7 @@ jobs:
           fi
 
       - name: Package artifacts as 7z
+        if: inputs.upload_target != 'local'
         run: |
           archive="$OUTPUT_DIR/libmpv-${{ matrix.name }}.7z"
           staging="${archive}.new"
@@ -188,6 +206,16 @@ jobs:
           7z a -t7z -mx=9 "$staging" .
           mv -f "$staging" "$archive"
           ls -lh "$archive"
+
+      - name: Stage immutable local runtime
+        if: inputs.upload_target == 'local'
+        run: |
+          python3 ci/publish_native_release.py stage \
+            --root "$NATIVE_RELEASE_ROOT" \
+            --source "$OUTPUT_DIR/$TARGET_ARCH" \
+            --architecture "${{ matrix.name }}" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --commit "$GITHUB_SHA"
 
       - name: Upload to GitHub Artifacts
         if: inputs.upload_target == 'github' || inputs.upload_target == 'both'
@@ -270,6 +298,24 @@ jobs:
             ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-build/CMakeFiles/CMakeOutput.log
             ${{ env.BUILD_DIR }}/packages/whisper-prefix/src/whisper-build/CMakeFiles/CMakeError.log
           retention-days: 7
+
+  publish-local:
+    needs: [prepare, build]
+    if: >-
+      needs.build.result == 'success' &&
+      inputs.build_x64 && inputs.build_arm64 &&
+      inputs.upload_target == 'local'
+    runs-on: [self-hosted, Linux, X64, "${{ needs.prepare.outputs.runner_label }}"]
+    env:
+      NATIVE_RELEASE_ROOT: ${{ vars.NATIVE_RELEASE_ROOT }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish latest complete local runtime
+        run: |
+          python3 ci/publish_native_release.py complete \
+            --root "$NATIVE_RELEASE_ROOT" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --commit "$GITHUB_SHA"
 
   publish-latest:
     needs: [prepare, build]

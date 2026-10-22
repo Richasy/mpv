@@ -137,6 +137,10 @@ jobs:
       - name: Test immutable local native publication
         run: python3 -B -m unittest discover -s ci/tests -p test_native_release.py
 
+      - name: Prepare runner-owned local native relay
+        if: inputs.upload_target == 'local'
+        run: mkdir -p "$NATIVE_RELEASE_ROOT"
+
       - name: Validate shared native destination
         if: inputs.upload_target == 'local'
         run: |
@@ -342,6 +346,22 @@ jobs:
             --root "$NATIVE_RELEASE_ROOT" \
             --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
             --commit "$GITHUB_SHA"
+
+      - name: Archive completed paired native build for Windows handoff
+        run: |
+          set -euo pipefail
+          cd "$NATIVE_RELEASE_ROOT"
+          tar -cf "$RUNNER_TEMP/rodel-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar" \
+            "native/builds/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" native/latest.json
+
+      - name: Upload completed native set for local Windows handoff
+        uses: actions/upload-artifact@v4
+        with:
+          name: rodel-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rodel-native-${{ github.run_id }}-${{ github.run_attempt }}.tar
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
 
   publish-latest:
     needs: [prepare, build]

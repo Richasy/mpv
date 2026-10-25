@@ -1,13 +1,21 @@
-# Local Windows runtime publication
+# Windows runtime publication
 
-The `libmpv` workflow's `upload_target=local` publishes the complete x64 and
-ARM64 runtimes without Azure Blob Storage or GitHub artifact uploads. Select
-both architectures; a partial local selection fails before building. Local mode selects the new shared-host runner; an explicit
-legacy runner is rejected instead of silently publishing to another machine.
-Existing GitHub and Azure modes keep their previous behavior.
+## Azure CI
 
-Configure the repository variable `NATIVE_RELEASE_ROOT` as an existing writable
-directory on that host. Its Linux/WSL path and a Windows consumer's path must
+The `libmpv` workflow supports GitHub artifacts, Azure Blob Storage, or both.
+For a Player release, select `upload_target=azure` and enable both x64 and
+ARM64. The workflow uploads complete run-specific runtime sets and updates
+`native/latest.json` only after validating both architectures and their source
+commit. Runner selection retains its explicit or time-of-day policy.
+No shared native directory or `NATIVE_RELEASE_ROOT` repository variable is
+required. Player consumes the completed pair through its canonical Azure
+downloader and verifies its run-owned receipt against both Store packages.
+
+## Explicit offline publication
+
+`ci/publish_native_release.py` remains available for separate offline
+publication; it is not a workflow upload target. Select an existing writable
+directory explicitly with `--root`. Its Linux/WSL path and a Windows consumer's path must
 refer to the same persistent storage. Keep it outside Actions checkouts,
 `RUNNER_TEMP`, and mutable compiler output. No machine-specific path belongs
 in the workflow. Only the trusted native publisher should have write access;
@@ -20,7 +28,7 @@ architecture, and changed bytes. Its architecture manifest records every DLL,
 PDB, and notice with its size and SHA-256. Existing architecture directories
 are never overwritten.
 
-After both architecture jobs succeed, `complete` verifies their source,
+After both architecture `stage` commands succeed, `complete` verifies their source,
 workflow attempt, and bytes again, writes `manifest.json`, and atomically
 replaces `native/latest.json`. The completion pointer has this shape:
 
@@ -39,8 +47,8 @@ Consumers freeze the pointer and manifest once and validate copied bytes
 against that document; a newer build never retargets an in-flight consumer.
 They must not consume the mutable `OUTPUT_DIR` directly.
 
-An incomplete build has no completion pointer. Rerun the full workflow to
-produce a new paired attempt; do not combine outputs from different attempts
+An incomplete local set has no completion pointer. Stage both completed
+architectures under a new paired attempt; do not combine outputs from different attempts
 or overwrite an existing set. An interrupted completion retains its immutable
 files. Repeating `complete` for that exact attempt verifies identical bytes
 and resumes pointer publication, but cannot roll back a newer pointer. The
@@ -51,7 +59,7 @@ versions retained by release jobs.
 
 Product-specific static assets are separate from the libmpv runtime set.
 The Player publisher can seed its `static/` set from a previous verified
-acquisition receipt; this workflow never relabels arbitrary models or vendor
+acquisition receipt; this helper never relabels arbitrary models or vendor
 DLLs as outputs of the mpv build.
 
 Run the publication contract tests without native compilation:

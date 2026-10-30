@@ -41,6 +41,7 @@
 #include "stream.h"
 #include "cache_lru.h"
 #include "network.h"
+#include "player/dash_source.h"
 
 #include "options/m_option.h"
 #include "options/m_config.h"
@@ -743,12 +744,18 @@ int64_t stream_get_io_deadline(struct stream *s)
     if (s->read_recovery_deadline)
         deadline = deadline ? MPMIN(deadline, s->read_recovery_deadline) :
                               s->read_recovery_deadline;
+    if (s->url && (!strcmp(s->url, MP_DASH_VIDEO_URL) ||
+                   !strcmp(s->url, MP_DASH_AUDIO_URL)))
+        deadline = mp_dash_source_io_deadline(s->global, deadline, s->network_timeout);
     return deadline;
 }
 
 bool stream_read_deadline_expired(struct stream *s)
 {
     int64_t deadline = stream_get_io_deadline(s);
+    if (s->url && (!strcmp(s->url, MP_DASH_VIDEO_URL) ||
+                   !strcmp(s->url, MP_DASH_AUDIO_URL)))
+        return mp_dash_source_io_expired(s->global, deadline, s->network_timeout);
     return deadline && mp_time_ns() >= deadline;
 }
 

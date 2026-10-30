@@ -64,6 +64,17 @@ int mp_dash_source_frame_snapshot(struct mpv_global *global,
 bool mp_dash_source_active(struct mpv_global *global);
 bool mp_dash_source_failed(struct mpv_global *global);
 bool mp_dash_source_terminal(struct mpv_global *global);
+void mp_dash_source_set_idle_pause(struct mpv_global *global, bool idle);
+void mp_dash_source_pending_open(struct mpv_global *global, bool begin);
+bool mp_dash_source_idle_paused(struct mpv_global *global);
+int64_t mp_dash_source_io_deadline(struct mpv_global *global, int64_t deadline,
+                                   double timeout);
+bool mp_dash_source_io_expired(struct mpv_global *global, int64_t deadline,
+                               double timeout);
+bool mp_dash_source_use_curl(struct mpv_global *global);
+void mp_dash_source_transport_started(struct mpv_global *global,
+                                      mpv_dash_track_kind track, bool curl);
+int mp_dash_source_transport_backend(struct mpv_global *global);
 bool mp_dash_source_get_track(struct mpv_global *global, const char *alias,
                               void *parent, mpv_dash_track_kind *kind,
                               struct mp_dash_track_config *config);

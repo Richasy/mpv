@@ -12,14 +12,17 @@
 #include <string.h>
 
 #include "common/global.h"
+#include "common/common.h"
 #include "demux/demux.h"
 #include "misc/dispatch.h"
 #include "mpv_talloc.h"
 #include "osdep/threads.h"
+#include "osdep/timer.h"
 #include "player/core.h"
 #include "video/out/display_surface.h"
 
 #include "dash_source.h"
+#include "stream/stream_curl.h"
 
 #if HAVE_LIBCURL
 #include <curl/curl.h>
@@ -32,6 +35,11 @@ struct mp_dash_source_state {
     char *user_agent;
     char *referer;
     bool allow_loopback_http;
+    bool use_curl;
+    unsigned transport_mask;
+    bool idle_pause;
+    int64_t resumed_at;
+    int pending_opens;
     uint64_t baseline_present_serial;
     uint32_t validated_ranges;
     mpv_dash_source_status status;
@@ -194,6 +202,7 @@ int mp_dash_source_validate(const mpv_dash_source *source)
 
 int mp_dash_source_begin(struct mpv_global *global, const mpv_dash_source *source)
 {
+    bool use_curl = mp_curl_enabled(global);
     struct mp_dash_source_state *state = global->dash_source;
     struct vo_display_surface_frame_snapshot previous =
         vo_display_surface_last_frame(state->mpctx->display_surface);
@@ -215,6 +224,10 @@ int mp_dash_source_begin(struct mpv_global *global, const mpv_dash_source *sourc
         !!(source->flags & MPV_DASH_SOURCE_ALLOW_LOOPBACK_HTTP);
     state->baseline_present_serial = previous.serial;
     state->validated_ranges = 0;
+    state->use_curl = use_curl;
+    state->transport_mask = 0;
+    state->idle_pause = false;
+    state->resumed_at = 0;
     state->status = (mpv_dash_source_status) {
         .struct_size = sizeof(mpv_dash_source_status),
         .api_version = MPV_DASH_SOURCE_API_VERSION,
@@ -548,6 +561,101 @@ bool mp_dash_source_terminal(struct mpv_global *global)
     return terminal;
 }
 
+bool mp_dash_source_use_curl(struct mpv_global *global)
+{
+    struct mp_dash_source_state *state = global->dash_source;
+    mp_mutex_lock(&state->lock);
+    bool value = state->use_curl;
+    mp_mutex_unlock(&state->lock);
+    return value;
+}
+
+void mp_dash_source_transport_started(struct mpv_global *global,
+                                      mpv_dash_track_kind track, bool curl)
+{
+    struct mp_dash_source_state *state = global->dash_source;
+    mp_mutex_lock(&state->lock);
+    bool wrong = state->use_curl != curl;
+    if (!wrong && (track == MPV_DASH_TRACK_VIDEO || track == MPV_DASH_TRACK_AUDIO))
+        state->transport_mask |= 1u << (track - 1);
+    mp_mutex_unlock(&state->lock);
+    if (wrong) mp_dash_source_fail(global, track, MPV_DASH_FAILURE_TRANSPORT);
+}
+
+int mp_dash_source_transport_backend(struct mpv_global *global)
+{
+    struct mp_dash_source_state *state = global->dash_source;
+    mp_mutex_lock(&state->lock);
+    int value = state->transport_mask == 3 ? (state->use_curl ? 1 : 2) : 0;
+    mp_mutex_unlock(&state->lock);
+    return value;
+}
+
+// Only the core changes pause ownership. Transports take snapshots under the
+// source lock; none reads MPContext or another thread's stream fields.
+void mp_dash_source_set_idle_pause(struct mpv_global *global, bool idle)
+{
+    struct mp_dash_source_state *state = global->dash_source;
+    mp_mutex_lock(&state->lock);
+    idle &= state->status.phase == MPV_DASH_SOURCE_TRACKS_BOUND && !state->pending_opens;
+    if (state->idle_pause && !idle)
+        state->resumed_at = mp_time_ns();
+    state->idle_pause = idle;
+    mp_mutex_unlock(&state->lock);
+}
+
+bool mp_dash_source_idle_paused(struct mpv_global *global)
+{
+    struct mp_dash_source_state *state = global->dash_source;
+    mp_mutex_lock(&state->lock);
+    bool idle = state->idle_pause;
+    mp_mutex_unlock(&state->lock);
+    return idle;
+}
+
+void mp_dash_source_pending_open(struct mpv_global *global, bool begin)
+{
+    struct mp_dash_source_state *state = global->dash_source;
+    mp_mutex_lock(&state->lock);
+    if (begin) {
+        state->pending_opens++;
+        if (state->idle_pause)
+            state->resumed_at = mp_time_ns();
+        state->idle_pause = false;
+    } else {
+        mp_assert(state->pending_opens > 0);
+        state->pending_opens--;
+    }
+    mp_mutex_unlock(&state->lock);
+}
+
+int64_t mp_dash_source_io_deadline(struct mpv_global *global, int64_t deadline,
+                                   double timeout)
+{
+    struct mp_dash_source_state *state = global->dash_source;
+    mp_mutex_lock(&state->lock);
+    if (state->idle_pause) {
+        deadline = 0;
+    } else if (state->resumed_at && deadline && timeout > 0) {
+        // One fixed window after each user demand, never a rolling watchdog.
+        deadline = MPMAX(deadline, mp_time_ns_add(state->resumed_at, timeout));
+    }
+    mp_mutex_unlock(&state->lock);
+    return deadline;
+}
+
+bool mp_dash_source_io_expired(struct mpv_global *global, int64_t deadline,
+                               double timeout)
+{
+    struct mp_dash_source_state *state = global->dash_source;
+    mp_mutex_lock(&state->lock);
+    if (state->resumed_at && deadline && timeout > 0)
+        deadline = MPMAX(deadline, mp_time_ns_add(state->resumed_at, timeout));
+    bool expired = !state->idle_pause && deadline && mp_time_ns() >= deadline;
+    mp_mutex_unlock(&state->lock);
+    return expired;
+}
+
 bool mp_dash_source_get_track(struct mpv_global *global, const char *alias,
                               void *parent, mpv_dash_track_kind *kind,
                               struct mp_dash_track_config *config)
@@ -576,6 +684,19 @@ bool mp_dash_source_get_track(struct mpv_global *global, const char *alias,
 }
 
 #else
+
+void mp_dash_source_set_idle_pause(struct mpv_global *global, bool idle) { }
+void mp_dash_source_pending_open(struct mpv_global *global, bool begin) { }
+bool mp_dash_source_idle_paused(struct mpv_global *global) { return false; }
+int64_t mp_dash_source_io_deadline(struct mpv_global *global, int64_t deadline,
+                                   double timeout) { return deadline; }
+bool mp_dash_source_io_expired(struct mpv_global *global, int64_t deadline,
+                               double timeout) { return false; }
+
+bool mp_dash_source_use_curl(struct mpv_global *global) { return true; }
+void mp_dash_source_transport_started(struct mpv_global *global,
+                                      mpv_dash_track_kind track, bool curl) { }
+int mp_dash_source_transport_backend(struct mpv_global *global) { return 0; }
 
 void mp_dash_source_init(struct mpv_global *global, struct MPContext *mpctx)
 { (void)global; (void)mpctx; }

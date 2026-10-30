@@ -299,6 +299,7 @@ class Server(http.server.ThreadingHTTPServer):
         self.tracks = tracks
         self.lock = threading.Lock()
         self.requests = []
+        self.arrivals = []
         self.early_hints_roles = set()
         self.interim_count_roles = {}
         self.malformed_status_roles = set()
@@ -397,6 +398,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if role not in self.server.tracks:
             self.send_error(404)
             return
+        with self.server.lock:
+            self.server.arrivals.append(role)
         if self.server.hold_headers_role == role:
             self.server.headers_blocked.set()
             self.server.release_headers.wait(10)
@@ -1402,15 +1405,15 @@ def test_stop_before_late_risk(mpv, server):
             command(mpv, handle, "stop")
             assert snapshot(mpv, handle).phase == STOPPED
             with server.lock:
-                count_at_stop = len(server.requests)
+                video_arrivals_at_stop = server.arrivals.count("video")
             server.deny = "video"
             server.release_followup_headers.set()
             event = await_event(mpv, handle, END_FILE)
             assert ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents.reason == 2
             time.sleep(0.2)
             with server.lock:
-                assert len(server.requests) <= count_at_stop + 1, (count_at_stop,
-                    [(r[0],r[1],r[2]) for r in server.requests])
+                assert server.arrivals.count("video") == video_arrivals_at_stop, \
+                    "A new video GET arrived after stopping its held continuation"
             state = snapshot(mpv, handle)
             assert state.phase == STOPPED and state.failure == 0
             assert state.video_http_status == 206

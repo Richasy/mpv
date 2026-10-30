@@ -2116,6 +2116,11 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     mp_assert(p->scheme);
     p->content_size = -1;
     p->buffer_size = p->opts->buffer_size;
+    // A metadata miss often abandons this response after a few sectors.
+    // Keep disc cursors responsive without downloading the default 4 MiB
+    // per region before the sparse cache has requested those bytes.
+    if (s->disc)
+        p->buffer_size = MPMIN(p->buffer_size, 256 * 1024);
     p->buffer = talloc_size(p, p->buffer_size);
     p->icy = mp_icy_new(p);
 

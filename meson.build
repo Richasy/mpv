@@ -740,6 +740,7 @@ libbluray = dependency('libbluray', version: '>= 1.0.2', required: get_option('l
 features += {'libbluray': libbluray.found()}
 if features['libbluray']
     dependencies += libbluray
+    sources += files('stream/bluray_files.c')
     sources += files('stream/stream_bluray.c')
 endif
 

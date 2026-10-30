@@ -481,6 +481,7 @@ static int stream_create_instance(const stream_info_t *sinfo,
     s->network_timeout = net_opts->timeout;
     talloc_free(net_opts);
     s->open_offset = args->open_offset;
+    s->disc = args->disc;
     s->url = talloc_strdup(s, url);
     s->path = talloc_strdup(s, path);
     s->mode = flags & (STREAM_READ | STREAM_WRITE);
@@ -559,6 +560,10 @@ static int stream_create_instance(const stream_info_t *sinfo,
                 .max_cursors = opts->lru_cache_cursors,
                 .read_through = (uint32_t)opts->lru_cache_read_through,
             };
+            if (args->disc) {
+                params.tail_prefetch = 0;
+                params.read_through = MPMIN(params.read_through, 64 * 1024);
+            }
             s->lru_cache = stream_lru_cache_create(s, &params);
             if (s->lru_cache) {
                 MP_VERBOSE(s, "byte-range LRU cache enabled: "
@@ -570,10 +575,10 @@ static int stream_create_instance(const stream_info_t *sinfo,
                            "filesize=%" PRId64 "B\n",
                            opts->lru_cache_size, opts->lru_cache_bucket,
                            opts->lru_cache_min_fetch,
-                           opts->lru_cache_tail_prefetch,
+                           (int64_t)params.tail_prefetch,
                            opts->lru_cache_tail_threshold,
                            opts->lru_cache_cursors,
-                           opts->lru_cache_read_through,
+                           (int64_t)params.read_through,
                            fsize);
             }
         }
@@ -648,6 +653,33 @@ struct stream *stream_create(const char *url, int flags,
     return s;
 }
 
+struct stream *stream_open_disc_file(struct stream *owner, const char *url)
+{
+    bool http = strncasecmp(url, "http://", 7) == 0 ||
+                strncasecmp(url, "https://", 8) == 0;
+    const stream_info_t *info = &stream_info_file;
+    if (http) {
+#if HAVE_LIBCURL
+        info = &stream_info_curl;
+#else
+        info = &stream_info_ffmpeg;
+#endif
+    }
+    struct stream_open_args args = {
+        .global = owner->global,
+        .cancel = owner->cancel,
+        .url = url,
+        .flags = STREAM_READ | (owner->stream_origin & STREAM_ORIGIN_MASK),
+        .sinfo = info,
+        .disc = true,
+        .log_parent = owner->log,
+        .log_name = "disc-file",
+    };
+    struct stream *s = NULL;
+    stream_create_with_args(&args, &s);
+    return s;
+}
+
 struct stream *stream_open_lru_cursor(struct stream *s,
                                       struct mp_cancel *cancel, int64_t pos,
                                       const char *name)
@@ -662,6 +694,7 @@ struct stream *stream_open_lru_cursor(struct stream *s,
         .open_offset = pos,
         .read_deadline_parent = s,
         .lru_cursor = true,
+        .disc = s->disc,
         .log_parent = s->log,
         .log_name = name,
     };

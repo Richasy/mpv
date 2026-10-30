@@ -53,8 +53,6 @@
 #include "video/csputils.h"
 #include "video/out/vo.h"
 
-extern const stream_info_t stream_info_ffmpeg;
-
 #include "stream_iso_cache.h"
 
 #define TITLE_MENU -1
@@ -1095,6 +1093,8 @@ static void stream_dvdnav_close(stream_t *s)
 static int dvd_stream_seek(void *p_stream, uint64_t i_pos)
 {
     struct iso_cache *cache = p_stream;
+    if (i_pos > INT64_MAX)
+        return -1;
     cache->pos = (int64_t)i_pos;
     return 0;
 }
@@ -1144,22 +1144,17 @@ static struct priv *new_dvdnav_stream(stream_t *stream, char *filename)
     if (!filename)
         return NULL;
 
-    if (strncmp(filename, "http://", 7) == 0 ||
-        strncmp(filename, "https://", 8) == 0)
+    if (strncasecmp(filename, "http://", 7) == 0 ||
+        strncasecmp(filename, "https://", 8) == 0)
     {
-        struct stream_open_args open_args = {
-            .global = stream->global,
-            .cancel = stream->cancel,
-            .url = filename,
-            .flags = STREAM_READ | (stream->stream_origin & STREAM_ORIGIN_MASK),
-            .sinfo = &stream_info_ffmpeg,
-        };
-        stream_create_with_args(&open_args, &priv->iso_stream);
+        priv->iso_stream = stream_open_disc_file(stream, filename);
         if (!priv->iso_stream || !priv->iso_stream->seekable) {
             MP_ERR(stream, "Cannot open or seek in remote ISO: %s\n", filename);
             return NULL;
         }
-        priv->iso_cache = iso_cache_create(priv, priv->iso_stream, stream->log);
+        stream->streaming = priv->iso_stream->streaming;
+        stream->is_network = priv->iso_stream->is_network;
+        priv->iso_cache = iso_cache_create(priv, priv->iso_stream);
         priv->stream_cb.pf_seek = dvd_stream_seek;
         priv->stream_cb.pf_read = dvd_stream_read;
         priv->stream_cb.pf_readv = NULL;

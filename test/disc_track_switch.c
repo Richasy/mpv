@@ -5,11 +5,13 @@
 
 #include "config.h"
 #include "common/common.h"
+#include "common/global.h"
 #include "common/msg.h"
 #include "demux/demux.h"
 #include "demux/stheader.h"
 #include "misc/dispatch.h"
 #include "player/core.h"
+#include "player/dash_source.h"
 #include "stream/stream.h"
 
 struct fixture {
@@ -51,6 +53,8 @@ static void init(struct fixture *f, enum stream_type type)
     f->player.demuxer = &f->demuxer;
     f->player.log = mp_null_log;
     f->player.dispatch = mp_dispatch_create(NULL);
+    f->player.global = talloc_zero(NULL, struct mpv_global);
+    mp_dash_source_init(f->player.global, &f->player);
     f->player.playback_initialized = true;
     f->player.play_dir = 1;
     f->player.playback_pts = 445.592267;
@@ -61,6 +65,7 @@ static void init(struct fixture *f, enum stream_type type)
 static void finish(struct fixture *f)
 {
     talloc_free(f->player.dispatch);
+    talloc_free(f->player.global);
 }
 
 static void assert_no_refresh(struct fixture *f)

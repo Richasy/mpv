@@ -21,12 +21,28 @@ The HTTP server must support `Range` requests for seeking to work (most servers 
 
 Local Blu-ray, DVD-Video, and DVD-Audio ISO files can be opened directly. mpv
 probes the enabled disc readers and falls back to regular file handling if none
-recognizes the image. HTTP ISO playback retains the fork's block cache and
-filename detection inside URL query strings:
+recognizes the image. HTTP ISO playback uses the regular curl transport when
+available, including network policy, cancellation and the sparse byte-range LRU.
+It also detects ISO filenames inside URL query strings:
 
 ```bash
 mpv /path/to/movie.iso
 ```
+
+Local BDMV roots, `BDMV/index.bdmv`, `MovieObject.bdmv` and individual
+`BDMV/PLAYLIST/00000.mpls` files are supported. An MPLS opens the requested
+playlist with its clip cuts, chapters and tracks intact.
+
+Remote BDMV is a directory of independently addressable files. Supply its
+disc-relative path-to-URL map with `bluray-files` and open `bd://` (or
+`bd://mpls/<number>`). libmpv clients can set this as an `MPV_FORMAT_NODE_MAP`
+of string values, allowing each file to have its own signed URL. Directory
+entries are derived from that session's map; HTTP directory listing and guessed
+sibling URLs are not required. Keep the map scoped to the intended media and
+clear it before opening another source.
+
+See [the disc streaming investigation](DOCS/disc-streaming.rst) for the source
+review, transport design, reproducible probes and measured limits.
 
 The fork is maintained as a `libmpv` build target — it produces `libmpv-2.dll` for Windows x64 and arm64.
 

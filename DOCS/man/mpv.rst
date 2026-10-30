@@ -1341,7 +1341,9 @@ PROTOCOLS
 ``bd://[title][/device]`` ``--bluray-device=PATH``
 
     Play a Blu-ray disc. Since libbluray 1.0.1, you can read from ISO files
-    by passing them to ``--bluray-device``.
+    by passing them to ``--bluray-device``. This fork also accepts seekable
+    HTTP(S) ISO URLs. A remote BDMV directory can be supplied through
+    ``--bluray-files``; a single HTTP URL cannot enumerate such a directory.
 
     A Blu-ray ``.iso`` image passed directly (e.g. ``mpv disc.iso``) is also
     detected and opened.

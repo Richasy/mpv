@@ -295,6 +295,7 @@ typedef struct stream {
     bool autoprobed : 1; // opened by the autoprobe loop, not explicitly
                          // requested, failures should stay quiet
     bool wants_lru_cache : 1; // backend opts in to byte-range LRU cache (set in open_f)
+    bool disc : 1; // small random disc reads; inherited by transport cursors
     // Set by a backend that honoured open_offset: its transport starts at
     // exactly that byte, so no seek is needed to get there.
     bool open_offset_ok : 1;
@@ -400,11 +401,17 @@ struct stream_open_args {
     // Additional connection of an LRU-cached stream: never gets a cache of
     // its own and logs as log_name below log_parent.
     bool lru_cursor;
+    // Disc readers issue small random metadata reads. Do not synchronously
+    // prefetch megabytes around the tail or read through distant regions.
+    bool disc;
     struct mp_log *log_parent;
     const char *log_name;
 };
 
 int stream_create_with_args(struct stream_open_args *args, struct stream **ret);
+// Open a disc image or a BDMV file without recursively probing disc formats.
+// Uses the regular HTTP transport, options, cancellation and byte-range cache.
+struct stream *stream_open_disc_file(struct stream *owner, const char *url);
 // Open another connection to the same resource as s, positioned at pos, for
 // the byte-range LRU cache. cancel is the connection's own cancel object: a
 // slave of s->cancel that outlives the returned stream. It must not be

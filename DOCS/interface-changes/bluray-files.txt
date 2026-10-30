@@ -1,0 +1,4 @@
+add `bluray-files`, a disc-relative path to source URL map for BDMV playback
+through libbluray's per-instance filesystem callbacks; libmpv accepts a node
+map with string values
+support opening local BDMV/index.bdmv and BDMV/PLAYLIST/*.mpls directly

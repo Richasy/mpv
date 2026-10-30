@@ -188,12 +188,24 @@ test('subtitle-timing', subtitle_timing)
 disc_track_switch = executable(
     'disc-track-switch',
     'disc_track_switch.c',
-    include_directories: incdir,
+    include_directories: [incdir, incdir_public],
     objects: libmpv.extract_all_objects(recursive: true),
     dependencies: dependencies,
     override_options: ['b_ndebug=false'],
 )
 test('disc-track-switch', disc_track_switch)
+
+if features['libbluray']
+    disc_io = executable(
+        'disc-io', 'disc_io.c',
+        objects: libmpv.extract_objects('stream/bluray_files.c'),
+        include_directories: incdir,
+        dependencies: libbluray,
+        link_with: test_utils,
+        override_options: ['b_ndebug=false'],
+    )
+    test('disc-io', disc_io, suite: 'libmpv-disc')
+endif
 
 if features['libass']
     subtitle_ass_translation = executable(
@@ -392,6 +404,11 @@ if get_option('libmpv')
             tsmuxer = find_program('tsMuxeR', required: false)
             disc_ffmpeg = find_program('ffmpeg', required: false)
             if features['libbluray'] and tsmuxer.found() and disc_ffmpeg.found()
+                test('libmpv-disc-streaming', python,
+                     args: ['-B', files('libmpv_disc_streaming.py'),
+                            mpvlib.full_path(), '--tsmuxer', tsmuxer,
+                            '--ffmpeg', disc_ffmpeg],
+                     depends: mpvlib, suite: 'libmpv-disc', timeout: 180)
                 test('libmpv-disc-tracks', python,
                      args: ['-B', files('libmpv_disc_tracks.py'),
                             mpvlib.full_path(), '--tsmuxer', tsmuxer,

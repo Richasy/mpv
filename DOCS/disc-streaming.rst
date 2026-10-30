@@ -98,7 +98,8 @@ the requested MPLS remains a playlist, not a media-file shortcut. Root handling
 preserves filesystem and Windows drive roots.
 
 For remote BDMV, ``bluray-files`` supplies an immutable per-session map from
-disc-relative paths to local files or HTTP(S) URLs. libbluray enumerates virtual
+disc-relative paths to local files, HTTP(S) URLs, or SMB URLs on Windows.
+libbluray enumerates virtual
 directories from the keys and opens each mapped file through mpv. Keys reject
 absolute paths, traversal and invalid components. Missing entries are not
 guessed. A libmpv node map preserves signed URLs containing commas and equals

@@ -4084,7 +4084,8 @@ Disc Devices
     Keys are disc-relative paths using ``/``, for example
     ``BDMV/index.bdmv``, ``BDMV/PLAYLIST/00000.mpls``,
     ``BDMV/CLIPINF/00000.clpi`` and ``BDMV/STREAM/00000.m2ts``.
-    Values are local file paths, file URLs or HTTP(S) URLs. Include all files
+    Values are local file paths, file URLs, HTTP(S) URLs, or SMB URLs on Windows.
+    Include all files
     needed by the selected titles; menus can require additional directories.
 
     libmpv accepts an ``MPV_FORMAT_NODE_MAP`` with string values. Use that

@@ -144,6 +144,12 @@ double get_relative_time(struct MPContext *mpctx)
 
 void update_core_idle_state(struct MPContext *mpctx)
 {
+    mp_dash_source_set_idle_pause(mpctx->global,
+        mpctx->opts->pause && mpctx->restart_complete && !mpctx->stop_play &&
+        !mpctx->step_frames && mpctx->seek.type == MPSEEK_NONE &&
+        !mpctx->current_seek.type && !mpctx->hrseek_active &&
+        mpctx->paused_refresh.phase != MP_REFRESH_REQUESTED &&
+        mpctx->paused_refresh.phase != MP_REFRESH_APPLIED);
     bool eof = mpctx->video_status == STATUS_EOF &&
                mpctx->audio_status == STATUS_EOF;
     bool active = !mpctx->paused && mpctx->restart_complete &&
@@ -329,6 +335,7 @@ bool mp_request_paused_refresh(struct MPContext *mpctx, int64_t id,
     struct mp_paused_refresh *s = &mpctx->paused_refresh;
     if (!mp_refresh_admit(s, mp_refresh_source_state(mpctx), id, saved_position))
         return false;
+    mp_dash_source_set_idle_pause(mpctx->global, false);
 
     // Do not coalesce with ordinary seeks. Admission and this assignment both
     // run on the player thread, with no command/event interleaving.
@@ -456,6 +463,7 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
 
     bool typed_dash = mp_dash_source_active(mpctx->global) &&
         mpctx->filename && !strcmp(mpctx->filename, MP_DASH_VIDEO_URL);
+    mp_dash_source_set_idle_pause(mpctx->global, false);
     if (!demux_seek(mpctx->demuxer, demux_pts, demux_flags)) {
         if (!mpctx->demuxer->seekable) {
             MP_ERR(mpctx, "Cannot seek in this stream.\n");
@@ -556,6 +564,8 @@ void queue_seek(struct MPContext *mpctx, enum seek_type type, double amount,
 {
     if (type != MPSEEK_NONE && mp_dash_source_seek_blocked(mpctx->global))
         return;
+    if (type != MPSEEK_NONE)
+        mp_dash_source_set_idle_pause(mpctx->global, false);
 
     struct seek_params *seek = &mpctx->seek;
     mp_refresh_supersede_seek(&mpctx->paused_refresh, &seek->refresh_id,

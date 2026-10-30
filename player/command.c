@@ -4288,6 +4288,15 @@ static int mp_property_dash_transfer(void *ctx, struct m_property *prop,
     return result;
 }
 
+static int mp_property_dash_network_backend(void *ctx, struct m_property *prop,
+                                            int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    int backend = mp_dash_source_transport_backend(mpctx->global);
+    if (!backend) return M_PROPERTY_UNAVAILABLE;
+    return m_property_strdup_ro(action, arg, backend == 1 ? "curl" : "lavf");
+}
+
 static int mp_property_current_watch_later_dir(void *ctx, struct m_property *prop,
                                                int action, void *arg)
 {
@@ -5127,6 +5136,7 @@ static const struct m_property mp_properties_base[] = {
     {"demuxer-start-time", mp_property_demuxer_start_time},
     {"demuxer-cache-state", mp_property_demuxer_cache_state},
     {"rodel-dash-transfer", mp_property_dash_transfer},
+    {"rodel-dash-network-backend", mp_property_dash_network_backend},
     {"cache-buffering-state", mp_property_cache_buffering},
     {"paused-for-cache", mp_property_paused_for_cache},
     {"demuxer-via-network", mp_property_demuxer_is_network},

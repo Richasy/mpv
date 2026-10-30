@@ -310,6 +310,9 @@ class Server(http.server.ThreadingHTTPServer):
         self.release_first_body = threading.Event()
         self.release_first_body.set()
         self.hold_followup_role = None
+        self.hold_followup_start_min = 1
+        self.hold_followup_before_midpoint = False
+        self.range_max_bytes = 0
         self.followup_requested = threading.Event()
         self.release_followup_headers = threading.Event()
         self.release_followup_headers.set()
@@ -325,6 +328,14 @@ class Server(http.server.ThreadingHTTPServer):
         self.wrong_total_role = None
         self.arm_code = 412
         self.full_body_roles = set()
+        self.chunked_roles = set()
+        self.chunk_endings = {}
+        self.chunk_extra_roles = set()
+        self.chunk_oversized_roles = set()
+        self.stall_body_after = {}
+        self.stalled_body = threading.Event()
+        self.release_stalled_body = threading.Event()
+        self.interim_pollution_roles = set()
         self.no_range_advertisement = set()
         self.full_body_after_first_zero = set()
         self.full_body_status = {}
@@ -398,6 +409,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         data = self.server.tracks[role]
         start = int(match[1])
         end = min(int(match[2]) if match[2] else len(data) - 1, len(data) - 1)
+        if self.server.range_max_bytes:
+            end = min(end, start + self.server.range_max_bytes - 1)
         if self.server.hold_video_body and role == "video" and start == 0:
             end = min(end, self.server.video_header_bytes - 1)
         if role in self.server.short_initial_roles and start == 0:
@@ -405,7 +418,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if start > end:
             self.send_error(416)
             return
-        if self.server.hold_followup_role == role and start > 0:
+        if (self.server.hold_followup_role == role and start >= self.server.hold_followup_start_min and
+            (not self.server.hold_followup_before_midpoint or start < len(data) // 2)):
             self.server.followup_requested.set()
             if not self.server.release_followup_headers.wait(10):
                 return
@@ -444,6 +458,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for _ in range(hints):
                 self.send_response_only(103, "Early Hints")
                 self.send_header("Link", "</unused>; rel=preload")
+                if role in self.server.interim_pollution_roles:
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Content-Length", "1")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.send_header("Content-Range", "bytes 0-0/1")
                 self.end_headers()
                 self.wfile.flush()
             if role in self.server.duplicate_final_roles:
@@ -474,6 +493,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 length = self.server.full_body_lengths.get(role, str(len(body)))
                 if length is not None:
                     self.send_header("Content-Length", str(length))
+                if role in self.server.chunked_roles:
+                    self.send_header("Transfer-Encoding", "chunked")
                 if role in self.server.content_length_conflict_roles:
                     self.send_header("Transfer-Encoding", "chunked")
             elif code in (200, 401, 403, 404, 412, 416):
@@ -489,9 +510,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header(
                     "Content-Range", f"bytes {actual_start}-{end}/{total}"
                 )
-                self.send_header("Content-Length", str(end - start + 1))
+                if role in self.server.chunked_roles:
+                    self.send_header("Transfer-Encoding", "chunked")
+                else:
+                    self.send_header("Content-Length", str(end - start + 1))
             self.send_header("Connection", "close")
             self.end_headers()
+            if (code == 206 or media_candidate) and role in self.server.chunked_roles:
+                payload = body if media_candidate else data[start:end + 1]
+                declared = len(payload) + int(role in self.server.chunk_oversized_roles)
+                extra = b'1\r\nX\r\n' if role in self.server.chunk_extra_roles else b''
+                self.wfile.write(f"{declared:x}\r\n".encode() + payload + b"\r\n" + extra +
+                    self.server.chunk_endings.get(role, b"0\r\n\r\n"))
+                self.wfile.flush()
+                return
             if (role == self.server.disconnect_role and
                 len(self.server.requests_for(role)) <= self.server.disconnect_attempts and
                 (media_candidate or code == 206)):
@@ -518,7 +550,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.server.audio_body_blocked.set()
                     if not self.server.release_audio_body.wait(15):
                         return
-                self.wfile.write(data[start:end + 1])
+                payload = data[start:end + 1]
+                cutoff = self.server.stall_body_after.get(role)
+                if cutoff and len(payload) > cutoff:
+                    self.wfile.write(payload[:cutoff])
+                    self.wfile.flush()
+                    self.server.stalled_body.set()
+                    if not self.server.release_stalled_body.wait(15):
+                        return
+                    payload = payload[cutoff:]
+                self.wfile.write(payload)
             elif media_candidate:
                 if role in self.server.content_length_conflict_roles:
                     self.wfile.write(
@@ -553,6 +594,7 @@ def serve(tracks, certificates=None):
         server.release_audio_body.set()
         server.release_first_body.set()
         server.release_followup_headers.set()
+        server.release_stalled_body.set()
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             with server.lock:
@@ -1367,7 +1409,8 @@ def test_stop_before_late_risk(mpv, server):
             assert ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents.reason == 2
             time.sleep(0.2)
             with server.lock:
-                assert len(server.requests) <= count_at_stop + 1
+                assert len(server.requests) <= count_at_stop + 1, (count_at_stop,
+                    [(r[0],r[1],r[2]) for r in server.requests])
             state = snapshot(mpv, handle)
             assert state.phase == STOPPED and state.failure == 0
             assert state.video_http_status == 206

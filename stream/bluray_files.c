@@ -59,7 +59,8 @@ struct mp_bluray_files *mp_bluray_files_create(struct stream *owner,
             return NULL;
         }
         if (strncasecmp(files[i + 1], "http://", 7) == 0 ||
-            strncasecmp(files[i + 1], "https://", 8) == 0) {
+            strncasecmp(files[i + 1], "https://", 8) == 0 ||
+            strncasecmp(files[i + 1], "smb://", 6) == 0) {
             owner->streaming = true;
             owner->is_network = true;
         }

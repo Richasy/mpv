@@ -665,6 +665,10 @@ struct stream *stream_open_disc_file(struct stream *owner, const char *url)
         info = &stream_info_ffmpeg;
 #endif
     }
+#ifdef _WIN32
+    if (strncasecmp(url, "smb://", 6) == 0)
+        info = &stream_info_smb;
+#endif
     struct stream_open_args args = {
         .global = owner->global,
         .cancel = owner->cancel,

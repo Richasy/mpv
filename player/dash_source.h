@@ -65,6 +65,7 @@ bool mp_dash_source_active(struct mpv_global *global);
 bool mp_dash_source_failed(struct mpv_global *global);
 bool mp_dash_source_terminal(struct mpv_global *global);
 void mp_dash_source_set_idle_pause(struct mpv_global *global, bool idle);
+void mp_dash_source_pending_open(struct mpv_global *global, bool begin);
 bool mp_dash_source_idle_paused(struct mpv_global *global);
 int64_t mp_dash_source_io_deadline(struct mpv_global *global, int64_t deadline,
                                    double timeout);

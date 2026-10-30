@@ -39,6 +39,7 @@ struct mp_dash_source_state {
     unsigned transport_mask;
     bool idle_pause;
     int64_t resumed_at;
+    int pending_opens;
     uint64_t baseline_present_serial;
     uint32_t validated_ranges;
     mpv_dash_source_status status;
@@ -596,7 +597,7 @@ void mp_dash_source_set_idle_pause(struct mpv_global *global, bool idle)
 {
     struct mp_dash_source_state *state = global->dash_source;
     mp_mutex_lock(&state->lock);
-    idle &= state->status.phase == MPV_DASH_SOURCE_TRACKS_BOUND;
+    idle &= state->status.phase == MPV_DASH_SOURCE_TRACKS_BOUND && !state->pending_opens;
     if (state->idle_pause && !idle)
         state->resumed_at = mp_time_ns();
     state->idle_pause = idle;
@@ -610,6 +611,22 @@ bool mp_dash_source_idle_paused(struct mpv_global *global)
     bool idle = state->idle_pause;
     mp_mutex_unlock(&state->lock);
     return idle;
+}
+
+void mp_dash_source_pending_open(struct mpv_global *global, bool begin)
+{
+    struct mp_dash_source_state *state = global->dash_source;
+    mp_mutex_lock(&state->lock);
+    if (begin) {
+        state->pending_opens++;
+        if (state->idle_pause)
+            state->resumed_at = mp_time_ns();
+        state->idle_pause = false;
+    } else {
+        mp_assert(state->pending_opens > 0);
+        state->pending_opens--;
+    }
+    mp_mutex_unlock(&state->lock);
 }
 
 int64_t mp_dash_source_io_deadline(struct mpv_global *global, int64_t deadline,
@@ -669,6 +686,7 @@ bool mp_dash_source_get_track(struct mpv_global *global, const char *alias,
 #else
 
 void mp_dash_source_set_idle_pause(struct mpv_global *global, bool idle) { }
+void mp_dash_source_pending_open(struct mpv_global *global, bool begin) { }
 bool mp_dash_source_idle_paused(struct mpv_global *global) { return false; }
 int64_t mp_dash_source_io_deadline(struct mpv_global *global, int64_t deadline,
                                    double timeout) { return deadline; }

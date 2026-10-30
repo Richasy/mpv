@@ -148,6 +148,7 @@ void update_core_idle_state(struct MPContext *mpctx)
         mpctx->opts->pause && mpctx->restart_complete && !mpctx->stop_play &&
         !mpctx->step_frames && mpctx->seek.type == MPSEEK_NONE &&
         !mpctx->current_seek.type && !mpctx->hrseek_active &&
+        mpctx->audio_status >= STATUS_READY && mpctx->video_status >= STATUS_READY &&
         mpctx->paused_refresh.phase != MP_REFRESH_REQUESTED &&
         mpctx->paused_refresh.phase != MP_REFRESH_APPLIED);
     bool eof = mpctx->video_status == STATUS_EOF &&

@@ -16,6 +16,7 @@
 #include "demux/demux.h"
 #include "misc/dispatch.h"
 #include "mpv_talloc.h"
+#include "options/m_config.h"
 #include "osdep/threads.h"
 #include "osdep/timer.h"
 #include "player/core.h"
@@ -23,6 +24,7 @@
 
 #include "dash_source.h"
 #include "stream/stream_curl.h"
+#include "stream/network.h"
 
 #if HAVE_LIBCURL
 #include <curl/curl.h>
@@ -36,6 +38,7 @@ struct mp_dash_source_state {
     char *referer;
     bool allow_loopback_http;
     bool use_curl;
+    bool tls_verify;
     unsigned transport_mask;
     bool idle_pause;
     int64_t resumed_at;
@@ -203,6 +206,9 @@ int mp_dash_source_validate(const mpv_dash_source *source)
 int mp_dash_source_begin(struct mpv_global *global, const mpv_dash_source *source)
 {
     bool use_curl = mp_curl_enabled(global);
+    struct mp_network_opts *network = mp_get_config_group(NULL, global, &mp_network_conf);
+    bool tls_verify = network->tls_verify;
+    talloc_free(network);
     struct mp_dash_source_state *state = global->dash_source;
     struct vo_display_surface_frame_snapshot previous =
         vo_display_surface_last_frame(state->mpctx->display_surface);
@@ -225,6 +231,7 @@ int mp_dash_source_begin(struct mpv_global *global, const mpv_dash_source *sourc
     state->baseline_present_serial = previous.serial;
     state->validated_ranges = 0;
     state->use_curl = use_curl;
+    state->tls_verify = tls_verify;
     state->transport_mask = 0;
     state->idle_pause = false;
     state->resumed_at = 0;
@@ -678,6 +685,7 @@ bool mp_dash_source_get_track(struct mpv_global *global, const char *alias,
         config->user_agent = talloc_strdup(parent, state->user_agent);
         config->referer = talloc_strdup(parent, state->referer);
         config->allow_loopback_http = state->allow_loopback_http;
+        config->tls_verify = state->tls_verify;
     }
     mp_mutex_unlock(&state->lock);
     return ok;

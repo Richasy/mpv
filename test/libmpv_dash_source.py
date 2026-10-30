@@ -1521,6 +1521,46 @@ def test_stop_while_opening(mpv, server, role):
             release.set()
 
 
+def test_tls_policy_frozen(mpv, server, backend, verify):
+    # The source must retain its admission policy across both tracks and seeks.
+    with client(mpv, {"curl-enabled": "yes" if backend == "curl" else "no",
+                      "tls-verify": "yes" if verify else "no",
+                      "stream-buffer-size": "4KiB", "curl-buffer-size": "32KiB",
+                      "demuxer-max-bytes": "4KiB", "demuxer-max-back-bytes": "0",
+                      "demuxer-seekable-cache": "no",
+                      "demuxer-lavf-o": "use_mfra_for=0"}) as handle:
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        command(mpv, handle, "set", "tls-verify", "no" if verify else "yes")
+        if verify:
+            await_event(mpv, handle, END_FILE)
+            assert snapshot(mpv, handle).failure == TRANSPORT
+            assert not server.requests, "Strict source accepted an untrusted certificate"
+            return
+        await_event(mpv, handle, FILE_LOADED)
+        assert snapshot(mpv, handle).phase == BOUND
+        assert prop(mpv, handle, "vid") not in (None, "no")
+        assert prop(mpv, handle, "aid") not in (None, "no")
+        with server.lock:
+            baseline = len(server.requests)
+        command(mpv, handle, "seek", "8", "absolute+exact")
+        await_event(mpv, handle, 21)  # MPV_EVENT_PLAYBACK_RESTART confirms seek completion.
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            event = mpv.mpv_wait_event(handle, 0.05).contents
+            assert event.event_id != END_FILE, "TLS policy changed on reopen"
+            position = prop(mpv, handle, "time-pos")
+            if position and abs(float(position) - 8) <= 0.25:
+                break
+        else:
+            raise AssertionError("TLS dual-track seek did not settle")
+        assert len(server.requests) > baseline, "Seek did not exercise a reopened request"
+        for role in ("video", "audio"):
+            assert server.requests_for(role)
+        command(mpv, handle, "stop")
+        await_event(mpv, handle, END_FILE)
+
+
 def test_tls_certificate_isolation(mpv, server, certificates, typed):
     options = {
         "tls-verify": "no",
@@ -2342,6 +2382,10 @@ def main():
                     print(f"[dash] {name} exposed={int(observed)}", flush=True)
             print("[dash] TLS client certificate isolation", flush=True)
             certificates = generate_tls_certificates(directory)
+            for backend in ("curl", "lavf"):
+                for verify in (True, False):
+                    with serve(tracks, certificates) as server:
+                        test_tls_policy_frozen(mpv, server, backend, verify)
             with serve(tracks, certificates) as server:
                 test_tls_certificate_isolation(mpv, server, certificates, True)
             with serve(tracks, certificates) as server:

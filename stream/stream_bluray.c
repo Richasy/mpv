@@ -47,13 +47,12 @@
 #include "options/path.h"
 #include "osdep/threads.h"
 #include "stream.h"
+#include "bluray_files.h"
 #include "osdep/io.h"
 #include "sub/osd.h"
 #include "sub/img_convert.h"
 #include "video/csputils.h"
 #include "video/mp_image.h"
-
-extern const stream_info_t stream_info_ffmpeg;
 
 #include "stream_iso_cache.h"
 
@@ -90,6 +89,7 @@ extern const stream_info_t stream_info_ffmpeg;
 const struct m_sub_options stream_bluray_conf = {
     .opts = (const struct m_option[]) {
         {"device", OPT_STRING(bluray_device), .flags = M_OPT_FILE},
+        {"files", OPT_KEYVALUELIST(files)},
         {"angle", OPT_INT(angle), M_RANGE(1, 999)},
         {0},
     },
@@ -132,6 +132,7 @@ struct bluray_priv_s {
 
     // Cached map from filtered title index (0..num_titles-1) to mpls_id.
     uint32_t *title_to_playlist;
+    double *title_durations;
 
     int cfg_title;
     int cfg_playlist;
@@ -141,7 +142,7 @@ struct bluray_priv_s {
     struct m_config_cache *opts_cache;
 
     stream_t *iso_stream;  // HTTP stream for remote ISO playback
-    struct iso_cache *iso_cache; // block cache for remote ISO
+    struct iso_cache *iso_cache; // sector adapter over the stream's sparse cache
 
     // Disc-menu support (enabled when cfg_title == BLURAY_MENU_TITLE).
     // The HDMV graphics controller emits IG-plane primitives through
@@ -467,13 +468,13 @@ inline static int play_title(struct bluray_priv_s *priv, int title)
 static int bluray_read_blocks(void *handle, void *buf, int lba, int num_blocks)
 {
     struct iso_cache *cache = handle;
+    if (lba < 0 || num_blocks < 0 || num_blocks > INT_MAX / 2048)
+        return -1;
     int64_t offset = (int64_t)lba * 2048;
     int size = num_blocks * 2048;
 
-    if (iso_cache_read(cache, buf, offset, size) < size)
-        return -1;
-
-    return num_blocks;
+    int got = iso_cache_read(cache, buf, offset, size);
+    return got < 0 ? -1 : got / 2048;
 }
 
 static void bluray_stream_close(stream_t *s)
@@ -886,22 +887,18 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
         int title = *(double *)arg;
         if (!b->bd || title < 0 || title >= b->num_titles)
             return STREAM_UNSUPPORTED;
-        BLURAY_TITLE_INFO *ti = bd_get_title_info(b->bd, title, 0);
-        if (!ti)
+        if (b->title_durations[title] < 0)
             return STREAM_UNSUPPORTED;
-        *(double *)arg = BD_TIME_TO_S(ti->duration);
-        bd_free_title_info(ti);
+        *(double *)arg = b->title_durations[title];
         return STREAM_OK;
     }
     case STREAM_CTRL_GET_TITLE_PLAYLIST: {
         int title = *(double *)arg;
         if (!b->bd || title < 0 || title >= b->num_titles)
             return STREAM_UNSUPPORTED;
-        BLURAY_TITLE_INFO *ti = bd_get_title_info(b->bd, title, 0);
-        if (!ti)
+        if (b->title_to_playlist[title] == (uint32_t)-1)
             return STREAM_UNSUPPORTED;
-        *(double *)arg = ti->playlist;
-        bd_free_title_info(ti);
+        *(double *)arg = b->title_to_playlist[title];
         return STREAM_OK;
     }
     case STREAM_CTRL_GET_LANG: {
@@ -1260,27 +1257,39 @@ static int bluray_stream_open_internal(stream_t *s)
 
     /* open device */
     BLURAY *bd;
-    if (strncmp(device, "http://", 7) == 0 || strncmp(device, "https://", 8) == 0) {
-        struct stream_open_args open_args = {
-            .global = s->global,
-            .cancel = s->cancel,
-            .url = device,
-            .flags = STREAM_READ | (s->stream_origin & STREAM_ORIGIN_MASK),
-            .sinfo = &stream_info_ffmpeg,
-        };
-        stream_create_with_args(&open_args, &b->iso_stream);
-        if (!b->iso_stream || !b->iso_stream->seekable) {
-            MP_ERR(s, "Cannot open or seek in remote ISO: %s\n", device);
-            ret = STREAM_UNSUPPORTED;
+    if (b->opts->files && b->opts->files[0]) {
+        struct mp_bluray_files *fs = mp_bluray_files_create(s, b->opts->files);
+        if (!fs) {
+            ret = STREAM_ERROR;
             goto err;
         }
-        b->iso_cache = iso_cache_create(b, b->iso_stream, s->log);
+        bd = bd_init();
+        if (!bd || !bd_open_files(bd, fs, mp_bluray_open_dir,
+                                 mp_bluray_open_file)) {
+            if (bd)
+                bd_close(bd);
+            MP_ERR(s, "Couldn't open mapped Blu-ray files.\n");
+            ret = STREAM_ERROR;
+            goto err;
+        }
+    } else if (strncasecmp(device, "http://", 7) == 0 ||
+               strncasecmp(device, "https://", 8) == 0) {
+        b->iso_stream = stream_open_disc_file(s, device);
+        if (!b->iso_stream || !b->iso_stream->seekable) {
+            MP_ERR(s, "Cannot open or seek in remote ISO: %s\n", device);
+            ret = STREAM_ERROR;
+            goto err;
+        }
+        s->streaming = b->iso_stream->streaming;
+        s->is_network = b->iso_stream->is_network;
+        b->iso_cache = iso_cache_create(b, b->iso_stream);
         bd = bd_init();
         if (!bd || !bd_open_stream(bd, b->iso_cache, bluray_read_blocks)) {
             MP_ERR(s, "Couldn't open Blu-ray stream from: %s\n", device);
             if (bd)
                 bd_close(bd);
-            ret = STREAM_UNSUPPORTED;
+            ret = b->iso_stream->error || b->iso_stream->broken ||
+                  mp_cancel_test(s->cancel) ? STREAM_ERROR : STREAM_UNSUPPORTED;
             goto err;
         }
     } else {
@@ -1313,8 +1322,10 @@ static int bluray_stream_open_internal(stream_t *s)
 
     /* parse titles information */
     b->title_to_playlist = talloc_array(b, uint32_t, b->num_titles);
+    b->title_durations = talloc_array(b, double, b->num_titles);
     for (int i = 0; i < b->num_titles; i++) {
         b->title_to_playlist[i] = (uint32_t)-1;
+        b->title_durations[i] = -1;
         /* the information we're accessing (duration, playlist, angle count)
          * doesn't depend on the angle */
         BLURAY_TITLE_INFO *ti = bd_get_title_info(bd, i, 0);
@@ -1322,6 +1333,7 @@ static int bluray_stream_open_internal(stream_t *s)
             continue;
 
         b->title_to_playlist[i] = ti->playlist;
+        b->title_durations[i] = BD_TIME_TO_S(ti->duration);
 
         char *time = mp_format_time(ti->duration / 90000, false);
         MP_INFO(s, "idx: %3d duration: %s angles: %2d (playlist: %05d.mpls)\n",
@@ -1459,21 +1471,22 @@ const stream_info_t stream_info_bluray = {
 
 static bool check_bdmv(const char *path)
 {
-    if (strcasecmp(mp_basename(path), "MovieObject.bdmv"))
+    bool index = strcasecmp(mp_basename(path), "index.bdmv") == 0;
+    if (!index && strcasecmp(mp_basename(path), "MovieObject.bdmv"))
         return false;
 
     FILE *temp = fopen(path, "rb");
     if (!temp)
         return false;
 
-    char data[50];
+    char data[8];
     bool ret = false;
 
-    if (fread(data, 50, 1, temp) == 1) {
-        bstr bdata = {data, 50};
-        ret = bstr_startswith0(bdata, "MOBJ0100") || // AVCHD
-              bstr_startswith0(bdata, "MOBJ0200") || // Blu-ray
-              bstr_startswith0(bdata, "MOBJ0300");   // UHD BD
+    if (fread(data, sizeof(data), 1, temp) == 1) {
+        ret = memcmp(data, index ? "INDX" : "MOBJ", 4) == 0 &&
+              (!memcmp(data + 4, "0100", 4) ||
+               !memcmp(data + 4, "0200", 4) ||
+               !memcmp(data + 4, "0300", 4));
     }
 
     fclose(temp);
@@ -1484,14 +1497,17 @@ static bool check_bdmv(const char *path)
 static void remove_prefix(char *path)
 {
     size_t len = strlen(path);
+    size_t root = path[0] == '/' ? 1 : 0;
 #if HAVE_DOS_PATHS
     const char *seps = "/\\";
+    if (len >= 3 && path[1] == ':' && strchr(seps, path[2]))
+        root = 3;
 #else
     const char *seps = "/";
 #endif
     while (len > 0 && !strchr(seps, path[len - 1]))
         len--;
-    while (len > 0 && strchr(seps, path[len - 1]))
+    while (len > root && strchr(seps, path[len - 1]))
         len--;
     path[len] = '\0';
 }
@@ -1531,6 +1547,32 @@ static int bdmv_dir_stream_open(stream_t *stream)
         return r;
     }
 
+    // Opening a specific MPLS retains its clip in/out times, chapters and
+    // seamless branching. Do not replace it with the largest M2TS clip.
+    const char *name = mp_basename(path);
+    if (strlen(name) == 10 && strspn(name, "0123456789") == 5 &&
+        strcasecmp(name + 5, ".mpls") == 0) {
+        FILE *file = fopen(path, "rb");
+        char magic[4];
+        bool valid = file && fread(magic, sizeof(magic), 1, file) == 1 &&
+                     memcmp(magic, "MPLS", 4) == 0;
+        if (file)
+            fclose(file);
+        if (!valid)
+            goto unsupported;
+        priv->cfg_title = BLURAY_PLAYLIST_TITLE;
+        priv->cfg_playlist = atoi(name);
+        remove_prefix(path);
+        if (strcasecmp(mp_basename(path), "PLAYLIST"))
+            goto unsupported;
+        remove_prefix(path);
+        if (strcasecmp(mp_basename(path), "BDMV"))
+            goto unsupported;
+        remove_prefix(path);
+        priv->cfg_device = path[0] ? path : ".";
+        return bluray_stream_open_internal(stream);
+    }
+
     // We allow the path to point to a directory containing BDMV/, a
     // directory containing MovieObject.bdmv, or that file itself.
     if (!check_bdmv(path)) {
@@ -1547,9 +1589,7 @@ static int bdmv_dir_stream_open(stream_t *stream)
     // Go up by 2 levels.
     remove_prefix(path);
     remove_prefix(path);
-    priv->cfg_device = path;
-    if (strlen(priv->cfg_device) <= 1)
-        goto unsupported;
+    priv->cfg_device = path[0] ? path : ".";
 
     MP_INFO(stream, "BDMV detected. Redirecting to bluray://\n");
     return bluray_stream_open_internal(stream);

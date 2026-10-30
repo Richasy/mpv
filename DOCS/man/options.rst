@@ -4070,13 +4070,42 @@ Disc Devices
     the scheduled page).
 
 ``--bluray-device=<path>``
-    Specify the Blu-ray disc location. Must be a directory with Blu-ray
-    structure. The default device path depends on the OS. See the
+    Specify the Blu-ray disc location: a directory with Blu-ray structure,
+    a local ISO, or an HTTP(S) ISO with working byte-range requests.
+    The default device path depends on the OS. See the
     `OPTICAL DRIVES`_ section.
 
     .. admonition:: Example
 
         ``mpv bd:// --bluray-device=/path/to/bd/``
+
+``--bluray-files=<relative-path=url,...>``
+    Provide a complete, read-only BDMV file map for ``bd://`` playback.
+    Keys are disc-relative paths using ``/``, for example
+    ``BDMV/index.bdmv``, ``BDMV/PLAYLIST/00000.mpls``,
+    ``BDMV/CLIPINF/00000.clpi`` and ``BDMV/STREAM/00000.m2ts``.
+    Values are local file paths, file URLs, HTTP(S) URLs, or SMB URLs on Windows.
+    Include all files
+    needed by the selected titles; menus can require additional directories.
+
+    libmpv accepts an ``MPV_FORMAT_NODE_MAP`` with string values. Use that
+    representation for signed URLs containing commas or other option syntax.
+    A host can enumerate its WebDAV or cloud source through its existing
+    provider and supply a separate URL for every file. mpv does not perform
+    WebDAV enumeration or infer sibling signed URLs.
+
+    The map supplies directory enumeration to libbluray and is copied when
+    the disc opens. Later changes do not redirect already-open disc callbacks.
+    This option takes precedence over ``--bluray-device``. Scope it to the
+    intended file and clear it for subsequent unrelated sources. Setting
+    ``--access-references=no`` disables file-map access.
+
+    Blu-ray title selection, chapter navigation, clip in/out times, angles,
+    audio and subtitle tracks still use libbluray. Network files inherit the
+    normal HTTP settings and cancellation. Seekable HTTP files use the normal
+    sparse LRU, without the synchronous tail prefetch intended for MP4 metadata.
+    Disc transport receive buffers are capped at 256 KiB, including additional
+    region cursors, to bound unused response read-ahead during metadata seeks.
 
 ``--cdda-...``
     These options can be used to tune the CD Audio reading feature of mpv.

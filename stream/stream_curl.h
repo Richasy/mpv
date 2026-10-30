@@ -28,6 +28,7 @@ struct demuxer;
 
 // Initialize libcurl state, must be called before stream_curl is used.
 void mp_curl_global_init(struct mpv_global *global);
+bool mp_curl_enabled(struct mpv_global *global);
 
 // Open `url` via mpv's libcurl backend and wrap it as a fresh AVIOContext.
 // On success returns 0, fills *pb_out with the new context, and sets *data to

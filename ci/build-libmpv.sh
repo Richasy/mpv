@@ -38,7 +38,7 @@ log() { echo -e "${GREEN}[BUILD]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
-readonly DEFAULT_FFMPEG_COMMIT=72c9b4c68d1d54f85f62337c0a2a327ce3d9a082
+readonly DEFAULT_FFMPEG_COMMIT=541631ce0472aa71ca114ddca7dad8a8edf27bbc
 readonly DAVS2_COMMIT=21d64c8f8e36af71fc7a488cd6f789c86cdd1200
 readonly UAVS3D_COMMIT=0e20d2c291853f196c68922a264bcd8471d75b68
 readonly AVS_PATCH_COMMIT=6788d317a3a67c44f799d02c4ff83f95d6b10165

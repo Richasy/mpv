@@ -54,6 +54,8 @@
 #include "osdep/threads.h"
 #include "osdep/timer.h"
 #include "player/dash_source.h"
+#include "stream_dash_lavf.h"
+#include "dash_http.h"
 
 enum curl_proto {
     MP_CURL_PROTO_HTTP,
@@ -450,7 +452,7 @@ static bool dash_read_deadline_expired(struct priv *p)
 {
     int64_t deadline = atomic_load_explicit(&p->dash_read_deadline,
                                            memory_order_relaxed);
-    return p->dash_kind && deadline && mp_time_ns() >= deadline;
+    return p->dash_kind && mp_dash_source_io_expired(p->global, deadline, p->net_opts->timeout);
 }
 
 static bool dash_header_retry_due(struct priv *p)
@@ -460,6 +462,7 @@ static bool dash_header_retry_due(struct priv *p)
     mp_mutex_lock(&p->mtx);
     int64_t deadline = atomic_load_explicit(&p->dash_read_deadline,
                                            memory_order_relaxed);
+    deadline = mp_dash_source_io_deadline(p->global, deadline, p->net_opts->timeout);
     int64_t now = mp_time_ns();
     bool due = !p->dash_header_probe_used && p->count == 0 &&
         !p->stream_eof && !p->stream_error && deadline > now &&
@@ -1153,16 +1156,7 @@ static void probe_ftp(struct priv *p, struct bstr line)
 
 static bool parse_range_number(const char **at, uint64_t *value)
 {
-    if (**at < '0' || **at > '9')
-        return false;
-    errno = 0;
-    char *end = NULL;
-    unsigned long long n = strtoull(*at, &end, 10);
-    if (errno || end == *at || n > INT64_MAX)
-        return false;
-    *value = n;
-    *at = end;
-    return true;
+    return mp_dash_http_number(at, value);
 }
 
 static bool dash_content_range(struct priv *p, uint64_t *length, int64_t *total)
@@ -1476,6 +1470,10 @@ static void start_request(struct priv *p)
         dash_test_record_continuation(p, false);
 #endif
         finish_dash_terminal(p);
+        return;
+    }
+    if (p->dash_kind && p->probed && mp_dash_source_idle_paused(p->global)) {
+        defer_request(p);
         return;
     }
     if (p->finished) {
@@ -2030,6 +2028,8 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
     }
 
     int64_t deadline = stream_get_io_deadline(s);
+    if (!deadline && p->dash_kind && s->network_timeout > 0)
+        deadline = mp_time_ns_add(mp_time_ns(), s->network_timeout);
     bool timed_out = false;
     mp_mutex_lock(&p->mtx);
     if (p->dash_kind && p->count == 0 && !p->stream_eof && !p->stream_error) {
@@ -2041,7 +2041,10 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
     while (p->count == 0 && !p->stream_eof && !p->stream_error &&
            !atomic_load_explicit(&p->aborted, memory_order_relaxed))
     {
-        if (deadline && mp_time_ns() >= deadline) {
+        int64_t effective = p->dash_kind ?
+            mp_dash_source_io_deadline(p->global, deadline, s->network_timeout) : deadline;
+        if (p->dash_kind ? mp_dash_source_io_expired(p->global, deadline, s->network_timeout) :
+                          (deadline && mp_time_ns() >= deadline)) {
             if (p->dash_kind)
                 atomic_store_explicit(&p->dash_read_timed_out, true,
                                       memory_order_relaxed);
@@ -2050,14 +2053,19 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
             timed_out = true;
             break;
         }
-        if (p->request_pending) {
+        if (p->request_pending &&
+            !(p->dash_kind && mp_dash_source_idle_paused(p->global))) {
             p->request_pending = false;
             mp_mutex_unlock(&p->mtx);
             cmd_sync(p, CMD_ADD, 0, false);
             mp_mutex_lock(&p->mtx);
             continue;
         }
-        if (deadline)
+        if (p->dash_kind)
+            mp_cond_timedwait_until(&p->cond, &p->mtx,
+                effective ? MPMIN(effective, mp_time_ns_add(mp_time_ns(), 0.1)) :
+                            mp_time_ns_add(mp_time_ns(), 0.1));
+        else if (deadline)
             mp_cond_timedwait_until(&p->cond, &p->mtx, deadline);
         else
             mp_cond_wait(&p->cond, &p->mtx);
@@ -2317,6 +2325,7 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
         return STREAM_ERROR;
 
     if (p->dash_kind) {
+        mp_dash_source_transport_started(s->global, p->dash_kind, true);
         s->mime_type = talloc_strdup(s, p->dash_kind == MPV_DASH_TRACK_VIDEO ?
                                     "video/mp4" : "audio/mp4");
     } else {
@@ -2409,9 +2418,23 @@ const stream_info_t stream_info_curl = {
     .stream_origin = STREAM_ORIGIN_NET,
 };
 
+bool mp_curl_enabled(struct mpv_global *global)
+{
+    struct curl_opts *opts = mp_get_config_group(NULL, global, &curl_conf);
+    bool enabled = opts->enabled;
+    talloc_free(opts);
+    return enabled;
+}
+
+static int dash_open(stream_t *s, const struct stream_open_args *args)
+{
+    return mp_dash_source_use_curl(s->global) ? curl_open(s, args) :
+                                               mp_dash_lavf_open(s, args);
+}
+
 const stream_info_t stream_info_dash = {
     .name = "dash",
-    .open2 = curl_open,
+    .open2 = dash_open,
     .protocols = (const char *const[]){"dash", NULL},
     .stream_origin = STREAM_ORIGIN_NET,
 };

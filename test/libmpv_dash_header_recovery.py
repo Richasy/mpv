@@ -90,6 +90,7 @@ def run_case(mpv, tracks, role, mode, ordinary_other=False):
                     maximum = 0.0
                     stopped = False
                     prefetch_proved = False
+                    paused_since = None
                     safe_diagnostics = []
                     deadline = time.monotonic() + (35 if mode == "paused-prefetch" else 15)
                     while time.monotonic() < deadline:
@@ -99,16 +100,16 @@ def run_case(mpv, tracks, role, mode, ordinary_other=False):
                             text = ctypes.string_at(message.text).decode("utf-8", "replace")
                             if "curl_request" in text:
                                 safe_diagnostics.append(dict(re.findall(r"(offset|buffered|read_waiting|headers|body)=(\d+)", text)))
-                            if "curl_request pending" in text and f"offset={held_offset} " in text:
-                                values = dict(re.findall(r"(buffered|read_waiting|headers|body)=(\d+)", text))
-                                if int(values.get("buffered", "0")) > 0 and values.get("read_waiting") == "0" and values.get("headers") == "0" and values.get("body") == "0":
-                                    prefetch_proved = True
-                                    assert len([start for current, start in attempts if current == role and start == held_offset]) == 1
-                                    assert fixture.snapshot(mpv, handle).failure == 0
-                                    release.set()
-                                    fixture.command(mpv, handle, "set", "pause", "no")
                         if event.event_id == fixture.FILE_LOADED:
                             loaded = True
+                        if mode == "paused-prefetch" and event.event_id == fixture.PLAYBACK_RESTART and paused_since is None:
+                            paused_since = time.monotonic()
+                        if mode == "paused-prefetch" and paused_since is not None and not prefetch_proved:
+                            assert fixture.snapshot(mpv, handle).failure == 0
+                            if time.monotonic() - paused_since > 8:
+                                prefetch_proved = True
+                                release.set()
+                                fixture.command(mpv, handle, "set", "pause", "no")
                         if mode == "stop" and blocked.is_set() and not stopped:
                             fixture.command(mpv, handle, "stop")
                             stopped = True

@@ -996,6 +996,10 @@ int mp_add_external_file(struct MPContext *mpctx, char *filename,
         break;
     }
 
+    bool typed_open = !strcmp(filename, MP_DASH_VIDEO_URL) ||
+                      !strcmp(filename, MP_DASH_AUDIO_URL);
+    if (typed_open)
+        mp_dash_source_pending_open(mpctx->global, true);
     mp_core_unlock(mpctx);
 
     char *path = mp_get_user_path(NULL, mpctx->global, filename);
@@ -1007,6 +1011,9 @@ int mp_add_external_file(struct MPContext *mpctx, char *filename,
         enable_demux_thread(mpctx, demuxer);
 
     mp_core_lock(mpctx);
+
+    if (typed_open)
+        mp_dash_source_pending_open(mpctx->global, false);
 
     // The command could have overlapped with playback exiting. (We don't care
     // if playback has started again meanwhile - weird, but not a problem.)

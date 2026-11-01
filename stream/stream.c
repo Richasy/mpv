@@ -39,6 +39,7 @@
 #include "options/path.h"
 #include "osdep/timer.h"
 #include "stream.h"
+#include "stream_curl.h"
 #include "cache_lru.h"
 #include "network.h"
 #include "player/dash_source.h"
@@ -660,10 +661,10 @@ struct stream *stream_open_disc_file(struct stream *owner, const char *url)
                 strncasecmp(url, "https://", 8) == 0;
     const stream_info_t *info = &stream_info_file;
     if (http) {
-#if HAVE_LIBCURL
-        info = &stream_info_curl;
-#else
         info = &stream_info_ffmpeg;
+#if HAVE_LIBCURL
+        if (mp_curl_enabled(owner->global))
+            info = &stream_info_curl;
 #endif
     }
 #ifdef _WIN32

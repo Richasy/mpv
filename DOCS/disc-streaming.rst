@@ -77,7 +77,9 @@ bypassing the fork's normal curl network policy. Generic tail-prefetch and
 read-through policies could add unrelated synchronous I/O.
 
 The adapter now reads demanded bytes through the existing sparse stream LRU.
-HTTP disc files select curl when compiled in, otherwise FFmpeg. They retain
+HTTP disc files follow the runtime ``curl-enabled`` setting: curl when enabled,
+otherwise FFmpeg. Builds without libcurl use FFmpeg. The selected transport is
+opened directly so that an ISO URL cannot recursively enter disc probing. They retain
 normal headers, cookies, proxy settings, network timeouts, recovery and
 cancellation. Disc opens disable synchronous tail prefetch and cap cursor
 read-through at 64 KiB; ordinary media streams retain their configured policy.
@@ -120,7 +122,10 @@ by the current player seek path; its previous null global caused a crash when
 linked with curl enabled.
 
 ``test/libmpv_disc_streaming.py`` authors synthetic ISO/BDMV data with ffmpeg
-and tsMuxeR. Its 15 cases include redirects with required headers, a typed URL
+and tsMuxeR. Its 15 cases run with both ``curl-enabled=no`` and
+``curl-enabled=yes`` when libcurl is available, and with FFmpeg alone otherwise.
+Successful network cases assert the observed transport as well as playback.
+The cases include redirects with required headers, a typed URL
 map with signed-query punctuation, explicit and automatic rejection of missing
 or wrong ranges, canceled opens, local index/MPLS entry points, and a two-clip
 playlist with different nonzero in/out cuts. The latter is 36.083 seconds with
@@ -134,6 +139,10 @@ To run the synthetic suite, keep the built runtime's DLL dependencies together::
 
     python -B test/libmpv_disc_streaming.py <libmpv-library> \
         --ffmpeg <ffmpeg> --tsmuxer <tsMuxeR>
+
+Use ``--curl no`` or ``--curl yes`` to select one runtime policy explicitly.
+The default ``--curl both`` includes the disabled-curl policy used by hosts
+that prefer FFmpeg; native default settings alone do not cover that path.
 
 To compare an existing read-only image::
 

@@ -210,12 +210,17 @@ def serving(*args, **kwargs):
 
 
 class Probe:
-    def __init__(self, library):
+    def __init__(self, library, curl):
         self.mpv = Mpv(str(library))
         self.logs = deque(maxlen=35)
+        self.transports = set()
         self.loaded = False
         self.restarts = 0
         self.ended = False
+        if self.mpv.property("curl-enabled") is not None:
+            self.mpv.command("set", "curl-enabled", curl)
+        else:
+            assert curl == "no", "This runtime has no curl backend"
         for name, value in {
             "demuxer-readahead-secs": "0", "demuxer-hysteresis-secs": "0",
             "demuxer-max-bytes": "2MiB", "network-timeout": "5",
@@ -229,7 +234,12 @@ class Probe:
         self.restarts += event["id"] == 21
         self.ended |= event["id"] == 7
         if event.get("log"):
-            self.logs.append(event["log"])
+            message = event["log"]
+            self.logs.append(message)
+            if message.startswith("curl_request begin "):
+                self.transports.add("curl")
+            if message.startswith("network_io begin "):
+                self.transports.add("lavf")
 
     def wait(self, predicate, description, limit=20):
         deadline = time.monotonic() + limit
@@ -283,8 +293,8 @@ class Probe:
         assert not self.loaded
 
 
-def run(library, source, case, server=None, file_map=None, expected=None):
-    probe = Probe(library)
+def run(args, source, case, server=None, file_map=None, expected=None):
+    probe = Probe(args.library, args.curl)
     try:
         if file_map:
             probe.file_map(file_map)
@@ -305,8 +315,12 @@ def run(library, source, case, server=None, file_map=None, expected=None):
         timings = []
         for fraction in (0.65, 0.2, 0.65, 0.9, 0.01):
             timings.append(probe.seek(props["duration"] * fraction))
+        if server:
+            backend = "curl" if args.curl == "yes" else "lavf"
+            assert probe.transports == {backend}, probe.transports
         report = {
-            "case": case, "openSeconds": round(opened, 4),
+            "case": case, "curlEnabled": args.curl,
+            "openSeconds": round(opened, 4),
             "seekSeconds": [round(t, 4) for t in timings],
             "duration": round(props["duration"], 3),
             "chapters": len(props["chapter-list"]),
@@ -332,6 +346,8 @@ def main():
     parser.add_argument("--mib-per-second", type=float, default=8)
     parser.add_argument("--baseline", action="store_true",
                         help="Skip new file-map/entry-point regressions")
+    parser.add_argument("--curl", choices=("no", "yes", "both"), default="both",
+                        help="Exercise the selected runtime network policy")
     args = parser.parse_args()
     args.library = args.library.resolve(strict=True)
     with contextlib.ExitStack() as stack:
@@ -343,44 +359,54 @@ def main():
             args.iso, args.folder = author_fixture(root, ffmpeg, tsmuxer)
             args.multi_folder = root / "multi"
             author_multiclip(args.folder, args.multi_folder)
-        exercise(args)
+        modes = (args.curl,)
+        if args.curl == "both":
+            probe = Mpv(str(args.library))
+            try:
+                modes = ("no", "yes") if probe.property("curl-enabled") is not None else ("no",)
+            finally:
+                probe.close()
+        for curl in modes:
+            args.curl = curl
+            exercise(args)
+    print("PASS disc-streaming", flush=True)
 
 
 def exercise(args):
     args.iso = args.iso.resolve(strict=True)
     folder = args.folder.resolve(strict=True) if args.folder else None
-    expected = run(args.library, args.iso, "local-iso")
+    expected = run(args, args.iso, "local-iso")
     with serving(args.iso, folder, args.rtt_ms / 1000,
                  args.mib_per_second * 1024 * 1024, True) as server:
-        run(args.library, server.url + "/disc.iso", "http-iso", server,
+        run(args, server.url + "/disc.iso", "http-iso", server,
             expected=expected)
-        run(args.library, server.url + "/redirect?name=disc.iso", "redirect-iso",
+        run(args, server.url + "/redirect?name=disc.iso", "redirect-iso",
             server, expected=expected)
         if folder and not args.baseline:
             mapping = {p.relative_to(folder).as_posix(): server.url + "/" +
                        p.relative_to(folder).as_posix() + "?token=fixture,opaque&x=y"
                        for p in sorted(folder.rglob("*")) if p.is_file()}
-            run(args.library, "bd://", "http-bdmv-map", server,
+            run(args, "bd://", "http-bdmv-map", server,
                 mapping, expected)
         if not args.baseline:
             for route, case in (("no-range", "reject-nonseekable"),
                                 ("bad-range", "reject-wrong-range")):
-                probe = Probe(args.library)
+                probe = Probe(args.library, args.curl)
                 try:
                     probe.mpv.command("set", "bluray-device",
                                       server.url + f"/{route}.iso")
                     probe.reject("bd://")
-                    print(json.dumps({"case": case, "passed": True}))
+                    print(json.dumps({"case": case, "curlEnabled": args.curl, "passed": True}))
                 finally:
                     probe.close()
-                probe = Probe(args.library)
+                probe = Probe(args.library, args.curl)
                 try:
                     probe.reject(server.url + f"/{route}.iso")
-                    print(json.dumps({"case": case + "-autoprobe", "passed": True}))
+                    print(json.dumps({"case": case + "-autoprobe", "curlEnabled": args.curl, "passed": True}))
                 finally:
                     probe.close()
             for disabled in (False, True):
-                probe = Probe(args.library)
+                probe = Probe(args.library, args.curl)
                 try:
                     before = server.stats()[0]
                     key = "BDMV/index.bdmv" if disabled else "../BDMV/index.bdmv"
@@ -391,12 +417,12 @@ def exercise(args):
                     probe.reject("bd://")
                     assert server.stats()[0] == before
                     print(json.dumps({"case": "reject-disabled-references" if disabled
-                                      else "reject-traversal-map", "passed": True}))
+                                      else "reject-traversal-map", "curlEnabled": args.curl, "passed": True}))
                 finally:
                     probe.close()
     if not args.baseline:
         with serving(args.iso, folder, 0.5, 32 * 1024, True) as server:
-            probe = Probe(args.library)
+            probe = Probe(args.library, args.curl)
             try:
                 probe.mpv.command("loadfile", server.url + "/disc.iso")
                 probe.wait(lambda: server.stats()[0] > 0, "starting canceled open")
@@ -405,18 +431,18 @@ def exercise(args):
                 probe.wait(lambda: probe.mpv.property("idle-active"), "canceling open", 2)
                 elapsed = time.monotonic() - start
                 assert elapsed < 1, elapsed
-                print(json.dumps({"case": "cancel-open", "seconds": round(elapsed, 4),
+                print(json.dumps({"case": "cancel-open", "curlEnabled": args.curl, "seconds": round(elapsed, 4),
                                   "passed": True}))
             finally:
                 probe.close()
     if folder and not args.baseline:
-        run(args.library, folder / "BDMV/index.bdmv", "local-index",
+        run(args, folder / "BDMV/index.bdmv", "local-index",
             expected=expected)
         for playlist in sorted((folder / "BDMV/PLAYLIST").glob("*.mpls"))[:1]:
-            run(args.library, playlist, "local-mpls", expected=expected)
+            run(args, playlist, "local-mpls", expected=expected)
     if args.multi_folder and not args.baseline:
         multi = args.multi_folder.resolve(strict=True)
-        expected = run(args.library, multi, "local-multiclip")
+        expected = run(args, multi, "local-multiclip")
         assert 36 <= expected["duration"] < 37
         assert len(expected["chapter-list"]) == 4
         with serving(args.iso, multi, args.rtt_ms / 1000,
@@ -424,7 +450,7 @@ def exercise(args):
             mapping = {p.relative_to(multi).as_posix(): server.url + "/" +
                        p.relative_to(multi).as_posix() for p in multi.rglob("*")
                        if p.is_file()}
-            run(args.library, "bd://", "http-multiclip", server, mapping, expected)
+            run(args, "bd://", "http-multiclip", server, mapping, expected)
 
 
 if __name__ == "__main__":

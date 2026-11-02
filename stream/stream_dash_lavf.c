@@ -178,7 +178,7 @@ static int open_at(struct dash_lavf *p, uint64_t offset)
     av_dict_set(&options, "user_agent", p->config.user_agent, 0);
     av_dict_set(&options, "referer", p->config.referer, 0);
     av_dict_set(&options, "headers", "Accept-Encoding: identity\r\n", 0);
-    av_dict_set(&options, "tls_verify", "1", 0);
+    av_dict_set(&options, "tls_verify", p->config.tls_verify ? "1" : "0", 0);
     av_dict_set(&options, "max_redirects", "0", 0);
     av_dict_set(&options, "reconnect", "0", 0);
     av_dict_set(&options, "multiple_requests", "0", 0);

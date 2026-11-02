@@ -1948,8 +1948,9 @@ static bool setup_curl(struct priv *p)
 
     if (info->features & CURL_VERSION_SSL)
         SETOPT(CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
-    SETOPT(CURLOPT_SSL_VERIFYPEER, p->net_opts->tls_verify ? 1L : 0L);
-    SETOPT(CURLOPT_SSL_VERIFYHOST, p->net_opts->tls_verify ? 2L : 0L);
+    bool tls_verify = p->dash_kind ? p->dash.tls_verify : p->net_opts->tls_verify;
+    SETOPT(CURLOPT_SSL_VERIFYPEER, tls_verify ? 1L : 0L);
+    SETOPT(CURLOPT_SSL_VERIFYHOST, tls_verify ? 2L : 0L);
     if (p->net_opts->tls_ca_file) {
         char *path = mp_get_user_path(p, p->global, p->net_opts->tls_ca_file);
         SETOPT(CURLOPT_CAINFO, path);

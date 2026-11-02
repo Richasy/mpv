@@ -25,6 +25,7 @@ struct mp_dash_track_config {
     char *user_agent;
     char *referer;
     bool allow_loopback_http;
+    bool tls_verify;
 };
 
 struct mp_dash_transfer_diagnostic {

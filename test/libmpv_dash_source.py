@@ -1521,6 +1521,37 @@ def test_stop_while_opening(mpv, server, role):
             release.set()
 
 
+def test_tls_policy_frozen(mpv, server, backend, verify):
+    # The source must retain its admission policy across both tracks and seeks.
+    server.range_max_bytes = 16384
+    with client(mpv, {"curl-enabled": "yes" if backend == "curl" else "no",
+                      "tls-verify": "yes" if verify else "no",
+                      "pause": "no", "demuxer-max-back-bytes": "0",
+                      "demuxer-seekable-cache": "no",
+                      "demuxer-lavf-o": "use_mfra_for=0"}) as handle:
+        source = source_for(server)
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        command(mpv, handle, "set", "tls-verify", "no" if verify else "yes")
+        if verify:
+            await_event(mpv, handle, END_FILE)
+            assert snapshot(mpv, handle).failure == TRANSPORT
+            assert not server.requests, "Strict source accepted an untrusted certificate"
+            return
+        await_event(mpv, handle, FILE_LOADED)
+        command(mpv, handle, "set", "pause", "no")
+        await_dual_decoder_ao(mpv, handle, "TLS policy dual-track playback")
+        assert snapshot(mpv, handle).phase == BOUND
+        assert prop(mpv, handle, "vid") not in (None, "no")
+        assert prop(mpv, handle, "aid") not in (None, "no")
+        command(mpv, handle, "set", "pause", "yes")
+        confirm_position(mpv, handle, 8, snapshot(mpv, handle).generation,
+                         lambda: command(mpv, handle, "seek", "8", "absolute+exact"))
+        for role in ("video", "audio"):
+            assert len(server.requests_for(role)) > 1, "TLS policy was not tested across continuation requests"
+        command(mpv, handle, "stop")
+        await_event(mpv, handle, END_FILE)
+
+
 def test_tls_certificate_isolation(mpv, server, certificates, typed):
     options = {
         "tls-verify": "no",
@@ -2342,6 +2373,10 @@ def main():
                     print(f"[dash] {name} exposed={int(observed)}", flush=True)
             print("[dash] TLS client certificate isolation", flush=True)
             certificates = generate_tls_certificates(directory)
+            for backend in ("curl", "lavf"):
+                for verify in (True, False):
+                    with serve(tracks, certificates) as server:
+                        test_tls_policy_frozen(mpv, server, backend, verify)
             with serve(tracks, certificates) as server:
                 test_tls_certificate_isolation(mpv, server, certificates, True)
             with serve(tracks, certificates) as server:

@@ -32,6 +32,7 @@ import urllib.parse
 
 VERSION = 1
 ALLOW_LOOPBACK = 1
+VIDEO_ONLY = 2
 SEGMENT_BASE = 1
 INVALID = -4
 UNSUPPORTED = -18
@@ -1039,6 +1040,69 @@ def test_playback(mpv, server):
         assert not stopped_range.audio_validated_206
     assert_headers(server)
     return state.generation
+
+
+def test_video_only(mpv, server, backend):
+    with client(mpv, {"curl-enabled": backend}) as handle:
+        source = source_for(server)
+        source.flags |= VIDEO_ONLY
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        source.audio = Track()
+        source.audio.quality = 1
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        source.audio = Track()
+        source.flags &= ~VIDEO_ONLY
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        assert not server.requests
+        source.flags |= VIDEO_ONLY
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        await_event(mpv, handle, FILE_LOADED)
+        state = snapshot(mpv, handle)
+        assert state.phase == BOUND, (state.phase, state.failure)
+        assert state.video_responses > 0 and state.audio_responses == 0
+        assert state.audio_http_status == 0
+        assert prop(mpv, handle, "aid") in (None, "no")
+        assert prop(mpv, handle, "audio-out-params/samplerate") is None
+        assert prop(mpv, handle, "video-params/w") == "160"
+        assert prop(mpv, handle, "seekable") == "yes"
+        assert prop(mpv, handle, "rodel-dash-network-backend") == (
+            "curl" if backend == "yes" else "lavf")
+        ranged = range_capability(mpv, handle)
+        assert ranged.video_validated_206 == 1
+        assert ranged.audio_validated_206 == 0
+        command(mpv, handle, "seek", "8", "absolute+exact")
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            mpv.mpv_wait_event(handle, 0.05)
+            position = prop(mpv, handle, "time-pos")
+            if position and abs(float(position) - 8) <= 0.25:
+                break
+        else:
+            raise AssertionError("Video-only seek did not reach its target")
+        command(mpv, handle, "set", "pause", "no")
+        command(mpv, handle, "seek", "17", "absolute+exact")
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            mpv.mpv_wait_event(handle, 0.05)
+            if prop(mpv, handle, "eof-reached") == "yes":
+                break
+        else:
+            raise AssertionError("Video-only playback did not reach EOF")
+        command(mpv, handle, "seek", "0", "absolute+exact")
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            mpv.mpv_wait_event(handle, 0.05)
+            if prop(mpv, handle, "eof-reached") == "no":
+                break
+        else:
+            raise AssertionError("Video-only replay did not leave EOF")
+        assert snapshot(mpv, handle).generation == state.generation
+        assert_private(mpv, handle)
+        command(mpv, handle, "stop")
+        await_event(mpv, handle, END_FILE)
+        assert snapshot(mpv, handle).phase == STOPPED
+    assert not server.requests_for("audio")
+    assert_headers(server, roles=("video",))
 
 
 def test_full_body_playback(mpv, server, full_role, http_status=200,
@@ -2172,13 +2236,14 @@ def test_complete_body_receive_error(mpv, server, role):
 
 
 def main():
+    video_only = len(sys.argv) == 3 and sys.argv[2] == "--video-only"
     scheduler = len(sys.argv) == 3 and sys.argv[2] == "--scheduler"
     controls = len(sys.argv) == 3 and sys.argv[2] == "--controls"
     recovery = len(sys.argv) == 3 and sys.argv[2] == "--recovery"
     timeouts = len(sys.argv) == 3 and sys.argv[2] == "--timeouts"
-    if not (len(sys.argv) == 2 or scheduler or controls or recovery or timeouts):
+    if not (len(sys.argv) == 2 or scheduler or controls or recovery or timeouts or video_only):
         raise SystemExit("usage: python test/libmpv_dash_source.py "
-                         "build/local-libmpv/x86_64 [--scheduler|--controls|--recovery|--timeouts]")
+                         "build/local-libmpv/x86_64 [--scheduler|--controls|--recovery|--timeouts|--video-only]")
     runtime = Path(sys.argv[1]).resolve()
     directory = runtime / f"dash-generated-{os.getpid()}"
     if not runtime.is_dir() or not (runtime / "libmpv-2.dll").is_file():
@@ -2234,6 +2299,15 @@ def main():
             assert RangeCapability.source_generation.offset == 8
             assert RangeCapability.video_validated_206.offset == 16
             assert RangeCapability.audio_validated_206.offset == 20
+            if video_only:
+                for backend in ("yes", "no"):
+                    with serve(tracks) as server:
+                        test_video_only(mpv, server, backend)
+                    print(f"[dash] video-only {backend}: PASS", flush=True)
+                with serve(tracks) as server:
+                    test_playback(mpv, server)
+                print("DASH_VIDEO_ONLY_AND_DUAL_TRACK_PASS", flush=True)
+                return
             if timeouts:
                 for role in ("video", "audio"):
                     for stage in ("open", "body"):

@@ -180,12 +180,22 @@ static int validate_track(const mpv_dash_track *track, bool video,
     return MPV_ERROR_SUCCESS;
 }
 
+static bool empty_track(const mpv_dash_track *track)
+{
+    return !track->struct_size && !track->flags && !track->url &&
+           !track->mime_type && !track->codec && !track->bandwidth &&
+           !track->quality && !track->width && !track->height &&
+           !track->initialization.start && !track->initialization.end &&
+           !track->index.start && !track->index.end;
+}
+
 int mp_dash_source_validate(const mpv_dash_source *source)
 {
     if (!source || source->struct_size != sizeof(*source) ||
         source->api_version != MPV_DASH_SOURCE_API_VERSION ||
         source->reserved ||
-        (source->flags & ~MPV_DASH_SOURCE_ALLOW_LOOPBACK_HTTP) ||
+        (source->flags & ~(MPV_DASH_SOURCE_ALLOW_LOOPBACK_HTTP |
+                          MPV_DASH_SOURCE_VIDEO_ONLY)) ||
         !isfinite(source->duration_seconds) || source->duration_seconds < 0 ||
         !safe_header_value(source->user_agent, 512) ||
         !safe_header_value(source->referer, 2048) ||
@@ -194,7 +204,10 @@ int mp_dash_source_validate(const mpv_dash_source *source)
 
     bool loopback = !!(source->flags & MPV_DASH_SOURCE_ALLOW_LOOPBACK_HTTP);
     int video = validate_track(&source->video, true, loopback);
-    int audio = validate_track(&source->audio, false, loopback);
+    int audio = source->flags & MPV_DASH_SOURCE_VIDEO_ONLY
+        ? (empty_track(&source->audio) ? MPV_ERROR_SUCCESS
+                                       : MPV_ERROR_INVALID_PARAMETER)
+        : validate_track(&source->audio, false, loopback);
     if (video == MPV_ERROR_INVALID_PARAMETER ||
         audio == MPV_ERROR_INVALID_PARAMETER)
         return MPV_ERROR_INVALID_PARAMETER;
@@ -223,7 +236,8 @@ int mp_dash_source_begin(struct mpv_global *global, const mpv_dash_source *sourc
         return MPV_ERROR_UNSUPPORTED;
     }
     state->video_url = talloc_strdup(state, source->video.url);
-    state->audio_url = talloc_strdup(state, source->audio.url);
+    state->audio_url = source->flags & MPV_DASH_SOURCE_VIDEO_ONLY
+        ? NULL : talloc_strdup(state, source->audio.url);
     state->user_agent = talloc_strdup(state, source->user_agent);
     state->referer = talloc_strdup(state, source->referer);
     state->allow_loopback_http =
@@ -498,6 +512,7 @@ bool mp_dash_source_seek_blocked(struct mpv_global *global)
     bool current = state->status.generation && state->mpctx->filename &&
                    !strcmp(state->mpctx->filename, MP_DASH_VIDEO_URL);
     bool bound = state->status.phase == MPV_DASH_SOURCE_TRACKS_BOUND;
+    bool has_audio = state->audio_url != NULL;
     mp_mutex_unlock(&state->lock);
     if (!current)
         return false;
@@ -505,11 +520,21 @@ bool mp_dash_source_seek_blocked(struct mpv_global *global)
         return true;
 
     // Called on the core thread. HTTP range observations are telemetry, not
-    // demux capability; both selected media demuxers must accept full seeks.
+    // demux capability; every declared media demuxer must accept full seeks.
     struct track *video = state->mpctx->current_track[0][STREAM_VIDEO];
     struct track *audio = state->mpctx->current_track[0][STREAM_AUDIO];
-    return !video || !audio || !video->demuxer || !audio->demuxer ||
-           !video->demuxer->seekable || !audio->demuxer->seekable;
+    return !video || !video->demuxer || !video->demuxer->seekable ||
+           (has_audio && (!audio || !audio->demuxer ||
+                          !audio->demuxer->seekable));
+}
+
+bool mp_dash_source_has_audio(struct mpv_global *global)
+{
+    struct mp_dash_source_state *state = global->dash_source;
+    mp_mutex_lock(&state->lock);
+    bool has_audio = state->audio_url != NULL;
+    mp_mutex_unlock(&state->lock);
+    return has_audio;
 }
 
 int mp_dash_source_frame_snapshot(struct mpv_global *global,
@@ -593,7 +618,9 @@ int mp_dash_source_transport_backend(struct mpv_global *global)
 {
     struct mp_dash_source_state *state = global->dash_source;
     mp_mutex_lock(&state->lock);
-    int value = state->transport_mask == 3 ? (state->use_curl ? 1 : 2) : 0;
+    unsigned expected = state->audio_url ? 3u : 1u;
+    int value = state->transport_mask == expected
+        ? (state->use_curl ? 1 : 2) : 0;
     mp_mutex_unlock(&state->lock);
     return value;
 }
@@ -675,7 +702,7 @@ bool mp_dash_source_get_track(struct mpv_global *global, const char *alias,
     if (ok && !strcmp(alias, MP_DASH_VIDEO_URL)) {
         *kind = MPV_DASH_TRACK_VIDEO;
         config->url = talloc_strdup(parent, state->video_url);
-    } else if (ok && !strcmp(alias, MP_DASH_AUDIO_URL)) {
+    } else if (ok && state->audio_url && !strcmp(alias, MP_DASH_AUDIO_URL)) {
         *kind = MPV_DASH_TRACK_AUDIO;
         config->url = talloc_strdup(parent, state->audio_url);
     } else {
@@ -692,6 +719,8 @@ bool mp_dash_source_get_track(struct mpv_global *global, const char *alias,
 }
 
 #else
+
+bool mp_dash_source_has_audio(struct mpv_global *global) { return false; }
 
 void mp_dash_source_set_idle_pause(struct mpv_global *global, bool idle) { }
 void mp_dash_source_pending_open(struct mpv_global *global, bool begin) { }

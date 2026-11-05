@@ -475,6 +475,8 @@ typedef struct mpv_dash_track {
 typedef enum mpv_dash_source_flags {
     /* Test-only: permits http://127.0.0.1:<port> and http://[::1]:<port>. */
     MPV_DASH_SOURCE_ALLOW_LOOPBACK_HTTP = 1u,
+    /* Explicitly omit audio. Every field of source.audio must be zero. */
+    MPV_DASH_SOURCE_VIDEO_ONLY = 2u,
 } mpv_dash_source_flags;
 
 typedef struct mpv_dash_source {
@@ -483,7 +485,7 @@ typedef struct mpv_dash_source {
     uint32_t flags;                  /* mpv_dash_source_flags */
     uint32_t reserved;               /* Must be zero. */
     mpv_dash_track video;
-    mpv_dash_track audio;
+    mpv_dash_track audio;             /* Required unless VIDEO_ONLY is set. */
     double duration_seconds;         /* Optional; zero if unknown. */
     const char *user_agent;           /* Optional, shared by both tracks. */
     const char *referer;              /* Optional HTTPS URL, shared by both. */

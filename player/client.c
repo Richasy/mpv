@@ -1614,7 +1614,10 @@ static void dash_load_locked(void *ptr)
 
     mpv_node audio = {.format = MPV_FORMAT_STRING,
                       .u.string = MP_DASH_AUDIO_URL};
-    mpv_node_list list = {.num = 1, .values = &audio};
+    mpv_node_list list = {
+        .num = mp_dash_source_has_audio(mpctx->global) ? 1 : 0,
+        .values = &audio,
+    };
     mpv_node option = {.format = MPV_FORMAT_NODE_ARRAY, .u.list = &list};
     if (m_config_set_option_node(mpctx->mconfig, bstr0("audio-files"),
                                  &option, 0) < 0 ||

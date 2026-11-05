@@ -1695,12 +1695,15 @@ static void load_external_opts_thread(void *p)
 
     bool dash = mp_dash_source_active(mpctx->global) && mpctx->filename &&
                 !strcmp(mpctx->filename, MP_DASH_VIDEO_URL);
+    bool dash_audio = dash && mp_dash_source_has_audio(mpctx->global);
     if (mpctx->stop_play)
         goto done;
     if (dash) {
         char **audio_files = mpctx->opts->audio_files;
-        if (!audio_files || !audio_files[0] ||
-            strcmp(audio_files[0], MP_DASH_AUDIO_URL) || audio_files[1])
+        if (dash_audio
+            ? (!audio_files || !audio_files[0] ||
+               strcmp(audio_files[0], MP_DASH_AUDIO_URL) || audio_files[1])
+            : (audio_files && audio_files[0]))
         {
             mp_dash_source_fail(mpctx->global, MPV_DASH_TRACK_AUDIO,
                                 MPV_DASH_FAILURE_TRACK_SELECTION);
@@ -1725,7 +1728,7 @@ static void load_external_opts_thread(void *p)
                 !strcmp(track->external_filename, MP_DASH_AUDIO_URL))
                 found_audio = true;
         }
-        if (!found_audio) {
+        if (dash_audio && !found_audio) {
             mp_dash_source_fail(mpctx->global, MPV_DASH_TRACK_AUDIO,
                                 MPV_DASH_FAILURE_AUDIO_OPEN);
             mpctx->error_playing = MPV_ERROR_LOADING_FAILED;
@@ -2088,11 +2091,16 @@ static void play_current_file(struct MPContext *mpctx)
     {
         struct track *video = mpctx->current_track[0][STREAM_VIDEO];
         struct track *audio = mpctx->current_track[0][STREAM_AUDIO];
+        bool has_audio = mp_dash_source_has_audio(mpctx->global);
+        bool audio_ok = has_audio
+            ? mpctx->ao_chain && audio && audio->is_external &&
+              audio->external_filename &&
+              !strcmp(audio->external_filename, MP_DASH_AUDIO_URL)
+            : !audio && !mpctx->ao_chain;
         if (mp_dash_source_failed(mpctx->global) ||
-            !mpctx->vo_chain || !mpctx->ao_chain ||
+            !mpctx->vo_chain ||
             !video || video->demuxer != mpctx->demuxer ||
-            !audio || !audio->is_external || !audio->external_filename ||
-            strcmp(audio->external_filename, MP_DASH_AUDIO_URL))
+            !audio_ok)
         {
             mp_dash_source_fail(mpctx->global, MPV_DASH_TRACK_NONE,
                                 MPV_DASH_FAILURE_TRACK_SELECTION);

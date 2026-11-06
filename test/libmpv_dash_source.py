@@ -189,18 +189,18 @@ def first_fragment_offset(data):
     raise AssertionError("Generated video has no first media fragment")
 
 
-def generate_tracks(directory):
+def generate_tracks(directory, duration=18):
     files = {}
     inputs = {
         "video": [
             "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=12",
-            "-t", "18", "-an", "-c:v", "libx264", "-preset", "ultrafast",
+            "-t", str(duration), "-an", "-c:v", "libx264", "-preset", "ultrafast",
             "-crf", "17", "-pix_fmt", "yuv420p", "-g", "12",
         ],
         "audio": [
             "-f", "lavfi", "-i",
             "anoisesrc=color=white:amplitude=0.03:sample_rate=48000",
-            "-t", "18", "-vn", "-c:a", "aac", "-b:a", "160k",
+            "-t", str(duration), "-vn", "-c:a", "aac", "-b:a", "160k",
         ],
     }
     for role, arguments in inputs.items():
@@ -327,6 +327,8 @@ class Server(http.server.ThreadingHTTPServer):
         self.disconnect_role = None
         self.disconnect_attempts = 0
         self.disconnect_bytes = 32768
+        self.disconnect_min_payload = 0
+        self.disconnections = []
         self.wrong_total_role = None
         self.arm_code = 412
         self.full_body_roles = set()
@@ -529,12 +531,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 return
             if (role == self.server.disconnect_role and
-                len(self.server.requests_for(role)) <= self.server.disconnect_attempts and
+                len(self.server.disconnections) < self.server.disconnect_attempts and
+                end - start + 1 >= self.server.disconnect_min_payload and
                 (media_candidate or code == 206)):
                 payload = body if media_candidate else data[start:end + 1]
                 cut = min(self.server.disconnect_bytes, max(0, len(payload) - 1))
                 self.wfile.write(payload[:cut])
                 self.wfile.flush()
+                self.server.disconnections.append((start, cut))
                 return
             if code == 206:
                 if self.server.truncate_range_role == role and start > 0:

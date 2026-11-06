@@ -1629,11 +1629,12 @@ static bool resume_dash_request(struct priv *p, CURLcode code)
 {
     if (!p->dash_kind || dash_request_stopped(p) || finish_dash_expired_read(p) ||
         !p->seekable || !is_recoverable_error(code) ||
-        p->retry_count >= p->opts->max_retries)
+        p->opts->max_retries <= 0)
         return false;
 
     if (p->dash_header_timed_out && code == CURLE_OPERATION_TIMEDOUT &&
-        dash_waiting_for_continuation_headers(p)) {
+        dash_waiting_for_continuation_headers(p) &&
+        p->retry_count < p->opts->max_retries) {
         p->retry_count++;
         MP_WARN(p, "DASH continuation awaiting headers (curl %d), retrying (#%d) at %" PRIu64 "\n",
                 code, p->retry_count, p->request_start);
@@ -1661,6 +1662,13 @@ static bool resume_dash_request(struct priv *p, CURLcode code)
         (p->request_end &&
          (p->request_start >= p->request_end ||
           p->request_received >= p->request_end - p->request_start)))
+        return false;
+
+    // Count consecutive low-progress failures, not distant disconnections
+    // throughout a large response. Tiny/trickling attempts retain their budget.
+    if (p->request_received >= 1024 * 1024)
+        p->retry_count = 0;
+    if (p->retry_count >= p->opts->max_retries)
         return false;
 
     // The ring retains these identity bytes. Resume after the producer's

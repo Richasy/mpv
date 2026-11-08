@@ -1583,6 +1583,8 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
     };
 
     avfc->opaque = demuxer;
+    if (demuxer->params->prefetch)
+        avfc->format_whitelist = av_strdup("matroska,webm,mov,avi,mpegts,mpeg,wav");
     if (demuxer->access_references) {
         priv->default_io_open = avfc->io_open;
         avfc->io_open = nested_io_open;

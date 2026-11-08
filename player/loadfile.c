@@ -1298,9 +1298,18 @@ static MP_THREAD_VOID open_demux_thread(void *ctx)
         .is_top_level = true,
         .allow_playlist_create = mpctx->playlist->num_entries <= 1 &&
                                  !mpctx->playlist->playlist_dir,
+        .prefetch = mpctx->open_prefetch_budget,
+        .disable_timeline = mpctx->open_prefetch_budget != NULL,
     };
     struct demuxer *demux =
         demux_open_url(mpctx->open_url, &p, mpctx->open_cancel, mpctx->global);
+    if (demux && p.prefetch &&
+        (demux->fully_read || demux->playlist ||
+         demux->matroska_data.num_ordered_chapters > 0))
+    {
+        demux_cancel_and_free(demux);
+        demux = NULL;
+    }
     mpctx->open_res_demuxer = demux;
 
     if (demux) {
@@ -1344,6 +1353,12 @@ static void cancel_open(struct MPContext *mpctx)
     if (mpctx->open_res_demuxer)
         demux_cancel_and_free(mpctx->open_res_demuxer);
     mpctx->open_res_demuxer = NULL;
+    if (mpctx->open_prefetch_budget) {
+        mpctx->prefetch_bytes = atomic_load(&mpctx->open_prefetch_budget->bytes);
+        mpctx->prefetch_requests = atomic_load(&mpctx->open_prefetch_budget->requests);
+    }
+    TA_FREEP(&mpctx->open_prefetch_budget);
+    TA_FREEP(&mpctx->open_prefetch_options);
 
     TA_FREEP(&mpctx->open_cancel);
     TA_FREEP(&mpctx->open_url);
@@ -1354,7 +1369,7 @@ static void cancel_open(struct MPContext *mpctx)
 
 // Setup all the field to open this url, and make sure a thread is running.
 static void start_open(struct MPContext *mpctx, char *url, int url_flags,
-                       bool for_prefetch)
+                       bool for_prefetch, struct mp_prefetch_budget *budget)
 {
     cancel_open(mpctx);
 
@@ -1368,6 +1383,7 @@ static void start_open(struct MPContext *mpctx, char *url, int url_flags,
     mpctx->open_format = talloc_strdup(NULL, mpctx->opts->demuxer_name);
     mpctx->open_url_flags = url_flags;
     mpctx->open_for_prefetch = for_prefetch && mpctx->opts->demuxer_thread;
+    mpctx->open_prefetch_budget = budget;
     mpctx->demuxer_changed = false;
 
     if (mp_thread_create(&mpctx->open_thread, open_demux_thread, mpctx)) {
@@ -1376,6 +1392,108 @@ static void start_open(struct MPContext *mpctx, char *url, int url_flags,
     }
 
     mpctx->open_active = true;
+}
+
+static bool prefetch_option(struct m_config_option *co)
+{
+    const char *prefixes[] = {
+        "demuxer-", "stream-", "cache", "http-", "tls-", "curl-",
+        "cookies", "user-agent", "network-", "access-references",
+    };
+    if (!co->data)
+        return false;
+    if (co->opt->flags & UPDATE_DEMUXER)
+        return true;
+    for (int n = 0; n < MP_ARRAY_SIZE(prefixes); n++) {
+        if (strncmp(co->name, prefixes[n], strlen(prefixes[n])) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool prefetch_options_match(struct MPContext *mpctx)
+{
+    if (!mpctx->open_prefetch_options)
+        return false;
+    for (int n = 0; n < mpctx->mconfig->num_opts; n++) {
+        struct m_config_option *co = &mpctx->mconfig->opts[n];
+        if (!prefetch_option(co))
+            continue;
+        char *value = m_option_print(co->opt, co->data);
+        char *before = mpctx->open_prefetch_options[n];
+        bool equal = (!value && !before) ||
+                     (value && before && strcmp(value, before) == 0);
+        talloc_free(value);
+        if (!equal)
+            return false;
+    }
+    return true;
+}
+
+void mp_cancel_prefetch(struct MPContext *mpctx)
+{
+    if (mpctx->open_prefetch_budget)
+        cancel_open(mpctx);
+    mpctx->prefetch_state = 0;
+}
+
+bool mp_prefetch_file(struct MPContext *mpctx, const char *url)
+{
+    if (!mpctx->demuxer || !mpctx->opts->demuxer_thread ||
+        (strncmp(url, "http://", 7) && strncmp(url, "https://", 8)))
+        return false;
+    if (mpctx->open_active)
+        return false;
+
+    struct mp_prefetch_budget *budget = talloc_zero(NULL, struct mp_prefetch_budget);
+    budget->active = true;
+    budget->max_bytes = 8 * 1024 * 1024;
+    budget->max_requests = 4;
+    budget->seconds = 2;
+    budget->deadline = mp_time_ns() + MP_TIME_S_TO_NS(5);
+    start_open(mpctx, (char *)url, STREAM_ORIGIN_DIRECT, true, budget);
+    if (!mpctx->open_active)
+        return false;
+    mpctx->prefetch_state = 1;
+    mpctx->prefetch_bytes = 0;
+    mpctx->prefetch_requests = 0;
+    mpctx->open_prefetch_options =
+        talloc_zero_array(NULL, char *, mpctx->mconfig->num_opts);
+    for (int n = 0; n < mpctx->mconfig->num_opts; n++) {
+        struct m_config_option *co = &mpctx->mconfig->opts[n];
+        if (prefetch_option(co)) {
+            mpctx->open_prefetch_options[n] = talloc_steal(
+                mpctx->open_prefetch_options, m_option_print(co->opt, co->data));
+        }
+    }
+    return true;
+}
+
+int mp_update_prefetch(struct MPContext *mpctx)
+{
+    struct mp_prefetch_budget *budget = mpctx->open_prefetch_budget;
+    if (!budget)
+        return mpctx->prefetch_state;
+    bool done = atomic_load(&mpctx->open_done);
+    if (mp_prefetch_stopped(budget) || (done && !mpctx->open_res_demuxer)) {
+        cancel_open(mpctx);
+        return mpctx->prefetch_state = 3;
+    }
+    if (done) {
+        struct demux_reader_state state;
+        demux_get_reader_state(mpctx->open_res_demuxer, &state);
+        if (state.stream_error) {
+            cancel_open(mpctx);
+            return mpctx->prefetch_state = 3;
+        }
+        if (state.idle && state.ts_info.duration > 0) {
+            atomic_store(&budget->ready, true);
+            mpctx->prefetch_state = 2;
+        }
+    }
+    mpctx->prefetch_bytes = atomic_load(&budget->bytes);
+    mpctx->prefetch_requests = atomic_load(&budget->requests);
+    return mpctx->prefetch_state;
 }
 
 static void open_demux_reentrant(struct MPContext *mpctx)
@@ -1387,7 +1505,10 @@ static void open_demux_reentrant(struct MPContext *mpctx)
         bool failed = done && !mpctx->open_res_demuxer;
         bool correct_url = strcmp(mpctx->open_url, url) == 0;
 
-        if (correct_url && !mpctx->demuxer_changed && !failed) {
+        bool compatible = mpctx->open_prefetch_budget
+          ? mp_update_prefetch(mpctx) == 2 && prefetch_options_match(mpctx)
+          : !mpctx->demuxer_changed;
+        if (correct_url && compatible && !failed) {
             MP_VERBOSE(mpctx, "Using prefetched/prefetching URL.\n");
         } else {
             if (correct_url && failed) {
@@ -1410,7 +1531,7 @@ static void open_demux_reentrant(struct MPContext *mpctx)
     }
 
     if (!mpctx->open_active)
-        start_open(mpctx, url, mpctx->playing->stream_flags, false);
+        start_open(mpctx, url, mpctx->playing->stream_flags, false, NULL);
 
     // If thread failed to start, cancel the playback
     if (!mpctx->open_active)
@@ -1429,6 +1550,15 @@ static void open_demux_reentrant(struct MPContext *mpctx)
     if (mpctx->open_res_demuxer) {
         mpctx->demuxer = mpctx->open_res_demuxer;
         mpctx->open_res_demuxer = NULL;
+        if (mpctx->open_prefetch_budget) {
+            mpctx->prefetch_bytes = atomic_load(&mpctx->open_prefetch_budget->bytes);
+            mpctx->prefetch_requests = atomic_load(&mpctx->open_prefetch_budget->requests);
+            demux_adopt_prefetch(mpctx->demuxer);
+            talloc_steal(mpctx->demuxer->in, mpctx->open_prefetch_budget);
+            mpctx->open_prefetch_budget = NULL;
+            mpctx->prefetch_state = 0;
+            mpctx->prefetch_adoptions++;
+        }
         mp_cancel_set_parent(mpctx->demuxer->cancel, mpctx->playback_abort);
     } else {
         mpctx->error_playing = mpctx->open_res_error;
@@ -1446,7 +1576,7 @@ void prefetch_next(struct MPContext *mpctx)
     struct playlist_entry *new_entry = mp_next_file(mpctx, +1, false, false);
     if (new_entry && new_entry->filename) {
         MP_VERBOSE(mpctx, "Prefetching: %s\n", new_entry->filename);
-        start_open(mpctx, new_entry->filename, new_entry->stream_flags, true);
+        start_open(mpctx, new_entry->filename, new_entry->stream_flags, true, NULL);
     }
 }
 

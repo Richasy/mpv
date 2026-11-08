@@ -936,6 +936,7 @@ static void handle_update_cache(struct MPContext *mpctx)
         force_update = true;
     }
 
+    mp_update_prefetch(mpctx);
     if (s.eof && !busy)
         prefetch_next(mpctx);
 

@@ -1896,6 +1896,20 @@ static int mp_property_playback_abort(void *ctx, struct m_property *prop,
     return m_property_bool_ro(action, arg, !mpctx->playing || mpctx->stop_play);
 }
 
+static int mp_property_prefetch(void *ctx, struct m_property *prop,
+                               int action, void *arg)
+{
+    struct MPContext *mpctx = ctx;
+    int state = mp_update_prefetch(mpctx);
+    if (!strcmp(prop->name, "prefetch-state"))
+        return m_property_int_ro(action, arg, state);
+    if (!strcmp(prop->name, "prefetch-requests"))
+        return m_property_int_ro(action, arg, mpctx->prefetch_requests);
+    if (!strcmp(prop->name, "prefetch-adoptions"))
+        return m_property_int_ro(action, arg, mpctx->prefetch_adoptions);
+    return m_property_int64_ro(action, arg, mpctx->prefetch_bytes);
+}
+
 static int mp_property_cache_speed(void *ctx, struct m_property *prop,
                                    int action, void *arg)
 {
@@ -5130,6 +5144,10 @@ static const struct m_property mp_properties_base[] = {
     {"sub-translate-status", mp_property_sub_translate_status},
     {"playback-abort", mp_property_playback_abort},
     {"cache-speed", mp_property_cache_speed},
+    {"prefetch-state", mp_property_prefetch},
+    {"prefetch-bytes", mp_property_prefetch},
+    {"prefetch-requests", mp_property_prefetch},
+    {"prefetch-adoptions", mp_property_prefetch},
     {"demuxer-cache-duration", mp_property_demuxer_cache_duration},
     {"demuxer-cache-time", mp_property_demuxer_cache_time},
     {"demuxer-cache-idle", mp_property_demuxer_cache_idle},
@@ -6936,6 +6954,18 @@ static struct playlist_entry *get_insert_entry(struct MPContext *mpctx, struct l
     }
 }
 
+static void cmd_prefetch_file(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    cmd->success = mp_prefetch_file(cmd->mpctx, cmd->args[0].v.s);
+}
+
+static void cmd_prefetch_cancel(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    mp_cancel_prefetch(cmd->mpctx);
+}
+
 static void cmd_loadfile(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
@@ -8318,6 +8348,8 @@ const struct mp_cmd_def mp_cmds[] = {
         .can_abort = true,
         .abort_on_playback_end = true,
     },
+    { "prefetch-file", cmd_prefetch_file, {{"url", OPT_STRING(v.s)}} },
+    { "prefetch-cancel", cmd_prefetch_cancel },
     { "loadfile", cmd_loadfile,
         {
             {"url", OPT_STRING(v.s)},

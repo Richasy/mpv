@@ -222,6 +222,7 @@ struct demuxer_params {
     int stream_flags;
     struct stream *external_stream; // if set, use this, don't open or close streams
     bool allow_playlist_create;
+    struct mp_prefetch_budget *prefetch;
     // result
     bool demuxer_failed;
 };
@@ -289,6 +290,7 @@ typedef struct demuxer {
     struct mp_log *log, *glog;
     struct demux_packet_pool *packet_pool;
     struct demuxer_params *params;
+    struct mp_prefetch_budget *prefetch;
 
     // internal to demux.c
     struct demux_internal *in;
@@ -349,6 +351,7 @@ void demux_start_thread(struct demuxer *demuxer);
 void demux_stop_thread(struct demuxer *demuxer);
 void demux_set_wakeup_cb(struct demuxer *demuxer, void (*cb)(void *ctx), void *ctx);
 void demux_start_prefetch(struct demuxer *demuxer);
+void demux_adopt_prefetch(struct demuxer *demuxer);
 void demux_drive_nav(struct demuxer *demuxer);
 void demux_nav_refresh(struct demuxer *demuxer);
 void demux_set_stream_still_image(struct demuxer *demuxer,

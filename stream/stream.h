@@ -27,6 +27,7 @@
 
 #include "common/common.h"
 #include "misc/bstr.h"
+#include "stream/prefetch.h"
 
 // Minimum guaranteed buffer and seek-back size. For any reads <= of this size,
 // it's guaranteed that you can seek back by <= of this size again.
@@ -265,6 +266,7 @@ typedef struct stream {
     int64_t read_qualification_deadline;
     int64_t read_recovery_deadline;
     struct stream *read_deadline_parent;
+    struct mp_prefetch_budget *prefetch;
     // Terminal failure flag. Set when an in-place backend reopen
     // (s->reconnect) failed, or succeeded but left the backend cursor detached
     // from s->pos and it could not be realigned. The backend is then unusable
@@ -398,6 +400,7 @@ struct stream_open_args {
     void *special_arg;          // specific to impl., use only with sinfo
     int64_t open_offset;        // see stream.open_offset
     struct stream *read_deadline_parent;
+    struct mp_prefetch_budget *prefetch;
     // Additional connection of an LRU-cached stream: never gets a cache of
     // its own and logs as log_name below log_parent.
     bool lru_cursor;

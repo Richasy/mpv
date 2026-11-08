@@ -478,6 +478,7 @@ static int stream_create_instance(const stream_info_t *sinfo,
     s->autoprobed = !args->sinfo;
     s->cancel = args->cancel;
     s->read_deadline_parent = args->read_deadline_parent;
+    s->prefetch = args->prefetch;
     struct mp_network_opts *net_opts =
         mp_get_config_group(s, s->global, &mp_network_conf);
     s->network_timeout = net_opts->timeout;
@@ -494,7 +495,7 @@ static int stream_create_instance(const stream_info_t *sinfo,
         mp_msg_set_max_level(s->log, MSGL_WARN);
 
     struct demux_opts *demux_opts = mp_get_config_group(s, s->global, &demux_conf);
-    s->access_references = demux_opts->access_references;
+    s->access_references = !s->prefetch && demux_opts->access_references;
     talloc_free(demux_opts);
 
     MP_VERBOSE(s, "Opening %s\n", url);
@@ -699,6 +700,7 @@ struct stream *stream_open_lru_cursor(struct stream *s,
         .sinfo = s->info,
         .open_offset = pos,
         .read_deadline_parent = s,
+        .prefetch = s->prefetch,
         .lru_cursor = true,
         .disc = s->disc,
         .log_parent = s->log,
@@ -812,6 +814,12 @@ static int stream_read_unbuffered_impl(stream_t *s, void *buf, int len)
         return 0;
 
     int res = stream_read_backend(s, buf, len);
+
+    if (res <= 0 && s->error && mp_prefetch_active(s->prefetch)) {
+        atomic_store(&s->prefetch->failed, true);
+        s->eof = 1;
+        return 0;
+    }
 
     if (res <= 0 && s->error && s->reconnect && !s->broken &&
         !mp_cancel_test(s->cancel))

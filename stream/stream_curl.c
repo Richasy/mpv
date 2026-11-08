@@ -831,6 +831,9 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
 {
     struct priv *p = userdata;
     size_t bytes = size * nmemb;
+    struct mp_prefetch_budget *budget = p->s->prefetch;
+    if (mp_prefetch_stopped(budget))
+        return CURL_WRITEFUNC_ERROR;
 
     // header_callback validated the response and logged any error status,
     // we don't care about error body.
@@ -865,7 +868,8 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
 
     mp_mutex_lock(&p->mtx);
 
-    if (p->buffer_size - p->count < bytes) {
+    if (p->buffer_size - p->count < bytes ||
+        (mp_prefetch_active(budget) && atomic_load(&budget->ready))) {
         // No room in the buffer. Pause the transfer and wait for the consumer.
         p->paused = true;
         mp_mutex_unlock(&p->mtx);
@@ -873,6 +877,15 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
         return CURL_WRITEFUNC_PAUSE;
     }
 
+    if (mp_prefetch_active(budget)) {
+        uint64_t used = atomic_load(&budget->bytes);
+        if (used > budget->max_bytes || bytes > budget->max_bytes - used) {
+            atomic_store(&budget->failed, true);
+            mp_mutex_unlock(&p->mtx);
+            return CURL_WRITEFUNC_ERROR;
+        }
+        atomic_fetch_add(&budget->bytes, bytes);
+    }
     mp_icy_process(p->icy, ptr, bytes, ring_write, p);
 
     p->paused = false;
@@ -893,6 +906,8 @@ static int xferinfo_callback(void *userdata, curl_off_t dl_total, curl_off_t dl_
                              curl_off_t ul_total, curl_off_t ul_now)
 {
     struct priv *p = userdata;
+    if (mp_prefetch_stopped(p->s->prefetch))
+        return 1;
     // Leave room inside the existing consumer deadline for a bounded retry.
     // Initial open and a body stalled behind backpressure keep their existing
     // timeout rules. The consumer deadline is never reset here.
@@ -1352,6 +1367,20 @@ static size_t header_callback(char *buffer, size_t size, size_t nitems, void *us
         return bytes;
 
     struct bstr line = bstr_strip_linebreaks((bstr){buffer, bytes});
+    struct mp_prefetch_budget *budget = p->s->prefetch;
+    if (mp_prefetch_active(budget) && bstr_startswith0(line, "HTTP/")) {
+        bstr status = bstr_cut(line, bstrchr(line, ' ') + 1);
+        int code = bstrtoll(status, NULL, 10);
+        bool redirect = code >= 300 && code < 400;
+        if ((redirect && atomic_load(&budget->requests) >= budget->max_requests) ||
+            (code >= 200 && code < 300 && code != 206))
+        {
+            atomic_store(&budget->failed, true);
+            return CURL_WRITEFUNC_ERROR;
+        }
+        if (redirect)
+            atomic_fetch_add(&budget->requests, 1);
+    }
     switch (p->scheme->proto) {
     case MP_CURL_PROTO_HTTP:
         on_http_header(p, line);
@@ -1463,6 +1492,16 @@ static void request_failed(struct priv *p)
 
 static void start_request(struct priv *p)
 {
+    struct mp_prefetch_budget *budget = p->s->prefetch;
+    if (mp_prefetch_active(budget) &&
+        (mp_prefetch_stopped(budget) ||
+         atomic_load(&budget->bytes) >= budget->max_bytes ||
+         atomic_load(&budget->requests) >= budget->max_requests))
+    {
+        atomic_store(&budget->failed, true);
+        request_failed(p);
+        return;
+    }
     if (finish_dash_expired_read(p))
         return;
     if (dash_request_stopped(p)) {
@@ -1492,7 +1531,21 @@ static void start_request(struct priv *p)
     uint64_t start = p->request_start;
 
     bool ranged = p->dash_kind || !p->probed || p->seekable;
-    bool chunked = ranged && p->opts->max_request_size > 0;
+    bool speculative = mp_prefetch_active(budget);
+    uint64_t speculative_size = 0;
+    if (speculative) {
+        uint_fast64_t reserved = atomic_load(&budget->reserved_bytes);
+        do {
+            if (reserved >= budget->max_bytes) {
+                atomic_store(&budget->failed, true);
+                request_failed(p);
+                return;
+            }
+            speculative_size = MPMIN(2 * 1024 * 1024, budget->max_bytes - reserved);
+        } while (!atomic_compare_exchange_weak(&budget->reserved_bytes,
+                                               &reserved, reserved + speculative_size));
+    }
+    bool chunked = ranged && (p->opts->max_request_size > 0 || speculative);
     bool capped = ranged && p->request_end > 0;
 
     bool past_size = p->seekable && p->content_size > 0 && start >= p->content_size;
@@ -1505,13 +1558,19 @@ static void start_request(struct priv *p)
         mp_mutex_unlock(&p->mtx);
         return;
     }
+    if (speculative)
+        atomic_fetch_add(&budget->requests, 1);
 
     char range[64], *range_arg = NULL;
     p->dash_requested_end = INT64_MAX;
     if (chunked || capped) {
         uint64_t end = UINT64_MAX;
         if (chunked) {
-            uint64_t cap = p->opts->max_request_size - 1;
+            uint64_t cap = speculative
+                ? speculative_size - 1
+                : p->opts->max_request_size - 1;
+            if (speculative && p->opts->max_request_size > 0)
+                cap = MPMIN(cap, p->opts->max_request_size - 1);
             end = cap > INT64_MAX - start ? INT64_MAX : start + cap;
         }
         if (p->content_size > 0)
@@ -1696,8 +1755,12 @@ static void on_done(struct priv *p, CURLcode code)
 #endif
     report_request(p, "end", code);
     bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
+    if (mp_prefetch_active(p->s->prefetch) &&
+        (code != CURLE_OK || p->reply_rejected || p->retry_http))
+        atomic_store(&p->s->prefetch->failed, true);
 
-    if (!p->dash_kind && p->retry_http && !aborted) {
+    if (!p->dash_kind && p->retry_http && !aborted &&
+        !mp_prefetch_active(p->s->prefetch)) {
         if (schedule_http_retry(p))
             return;
         MP_ERR(p, "HTTP error 429; retry count or wait budget exhausted.\n");
@@ -1819,6 +1882,7 @@ static void on_done(struct priv *p, CURLcode code)
     // Try to recover if the stream is seekable and the failure looks
     // recoverable.
     bool recoverable = !aborted && p->seekable &&
+                       !mp_prefetch_active(p->s->prefetch) &&
                        is_recoverable_error(code) &&
                        p->retry_count < p->opts->max_retries;
     if (recoverable) {
@@ -1911,6 +1975,8 @@ static bool setup_curl(struct priv *p)
     SETOPT(CURLOPT_ACCEPT_ENCODING, identity ? "identity" : "");
     SETOPT(CURLOPT_FOLLOWLOCATION, p->dash_kind ? 0L : 1L);
     SETOPT(CURLOPT_MAXREDIRS, p->dash_kind ? 0L : (long)p->opts->max_redirects);
+    if (p->s->prefetch)
+        SETOPT(CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L);
     if (p->dash_kind) {
         SETOPT(CURLOPT_PROTOCOLS_STR,
                p->dash.allow_loopback_http ? "https,http" : "https");
@@ -2216,7 +2282,7 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
         return STREAM_ERROR;
     }
     struct curl_opts *opts = mp_get_config_group(s, s->global, &curl_conf);
-    if (!opts->enabled && !dash)
+    if (!opts->enabled && !dash && !s->prefetch)
         return STREAM_NO_MATCH;
     if (curl_failed(s->global->curl, s->log, MSGL_ERR))
         return STREAM_NO_MATCH;
@@ -2244,6 +2310,8 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     mp_assert(p->scheme);
     p->content_size = -1;
     p->buffer_size = p->opts->buffer_size;
+    if (s->prefetch)
+        p->buffer_size = MPMIN(p->buffer_size, 256 * 1024);
     // A metadata miss often abandons this response after a few sectors.
     // Keep disc cursors responsive without downloading the default 4 MiB
     // per region before the sparse cache has requested those bytes.
@@ -2295,6 +2363,9 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
         mp_cancel_set_cb(s->cancel, on_cancel, p);
 
     int64_t deadline = stream_get_io_deadline(s);
+    if (mp_prefetch_active(s->prefetch))
+        deadline = deadline ? MPMIN(deadline, s->prefetch->deadline)
+                            : s->prefetch->deadline;
     p->open_deadline = deadline;
     cmd_sync(p, CMD_ADD, 0, false);
 

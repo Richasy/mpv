@@ -2936,6 +2936,13 @@ static void update_opts(struct demuxer *demuxer)
         if (seekable < 0)
             seekable = 1;
     }
+    if (mp_prefetch_active(demuxer->prefetch)) {
+        in->min_secs = demuxer->prefetch->seconds;
+        in->max_bytes = MPMIN(in->max_bytes, demuxer->prefetch->max_bytes);
+        in->max_bytes_bw = 0;
+        in->hyst_secs = 0;
+        in->hyst_bytes = 0;
+    }
     in->seekable_cache = seekable == 1;
     if (in->d_thread->no_cache_seeking)
         in->seekable_cache = false;
@@ -3852,7 +3859,8 @@ static struct demuxer *open_given_type(struct mpv_global *global,
         .is_network = sinfo->is_network,
         .is_streaming = sinfo->is_streaming,
         .stream_origin = sinfo->stream_origin,
-        .access_references = opts->access_references,
+        .access_references = opts->access_references && !(params && params->prefetch),
+        .prefetch = params ? params->prefetch : NULL,
         .opts = opts,
         .opts_cache = opts_cache,
         .events = DEMUX_EVENT_INIT | DEMUX_EVENT_DURATION | DEMUX_EVENT_METADATA | DEMUX_EVENT_STREAMS,
@@ -4061,8 +4069,23 @@ struct demuxer *demux_open_url(const char *url,
         mp_cancel_set_parent(priv_cancel, cancel);
     struct stream *s = params->external_stream;
     if (!s) {
-        s = stream_create(url, STREAM_READ | params->stream_flags,
-                          priv_cancel, global);
+        if (params->prefetch) {
+#if HAVE_LIBCURL
+            extern const stream_info_t stream_info_curl;
+            struct stream_open_args args = {
+                .url = url,
+                .flags = STREAM_READ | params->stream_flags,
+                .cancel = priv_cancel,
+                .global = global,
+                .sinfo = &stream_info_curl,
+                .prefetch = params->prefetch,
+            };
+            stream_create_with_args(&args, &s);
+#endif
+        } else {
+            s = stream_create(url, STREAM_READ | params->stream_flags,
+                              priv_cancel, global);
+        }
         if (s && params->init_fragment.len) {
             s = create_webshit_concat_stream(global, priv_cancel,
                                              params->init_fragment, s);
@@ -4083,6 +4106,17 @@ struct demuxer *demux_open_url(const char *url,
         talloc_free(priv_cancel);
     }
     return d;
+}
+
+void demux_adopt_prefetch(struct demuxer *demuxer)
+{
+    struct demux_internal *in = demuxer->in;
+    mp_mutex_lock(&in->lock);
+    if (demuxer->prefetch)
+        atomic_store(&demuxer->prefetch->active, false);
+    update_opts(in->d_thread);
+    mp_cond_signal(&in->wakeup);
+    mp_mutex_unlock(&in->lock);
 }
 
 // clear the packet queues

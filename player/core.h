@@ -497,6 +497,12 @@ typedef struct MPContext {
     int open_url_flags;
     bool open_for_prefetch;
     bool demuxer_changed;
+    struct mp_prefetch_budget *open_prefetch_budget;
+    char **open_prefetch_options;
+    int prefetch_state;
+    int64_t prefetch_bytes;
+    int prefetch_requests;
+    int prefetch_adoptions;
     // --- All fields below are owned by open_thread, unless open_done was set
     //     to true.
     struct demuxer *open_res_demuxer;
@@ -642,6 +648,9 @@ void autoload_external_files(struct MPContext *mpctx, struct mp_cancel *cancel);
 struct track *select_default_track(struct MPContext *mpctx, int order,
                                    enum stream_type type);
 void prefetch_next(struct MPContext *mpctx);
+bool mp_prefetch_file(struct MPContext *mpctx, const char *url);
+void mp_cancel_prefetch(struct MPContext *mpctx);
+int mp_update_prefetch(struct MPContext *mpctx);
 void update_lavfi_complex(struct MPContext *mpctx);
 void update_vo_chain_el_pair(struct MPContext *mpctx);
 

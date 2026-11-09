@@ -1600,7 +1600,7 @@ static void log_curl_error(struct priv *p, const char *what, CURLcode code)
     }
 }
 
-static bool schedule_http_retry(struct priv *p)
+static bool schedule_retry(struct priv *p, CURLcode code)
 {
     if (p->retry_count >= p->opts->max_retries)
         return false;
@@ -1620,8 +1620,14 @@ static bool schedule_http_retry(struct priv *p)
     p->retry_at = retry_at;
     p->retry_next = p->ctx->retries;
     p->ctx->retries = p;
-    MP_WARN(p, "HTTP 429, retrying (#%d) in %.3f seconds at offset %" PRIu64 "\n",
-            p->retry_count, delay, p->request_start);
+    if (p->dash_kind) {
+        MP_WARN(p, "DASH initial connection failed (curl %d), retrying (#%d)"
+                " in %.3f seconds at offset %" PRIu64 "\n",
+                code, p->retry_count, delay, p->request_start);
+    } else {
+        MP_WARN(p, "HTTP 429, retrying (#%d) in %.3f seconds at offset %" PRIu64 "\n",
+                p->retry_count, delay, p->request_start);
+    }
     return true;
 }
 
@@ -1706,7 +1712,7 @@ static void on_done(struct priv *p, CURLcode code)
     bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
 
     if (!p->dash_kind && p->retry_http && !aborted) {
-        if (schedule_http_retry(p))
+        if (schedule_retry(p, code))
             return;
         MP_ERR(p, "HTTP error 429; retry count or wait budget exhausted.\n");
         mp_mutex_lock(&p->mtx);
@@ -1732,6 +1738,10 @@ static void on_done(struct priv *p, CURLcode code)
     }
     if (!p->probed) {
         // Connection died before any headers arrived.
+        if (p->dash_kind && !p->dash_status_seen && !p->dash_headers_ok &&
+            !p->reply_rejected && !p->request_received &&
+            is_recoverable_error(code) && schedule_retry(p, code))
+            return;
         if (p->dash_kind && !aborted && !mp_dash_source_terminal(p->global))
             mp_dash_source_fail_transfer(p->global, MPV_DASH_FAILURE_TRANSPORT,
                 MPV_DASH_ORIGIN_OTHER, diagnostic);

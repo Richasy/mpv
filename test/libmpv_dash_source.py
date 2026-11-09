@@ -288,8 +288,8 @@ class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
 
-    def __init__(self, tracks, certificates=None):
-        super().__init__(("127.0.0.1", 0), Handler)
+    def __init__(self, tracks, certificates=None, address=("127.0.0.1", 0)):
+        super().__init__(address, Handler)
         self.secure = certificates is not None
         if certificates:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

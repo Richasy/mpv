@@ -6179,7 +6179,8 @@ sensitive request details.
 ``--curl-respect-retry-after=<yes|no>``
     Honor seconds and HTTP-date forms of Retry-After when retrying HTTP 429
     (default: ``yes``). Missing or invalid values use bounded exponential
-    backoff. Cancellation and network timeout remain authoritative.
+    backoff starting at one second, doubling on each consecutive retry.
+    Cancellation and network timeout remain authoritative.
 
 ``--curl-retry-delay-max=<seconds>``
     Maximum permitted retry delay (default: 30, range 0-600). A Retry-After

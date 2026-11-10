@@ -1663,7 +1663,7 @@ static bool schedule_http_retry(struct priv *p)
 {
     if (p->retry_count >= p->opts->max_retries)
         return false;
-    double delay = p->retry_count ? ldexp(1, p->retry_count) - 1 : 0;
+    double delay = ldexp(1, p->retry_count);
     if (p->opts->respect_retry_after && p->retry_after >= 0)
         delay = p->retry_after;
     if (delay > p->opts->retry_delay_max)

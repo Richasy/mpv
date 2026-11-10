@@ -155,7 +155,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def retry(self, path, count):
         scenario = self.server.state.scenario
-        if scenario == "seconds" and count == 1:
+        if scenario in ("missing-header", "invalid-header") and count <= 2:
+            headers = [("Retry-After", "invalid")] if scenario == "invalid-header" else []
+            self.reply(429, headers=headers)
+        elif scenario == "seconds" and count == 1:
             self.server.state.first_429.set()
             self.reply(429, headers=[("Retry-After", "1")])
         elif scenario == "date" and count == 1:
@@ -247,6 +250,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if scenario == "keepalive":
             self.media(WAV, "audio/wav")
         elif scenario in {
+            "missing-header", "invalid-header",
             "seconds", "date", "opt-out", "always-zero", "delay-max",
             "budget", "cancel", "ignore-date", "isolation",
         }:
@@ -357,6 +361,8 @@ def child_keepalive(library, base, enabled):
 
 def child_retry(library, url, case):
     case_options = {
+        "missing-header": {"curl-retry-http-429": "yes", "curl-max-retries": "2"},
+        "invalid-header": {"curl-retry-http-429": "yes", "curl-max-retries": "2"},
         "seconds": {"curl-retry-http-429": "yes", "curl-max-retries": "1"},
         "date": {"curl-retry-http-429": "yes", "curl-max-retries": "1"},
         "opt-out": {},
@@ -379,7 +385,7 @@ def child_retry(library, url, case):
     with contextlib.ExitStack() as stack:
         mpv = load_libmpv(stack, library)
         client = create_client(stack, mpv, options(**case_options))
-        if case in ("seconds", "date", "ignore-date"):
+        if case in ("seconds", "date", "ignore-date", "missing-header", "invalid-header"):
             load_complete(mpv, client, url)
             result = {"success": True}
         else:
@@ -527,6 +533,8 @@ def check_keepalive(library, server):
 def check_retries(library, server):
     base = f"http://127.0.0.1:{server.server_port}"
     expectations = {
+        "missing-header": (3, True),
+        "invalid-header": (3, True),
         "seconds": (2, True),
         "date": (2, True),
         "opt-out": (1, False),
@@ -546,6 +554,10 @@ def check_retries(library, server):
                 f"{case}: expected {count} requests, got {len(requests)}")
         if bool(report.get("success")) != success:
             raise RuntimeError(f"{case}: unexpected result {report}")
+        if case in ("missing-header", "invalid-header"):
+            for index, minimum in ((1, 0.8), (2, 1.8)):
+                if requests[index][2] - requests[index - 1][2] < minimum:
+                    raise RuntimeError(f"{case}: HTTP 429 retry did not back off")
         if case == "seconds" and requests[1][2] - requests[0][2] < 0.8:
             raise RuntimeError("Retry-After seconds was not respected")
         if case == "date" and requests[1][2] - requests[0][2] < 0.7:

@@ -233,9 +233,15 @@ static void set_errno_from_lasterror(void)
     }
 }
 
+// Windows can report ERROR_PATH_NOT_FOUND for an overlong path as well.
+// Retry failed paths at MAX_PATH regardless of the initial error code.
+static bool mp_long_path_retry(DWORD error, const wchar_t *path)
+{
+    return error == ERROR_FILENAME_EXCED_RANGE || wcslen(path) >= MAX_PATH;
+}
+
 // Build an extended-length path (\\?\...) from a wide-char path.
 // Returns a talloc-allocated wide string, or NULL if the path cannot be extended.
-// Only call this when CreateFileW/MoveFileExW fails with ERROR_FILENAME_EXCED_RANGE.
 static wchar_t *mp_extend_long_path(void *talloc_ctx, const wchar_t *wpath)
 {
     if (!wpath || !wpath[0])
@@ -263,7 +269,8 @@ static wchar_t *mp_extend_long_path(void *talloc_ctx, const wchar_t *wpath)
 
     // Drive-letter path: C:\... -> \\?\C:\...
     if (((norm[0] >= L'A' && norm[0] <= L'Z') ||
-         (norm[0] >= L'a' && norm[0] <= L'z')) && norm[1] == L':')
+         (norm[0] >= L'a' && norm[0] <= L'z')) && norm[1] == L':' &&
+        norm[2] == L'\\')
     {
         wchar_t *result = talloc_array(talloc_ctx, wchar_t, len + 5);
         wmemcpy(result, L"\\\\?\\", 4);
@@ -399,7 +406,7 @@ int mp_stat(const char *path, struct mp_stat *buf)
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | SECURITY_SQOS_PRESENT |
         SECURITY_IDENTIFICATION, NULL);
 
-    if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILENAME_EXCED_RANGE) {
+    if (h == INVALID_HANDLE_VALUE && mp_long_path_retry(GetLastError(), wpath)) {
         wchar_t *long_path = mp_extend_long_path(NULL, wpath);
         if (long_path) {
             h = CreateFileW(long_path, FILE_READ_ATTRIBUTES,
@@ -583,7 +590,7 @@ int mp_open(const char *filename, int oflag, ...)
     HANDLE h = CreateFileW(wpath, access, share, NULL, disposition, flags, NULL);
 
     // Retry with \\?\ prefix for paths exceeding MAX_PATH
-    if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILENAME_EXCED_RANGE) {
+    if (h == INVALID_HANDLE_VALUE && mp_long_path_retry(GetLastError(), wpath)) {
         wchar_t *long_path = mp_extend_long_path(NULL, wpath);
         if (long_path) {
             h = CreateFileW(long_path, access, share, NULL, disposition, flags, NULL);
@@ -621,7 +628,8 @@ int mp_rename(const char *oldpath, const char *newpath)
         *wnewpath = mp_from_utf8(NULL, newpath);
     BOOL ok = MoveFileExW(woldpath, wnewpath, MOVEFILE_REPLACE_EXISTING);
 
-    if (!ok && GetLastError() == ERROR_FILENAME_EXCED_RANGE) {
+    if (!ok && (mp_long_path_retry(GetLastError(), woldpath) ||
+                mp_long_path_retry(GetLastError(), wnewpath))) {
         wchar_t *long_old = mp_extend_long_path(NULL, woldpath);
         wchar_t *long_new = mp_extend_long_path(NULL, wnewpath);
         if (long_old || long_new) {

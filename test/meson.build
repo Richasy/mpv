@@ -331,6 +331,15 @@ if get_option('libmpv')
         shared = true
     endif
     if shared
+        if win32
+            long_paths = executable(
+                'libmpv-long-paths', 'libmpv_test_long_paths.c',
+                include_directories: incdir_public,
+                link_args: cc.get_supported_link_arguments('-municode'),
+            )
+            test('libmpv-long-paths', long_paths, args: [mpvlib.full_path()],
+                 depends: mpvlib, timeout: 30)
+        endif
         test('libmpv-paused-refresh', python,
              args: [files('libmpv_paused_refresh.py'), mpvlib.full_path(),
                     join_paths(outdir, 'paused-refresh')],

@@ -263,16 +263,18 @@ def generate_tls_certificates(directory):
             "-keyout", wsl_path(server_key), "-out", wsl_path(server_cert),
             "-subj", "/CN=server-local-test",
             "-addext", "subjectAltName=IP:127.0.0.1", "-days", "1")
-    validity = subprocess.run(
-        ["wsl.exe", "-d", "mpv-build", "--", "openssl", "x509",
-         "-in", wsl_path(client_cert), "-noout", "-startdate"],
-        capture_output=True, text=True, timeout=15, check=True,
-    ).stdout.strip()
-    if not validity.startswith("notBefore="):
-        raise AssertionError("Synthetic client certificate validity is unavailable")
-    not_before = datetime.strptime(
-        validity.removeprefix("notBefore="), "%b %d %H:%M:%S %Y GMT"
-    ).replace(tzinfo=timezone.utc).timestamp()
+    not_before = 0
+    for certificate in (ca_cert, client_cert, server_cert):
+        validity = subprocess.run(
+            ["wsl.exe", "-d", "mpv-build", "--", "openssl", "x509",
+             "-in", wsl_path(certificate), "-noout", "-startdate"],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout.strip()
+        if not validity.startswith("notBefore="):
+            raise AssertionError("Synthetic certificate validity is unavailable")
+        not_before = max(not_before, datetime.strptime(
+            validity.removeprefix("notBefore="), "%b %d %H:%M:%S %Y GMT"
+        ).replace(tzinfo=timezone.utc).timestamp())
     wait = max(0, not_before - time.time() + 0.5)
     if wait > 30:
         raise AssertionError("Windows/WSL certificate clock skew exceeds 30 seconds")

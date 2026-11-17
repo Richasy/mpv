@@ -78,7 +78,7 @@ def run_case(mpv, tracks, role, mode):
                         message = ctypes.cast(event.data, ctypes.POINTER(fixture.LogMessage)).contents
                         text = ctypes.string_at(message.text).decode("utf-8", "replace")
                         retry = re.search(
-                            r"DASH initial connection failed \(curl (\d+)\), retrying \(#(\d+)\)", text)
+                            r"DASH recovery: stream=\d+ track=\d+ phase=1 action=1 reason=1 curl=(\d+) attempt=(\d+)", text)
                         if retry:
                             counts.append(int(retry[2]))
                             if mode == "connect" and recovered_server is None:

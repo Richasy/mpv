@@ -119,7 +119,7 @@ def run_case(mpv, tracks, role, mode, ordinary_other=False):
                             assert blocked.is_set(), "Fixture did not reach a continuation"
                             assert state.generation == generation, "Recovery created a new source generation"
                             repeated = [start for current, start in attempts if current == role and start == held_offset]
-                            if mode in ("recover", "paused-prefetch"):
+                            if mode in ("recover", "paused-prefetch", "empty-reply"):
                                 assert reason == 0 and state.failure == 0 and loaded and maximum >= 12, (
                                     "Header stall terminated playback", reason, state.failure, maximum,
                                     fixture.prop(mpv, handle, "rodel-dash-transfer"))
@@ -136,8 +136,6 @@ def run_case(mpv, tracks, role, mode, ordinary_other=False):
                                 if mode in ("permanent", "budget-zero"):
                                     assert time.monotonic() - stalled_at < 6, "Recovery extended the consumer deadline"
                                     assert len(repeated) <= (1 if mode == "budget-zero" else 2)
-                                elif mode == "empty-reply":
-                                    assert len(repeated) == 1, "An immediate non-timeout failure was retried"
                                 else:
                                     assert len(repeated) == 2
                             settled = len(attempts)

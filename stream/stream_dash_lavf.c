@@ -6,6 +6,7 @@
 #include <libavutil/error.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <string.h>
 #include "common/common.h"
 #include "common/global.h"
@@ -29,8 +30,12 @@ struct dash_lavf {
     uint64_t offset, start, expected, received;
     int status, interim_count, requests;
     bool interim, final_seen, headers_ok, length_known, seekable, finished;
+    uint64_t diagnostic_stream;
+    bool recovery_reported;
     char *range, *length, *encoding, *accept_ranges, *transfer_encoding;
 };
+
+static atomic_uint_fast64_t next_diagnostic_stream;
 
 static bool stopped(struct dash_lavf *p)
 {
@@ -55,6 +60,19 @@ static void begin_io(struct dash_lavf *p)
 static int fail(struct dash_lavf *p, mpv_dash_source_failure failure,
                 mpv_dash_failure_origin origin)
 {
+    if (!p->recovery_reported) {
+        p->recovery_reported = true;
+        int64_t remaining = p->deadline ?
+            MPMAX(p->deadline - mp_time_ns(), 0) / 1000000 : -1;
+        int reason = mp_cancel_test(p->s->cancel) ? 5 :
+                     mp_dash_source_terminal(p->s->global) ? 8 :
+                     remaining == 0 ? 4 :
+                     failure == MPV_DASH_FAILURE_TRANSPORT ? 9 : 6;
+        MP_WARN(p->s, "DASH recovery: stream=%llu track=%d phase=%d action=2 reason=%d curl=-1 attempt=0 limit=0 delay_ms=0 remaining_ms=%lld\n",
+                (unsigned long long)p->diagnostic_stream, p->kind,
+                p->headers_ok ? 3 : p->start ? 2 : 1,
+                reason, (long long)remaining);
+    }
     if (!stopped(p))
         mp_dash_source_fail_with_origin(p->s->global, p->kind, failure, origin);
     p->s->error = AVERROR(EIO);
@@ -191,7 +209,7 @@ static int open_at(struct dash_lavf *p, uint64_t offset)
     av_dict_free(&options);
     if (result < 0 || !p->headers_ok || stopped(p)) {
         close_io(p);
-        if (!stopped(p)) fail(p, MPV_DASH_FAILURE_TRANSPORT, MPV_DASH_ORIGIN_OTHER);
+        fail(p, MPV_DASH_FAILURE_TRANSPORT, MPV_DASH_ORIGIN_OTHER);
         return result < 0 ? result : AVERROR(EIO);
     }
     p->s->seekable = p->seekable;
@@ -260,6 +278,8 @@ int mp_dash_lavf_open(struct stream *s, const struct stream_open_args *args)
     if (args->open_offset < 0) return STREAM_ERROR;
     struct dash_lavf *p = talloc_zero(s, struct dash_lavf);
     p->s = s; p->total = -1; s->priv = p;
+    p->diagnostic_stream = (UINT64_C(1) << 63) |
+                          (atomic_fetch_add(&next_diagnostic_stream, 1) + 1);
     if (!mp_dash_source_get_track(s->global, s->url, p, &p->kind, &p->config)) return STREAM_ERROR;
     s->close = close_stream;
     if (open_at(p, args->open_offset) < 0) return STREAM_ERROR;

@@ -56,6 +56,7 @@
 #include "player/dash_source.h"
 #include "stream_dash_lavf.h"
 #include "dash_http.h"
+#include "dash_recovery.h"
 
 enum curl_proto {
     MP_CURL_PROTO_HTTP,
@@ -254,6 +255,9 @@ struct priv {
     int64_t retry_deadline;
     int64_t retry_at;
     struct priv *retry_next;
+    uint64_t recovery_stream;
+    int recovery_phase, recovery_code, recovery_delay;
+    bool recovery_pending, recovery_episode_active;
 
     uint64_t diagnostic_id;
     uint64_t diagnostic_offset;
@@ -310,6 +314,9 @@ struct cmd {
 
 static void start_request(struct priv *p);
 static void on_done(struct priv *p, CURLcode code);
+static bool dash_request_stopped(struct priv *p);
+static void report_recovery(struct priv *p, int action, int reason,
+                            int64_t remaining);
 static void fail_dash_timeout(struct priv *p);
 
 static void defer_request(struct priv *p)
@@ -391,6 +398,12 @@ static void remove_retry(struct priv *p)
     struct priv **next = &p->ctx->retries;
     while (*next) {
         if (*next == p) {
+            if (p->recovery_pending) {
+                report_recovery(p, 2, MP_DASH_RECOVERY_ABORTED,
+                    p->retry_deadline ?
+                        MPMAX(p->retry_deadline - mp_time_ns(), 0) / 1000000 : -1);
+                p->recovery_pending = false;
+            }
             *next = p->retry_next;
             p->retry_next = NULL;
             p->retry_at = 0;
@@ -406,11 +419,12 @@ static void start_pending_retries(struct curl_ctx *ctx)
     int64_t now = mp_time_ns();
     while (*next) {
         struct priv *p = *next;
-        if (atomic_load(&p->aborted) || p->retry_at <= now) {
+        if (atomic_load(&p->aborted) || dash_request_stopped(p) ||
+            p->retry_at <= now) {
             *next = p->retry_next;
             p->retry_next = NULL;
             p->retry_at = 0;
-            if (!atomic_load(&p->aborted))
+            if (p->dash_kind || !atomic_load(&p->aborted))
                 start_request(p);
         } else {
             next = &p->retry_next;
@@ -528,6 +542,8 @@ static void run_cmd(void *arg)
         c->p->request_received = 0;
         c->p->retry_count = 0;
         c->p->retry_deadline = 0;
+        c->p->recovery_episode_active = false;
+        c->p->recovery_pending = false;
         c->p->finished = false;
         start_request(c->p);
         break;
@@ -1416,6 +1432,10 @@ static bool finish_dash_expired_read(struct priv *p)
     mp_mutex_unlock(&p->mtx);
     if (!expired)
         return false;
+    if (p->recovery_pending) {
+        report_recovery(p, 2, MP_DASH_RECOVERY_DEADLINE, 0);
+        p->recovery_pending = false;
+    }
     if (p->active) {
         curl_multi_remove_handle(p->ctx->multi, p->curl);
         p->active = false;
@@ -1461,8 +1481,49 @@ static void request_failed(struct priv *p)
     mp_mutex_unlock(&p->mtx);
 }
 
+static void report_recovery(struct priv *p, int action, int reason,
+                            int64_t remaining)
+{
+    MP_WARN(p, "DASH recovery: stream=%llu track=%d phase=%d action=%d reason=%d curl=%d attempt=%d limit=%d delay_ms=%d remaining_ms=%lld\n",
+            (unsigned long long)p->recovery_stream, p->dash_kind, p->recovery_phase,
+            action, reason, p->recovery_code, p->retry_count,
+            p->opts->max_retries, p->recovery_delay, (long long)remaining);
+}
+
+static bool finish_pending_recovery(struct priv *p)
+{
+    if (p->dash_kind && p->recovery_pending) {
+        int64_t read = atomic_load_explicit(&p->dash_read_deadline,
+                                            memory_order_relaxed);
+        read = mp_dash_source_io_deadline(p->global, read, p->net_opts->timeout);
+        if (read && (!p->retry_deadline || read < p->retry_deadline))
+            p->retry_deadline = read;
+        int64_t remaining = p->retry_deadline ?
+            MPMAX(p->retry_deadline - mp_time_ns(), 0) / 1000000 : -1;
+        int reason = atomic_load_explicit(&p->aborted, memory_order_relaxed) ?
+            MP_DASH_RECOVERY_ABORTED : dash_request_stopped(p) ?
+            MP_DASH_RECOVERY_TERMINAL :
+            remaining == 0 ? MP_DASH_RECOVERY_DEADLINE : 0;
+        if (reason) {
+            report_recovery(p, 2, reason, remaining);
+            p->recovery_pending = false;
+            if (reason == MP_DASH_RECOVERY_DEADLINE)
+                fail_dash_timeout(p);
+            if (p->active) {
+                curl_multi_remove_handle(p->ctx->multi, p->curl);
+                p->active = false;
+            }
+            finish_dash_terminal(p);
+            return true;
+        }
+    }
+    return false;
+}
+
 static void start_request(struct priv *p)
 {
+    if (finish_pending_recovery(p))
+        return;
     if (finish_dash_expired_read(p))
         return;
     if (dash_request_stopped(p)) {
@@ -1553,14 +1614,26 @@ static void start_request(struct priv *p)
     }
     if (finish_dash_expired_read(p))
         return;
+    if (finish_pending_recovery(p))
+        return;
     CURLMcode mres = curl_multi_add_handle(p->ctx->multi, p->curl);
     if (mres != CURLM_OK) {
+        if (p->recovery_pending) {
+            report_recovery(p, 2, MP_DASH_RECOVERY_PERMANENT,
+                p->retry_deadline ?
+                    MPMAX(p->retry_deadline - mp_time_ns(), 0) / 1000000 : -1);
+            p->recovery_pending = false;
+        }
         MP_ERR(p, "Failed to start the request: %s\n", curl_multi_strerror(mres));
         request_failed(p);
         return;
     }
     p->active = true;
+    if (finish_pending_recovery(p))
+        return;
     p->diagnostic_id = ++p->ctx->next_request_id;
+    if (!p->recovery_stream)
+        p->recovery_stream = p->diagnostic_id;
     p->diagnostic_offset = start;
     p->diagnostic_started = mp_time_ns();
     p->diagnostic_reports = 0;
@@ -1577,12 +1650,25 @@ static void start_request(struct priv *p)
     if (finish_dash_expired_read(p))
         return;
     if (dash_request_stopped(p)) {
+        if (p->recovery_pending) {
+            report_recovery(p, 2,
+                atomic_load_explicit(&p->aborted, memory_order_relaxed) ?
+                    MP_DASH_RECOVERY_ABORTED : MP_DASH_RECOVERY_TERMINAL,
+                p->retry_deadline ?
+                    MPMAX(p->retry_deadline - mp_time_ns(), 0) / 1000000 : -1);
+            p->recovery_pending = false;
+        }
 #ifdef MPV_DASH_TEST_HOOKS
         dash_test_record_continuation(p, true);
 #endif
         curl_multi_remove_handle(p->ctx->multi, p->curl);
         p->active = false;
         finish_dash_terminal(p);
+    } else if (!finish_pending_recovery(p) && p->recovery_pending) {
+        report_recovery(p, 3, MP_DASH_RECOVERY_CANDIDATE,
+            p->retry_deadline ?
+                MPMAX(p->retry_deadline - mp_time_ns(), 0) / 1000000 : -1);
+        p->recovery_pending = false;
     }
 }
 
@@ -1600,7 +1686,7 @@ static void log_curl_error(struct priv *p, const char *what, CURLcode code)
     }
 }
 
-static bool schedule_retry(struct priv *p, CURLcode code)
+static bool schedule_retry(struct priv *p)
 {
     if (p->retry_count >= p->opts->max_retries)
         return false;
@@ -1620,74 +1706,89 @@ static bool schedule_retry(struct priv *p, CURLcode code)
     p->retry_at = retry_at;
     p->retry_next = p->ctx->retries;
     p->ctx->retries = p;
-    if (p->dash_kind) {
-        MP_WARN(p, "DASH initial connection failed (curl %d), retrying (#%d)"
-                " in %.3f seconds at offset %" PRIu64 "\n",
-                code, p->retry_count, delay, p->request_start);
-    } else {
-        MP_WARN(p, "HTTP 429, retrying (#%d) in %.3f seconds at offset %" PRIu64 "\n",
-                p->retry_count, delay, p->request_start);
-    }
+    MP_WARN(p, "HTTP 429, retrying (#%d) in %.3f seconds at offset %" PRIu64 "\n",
+            p->retry_count, delay, p->request_start);
     return true;
 }
 
-static bool resume_dash_request(struct priv *p, CURLcode code)
+static bool recover_dash_request(struct priv *p, CURLcode code)
 {
-    if (!p->dash_kind || dash_request_stopped(p) || finish_dash_expired_read(p) ||
-        !p->seekable || !is_recoverable_error(code) ||
-        p->opts->max_retries <= 0)
-        return false;
+    int phase = !p->probed ? MP_DASH_RECOVERY_INITIAL :
+                !p->dash_headers_ok ? MP_DASH_RECOVERY_HEADER :
+                                     MP_DASH_RECOVERY_BODY;
+    bool safe = false;
+    if (phase == MP_DASH_RECOVERY_INITIAL)
+        safe = !p->dash_status_seen && !p->dash_headers_ok &&
+               !p->reply_rejected && !p->request_received;
+    else if (phase == MP_DASH_RECOVERY_HEADER)
+        safe = dash_waiting_for_continuation_headers(p);
+    struct curl_header *transfer = NULL;
+    uint64_t total = p->content_size;
+    long status = 0;
+    curl_easy_getinfo(p->curl, CURLINFO_RESPONSE_CODE, &status);
+    if (phase == MP_DASH_RECOVERY_BODY)
+        safe = (status == 200 || status == 206) &&
+            p->seekable && p->dash_response_length_known &&
+            p->request_received > 0 &&
+            p->request_received < p->dash_response_length &&
+            p->content_size > 0 && p->request_start < total &&
+            p->request_received < total - p->request_start &&
+            (!p->request_end || (p->request_start < p->request_end &&
+             p->request_received < p->request_end - p->request_start)) &&
+            dash_identity_encoding(p->curl) &&
+            curl_easy_header(p->curl, "Transfer-Encoding", 0,
+                             CURLH_HEADER, -1, &transfer) == CURLHE_MISSING;
+    if (safe && phase == MP_DASH_RECOVERY_BODY &&
+        p->request_received >= 1024 * 1024)
+        p->retry_count = 0;
 
-    if (p->dash_header_timed_out && code == CURLE_OPERATION_TIMEDOUT &&
-        dash_waiting_for_continuation_headers(p) &&
-        p->retry_count < p->opts->max_retries) {
-        p->retry_count++;
-        MP_WARN(p, "DASH continuation awaiting headers (curl %d), retrying (#%d) at %" PRIu64 "\n",
-                code, p->retry_count, p->request_start);
-#ifdef MPV_DASH_TEST_HOOKS
-        dash_test_before_continuation(p);
-#endif
-        start_request(p);
-        return true;
+    int64_t now = mp_time_ns();
+    if (!p->recovery_episode_active) {
+        p->recovery_episode_active = true;
+        p->recovery_stream = p->diagnostic_id;
+    }
+    if (!p->retry_deadline && p->net_opts->timeout > 0)
+        p->retry_deadline = mp_time_ns_add(now, p->net_opts->timeout);
+    int64_t deadline = p->probed ? p->retry_deadline : p->open_deadline;
+    int64_t read = atomic_load_explicit(&p->dash_read_deadline,
+                                        memory_order_relaxed);
+    read = mp_dash_source_io_deadline(p->global, read, p->net_opts->timeout);
+    if (read && (!deadline || read < deadline))
+        deadline = read;
+    p->retry_deadline = deadline;
+    int64_t remaining = deadline ? MPMAX(deadline - now, 0) / 1000000 : -1;
+    struct mp_dash_recovery_decision decision = mp_dash_recovery_decide(
+        (struct mp_dash_recovery_input) {
+            .code = code, .safe = safe, .supported = true,
+            .aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed),
+            .terminal = mp_dash_source_terminal(p->global),
+            .attempt = p->retry_count, .limit = p->opts->max_retries,
+            .remaining_ms = remaining,
+            .delay_max_ms = p->opts->retry_delay_max * 1000,
+        });
+    p->recovery_phase = phase;
+    p->recovery_code = code;
+    p->recovery_delay = decision.delay_ms;
+    if (decision.action != 1) {
+        report_recovery(p, 2, decision.reason, remaining);
+        return false;
     }
 
-    if (!p->dash_headers_ok || !p->dash_response_length_known ||
-        !p->request_received ||
-        p->request_received >= p->dash_response_length || p->content_size <= 0)
-        return false;
-
-    struct curl_header *transfer = NULL;
-    if (!dash_identity_encoding(p->curl) ||
-        curl_easy_header(p->curl, "Transfer-Encoding", 0,
-                         CURLH_HEADER, -1, &transfer) != CURLHE_MISSING)
-        return false;
-
-    uint64_t total = p->content_size;
-    if (p->request_start >= total ||
-        p->request_received >= total - p->request_start ||
-        (p->request_end &&
-         (p->request_start >= p->request_end ||
-          p->request_received >= p->request_end - p->request_start)))
-        return false;
-
-    // Count consecutive low-progress failures, not distant disconnections
-    // throughout a large response. Tiny/trickling attempts retain their budget.
-    if (p->request_received >= 1024 * 1024)
-        p->retry_count = 0;
-    if (p->retry_count >= p->opts->max_retries)
-        return false;
-
-    // The ring retains these identity bytes. Resume after the producer's
-    // accepted bytes, not the consumer cursor or a past-size EOF shortcut.
-    p->request_start += p->request_received;
-    p->request_received = 0;
+    if (phase == MP_DASH_RECOVERY_BODY) {
+        // The ring owns accepted identity bytes, not the consumer cursor.
+        p->request_start += p->request_received;
+        p->request_received = 0;
+    }
     p->retry_count++;
-    MP_WARN(p, "DASH transfer interrupted (curl %d), resuming (#%d) at %" PRIu64 "\n",
-            code, p->retry_count, p->request_start);
+    report_recovery(p, 1, decision.reason, remaining);
+    p->recovery_pending = true;
 #ifdef MPV_DASH_TEST_HOOKS
-    dash_test_before_continuation(p);
+    if (phase != MP_DASH_RECOVERY_INITIAL)
+        dash_test_before_continuation(p);
 #endif
-    start_request(p);
+    p->retry_at = mp_time_ns_add(now, decision.delay_ms / 1000.0);
+    p->retry_next = p->ctx->retries;
+    p->ctx->retries = p;
     return true;
 }
 
@@ -1712,7 +1813,7 @@ static void on_done(struct priv *p, CURLcode code)
     bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
 
     if (!p->dash_kind && p->retry_http && !aborted) {
-        if (schedule_retry(p, code))
+        if (schedule_retry(p))
             return;
         MP_ERR(p, "HTTP error 429; retry count or wait budget exhausted.\n");
         mp_mutex_lock(&p->mtx);
@@ -1732,16 +1833,18 @@ static void on_done(struct priv *p, CURLcode code)
         .aborted = aborted,
     };
 
+    if (p->dash_kind && (dash_request_stopped(p) || !p->probed ||
+        !p->dash_headers_ok || code != CURLE_OK ||
+        (p->dash_response_length_known &&
+         p->request_received != p->dash_response_length)) &&
+        recover_dash_request(p, code))
+        return;
     if (dash_request_stopped(p)) {
         finish_dash_terminal(p);
         return;
     }
     if (!p->probed) {
         // Connection died before any headers arrived.
-        if (p->dash_kind && !p->dash_status_seen && !p->dash_headers_ok &&
-            !p->reply_rejected && !p->request_received &&
-            is_recoverable_error(code) && schedule_retry(p, code))
-            return;
         if (p->dash_kind && !aborted && !mp_dash_source_terminal(p->global))
             mp_dash_source_fail_transfer(p->global, MPV_DASH_FAILURE_TRANSPORT,
                 MPV_DASH_ORIGIN_OTHER, diagnostic);
@@ -1753,9 +1856,6 @@ static void on_done(struct priv *p, CURLcode code)
         mp_mutex_unlock(&p->mtx);
         return;
     }
-
-    if (resume_dash_request(p, code))
-        return;
 
     if (p->dash_kind &&
         (!p->dash_headers_ok || code != CURLE_OK ||
@@ -1802,6 +1902,7 @@ static void on_done(struct priv *p, CURLcode code)
     if (code == CURLE_OK && !aborted) {
         p->retry_count = 0;
         p->retry_deadline = 0;
+        p->recovery_episode_active = false;
 
         if (p->dash_kind && p->dash_ordinary_response) {
             p->finished = true;

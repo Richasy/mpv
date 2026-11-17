@@ -21,6 +21,11 @@ def run_case(mpv, tracks, role, mode):
         server.disconnect_role = role
         server.disconnect_attempts = 7 if mode == "progress" else 100
         server.disconnect_bytes = 1048576 if mode == "progress" else 1
+        if mode == "http-503":
+            server.full_body_roles.add(role)
+            server.full_body_status[role] = 503
+            server.full_body_payloads[role] = tracks[role][:32768]
+            server.full_body_lengths[role] = len(tracks[role])
         if mode == "progress":
             server.disconnect_min_payload = 1048577
         retries = 0 if mode == "disabled" else 5
@@ -62,8 +67,8 @@ def run_case(mpv, tracks, role, mode):
                 else:
                     assert reason == fixture.END_ERROR
                     assert state.failure == fixture.TRANSPORT
-                    assert offsets == [i * server.disconnect_bytes
-                                       for i in range(retries + 1)], offsets
+                    assert offsets == ([0] if mode == "http-503" else [
+                        i * server.disconnect_bytes for i in range(retries + 1)]), offsets
                 settled = len(server.requests)
                 for _ in range(5):
                     mpv.mpv_wait_event(handle, 0.02)
@@ -88,7 +93,7 @@ def main():
             fixture.configure_library(mpv)
             assert not hasattr(mpv, "mpv_dash_test_control")
             for role in ("video", "audio"):
-                for mode in ("progress", "tiny", "disabled"):
+                for mode in ("progress", "tiny", "disabled", "http-503"):
                     run_case(mpv, tracks, role, mode)
             if "--positive-only" not in sys.argv:
                 short = fixture.generate_tracks(directory)

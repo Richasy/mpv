@@ -3735,6 +3735,8 @@ Property list
     model session. Decoder-owned image memory never escapes into the worker.
     The normal bitmap decoder still retains its four-event display queue:
     demuxer read-ahead does not make it an unlimited decoded-image cache.
+    Contiguous redraws of the same bitmap keep one OCR cue and its translation.
+    A gap or a change to the bitmap starts a separate cue with its own fallback.
     A subtitle whose end is not known yet uses the decoder's one-minute
     ceiling and is revised when a following display/clear event closes it.
     This provisional interval does not advance bilingual-layout observations.

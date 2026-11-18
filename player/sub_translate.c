@@ -220,15 +220,20 @@ static bool secondary_conflict(struct sub_translate_state *state)
     return secondary && !owns_secondary(state, secondary);
 }
 
+static void reset_companion(struct sub_translate_state *state)
+{
+    if (state->mpctx->demuxer)
+        demux_clear_translated_sub_queue(state->mpctx->demuxer);
+    reset_translated_subtitle_track(state->mpctx);
+}
+
 static void clear_output(struct sub_translate_state *state, bool deselect)
 {
     if (state->bitmap && state->source_decoder) {
         sub_control(state->source_decoder, SD_CTRL_SET_BITMAP_REPLACEMENT, NULL);
         redraw_replacement(state);
     }
-    if (state->mpctx->demuxer)
-        demux_clear_translated_sub_queue(state->mpctx->demuxer);
-    reset_translated_subtitle_track(state->mpctx);
+    reset_companion(state);
 
     struct track *secondary =
         state->mpctx->current_track[1][STREAM_SUB];
@@ -539,16 +544,22 @@ static void rebuild_output(struct sub_translate_state *state)
         state->needs_rebuild = true;
         return;
     }
-    clear_output(state, false);
-    if (state->bitmap)
-        sub_control(state->source_decoder, SD_CTRL_SET_BITMAP_REPLACEMENT, NULL);
+    reset_companion(state);
+    uint64_t *ids = state->bitmap ? talloc_array(NULL, uint64_t, state->num_cues) : NULL;
+    int count = 0;
     for (int n = 0; n < state->num_cues; n++) {
         if (state->cues[n]->state == CUE_TRANSLATED) {
             bool fed = feed_cue(state, state->cues[n]);
             if (fed && state->bitmap)
-                sub_control(state->source_decoder, SD_CTRL_SET_BITMAP_REPLACEMENT,
-                            &state->cues[n]->id);
+                ids[count++] = state->cues[n]->id;
         }
+    }
+    if (state->bitmap) {
+        // Publish the entire mask under one decoder lock. A render between
+        // clearing and restoring individual IDs used to expose the original.
+        struct sub_bitmap_replacements set = {.ids = ids, .count = count};
+        sub_control(state->source_decoder, SD_CTRL_SET_BITMAP_REPLACEMENT, &set);
+        talloc_free(ids);
     }
     redraw_replacement(state);
     state->needs_rebuild = false;
@@ -585,6 +596,13 @@ static void accept_result(
                  result->kind == MP_TRANSLATION_RESULT_FALLBACK_QUEUE)
             set_error(state, "translation request skipped by limits");
         else if (result->kind == MP_TRANSLATION_RESULT_FALLBACK_LATE) {
+            if (state->bitmap && cue->start + cue->duration >
+                                 result->pts + result->duration)
+            {
+                // A redraw extended this cue while the earlier request ran.
+                submit_cue(state, cue);
+                return;
+            }
             cue->state = CUE_EXPIRED;
             set_error(state, "translation arrived after cue end");
         }
@@ -720,6 +738,9 @@ static void on_bitmap_cue(void *ctx, const struct sub_bitmap_cue *source)
         state->ocr_reselect = true;
         struct translated_cue *output = find_cue(state, cue->id);
         if (output) {
+            if (output->state == CUE_EXPIRED && source->start + source->duration >
+                                                output->start + output->duration)
+                output->state = CUE_WAITING;
             output->start = source->start;
             output->duration = source->duration;
             state->needs_rebuild = true;

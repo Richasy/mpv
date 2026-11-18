@@ -49,6 +49,9 @@ struct sub {
     double pts;
     double endpts;
     int64_t id;
+    int64_t ocr_id;
+    double ocr_start;
+    bool check_ocr_continuation;
 };
 
 struct seekpoint {
@@ -363,23 +366,48 @@ static void rerender_queued_subs(struct sd *sd)
         sub->src_w = 0;
         sub->src_h = 0;
         sub->id = priv->new_id++;
+        sub->ocr_id = sub->id;
+        sub->ocr_start = sub->pts;
+        sub->check_ocr_continuation = false;
         sub->replaced = false;
         read_sub_bitmaps(sd, sub);
     }
 }
+
+static bool same_bitmap_content(const AVSubtitle *a, const AVSubtitle *b);
 
 static void emit_bitmap_cues(struct sd *sd, double start, double end)
 {
     struct sd_lavc_priv *priv = sd->priv;
     if (!sd->bitmap_cue_callback || priv->menu_active)
         return;
+    // Translation can be enabled after these display events were decoded.
+    // Compare each adjacent pair only once, oldest first, and only for OCR.
+    for (int n = MAX_QUEUE - 1; n >= 0; n--) {
+        struct sub *sub = &priv->subs[n];
+        if (!sub->valid || !sub->check_ocr_continuation)
+            continue;
+        sub->check_ocr_continuation = false;
+        if (n + 1 < MAX_QUEUE) {
+            const struct sub *prev = &priv->subs[n + 1];
+            if (prev->valid && same_bitmap_content(&prev->avsub, &sub->avsub)) {
+                sub->ocr_id = prev->ocr_id;
+                sub->ocr_start = prev->ocr_start;
+                sub->replaced = prev->replaced;
+            }
+        }
+    }
     for (int n = MAX_QUEUE - 1; n >= 0; n--) {
         struct sub *sub = &priv->subs[n];
         if (!sub->valid || sub->pts == MP_NOPTS_VALUE)
             continue;
+        // The newest composition carries the full interval of a continuous cue.
+        if (n && priv->subs[n - 1].valid &&
+            priv->subs[n - 1].ocr_id == sub->ocr_id)
+            continue;
         double until = sub->endpts == MP_NOPTS_VALUE
             ? sub->pts + 60 : sub->endpts;
-        if (until < start || sub->pts > end || until <= sub->pts)
+        if (until < start || sub->ocr_start > end || until <= sub->ocr_start)
             continue;
         if (sub->avsub.num_rects > 64) {
             MP_WARN(sd, "Bitmap OCR skipped an event with too many objects.\n");
@@ -401,14 +429,38 @@ static void emit_bitmap_cues(struct sd *sd, double start, double end)
         }
         if (count) {
             struct sub_bitmap_cue cue = {
-                .id = sub->id, .start = sub->pts,
-                .duration = until - sub->pts,
+                .id = sub->ocr_id, .start = sub->ocr_start,
+                .duration = until - sub->ocr_start,
                 .end_known = sub->endpts != MP_NOPTS_VALUE,
                 .parts = parts, .num_parts = count,
             };
             sd->bitmap_cue_callback(sd->bitmap_cue_callback_ctx, &cue);
         }
     }
+}
+
+static bool same_bitmap_content(const AVSubtitle *a, const AVSubtitle *b)
+{
+    if (!a->num_rects || a->num_rects != b->num_rects || a->num_rects > 64)
+        return false;
+    for (unsigned n = 0; n < a->num_rects; n++) {
+        const AVSubtitleRect *r = a->rects[n], *s = b->rects[n];
+        if (r->type != SUBTITLE_BITMAP || s->type != SUBTITLE_BITMAP ||
+            r->flags != s->flags || r->x != s->x || r->y != s->y ||
+            r->w != s->w || r->h != s->h || r->w <= 0 || r->h <= 0 ||
+            r->nb_colors != s->nb_colors || r->nb_colors <= 0 ||
+            r->nb_colors > 256 || !r->data[0] || !s->data[0] ||
+            !r->data[1] || !s->data[1] ||
+            r->linesize[0] < r->w || s->linesize[0] < s->w ||
+            memcmp(r->data[1], s->data[1], r->nb_colors * sizeof(uint32_t)))
+            return false;
+        for (int y = 0; y < r->h; y++) {
+            if (memcmp(r->data[0] + (size_t)y * r->linesize[0],
+                       s->data[0] + (size_t)y * s->linesize[0], r->w))
+                return false;
+        }
+    }
+    return true;
 }
 
 static void decode(struct sd *sd, struct demux_packet *packet)
@@ -449,6 +501,7 @@ static void decode(struct sd *sd, struct demux_packet *packet)
     if (sub.pts != AV_NOPTS_VALUE)
         pts = sub.pts / (double)AV_TIME_BASE;
 
+    bool continuous = false;
     if (pts != MP_NOPTS_VALUE) {
         if (sub.end_display_time > sub.start_display_time &&
             sub.end_display_time != UINT32_MAX)
@@ -460,6 +513,9 @@ static void decode(struct sd *sd, struct demux_packet *packet)
         // set end time of previous sub
         struct sub *prev = &priv->subs[0];
         if (prev->valid) {
+            continuous = prev->pts != MP_NOPTS_VALUE && pts > prev->pts &&
+                pts <= (prev->endpts == MP_NOPTS_VALUE
+                       ? prev->pts + 60 : prev->endpts);
             if (prev->endpts == MP_NOPTS_VALUE || prev->endpts > pts)
                 prev->endpts = pts;
 
@@ -489,6 +545,9 @@ static void decode(struct sd *sd, struct demux_packet *packet)
     current->pts = pts;
     current->endpts = endpts;
     current->avsub = sub;
+    current->ocr_id = current->id;
+    current->ocr_start = pts;
+    current->check_ocr_continuation = continuous && !priv->menu_active;
 
     read_sub_bitmaps(sd, current);
 
@@ -797,14 +856,20 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
 {
     struct sd_lavc_priv *priv = sd->priv;
     switch (cmd) {
-    case SD_CTRL_SET_BITMAP_REPLACEMENT:
+    case SD_CTRL_SET_BITMAP_REPLACEMENT: {
+        const struct sub_bitmap_replacements *set = arg;
         for (int n = 0; n < MAX_QUEUE; n++) {
-            if (!arg)
-                priv->subs[n].replaced = false;
-            else if ((uint64_t)priv->subs[n].id == *(uint64_t *)arg)
-                priv->subs[n].replaced = true;
+            struct sub *sub = &priv->subs[n];
+            sub->replaced = false;
+            for (int i = 0; sub->valid && set && i < set->count; i++) {
+                if ((uint64_t)sub->ocr_id == set->ids[i]) {
+                    sub->replaced = true;
+                    break;
+                }
+            }
         }
         return CONTROL_OK;
+    }
     case SD_CTRL_SUB_STEP: {
         double *a = arg;
         double res = step_sub(sd, a[0], a[1]);

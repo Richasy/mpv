@@ -25,7 +25,7 @@ enum sd_ctrl {
     SD_CTRL_UPDATE_OPTS,
     SD_CTRL_APPLY_DVDNAV,   // const struct stream_nav_state *
     SD_CTRL_SET_TEXT_REPLACEMENT, // struct sub_text_replacement *; NULL clears all
-    SD_CTRL_SET_BITMAP_REPLACEMENT, // uint64_t *; NULL clears all
+    SD_CTRL_SET_BITMAP_REPLACEMENT, // struct sub_bitmap_replacements *; NULL clears all
 };
 
 enum sd_text_type {
@@ -85,6 +85,11 @@ struct sub_bitmap_cue {
     bool end_known;
     const struct sub_bitmap_part *parts;
     int num_parts;
+};
+
+struct sub_bitmap_replacements {
+    const uint64_t *ids;
+    int count;
 };
 
 // Bitmap storage is borrowed only for the callback; asynchronous consumers copy it.

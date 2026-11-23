@@ -63,6 +63,7 @@ bool mp_dash_source_seek_blocked(struct mpv_global *global);
 int mp_dash_source_frame_snapshot(struct mpv_global *global,
                                   mpv_dash_frame_status *out);
 bool mp_dash_source_active(struct mpv_global *global);
+bool mp_dash_source_has_audio(struct mpv_global *global);
 bool mp_dash_source_failed(struct mpv_global *global);
 bool mp_dash_source_terminal(struct mpv_global *global);
 void mp_dash_source_set_idle_pause(struct mpv_global *global, bool idle);

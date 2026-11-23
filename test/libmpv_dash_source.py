@@ -32,6 +32,7 @@ import urllib.parse
 
 VERSION = 1
 ALLOW_LOOPBACK = 1
+VIDEO_ONLY = 2
 SEGMENT_BASE = 1
 INVALID = -4
 UNSUPPORTED = -18
@@ -188,18 +189,18 @@ def first_fragment_offset(data):
     raise AssertionError("Generated video has no first media fragment")
 
 
-def generate_tracks(directory):
+def generate_tracks(directory, duration=18):
     files = {}
     inputs = {
         "video": [
             "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=12",
-            "-t", "18", "-an", "-c:v", "libx264", "-preset", "ultrafast",
+            "-t", str(duration), "-an", "-c:v", "libx264", "-preset", "ultrafast",
             "-crf", "17", "-pix_fmt", "yuv420p", "-g", "12",
         ],
         "audio": [
             "-f", "lavfi", "-i",
             "anoisesrc=color=white:amplitude=0.03:sample_rate=48000",
-            "-t", "18", "-vn", "-c:a", "aac", "-b:a", "160k",
+            "-t", str(duration), "-vn", "-c:a", "aac", "-b:a", "160k",
         ],
     }
     for role, arguments in inputs.items():
@@ -262,16 +263,18 @@ def generate_tls_certificates(directory):
             "-keyout", wsl_path(server_key), "-out", wsl_path(server_cert),
             "-subj", "/CN=server-local-test",
             "-addext", "subjectAltName=IP:127.0.0.1", "-days", "1")
-    validity = subprocess.run(
-        ["wsl.exe", "-d", "mpv-build", "--", "openssl", "x509",
-         "-in", wsl_path(client_cert), "-noout", "-startdate"],
-        capture_output=True, text=True, timeout=15, check=True,
-    ).stdout.strip()
-    if not validity.startswith("notBefore="):
-        raise AssertionError("Synthetic client certificate validity is unavailable")
-    not_before = datetime.strptime(
-        validity.removeprefix("notBefore="), "%b %d %H:%M:%S %Y GMT"
-    ).replace(tzinfo=timezone.utc).timestamp()
+    not_before = 0
+    for certificate in (ca_cert, client_cert, server_cert):
+        validity = subprocess.run(
+            ["wsl.exe", "-d", "mpv-build", "--", "openssl", "x509",
+             "-in", wsl_path(certificate), "-noout", "-startdate"],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout.strip()
+        if not validity.startswith("notBefore="):
+            raise AssertionError("Synthetic certificate validity is unavailable")
+        not_before = max(not_before, datetime.strptime(
+            validity.removeprefix("notBefore="), "%b %d %H:%M:%S %Y GMT"
+        ).replace(tzinfo=timezone.utc).timestamp())
     wait = max(0, not_before - time.time() + 0.5)
     if wait > 30:
         raise AssertionError("Windows/WSL certificate clock skew exceeds 30 seconds")
@@ -287,8 +290,8 @@ class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
 
-    def __init__(self, tracks, certificates=None):
-        super().__init__(("127.0.0.1", 0), Handler)
+    def __init__(self, tracks, certificates=None, address=("127.0.0.1", 0)):
+        super().__init__(address, Handler)
         self.secure = certificates is not None
         if certificates:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -326,6 +329,8 @@ class Server(http.server.ThreadingHTTPServer):
         self.disconnect_role = None
         self.disconnect_attempts = 0
         self.disconnect_bytes = 32768
+        self.disconnect_min_payload = 0
+        self.disconnections = []
         self.wrong_total_role = None
         self.arm_code = 412
         self.full_body_roles = set()
@@ -528,12 +533,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 return
             if (role == self.server.disconnect_role and
-                len(self.server.requests_for(role)) <= self.server.disconnect_attempts and
+                len(self.server.disconnections) < self.server.disconnect_attempts and
+                end - start + 1 >= self.server.disconnect_min_payload and
                 (media_candidate or code == 206)):
                 payload = body if media_candidate else data[start:end + 1]
                 cut = min(self.server.disconnect_bytes, max(0, len(payload) - 1))
                 self.wfile.write(payload[:cut])
                 self.wfile.flush()
+                self.server.disconnections.append((start, cut))
                 return
             if code == 206:
                 if self.server.truncate_range_role == role and start > 0:
@@ -1039,6 +1046,69 @@ def test_playback(mpv, server):
         assert not stopped_range.audio_validated_206
     assert_headers(server)
     return state.generation
+
+
+def test_video_only(mpv, server, backend):
+    with client(mpv, {"curl-enabled": backend}) as handle:
+        source = source_for(server)
+        source.flags |= VIDEO_ONLY
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        source.audio = Track()
+        source.audio.quality = 1
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        source.audio = Track()
+        source.flags &= ~VIDEO_ONLY
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == INVALID
+        assert not server.requests
+        source.flags |= VIDEO_ONLY
+        assert mpv.mpv_dash_source_load(handle, ctypes.byref(source)) == 0
+        await_event(mpv, handle, FILE_LOADED)
+        state = snapshot(mpv, handle)
+        assert state.phase == BOUND, (state.phase, state.failure)
+        assert state.video_responses > 0 and state.audio_responses == 0
+        assert state.audio_http_status == 0
+        assert prop(mpv, handle, "aid") in (None, "no")
+        assert prop(mpv, handle, "audio-out-params/samplerate") is None
+        assert prop(mpv, handle, "video-params/w") == "160"
+        assert prop(mpv, handle, "seekable") == "yes"
+        assert prop(mpv, handle, "rodel-dash-network-backend") == (
+            "curl" if backend == "yes" else "lavf")
+        ranged = range_capability(mpv, handle)
+        assert ranged.video_validated_206 == 1
+        assert ranged.audio_validated_206 == 0
+        command(mpv, handle, "seek", "8", "absolute+exact")
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            mpv.mpv_wait_event(handle, 0.05)
+            position = prop(mpv, handle, "time-pos")
+            if position and abs(float(position) - 8) <= 0.25:
+                break
+        else:
+            raise AssertionError("Video-only seek did not reach its target")
+        command(mpv, handle, "set", "pause", "no")
+        command(mpv, handle, "seek", "17", "absolute+exact")
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            mpv.mpv_wait_event(handle, 0.05)
+            if prop(mpv, handle, "eof-reached") == "yes":
+                break
+        else:
+            raise AssertionError("Video-only playback did not reach EOF")
+        command(mpv, handle, "seek", "0", "absolute+exact")
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            mpv.mpv_wait_event(handle, 0.05)
+            if prop(mpv, handle, "eof-reached") == "no":
+                break
+        else:
+            raise AssertionError("Video-only replay did not leave EOF")
+        assert snapshot(mpv, handle).generation == state.generation
+        assert_private(mpv, handle)
+        command(mpv, handle, "stop")
+        await_event(mpv, handle, END_FILE)
+        assert snapshot(mpv, handle).phase == STOPPED
+    assert not server.requests_for("audio")
+    assert_headers(server, roles=("video",))
 
 
 def test_full_body_playback(mpv, server, full_role, http_status=200,
@@ -2172,13 +2242,14 @@ def test_complete_body_receive_error(mpv, server, role):
 
 
 def main():
+    video_only = len(sys.argv) == 3 and sys.argv[2] == "--video-only"
     scheduler = len(sys.argv) == 3 and sys.argv[2] == "--scheduler"
     controls = len(sys.argv) == 3 and sys.argv[2] == "--controls"
     recovery = len(sys.argv) == 3 and sys.argv[2] == "--recovery"
     timeouts = len(sys.argv) == 3 and sys.argv[2] == "--timeouts"
-    if not (len(sys.argv) == 2 or scheduler or controls or recovery or timeouts):
+    if not (len(sys.argv) == 2 or scheduler or controls or recovery or timeouts or video_only):
         raise SystemExit("usage: python test/libmpv_dash_source.py "
-                         "build/local-libmpv/x86_64 [--scheduler|--controls|--recovery|--timeouts]")
+                         "build/local-libmpv/x86_64 [--scheduler|--controls|--recovery|--timeouts|--video-only]")
     runtime = Path(sys.argv[1]).resolve()
     directory = runtime / f"dash-generated-{os.getpid()}"
     if not runtime.is_dir() or not (runtime / "libmpv-2.dll").is_file():
@@ -2234,6 +2305,15 @@ def main():
             assert RangeCapability.source_generation.offset == 8
             assert RangeCapability.video_validated_206.offset == 16
             assert RangeCapability.audio_validated_206.offset == 20
+            if video_only:
+                for backend in ("yes", "no"):
+                    with serve(tracks) as server:
+                        test_video_only(mpv, server, backend)
+                    print(f"[dash] video-only {backend}: PASS", flush=True)
+                with serve(tracks) as server:
+                    test_playback(mpv, server)
+                print("DASH_VIDEO_ONLY_AND_DUAL_TRACK_PASS", flush=True)
+                return
             if timeouts:
                 for role in ("video", "audio"):
                     for stage in ("open", "body"):

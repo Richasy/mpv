@@ -199,7 +199,11 @@ struct mp_osd_render_opts {
 struct mp_bluray_opts {
     char *bluray_device;
     char **files;
+    char *keyfile;
     int angle;
+    int min_title_length;
+    int region;
+    int uo_restriction;
 };
 
 struct dvda_opts {

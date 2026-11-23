@@ -122,11 +122,17 @@ FILE *mp_fopen(const char *filename, const char *mode)
 #ifndef _WIN32
 int mp_dup_cloexec(int fd)
 {
-    return fcntl(fd, F_DUPFD_CLOEXEC);
+    return fcntl(fd, F_DUPFD_CLOEXEC, 0);
 }
 
 int mp_make_cloexec_pipe(int pipes[2])
 {
+#if HAVE_PIPE2
+    if (pipe2(pipes, O_CLOEXEC) != 0) {
+        pipes[0] = pipes[1] = -1;
+        return -1;
+    }
+#else
     if (pipe(pipes) != 0) {
         pipes[0] = pipes[1] = -1;
         return -1;
@@ -134,6 +140,7 @@ int mp_make_cloexec_pipe(int pipes[2])
 
     for (int i = 0; i < 2; i++)
         mp_set_cloexec(pipes[i]);
+#endif
     return 0;
 }
 
@@ -154,6 +161,37 @@ void mp_flush_wakeup_pipe(int pipe_end)
 {
     char buf[100];
     (void)read(pipe_end, buf, sizeof(buf));
+}
+#endif
+
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && !defined(_WIN32)
+// Fuzzed commands and options make mpv write files anywhere. Fuzzing builds
+// write to anonymous memory and only pretend to change the file system.
+int mp_open(const char *filename, int oflag, ...)
+{
+    if (oflag & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC))
+        return memfd_create("mpv", oflag & O_CLOEXEC ? MFD_CLOEXEC : 0);
+    return (open)(filename, oflag);
+}
+
+int mp_mkdir(const char *path, mode_t mode)
+{
+    return 0;
+}
+
+int mp_unlink(const char *path)
+{
+    return 0;
+}
+
+int mp_rename(const char *oldpath, const char *newpath)
+{
+    return 0;
+}
+
+int mp_utime(const char *path, const struct utimbuf *times)
+{
+    return 0;
 }
 #endif
 
@@ -211,10 +249,15 @@ static void set_errno_from_lasterror(void)
     switch (GetLastError()) {
     case ERROR_FILE_NOT_FOUND:
     case ERROR_PATH_NOT_FOUND:
+    case ERROR_INVALID_DRIVE:
+    case ERROR_BAD_NETPATH:
+    case ERROR_BAD_NET_NAME:
+    case ERROR_BAD_PATHNAME:
         errno = ENOENT;
         break;
     case ERROR_SHARING_VIOLATION:
     case ERROR_ACCESS_DENIED:
+    case ERROR_NETWORK_ACCESS_DENIED:
         errno = EACCES;
         break;
     case ERROR_FILE_EXISTS:

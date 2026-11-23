@@ -28,6 +28,7 @@ struct user_lut {
 };
 
 struct gl_next_opts {
+    struct pl_tone_map_constants tone_constants;
     bool delayed_peak;
     int sub_hdr_peak;
     int image_subs_hdr_peak;

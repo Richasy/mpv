@@ -124,6 +124,7 @@ enum demux_event {
     DEMUX_EVENT_METADATA = 1 << 2,  // metadata or stream_metadata changed
     DEMUX_EVENT_DURATION = 1 << 3,  // duration updated
     DEMUX_EVENT_LISTS = 1 << 4,     // chapters / editions list changed
+    DEMUX_EVENT_CODEC = 1 << 5,     // codec params of a stream replaced
     DEMUX_EVENT_ALL = 0xFFFF,
 };
 
@@ -331,9 +332,12 @@ int demux_read_packet_async_until(struct sh_stream *sh, double min_pts,
                                   struct demux_packet **out_pkt);
 void demux_request_read_ahead(struct sh_stream *sh, double min_pts);
 bool demux_stream_is_selected(struct sh_stream *stream);
+bool demux_stream_eof_is_lazy(struct sh_stream *stream);
+bool demux_stream_has_packets(struct sh_stream *stream);
 void demux_set_stream_wakeup_cb(struct sh_stream *sh,
                                 void (*cb)(void *ctx), void *ctx);
-struct demux_packet *demux_read_any_packet(struct demuxer *demuxer);
+struct demux_packet *demux_read_any_packet(struct demuxer *demuxer,
+                                           bool *new_streams);
 
 struct sh_stream *demux_get_stream(struct demuxer *demuxer, int index);
 int demux_get_num_stream(struct demuxer *demuxer);
@@ -354,10 +358,12 @@ void demux_start_prefetch(struct demuxer *demuxer);
 void demux_adopt_prefetch(struct demuxer *demuxer);
 void demux_drive_nav(struct demuxer *demuxer);
 void demux_nav_refresh(struct demuxer *demuxer);
-void demux_set_stream_still_image(struct demuxer *demuxer,
-                                  struct sh_stream *sh, bool still_image);
 void demux_set_stream_absent(struct demuxer *demuxer, struct sh_stream *sh,
                              bool absent);
+void demux_set_stream_group(struct demuxer *demuxer,
+                            struct sh_stream_group *group);
+void demux_set_stream_codec(struct demuxer *demuxer, struct sh_stream *sh,
+                            struct mp_codec_params *codec);
 
 bool demux_cancel_test(struct demuxer *demuxer);
 bool demux_read_interrupted(struct demuxer *demuxer);

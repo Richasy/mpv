@@ -193,6 +193,7 @@ int main(int argc, char **argv)
     TEST_JOIN("c:",         "b",            "c:b");
 #endif
 
+    TEST_NORMALIZE("", "");
     TEST_NORMALIZE("https://foo", "https://foo");
 #if !HAVE_DOS_PATHS
     TEST_NORMALIZE("/foo", "/foo");
@@ -223,12 +224,25 @@ int main(int argc, char **argv)
     TEST_NORMALIZE("\\\\server\\share\\path", "\\\\?\\UNC/server/share/path/.");
     TEST_NORMALIZE("C:\\", "C:/.");
     TEST_NORMALIZE("C:\\", "C:/../");
+    TEST_NORMALIZE("\\\\server\\share\\path", "//server/share/path");
+    TEST_NORMALIZE("\\\\server\\share\\path", "//server\\share/path");
+    TEST_NORMALIZE("\\\\server\\share\\path", "\\\\server/share/path");
+    TEST_NORMALIZE("\\\\server\\share\\path", "//server/share/sub/../path");
+    TEST_NORMALIZE("\\\\server\\share\\path", "//server/share/../../path");
+    TEST_NORMALIZE("\\\\server\\share\\path", "//?/UNC/server/share/path");
+    TEST_NORMALIZE("C:\\file.mkv", "//?/C:/folder/../file.mkv");
+    TEST_NORMALIZE("\\\\.\\pipe\\mpv", "\\\\.\\pipe\\mpv");
+    TEST_NORMALIZE("\\\\.\\pipe\\mpv", "//./pipe/mpv");
+    TEST_NORMALIZE("\\\\.\\C:\\file.mkv", "//./C:/folder/../file.mkv");
 #else
     TEST_NORMALIZE("/foo/bar", "/foo//bar");
     TEST_NORMALIZE("/foo/bar", "/foo///bar");
     TEST_NORMALIZE("/foo/bar", "/foo/bar/");
     TEST_NORMALIZE("/foo/bar", "/foo/./bar");
     TEST_NORMALIZE("/usr", "/usr/bin/..");
+    TEST_NORMALIZE("/", "/");
+    TEST_NORMALIZE("/", "//");
+    TEST_NORMALIZE("/", "/.");
 #endif
 
     TEST_BASENAME("/usr/local/bin", "bin");

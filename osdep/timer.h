@@ -19,6 +19,8 @@
 #define MPLAYER_TIMER_H
 
 #include <inttypes.h>
+#include <stdbool.h>
+#include <time.h>
 #include "config.h"
 
 // Initialize timer, must be called at least once at start.
@@ -29,6 +31,12 @@ int64_t mp_time_ns(void);
 
 // Return time in nanoseconds. Converts raw time in nanoseconds to mp time, subtracts init offset.
 int64_t mp_time_ns_from_raw_time(uint64_t raw_time);
+
+#if HAVE_POSIX
+// Return time in nanoseconds. Converts a time of the given clock in
+// nanoseconds to mp time.
+int64_t mp_time_ns_from_clock(clockid_t clk_id, int64_t clk_time);
+#endif
 
 // Return time in seconds. Can have down to 1 nanosecond resolution, but will
 // be much worse when casted to float.
@@ -42,17 +50,21 @@ uint64_t mp_raw_time_ns(void);
 // Sleep in nanoseconds.
 void mp_sleep_ns(int64_t ns);
 
+// Set idle power mode. This may adjust the system's timer resolution or other
+// power-related settings to favor either power saving over timing precision.
+void mp_set_idle_power_mode(bool idle);
+
 #if HAVE_DARWIN
 // Converts mach time to raw time in nanoseconds and returns it.
 uint64_t mp_raw_time_ns_from_mach(uint64_t mach_time);
 #endif
 
 #ifdef _WIN32
-// returns: timer resolution in ns if needed and started successfully, else 0
-int64_t mp_start_hires_timers(int64_t wait_ns);
+// returns: timer resolution in ms if needed and started successfully, else 0
+int mp_start_hires_timers(int wait_ms);
 
 // call unconditionally with the return value of mp_start_hires_timers
-void mp_end_hires_timers(int64_t resolution_ns);
+void mp_end_hires_timers(int resolution_ms);
 #endif  /* _WIN32 */
 
 // Converts time units to nanoseconds (int64_t)

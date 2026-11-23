@@ -362,11 +362,13 @@ bool vo_drm_acquire_crtc(struct vo_drm_state *drm)
     MP_VERBOSE(drm, "crtc is%s VRR capable\n", vrr_capable ? "" : " not");
 
     uint64_t vrr_requested = drm->opts->vrr_enabled;
+    uint64_t vrr_enabled = atomic_ctx->old_state.crtc.vrr_enabled;
     if (vrr_requested == 1 || (vrr_capable && vrr_requested == -1)) {
         if (drm_object_set_property(request, atomic_ctx->crtc, "VRR_ENABLED", 1) < 0) {
             MP_WARN(drm, "Could not enable VRR on crtc\n");
         } else {
             MP_VERBOSE(drm, "Enabled VRR on crtc\n");
+            vrr_enabled = 1;
         }
     }
 
@@ -386,6 +388,7 @@ bool vo_drm_acquire_crtc(struct vo_drm_state *drm)
         goto err;
     }
 
+    drm->vrr = vrr_capable && vrr_enabled;
     drmModeAtomicFree(request);
     return true;
 
@@ -506,7 +509,7 @@ static void restore_sdr(struct vo_drm_state *drm)
         return;
 
     struct pl_color_space sdr = pl_color_space_srgb;
-    vo_drm_set_color(drm->vo, &sdr);
+    vo_drm_set_colorspace_blob(drm->vo, &sdr);
     int ret = drmModeAtomicCommit(drm->fd, atomic_ctx->request, DRM_MODE_ATOMIC_ALLOW_MODESET, drm);
     if (ret)
         MP_VERBOSE(drm, "Failed to commit atomic request: %s\n", mp_strerror(ret));
@@ -583,7 +586,7 @@ static bool setup_crtc(struct vo_drm_state *drm, const drmModeRes *res)
         // iterate all global CRTCs
         for (unsigned int j = 0; j < res->count_crtcs; ++j) {
             // check whether this CRTC works with the encoder
-            if (!(encoder->possible_crtcs & (1 << j)))
+            if (!(encoder->possible_crtcs & (1u << j)))
                 continue;
 
             drm->encoder = encoder;
@@ -986,8 +989,9 @@ static void drm_pflip_cb(int fd, unsigned int msc, unsigned int sec,
     struct vo_drm_state *drm = data;
 
     int64_t ust = MP_TIME_S_TO_NS(sec) + MP_TIME_US_TO_NS(usec);
-    present_sync_update_values(drm->present, ust, msc);
-    present_sync_swap(drm->present);
+    present_sync_update_values(drm->present, mp_time_ns_from_clock(CLOCK_MONOTONIC, ust), msc, 0,
+                               drm->flip_swap,
+                               drm->vrr ? VO_REFRESH_UNKNOWN : VO_REFRESH_FIXED);
     drm->waiting_for_flip = false;
 }
 
@@ -1124,7 +1128,7 @@ bool vo_drm_init(struct vo *vo)
 
     drm->ev.version = DRM_EVENT_CONTEXT_VERSION;
     drm->ev.page_flip_handler = &drm_pflip_cb;
-    drm->present = mp_present_initialize(drm, drm->vo->opts, VO_MAX_SWAPCHAIN_DEPTH);
+    drm->present = mp_present_initialize(drm);
 
     return true;
 
@@ -1370,20 +1374,22 @@ double vo_drm_get_display_fps(struct vo_drm_state *drm)
     return mode_get_Hz(&drm->mode.mode);
 }
 
-bool vo_drm_set_color(struct vo *vo, struct pl_color_space *color)
+void vo_drm_set_color(struct vo *vo, struct pl_color_space *color)
 {
     struct vo_drm_state *drm = vo->drm;
-    if (pl_color_space_equal(&drm->colorspace, color))
-        return false;
 
     // Set to sdr if the display doesn't support the colorspace.
     if (!vo_drm_color_supported_by_display(drm, *color)) {
         *color = pl_color_space_srgb;
         pl_color_space_infer(color);
     }
-
-    destroy_hdr_blob(drm);
     drm->colorspace = *color;
+}
+
+void vo_drm_set_colorspace_blob(struct vo *vo, struct pl_color_space *color)
+{
+    struct vo_drm_state *drm = vo->drm;
+    destroy_hdr_blob(drm);
 
     // For any HDR, the BT2020 drm colorspace is the only one that works in practice.
     struct drm_atomic_context *atomic_ctx = drm->atomic_context;
@@ -1416,7 +1422,6 @@ bool vo_drm_set_color(struct vo *vo, struct pl_color_space *color)
     };
     drmModeCreatePropertyBlob(drm->fd, &metadata, sizeof(metadata), &drm->hdr.blob_id);
     drm_object_set_property(atomic_ctx->request, atomic_ctx->connector, "HDR_OUTPUT_METADATA", drm->hdr.blob_id);
-    return true;
 }
 
 void vo_drm_set_monitor_par(struct vo *vo)

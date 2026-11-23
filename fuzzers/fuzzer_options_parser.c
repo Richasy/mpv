@@ -62,8 +62,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (!ctx)
         exit(1);
 
+    check_error(mpv_set_option_string(ctx, "input-builtin-bindings", "no"));
+
     mpv_initialize_opts(ctx, opts);
 
+    // The player quits on its own after the options, see mpv_initialize_opts().
+    wait_event(ctx, MPV_EVENT_SHUTDOWN);
     mpv_terminate_destroy(ctx);
 
     return 0;

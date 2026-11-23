@@ -872,8 +872,8 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
         (mp_prefetch_active(budget) && atomic_load(&budget->ready))) {
         // No room in the buffer. Pause the transfer and wait for the consumer.
         p->paused = true;
-        mp_mutex_unlock(&p->mtx);
         MP_TRACE(p, "pausing curl transfer, buffer full (%zu bytes)\n", p->count);
+        mp_mutex_unlock(&p->mtx);
         return CURL_WRITEFUNC_PAUSE;
     }
 
@@ -967,7 +967,7 @@ static void parse_content_range(CURL *c, int64_t *out_start, int64_t *out_end,
         return;
     bstr rest;
     long long v = bstrtoll(total, &rest, 10);
-    if (rest.len == 0 && v > 0)
+    if (rest.len == 0 && v >= 0)
         *out_total = v;
     bstr_eatstart0(&range, "bytes");
     bstr start, end;
@@ -1030,8 +1030,9 @@ static void check_http_reply(struct priv *p, long resp, int64_t range_start,
         (range_total < 0 || range_total <= p->request_start))
     {
         // The request started past the end of a file of unknown size, so this
-        // is EOF. The reply tells the size if the server knows it by now.
-        if (range_total > 0 && range_total <= p->request_start) {
+        // is EOF. The reply tells the size if the server knows it by now. A
+        // 416 that states a size past the requested offset is an error.
+        if (range_total >= 0) {
             mp_mutex_lock(&p->mtx);
             p->content_size = range_total;
             mp_mutex_unlock(&p->mtx);
@@ -1097,6 +1098,16 @@ static void on_http_header(struct priv *p, struct bstr line)
     if (p->probed) {
         check_http_reply(p, resp, range_start, range_total);
         return;
+    }
+
+    // The first range of an empty file is not satisfiable.
+    if (resp == 416 && p->request_start == 0 && range_total <= 0) {
+        p->seekable = true;
+        p->content_size = 0;
+        p->finished = true;
+        p->reply_rejected = true;
+        p->stream_ok = true;
+        goto done;
     }
 
     if (!is_http_success(resp)) {
@@ -1548,7 +1559,7 @@ static void start_request(struct priv *p)
     bool chunked = ranged && (p->opts->max_request_size > 0 || speculative);
     bool capped = ranged && p->request_end > 0;
 
-    bool past_size = p->seekable && p->content_size > 0 && start >= p->content_size;
+    bool past_size = p->seekable && p->content_size >= 0 && start >= p->content_size;
     bool past_end = capped && start >= p->request_end;
     if (past_size || past_end) {
         p->finished = true;
@@ -1826,7 +1837,10 @@ static void on_done(struct priv *p, CURLcode code)
 
     // Roll completed bytes into request_start so retries and chunk
     // continuations resume at the next missing byte.
-    p->request_start += p->request_received;
+    uint64_t received = p->request_received;
+    if (received)
+        p->retry_count = 0;
+    p->request_start += received;
     p->request_received = 0;
 
     if (p->reply_rejected && !aborted) {
@@ -1857,10 +1871,16 @@ static void on_done(struct priv *p, CURLcode code)
             return;
         }
 
-        bool past_size = p->content_size > 0 && p->request_start >= p->content_size;
+        bool past_size = p->content_size >= 0 && p->request_start >= p->content_size;
         bool past_end = p->request_end > 0 && p->request_start >= p->request_end;
         if ((p->dash_kind || (p->seekable && p->reply_end >= 0)) &&
             !past_size && !past_end) {
+            if (!received) {
+                MP_ERR(p, "Server sent back no data at offset %" PRIu64 "\n",
+                       p->request_start);
+                code = CURLE_PARTIAL_FILE;
+                goto error;
+            }
 #ifdef MPV_DASH_TEST_HOOKS
             dash_test_before_continuation(p);
 #endif
@@ -1896,6 +1916,7 @@ static void on_done(struct priv *p, CURLcode code)
     if (!aborted)
         log_curl_error(p, "transfer failed", code);
 
+error:
     mp_mutex_lock(&p->mtx);
     p->stream_error = true;
     p->error_code = code;

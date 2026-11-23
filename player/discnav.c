@@ -23,6 +23,7 @@
 #include "common/common.h"
 #include "common/msg.h"
 #include "input/input.h"
+#include "osdep/timer.h"
 #include "player/command.h"
 
 #include "stream/stream.h"
@@ -47,11 +48,13 @@ struct disc_nav_state {
     uint32_t bd_last_change_id;
     struct mp_osd_res bd_last_vo_res;
 
+    double pushed_rate; // last playback rate handed to the disc VM
+
     // Last menu-overlay change_id we forced an OSD redraw for.
     uint32_t last_overlay_change_id;
     bool overlay_change_seen;
 
-    bool drain_was_pending; // last poll saw a boundary awaiting resync
+    uint32_t resync_queued_id; // discontinuity the resync seek was queued for
 
     // DVD-only: dvd_subtitle track we force-selected for the menu, and the
     // selection it displaced (restored on menu close).
@@ -73,6 +76,9 @@ struct disc_nav_state {
     // Last menu_active pushed through property-change notification.
     bool last_menu_active;
     bool menu_active_seen;
+
+    double still_shown;   // Elapsed time a timed still has been on screen.
+    double still_counted; // Last mp_time_sec() the still was checked.
 };
 
 static bool is_dvd_sub_track(struct track *t)
@@ -202,8 +208,32 @@ bool disc_nav_mouse_pos_to_src(struct MPContext *mpctx, int src_w, int src_h,
     double fy = (wy - dst.y0) / (double)dh;
     if (fx < 0 || fx > 1 || fy < 0 || fy > 1)
         return false;
-    *out_x = MPMIN((int)(fx * src_w), src_w - 1);
-    *out_y = MPMIN((int)(fy * src_h), src_h - 1);
+    // src is the part of the frame on screen, in the frame as the VO shows
+    // it, rotated and flipped. Take the point through it and undo the VO's
+    // transform, the button coordinates span the frame as decoded.
+    struct mp_image_params par = vo_get_current_params(vo);
+    int rotate = 0;
+    if ((vo->driver->caps & VO_CAP_ROTATE90) && par.rotate % 90 == 0)
+        rotate = par.rotate % 360;
+    int fw = par.w, fh = par.h;
+    if (rotate % 180 == 90)
+        MPSWAP(int, fw, fh);
+    if (fw <= 0 || fh <= 0)
+        return false;
+    double vx = (src.x0 + fx * (src.x1 - src.x0)) / fw;
+    double vy = (src.y0 + fy * (src.y1 - src.y0)) / fh;
+    if (vx < 0 || vx > 1 || vy < 0 || vy > 1)
+        return false;
+    if (rotate % 180 == 90)
+        MPSWAP(double, vx, vy);
+    if (rotate == 90 || rotate == 180)
+        vy = 1 - vy;
+    if (rotate == 180 || rotate == 270)
+        vx = 1 - vx;
+    if ((vo->driver->caps & VO_CAP_VFLIP) && par.vflip)
+        vy = 1 - vy;
+    *out_x = MPMIN((int)(vx * src_w), src_w - 1);
+    *out_y = MPMIN((int)(vy * src_h), src_h - 1);
     return true;
 }
 
@@ -327,10 +357,9 @@ static void check_async_discontinuity(struct MPContext *mpctx, struct stream *s,
     if (!mpctx->demuxer)
         return;
 
-    bool new_drain = nav->drain_pending && !st->drain_was_pending;
-    st->drain_was_pending = nav->drain_pending;
-    if (!new_drain)
+    if (!nav->drain_pending || nav->discontinuity_id == st->resync_queued_id)
         return;
+    st->resync_queued_id = nav->discontinuity_id;
 
     // The disc jumped on its own, resync through the regular seek path.
     // demux_disc releases the held boundary instead of repositioning the VM.
@@ -364,7 +393,13 @@ static void sync_disc_track_selection(struct MPContext *mpctx, struct stream *s,
     st->last_track_disc_id = nav->discontinuity_id;
     st->track_sync_seen = true;
 
-    if (!first && hopped && nav->no_audio &&
+    // The deselect below leaves aid at "auto", so a stream surfacing later
+    // can be auto-selected into the slot with no hop in between.
+    bool auto_reselected_audio = st->last_audio_id < 0 &&
+                                 mpctx->opts->stream_id[0][STREAM_AUDIO] == -1 &&
+                                 mpctx->current_track[0][STREAM_AUDIO];
+
+    if (!first && (hopped || auto_reselected_audio) && nav->no_audio &&
         mpctx->opts->stream_id[0][STREAM_AUDIO] != -2)
     {
         // The disc hopped into a domain without any audio stream. Deselect audio.
@@ -507,6 +542,32 @@ static void ensure_menu_sub_selection(struct MPContext *mpctx, bool menu_on)
     }
 }
 
+static void run_timed_still(struct MPContext *mpctx, struct stream *s,
+                            struct stream_nav_state *nav)
+{
+    struct disc_nav_state *st = get_state(mpctx);
+    double now = mp_time_sec();
+    if (st->still_counted)
+        st->still_shown += now - st->still_counted;
+    bool running = nav->still_active && nav->still_length > 0 &&
+                   !mpctx->paused && mpctx->video_status == STATUS_EOF &&
+                   mpctx->audio_status == STATUS_EOF;
+    st->still_counted = running ? now : 0;
+    if (!nav->still_active)
+        st->still_shown = 0;
+    if (!running)
+        return;
+    double left = nav->still_length - st->still_shown;
+    if (left > 0) {
+        mp_set_timeout(mpctx, left);
+        return;
+    }
+    st->still_shown = st->still_counted = 0;
+    struct stream_nav_cmd cmd = {.action = STREAM_NAV_SKIP_STILL};
+    stream_control(s, STREAM_CTRL_NAV_CMD, &cmd);
+    mp_wakeup_core(mpctx);
+}
+
 void disc_nav_update(struct MPContext *mpctx)
 {
     struct stream *s = disc_nav_get_stream(mpctx);
@@ -520,6 +581,20 @@ void disc_nav_update(struct MPContext *mpctx)
         MP_VERBOSE(s, "still_frame %d->%d\n",
                    mpctx->disc_nav_still_frame, still);
     mpctx->disc_nav_still_frame = still;
+
+    // BD-J applets schedule against the presentation clock. Left alone
+    // libbluray derives it from the read position, which runs ahead by the
+    // whole readahead, set the real playback time.
+    if (have && mpctx->playback_pts != MP_NOPTS_VALUE) {
+        double t = mpctx->playback_pts;
+        stream_control(s, STREAM_CTRL_SET_PLAYBACK_TIME, &t);
+    }
+
+    double rate = mpctx->paused ? 0.0 : mpctx->opts->playback_speed;
+    if (have && rate != st->pushed_rate) {
+        if (stream_control(s, STREAM_CTRL_SET_PLAYBACK_RATE, &rate) >= 1)
+            st->pushed_rate = rate;
+    }
 
     // The BD-J VM progresses only on reads, pump them while playback idles
     // at EOF or a held still, per libbluray's requirement. Our core wakes up
@@ -560,6 +635,7 @@ void disc_nav_update(struct MPContext *mpctx)
         mp_notify_property(mpctx, "disc-menu-active");
     }
 
+    run_timed_still(mpctx, s, &nav);
     check_async_discontinuity(mpctx, s, &nav);
     sync_current_edition(mpctx, s, &nav);
     sync_disc_track_selection(mpctx, s, &nav);

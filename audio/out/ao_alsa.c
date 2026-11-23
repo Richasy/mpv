@@ -284,6 +284,11 @@ static const int alsa_to_mp_channels[][2] = {
     {SND_CHMAP_TRC,     MP_SP(TBC)},
     {SND_CHMAP_RRC,     MP_SP(SDR)},
     {SND_CHMAP_RLC,     MP_SP(SDL)},
+    {SND_CHMAP_TSL,     MP_SP(TSL)},
+    {SND_CHMAP_TSR,     MP_SP(TSR)},
+    {SND_CHMAP_BC,      MP_SP(BFC)},
+    {SND_CHMAP_BLC,     MP_SP(BFL)},
+    {SND_CHMAP_BRC,     MP_SP(BFR)},
     {SND_CHMAP_MONO,    MP_SP(FC)},
     {SND_CHMAP_NA,      MP_SPEAKER_ID_NA},
     {SND_CHMAP_UNKNOWN, MP_SPEAKER_ID_NA},
@@ -941,7 +946,11 @@ static bool recover_and_get_state(struct ao *ao, struct mp_pcm_state *state)
             // Otherwise do error checking and query the PCM state properly.
             CHECK_ALSA_ERROR("snd_pcm_status");
 
+            // ALSA can compute xrun status *after* computing this return value,
+            // so ask again to make sure.
             pcmst = snd_pcm_status_get_state(st);
+            if (pcmst == SND_PCM_STATE_RUNNING)
+                pcmst = snd_pcm_state(p->alsa);
         }
 
         if (n == 10)

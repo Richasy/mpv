@@ -65,6 +65,11 @@
 #define MP_PTS_MAX(a, b) MPMAX(MP_PTS_OR_DEF(a, b), MP_PTS_OR_DEF(b, a))
 // Return a+b, unless a is NOPTS. b must not be NOPTS.
 #define MP_ADD_PTS(a, b) ((a) == MP_NOPTS_VALUE ? (a) : ((a) + (b)))
+// Timestamps that differ by less than this can be the same time, rounded by
+// the file. Matroska and similar formats usually round on 1ms. Some muxers do
+// this incorrectly, and might go off by 1ms more, and compensate for it later
+// by an equal rounding error into the opposite direction.
+#define MP_PTS_ROUNDING_TOLERANCE (0.001 * 3 + 0.0001)
 
 // Return the maximum value representable by integer type of a.
 #define MP_MAX_VAL(a) _Generic((a),                             \
@@ -120,6 +125,7 @@ enum track_flags {
     TRACK_ATTACHED_PICTURE = 1 << 4,
     TRACK_FORCED = 1 << 5,
     TRACK_DEFAULT = 1 << 6,
+    TRACK_COMMENTARY = 1 << 7,
 };
 
 #define VS_IS_DISP(x) ((x) == VS_DISP_RESAMPLE ||       \

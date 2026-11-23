@@ -128,10 +128,10 @@ struct vo_w32_state {
     bool pending_resize;
     bool pending_reset_size;
     bool window_state_changed;
-    bool pending_maximize;
 
     RECT current_rect; // client rect of the window
     RECT windowed_rect; // client rect of the window, when windowed.
+    RECT invisible_borders; // of the window, when windowed.
 
     POINT max_track_size;
 
@@ -151,6 +151,7 @@ struct vo_w32_state {
 
     int mouse_x;
     int mouse_y;
+    POINT mouse_screen_pos;
 
     // Should SetCursor be called when handling VOCTRL_SET_CURSOR_VISIBILITY?
     bool can_set_cursor;
@@ -203,9 +204,9 @@ static inline int get_system_metrics(struct vo_w32_state *w32, int metric)
     return GetSystemMetricsForDpi(metric, w32->dpi);
 }
 
-static void adjust_window_rect(struct vo_w32_state *w32, HWND hwnd, RECT *rc)
+static void adjust_window_rect(struct vo_w32_state *w32, HWND hwnd, RECT *rc, bool maximized)
 {
-    if (!w32->opts->border && !IsMaximized(w32->window))
+    if (!w32->opts->border && !maximized)
         return;
 
     AdjustWindowRectExForDpi(rc, GetWindowLongPtrW(hwnd, GWL_STYLE), 0,
@@ -232,9 +233,9 @@ static bool check_windows10_build(DWORD build)
 }
 
 // Get adjusted title bar height, only relevant for --title-bar=no
-static int get_title_bar_height(struct vo_w32_state *w32)
+static int get_title_bar_height(struct vo_w32_state *w32, bool maximized)
 {
-    mp_assert(w32->opts->border ? !w32->opts->title_bar : IsMaximized(w32->window));
+    mp_assert(w32->opts->border ? !w32->opts->title_bar : maximized);
     UINT visible_border = 0;
     // Only available on Windows 11, check in case it's backported and breaks
     // WM_NCCALCSIZE exception for Windows 10.
@@ -242,17 +243,17 @@ static int get_title_bar_height(struct vo_w32_state *w32)
         DwmGetWindowAttribute(w32->window, DWMWA_VISIBLE_FRAME_BORDER_THICKNESS,
                               &visible_border, sizeof(visible_border));
     }
-    int top_bar = IsMaximized(w32->window)
+    int top_bar = maximized
                       ? get_system_metrics(w32, SM_CYFRAME) +
                         get_system_metrics(w32, SM_CXPADDEDBORDER)
                       : visible_border;
     return top_bar;
 }
 
-static void add_window_borders(struct vo_w32_state *w32, HWND hwnd, RECT *rc)
+static void add_window_borders(struct vo_w32_state *w32, HWND hwnd, RECT *rc, bool maximized)
 {
     RECT win = *rc;
-    adjust_window_rect(w32, hwnd, rc);
+    adjust_window_rect(w32, hwnd, rc, maximized);
     // Adjust for title bar height that will be hidden in WM_NCCALCSIZE
     // Keep the frame border. On Windows 10 the top border is not retained.
     // It appears that DWM draws the title bar with its full height, extending
@@ -269,17 +270,17 @@ static void add_window_borders(struct vo_w32_state *w32, HWND hwnd, RECT *rc)
     if (w32->opts->border && !w32->opts->title_bar && !w32->current_fs &&
        (GetWindowLongPtrW(w32->window, GWL_STYLE) & WS_CAPTION))
     {
-        if (!check_windows10_build(22000) && !IsMaximized(w32->window))
+        if (!check_windows10_build(22000) && !maximized)
             *rc = win;
-        rc->top = win.top - get_title_bar_height(w32);
+        rc->top = win.top - get_title_bar_height(w32, maximized);
     }
 }
 
 // basically a reverse AdjustWindowRect (win32 doesn't appear to have this)
-static void subtract_window_borders(struct vo_w32_state *w32, HWND hwnd, RECT *rc)
+static void subtract_window_borders(struct vo_w32_state *w32, HWND hwnd, RECT *rc, bool maximized)
 {
     RECT b = { 0, 0, 0, 0 };
-    add_window_borders(w32, hwnd, &b);
+    add_window_borders(w32, hwnd, &b, maximized);
     rc->left -= b.left;
     rc->top -= b.top;
     rc->right -= b.right;
@@ -533,6 +534,9 @@ static void begin_dragging(struct vo_w32_state *w32)
     w32->dragging = true;
     SendMessage(w32->window, WM_NCLBUTTONDOWN, HTCAPTION, 0);
     w32->dragging = false;
+    // The move loop does not pass on the WM_QUIT.
+    if (w32->destroyed)
+        PostQuitMessage(0);
     SystemParametersInfoW(SPI_SETWINARRANGING, w32->win_arranging, 0, 0);
 
     mp_input_put_key(w32->input_ctx, MP_INPUT_RELEASE_ALL);
@@ -837,18 +841,28 @@ static RECT get_working_area(struct vo_w32_state *w32)
                              get_monitor_info(w32).rcWork;
 }
 
-// Adjust working area boundaries to compensate for invisible borders.
-static void adjust_working_area_for_extended_frame(RECT *wa_rect, RECT *wnd_rect, HWND wnd)
+static void update_invisible_borders(struct vo_w32_state *w32)
 {
-    RECT frame = {0};
+    if (w32->current_fs || IsMaximized(w32->window) || IsMinimized(w32->window))
+        return;
 
-    if (DwmGetWindowAttribute(wnd, DWMWA_EXTENDED_FRAME_BOUNDS,
-                              &frame, sizeof(RECT)) == S_OK) {
-        wa_rect->left -= frame.left - wnd_rect->left;
-        wa_rect->top -= frame.top - wnd_rect->top;
-        wa_rect->right += wnd_rect->right - frame.right;
-        wa_rect->bottom += wnd_rect->bottom - frame.bottom;
+    RECT wnd, frame;
+    if (GetWindowRect(w32->window, &wnd) &&
+        DwmGetWindowAttribute(w32->window, DWMWA_EXTENDED_FRAME_BOUNDS,
+                              &frame, sizeof(frame)) == S_OK)
+    {
+        SetRect(&w32->invisible_borders, frame.left - wnd.left, frame.top - wnd.top,
+                wnd.right - frame.right, wnd.bottom - frame.bottom);
     }
+}
+
+// Adjust working area boundaries to compensate for invisible borders.
+static void adjust_working_area_for_extended_frame(struct vo_w32_state *w32, RECT *wa_rect)
+{
+    wa_rect->left -= w32->invisible_borders.left;
+    wa_rect->top -= w32->invisible_borders.top;
+    wa_rect->right += w32->invisible_borders.right;
+    wa_rect->bottom += w32->invisible_borders.bottom;
 }
 
 static bool snap_to_screen_edges(struct vo_w32_state *w32, RECT *rc)
@@ -881,7 +895,7 @@ static bool snap_to_screen_edges(struct vo_w32_state *w32, RECT *rc)
     // Get the work area to let the window snap to taskbar
     wr = get_working_area(w32);
 
-    adjust_working_area_for_extended_frame(&wr, &rect, w32->window);
+    adjust_working_area_for_extended_frame(w32, &wr);
 
     // Let the window to unsnap by changing its position,
     // otherwise it will stick to the screen edges forever
@@ -931,15 +945,14 @@ static bool is_high_contrast(void)
 
 static LONG_PTR update_style(struct vo_w32_state *w32, LONG_PTR style)
 {
-    const LONG_PTR NO_FRAME = WS_OVERLAPPED | WS_MINIMIZEBOX | WS_THICKFRAME;
     const LONG_PTR FRAME = WS_OVERLAPPEDWINDOW;
-    const LONG_PTR FULLSCREEN = NO_FRAME & ~WS_THICKFRAME;
-    style &= ~(NO_FRAME | FRAME | FULLSCREEN);
+    const LONG_PTR FULLSCREEN = WS_OVERLAPPED | WS_MINIMIZEBOX;
+    style &= ~(FRAME | FULLSCREEN);
     style |= WS_SYSMENU;
     if (w32->current_fs) {
         style |= FULLSCREEN;
     } else {
-        style |= (w32->opts->border || w32->opts->window_maximized) ? FRAME : NO_FRAME;
+        style |= FRAME;
         if (!w32->opts->title_bar && is_high_contrast())
             style &= ~WS_CAPTION;
     }
@@ -1021,11 +1034,8 @@ static void fit_rect_on_screen(struct vo_w32_state *w32, RECT *rc)
 {
     RECT screen = get_working_area(w32);
     if (w32->opts->border)
-        subtract_window_borders(w32, w32->window, &screen);
-
-    RECT window_rect;
-    if (GetWindowRect(w32->window, &window_rect))
-        adjust_working_area_for_extended_frame(&screen, &window_rect, w32->window);
+        subtract_window_borders(w32, w32->window, &screen, false);
+    adjust_working_area_for_extended_frame(w32, &screen);
 
     bool adjusted = fit_rect_size(w32, rc, rect_w(screen), rect_h(screen));
 
@@ -1068,14 +1078,11 @@ static void update_maximized_state(struct vo_w32_state *w32)
             wp.flags &= ~WPF_RESTORETOMAXIMIZED;
         }
         SetWindowPlacement(w32->window, &wp);
-        w32->pending_maximize = w32->opts->window_maximized && w32->current_fs;
         return;
     }
 
-    if (w32->current_fs) {
-        w32->pending_maximize = w32->opts->window_maximized;
+    if (w32->current_fs)
         return;
-    }
 
     ShowWindow(w32->window, w32->opts->window_maximized ? SW_MAXIMIZE : SW_RESTORE);
 }
@@ -1083,6 +1090,23 @@ static void update_maximized_state(struct vo_w32_state *w32)
 static void window_resize(struct vo_w32_state *w32);
 static void window_set_pos(struct vo_w32_state *w32, RECT client_rect);
 static void update_corners_pref(const struct vo_w32_state *w32);
+
+static void update_restore_rect(struct vo_w32_state *w32)
+{
+    RECT rc = w32->current_fs ? get_screen_area(w32) : w32->windowed_rect;
+    add_window_borders(w32, w32->window, &rc, false);
+    // WINDOWPLACEMENT is relative to the work area, except for tool windows.
+    if (!(GetWindowLongPtrW(w32->window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) {
+        MONITORINFO mi = { .cbSize = sizeof(mi) };
+        GetMonitorInfoW(MonitorFromRect(&rc, MONITOR_DEFAULTTOPRIMARY), &mi);
+        OffsetRect(&rc, mi.rcMonitor.left - mi.rcWork.left, mi.rcMonitor.top - mi.rcWork.top);
+    }
+
+    WINDOWPLACEMENT wp = { .length = sizeof(wp) };
+    GetWindowPlacement(w32->window, &wp);
+    wp.rcNormalPosition = rc;
+    SetWindowPlacement(w32->window, &wp);
+}
 
 static void update_fullscreen_state(struct vo_w32_state *w32)
 {
@@ -1094,57 +1118,53 @@ static void update_fullscreen_state(struct vo_w32_state *w32)
         return;
     }
 
-    if (IsMinimized(w32->window)) {
-        w32->pending_resize = true;
-        return;
-    }
-
     if (w32->current_fs == w32->opts->fullscreen)
         return;
 
     w32->current_fs = w32->opts->fullscreen;
+    bool maximize = !w32->current_fs && w32->opts->window_maximized;
+    // Start right after a DWM composition pass, or the frame removal can show before the move.
+    if (w32->current_fs && !IsMinimized(w32->window))
+        DwmFlush();
     update_window_style(w32);
+    update_corners_pref(w32);
 
-    WINDOWPLACEMENT wp = { .length = sizeof(wp) };
-    GetWindowPlacement(w32->window, &wp);
-    if (!w32->current_fs) {
-        wp.showCmd = w32->pending_maximize ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
-
-        if (w32->pending_maximize || IsMaximized(w32->window)) {
-            w32->pending_maximize = false;
-
-            // We have to do this in two steps because Windows adds transition
-            // animations when maximizing, which start from rcNormalPosition
-            // to the maximized rectangle. To get a valid transition from fullscreen
-            // to maximized, we first enter the maximized state and then set the
-            // restore size.
-            SetWindowPlacement(w32->window, &wp);
-            wp.rcNormalPosition = w32->windowed_rect;
-            add_window_borders(w32, w32->window, &wp.rcNormalPosition);
-            SetWindowPlacement(w32->window, &wp);
-
-            // This is required after updating the window style. And also for us to
-            // signal new window size to the VO.
-            SetWindowPos(w32->window, 0, 0, 0, 0, 0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
-            goto done;
-
-        }
-    } else if (IsMaximized(w32->window)) {
-        wp.showCmd = SW_SHOWNORMAL;
-        SetWindowPlacement(w32->window, &wp);
-        w32->pending_maximize = true;
-    } else if (w32->opts->window_maximized) {
-        // If the window was initialized directly in fullscreen mode, restore
-        // it to maximized state later.
-        w32->pending_maximize = true;
+    if (IsMinimized(w32->window)) {
+        update_maximized_state(w32);
+        update_restore_rect(w32);
+        return;
     }
 
-    RECT r = w32->current_fs ? get_screen_area(w32) : w32->windowed_rect;
-    update_corners_pref(w32);
-    window_set_pos(w32, r);
+    // Workaround for DWM, which needs a composition pass to render the frame again.
+    if (!w32->current_fs && w32->opts->border)
+        DwmFlush();
 
-done:
+    if (maximize) {
+        // We have to do this in two steps because Windows adds transition
+        // animations when maximizing, which start from rcNormalPosition
+        // to the maximized rectangle. To get a valid transition from fullscreen
+        // to maximized, we first enter the maximized state and then set the
+        // restore size.
+        WINDOWPLACEMENT wp = { .length = sizeof(wp) };
+        GetWindowPlacement(w32->window, &wp);
+        wp.showCmd = SW_SHOWMAXIMIZED;
+        SetWindowPlacement(w32->window, &wp);
+        update_restore_rect(w32);
+
+        // This is required after updating the window style. And also for us to
+        // signal new window size to the VO.
+        SetWindowPos(w32->window, 0, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    } else {
+        if (IsMaximized(w32->window)) {
+            // Restore directly into the new position, skipping the old restore position.
+            update_restore_rect(w32);
+            ShowWindow(w32->window, SW_SHOWNORMAL);
+        }
+        RECT r = w32->current_fs ? get_screen_area(w32) : w32->windowed_rect;
+        window_set_pos(w32, r);
+    }
+
     signal_events(w32, VO_EVENT_RESIZE);
 }
 
@@ -1287,7 +1307,7 @@ static void handle_sizing(struct vo_w32_state *w32, int edge, RECT *rc)
         return;
 
     RECT wb = {0};
-    add_window_borders(w32, w32->window, &wb);
+    add_window_borders(w32, w32->window, &wb, IsMaximized(w32->window));
     // WM_GETMINMAXINFO should be always sent before any WM_SIZING.
     mp_assert(w32->max_track_size.x && w32->max_track_size.y);
     LONG max_w = w32->max_track_size.x - rect_w(wb);
@@ -1360,7 +1380,6 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         signal_events(w32, VO_EVENT_EXPOSE);
         break;
     case WM_MOVE: {
-        w32->moving = false;
         const int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
         OffsetRect(&w32->current_rect, x - w32->current_rect.left,
                                        y - w32->current_rect.top);
@@ -1375,7 +1394,6 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         break;
     }
     case WM_MOVING: {
-        w32->moving = true;
         RECT *rc = (RECT*)lParam;
         // Prevent the window from being moved if the window dragging hack
         // is active, and the window is currently in fullscreen.
@@ -1408,6 +1426,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         break;
     case WM_EXITSIZEMOVE:
         w32->moving = false;
+        if (w32->pending_resize)
+            window_resize(w32);
         break;
     case WM_SIZE: {
         const int w = LOWORD(lParam), h = HIWORD(lParam);
@@ -1415,7 +1435,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         if (w > 0 && h > 0) {
             w32->current_rect.right = w32->current_rect.left + w;
             w32->current_rect.bottom = w32->current_rect.top + h;
-            if (!w32->current_fs && !IsMaximized(w32->window) && !IsMinimized(w32->window))
+            if (!w32->current_fs && !IsMaximized(w32->window))
                 w32->windowed_rect = w32->current_rect;
             events |= VO_EVENT_RESIZE;
             MP_TRACE(w32, "resize window: %d:%d\n", w, h);
@@ -1439,7 +1459,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
                 SetWindowPlacement(w32->window, &wp);
                 break;
             case SIZE_RESTORED:
-                w32->opts->window_maximized = w32->pending_maximize && w32->current_fs;
+                // In fullscreen the option tells what to return to.
+                if (!w32->current_fs)
+                    w32->opts->window_maximized = false;
                 w32->opts->window_minimized = false;
                 break;
             }
@@ -1450,12 +1472,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
             }
         }
 
-        bool updated = (m_config_cache_write_opt(w32->opts_cache, &w32->opts->window_maximized) ||
-                        m_config_cache_write_opt(w32->opts_cache, &w32->opts->window_minimized));
+        bool updated = m_config_cache_write_opt(w32->opts_cache, &w32->opts->window_maximized);
+        updated |= m_config_cache_write_opt(w32->opts_cache, &w32->opts->window_minimized);
         if (updated || w32->pending_resize) {
-            // We call window resize here, only to recalculate possible window
-            // size after changing the style, but we want to preserve the client
-            // size.
+            // Measures the invisible borders once the window is normal and
+            // applies a resize that waited for this state, the client size
+            // is preserved otherwise.
             w32->window_state_changed = true;
             window_resize(w32);
             events |= VO_EVENT_WIN_STATE;
@@ -1463,6 +1485,25 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
 
         signal_events(w32, events);
         update_display_info(w32);
+        break;
+    }
+    case WM_WINDOWPOSCHANGING: {
+        // Workaround for Windows 10 1809, which shrinks a snapped window by its
+        // invisible borders after its frame was removed, also in fullscreen.
+        WINDOWPOS *wp = (WINDOWPOS *)lParam;
+        if (!w32->current_fs || (wp->flags & SWP_NOSIZE) || check_windows10_build(18362))
+            break;
+        RECT fs = get_screen_area(w32);
+        RECT rc = {wp->x, wp->y, wp->x + wp->cx, wp->y + wp->cy};
+        RECT inside;
+        if (!EqualRect(&rc, &fs) && IntersectRect(&inside, &rc, &fs) && EqualRect(&inside, &rc)) {
+            MP_VERBOSE(w32, "Keeping the fullscreen size, ignoring: %d:%d:%d:%d flags 0x%x\n",
+                       wp->x, wp->y, wp->cx, wp->cy, wp->flags);
+            wp->x = fs.left;
+            wp->y = fs.top;
+            wp->cx = rect_w(fs);
+            wp->cy = rect_h(fs);
+        }
         break;
     }
     case WM_GETMINMAXINFO: {
@@ -1475,10 +1516,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         MINMAXINFO* mmi = (MINMAXINFO *)lParam;
         RECT r = {0, 0, get_system_metrics(w32, SM_CXVIRTUALSCREEN),
                         get_system_metrics(w32, SM_CYVIRTUALSCREEN)};
-        RECT window_rect;
-        if (GetWindowRect(w32->window, &window_rect))
-            adjust_working_area_for_extended_frame(&r, &window_rect, w32->window);
-        mmi->ptMaxTrackSize = w32->max_track_size = (POINT){rect_w(r), rect_h(r)};
+        adjust_working_area_for_extended_frame(w32, &r);
+        mmi->ptMaxTrackSize = w32->max_track_size = (POINT){MPMAX(rect_w(r), mmi->ptMaxSize.x),
+                                                            MPMAX(rect_h(r), mmi->ptMaxSize.y)};
         break;
     }
     case WM_SIZING:
@@ -1491,7 +1531,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
 
         RECT *rc = (RECT*)lParam;
         w32->current_rect = *rc;
-        subtract_window_borders(w32, w32->window, &w32->current_rect);
+        subtract_window_borders(w32, w32->window, &w32->current_rect, IsMaximized(w32->window));
         window_resize(w32);
         break;
     case WM_PARENT_LOCATION_CHANGED:
@@ -1637,12 +1677,17 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         // https://blogs.msdn.com/b/oldnewthing/archive/2003/10/01/55108.aspx>
         int x = GET_X_LPARAM(lParam);
         int y = GET_Y_LPARAM(lParam);
+        POINT screen_pos = {x, y};
+        ClientToScreen(w32->window, &screen_pos);
         if (x != w32->mouse_x || y != w32->mouse_y) {
+            bool quiet = screen_pos.x == w32->mouse_screen_pos.x &&
+                         screen_pos.y == w32->mouse_screen_pos.y;
             w32->mouse_x = x;
             w32->mouse_y = y;
             if (!should_ignore_mouse_event(w32))
-                mp_input_set_mouse_pos(w32->input_ctx, x, y, false);
+                mp_input_set_mouse_pos(w32->input_ctx, x, y, quiet);
         }
+        w32->mouse_screen_pos = screen_pos;
         break;
     }
     case WM_LBUTTONDOWN:
@@ -1692,6 +1737,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         window_resize(w32);
         break;
     case WM_NCCALCSIZE:
+        if (IsMinimized(w32->window))
+            break;
         if (!w32->opts->border && !IsMaximized(w32->window))
             return 0;
 
@@ -1706,9 +1753,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
             if (!check_windows10_build(22000) && !IsMaximized(w32->window))
                 return 0;
             RECT r = {0};
-            adjust_window_rect(w32, w32->window, &r);
+            adjust_window_rect(w32, w32->window, &r, IsMaximized(w32->window));
             NCCALCSIZE_PARAMS *p = (LPNCCALCSIZE_PARAMS)lParam;
-            p->rgrc[0].top += r.top + get_title_bar_height(w32);
+            p->rgrc[0].top += r.top + get_title_bar_height(w32, IsMaximized(w32->window));
         }
         break;
     case WM_IME_STARTCOMPOSITION: {
@@ -1918,25 +1965,25 @@ static void window_set_pos(struct vo_w32_state *w32, RECT client_rect)
     if (w32->parent)
         return;
 
-    add_window_borders(w32, w32->window, &client_rect);
+    add_window_borders(w32, w32->window, &client_rect, IsMaximized(w32->window));
     SetWindowPos(w32->window, w32->opts->ontop ? HWND_TOPMOST : HWND_NOTOPMOST,
         client_rect.left, client_rect.top, rect_w(client_rect), rect_h(client_rect),
         SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     MP_VERBOSE(w32, "Window size changed to: %ld:%ld:%ld:%ld\n",
            client_rect.left, client_rect.top, rect_w(client_rect), rect_h(client_rect));
+    update_invisible_borders(w32);
 }
 
 static void window_resize(struct vo_w32_state *w32)
 {
     struct vo *vo = w32->vo;
 
-    RECT r = get_working_area(w32);
-    if (!w32->current_fs && !IsMaximized(w32->window) && w32->opts->border)
-        subtract_window_borders(w32, w32->window, &r);
+    update_invisible_borders(w32);
 
-    RECT window_rect;
-    if (GetWindowRect(w32->window, &window_rect))
-        adjust_working_area_for_extended_frame(&r, &window_rect, w32->window);
+    RECT r = get_working_area(w32);
+    if (!w32->current_fs && w32->opts->border)
+        subtract_window_borders(w32, w32->window, &r, false);
+    adjust_working_area_for_extended_frame(w32, &r);
 
     struct mp_rect screen = { r.left, r.top, r.right, r.bottom };
     struct vo_win_geometry geo;
@@ -1994,17 +2041,27 @@ static void window_resize(struct vo_w32_state *w32)
             fit_rect_on_screen(w32, &client_rect);
     }
 
-    w32->pending_resize = w32->opts->window_minimized ||
-                          w32->opts->window_maximized || w32->current_fs;
-    if (w32->pending_resize && w32->window_bounds_initialized)
+    w32->pending_resize = w32->window_bounds_initialized &&
+                          (w32->opts->window_minimized || w32->current_fs);
+    if (w32->pending_resize)
         goto set_pos_done;
 
-    if (w32->window_bounds_initialized && !w32->pending_reset_size)
-        client_rect = w32->current_rect;
-
-    window_set_pos(w32, client_rect);
+    bool reset_size = w32->pending_reset_size;
     w32->pending_reset_size = false;
     w32->force_pos = false;
+
+    if (IsMaximized(w32->window)) {
+        // The shell can take the window out of this state to a place of its
+        // own (snap, drag), so nothing can wait for that.
+        if (reset_size) {
+            w32->windowed_rect = client_rect;
+            update_restore_rect(w32);
+        }
+    } else {
+        if (w32->window_bounds_initialized && !reset_size)
+            client_rect = w32->current_rect;
+        window_set_pos(w32, client_rect);
+    }
 
 set_pos_done:
     w32->window_bounds_initialized = true;
@@ -2038,7 +2095,13 @@ finish:
 
 static void gui_thread_reconfig(void *ptr)
 {
-    window_resize(ptr);
+    struct vo_w32_state *w32 = ptr;
+    // Hold any resizes until the window is dropped.
+    if (w32->moving) {
+        w32->pending_resize = true;
+        return;
+    }
+    window_resize(w32);
 }
 
 // Resize the window. On the first call, it's also made visible.
@@ -2134,7 +2197,7 @@ static MP_THREAD_VOID gui_thread(void *ptr)
         if (w32->window)
             install_parent_hook(w32);
     } else {
-        CreateWindowExW(0, (LPWSTR)MAKEINTATOM(cls), MPV_WINDOW_CLASS_NAME,
+        CreateWindowExW(update_exstyle(w32, 0), (LPWSTR)MAKEINTATOM(cls), MPV_WINDOW_CLASS_NAME,
                         update_style(w32, 0), CW_USEDEFAULT, SW_HIDE, 100, 100,
                         0, 0, HINST_THISCOMPONENT, w32);
     }
@@ -2147,6 +2210,9 @@ static MP_THREAD_VOID gui_thread(void *ptr)
     w32->menu_ctx = mp_win32_menu_init(w32->window);
     update_dark_mode(w32);
     update_corners_pref(w32);
+    // Workaround for DWM, which stops rendering the frame in fullscreen and resumes it late.
+    DwmSetWindowAttribute(w32->window, DWMWA_NCRENDERING_POLICY,
+                          &(int){DWMNCRP_ENABLED}, sizeof(int));
     if (w32->opts->window_affinity)
         update_affinity(w32);
     if (w32->opts->backdrop_type)
@@ -2379,6 +2445,11 @@ static int gui_thread_control(struct vo_w32_state *w32, int request, void *arg)
                        changed_option == &vo_opts->title_bar)
             {
                 update_window_style(w32);
+                if (IsMaximized(w32->window) || IsMinimized(w32->window)) {
+                    update_restore_rect(w32);
+                    SetWindowPos(w32->window, 0, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+                }
                 w32->window_state_changed = true;
                 window_resize(w32);
             } else if (changed_option == &vo_opts->show_in_taskbar) {
@@ -2412,10 +2483,11 @@ static int gui_thread_control(struct vo_w32_state *w32, int request, void *arg)
                     w32->opts->window_maximized = false;
                     m_config_cache_write_opt(w32->opts_cache, &w32->opts->window_maximized);
                     signal_events(w32, VO_EVENT_WIN_STATE);
+                    if (IsMinimized(w32->window))
+                        update_maximized_state(w32);
                 }
 
                 w32->pending_resize = true;
-                w32->pending_maximize = false;
 
                 if (IsMaximized(w32->window)) {
                     ShowWindow(w32->window, SW_RESTORE);
@@ -2463,14 +2535,11 @@ static int gui_thread_control(struct vo_w32_state *w32, int request, void *arg)
             return VO_TRUE;
 
         if (IsMaximized(w32->window) || IsMinimized(w32->window)) {
-            WINDOWPLACEMENT wp = { .length = sizeof(wp) };
-            GetWindowPlacement(w32->window, &wp);
-            wp.showCmd = SW_RESTORE;
-            // We need to restore the window first, to get the correct border size.
-            SetWindowPlacement(w32->window, &wp);
-            wp.rcNormalPosition = w32->windowed_rect;
-            add_window_borders(w32, w32->window, &wp.rcNormalPosition);
-            SetWindowPlacement(w32->window, &wp);
+            update_restore_rect(w32);
+            // WM_SIZE does not come for a minimized window, so write it here.
+            w32->opts->window_maximized = false;
+            m_config_cache_write_opt(w32->opts_cache, &w32->opts->window_maximized);
+            update_maximized_state(w32);
             return VO_TRUE;
         }
 

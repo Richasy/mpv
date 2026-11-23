@@ -72,7 +72,6 @@ struct osd_buffer {
     struct wl_buffer *buffer;
     struct wl_list link;
     struct mp_image image;
-    size_t size;
     bool attached;
 };
 
@@ -91,13 +90,13 @@ struct priv {
 
     struct wl_shm_pool *osd_shm_pool;
     uint8_t *osd_shm_data;
+    size_t osd_shm_size;
     int osd_shm_width;
     int osd_shm_stride;
     int osd_shm_height;
     bool osd_surface_is_mapped;
     bool osd_surface_has_contents;
 
-    struct osd_buffer *osd_buffer;
     struct mp_draw_sub_cache *osd_cache;
     struct mp_osd_res screen_osd_res;
 
@@ -252,7 +251,6 @@ static void drmprime_dmabuf_importer(struct buffer *buf, struct mp_image *src,
 {
 #if HAVE_DRM
     int layer_no, plane_no;
-    int max_planes = 0;
     const AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)src->planes[0];
     if (!desc)
         return;
@@ -262,7 +260,6 @@ static void drmprime_dmabuf_importer(struct buffer *buf, struct mp_image *src,
         AVDRMLayerDescriptor layer = desc->layers[layer_no];
 
         buf->drm_format = layer.format;
-        max_planes = MPMAX(max_planes, layer.nb_planes);
         for (plane_no = 0; plane_no < layer.nb_planes; ++plane_no) {
             AVDRMPlaneDescriptor plane = layer.planes[plane_no];
             int object_index = plane.object_index;
@@ -335,6 +332,8 @@ static struct buffer *buffer_create(struct vo *vo, struct vo_frame *frame)
 
     struct mp_image *image = buf->frame->current;
     struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(wl->dmabuf);
+    if (!params)
+        goto err;
 
     switch(p->hwdec_type) {
     case HWDEC_VAAPI:
@@ -345,19 +344,23 @@ static struct buffer *buffer_create(struct vo *vo, struct vo_frame *frame)
         break;
     }
 
-    if (!buf->drm_format) {
-        talloc_free(buf->frame);
-        talloc_free(buf);
-        zwp_linux_buffer_params_v1_destroy(params);
-        return NULL;
-    }
+    if (!buf->drm_format)
+        goto err;
 
     buf->buffer = zwp_linux_buffer_params_v1_create_immed(params, image->params.w, image->params.h,
                                                           buf->drm_format, 0);
+    if (!buf->buffer)
+        goto err;
     zwp_linux_buffer_params_v1_destroy(params);
     wl_buffer_add_listener(buf->buffer, &buffer_listener, buf);
     wl_list_insert(&p->buffer_list, &buf->link);
     return buf;
+err:
+    if (params)
+        zwp_linux_buffer_params_v1_destroy(params);
+    talloc_free(buf->frame);
+    talloc_free(buf);
+    return NULL;
 }
 
 static struct buffer *buffer_get(struct vo *vo, struct vo_frame *frame)
@@ -399,12 +402,27 @@ static void destroy_osd_buffers(struct vo *vo)
     struct osd_buffer *osd_buf, *tmp;
     wl_list_for_each_safe(osd_buf, tmp, &p->osd_buffer_list, link) {
         wl_list_remove(&osd_buf->link);
-        munmap(osd_buf->image.planes[0], osd_buf->size);
-        if (osd_buf->buffer) {
+        if (osd_buf->buffer)
             wl_buffer_destroy(osd_buf->buffer);
-            osd_buf->buffer = NULL;
-        }
+        talloc_free(osd_buf);
     }
+}
+
+static void destroy_osd_shm_pool(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+
+    destroy_osd_buffers(vo);
+    if (p->osd_shm_pool)
+        wl_shm_pool_destroy(p->osd_shm_pool);
+    if (p->osd_shm_data)
+        munmap(p->osd_shm_data, p->osd_shm_size);
+    p->osd_shm_pool = NULL;
+    p->osd_shm_data = NULL;
+    p->osd_shm_height = 0;
+    p->osd_shm_width = 0;
+    p->osd_shm_stride = 0;
+    p->osd_shm_size = 0;
 }
 
 static struct osd_buffer *osd_buffer_check(struct vo *vo)
@@ -421,10 +439,13 @@ static struct osd_buffer *osd_buffer_check(struct vo *vo)
 static struct osd_buffer *osd_buffer_create(struct vo *vo)
 {
     struct priv *p = vo->priv;
+
+    if (!p->osd_shm_pool)
+        return NULL;
+
     struct osd_buffer *osd_buf = talloc_zero(vo, struct osd_buffer);
 
     osd_buf->vo = vo;
-    osd_buf->size = p->osd_shm_height * p->osd_shm_stride;
     mp_image_set_size(&osd_buf->image, p->osd_shm_width, p->osd_shm_height);
     osd_buf->image.planes[0] = p->osd_shm_data;
     osd_buf->image.stride[0] = p->osd_shm_stride;
@@ -452,7 +473,7 @@ static struct osd_buffer *osd_buffer_get(struct vo *vo)
     }
 }
 
-static void create_shm_pool(struct vo *vo)
+static void create_osd_shm_pool(struct vo *vo)
 {
     struct vo_wayland_state *wl = vo->wl;
     struct priv *p = vo->priv;
@@ -470,15 +491,14 @@ static void create_shm_pool(struct vo *vo)
         goto error2;
     close(fd);
 
-    destroy_osd_buffers(vo);
+    destroy_osd_shm_pool(vo);
 
-    if (p->osd_shm_pool)
-        wl_shm_pool_destroy(p->osd_shm_pool);
     p->osd_shm_pool = pool;
     p->osd_shm_width = vo->dwidth;
     p->osd_shm_height = vo->dheight;
     p->osd_shm_stride = stride;
     p->osd_shm_data = data;
+    p->osd_shm_size = size;
     return;
 
 error2:
@@ -523,7 +543,8 @@ static void resize(struct vo *vo)
     vo->dwidth = width;
     vo->dheight = height;
 
-    create_shm_pool(vo);
+    if (!p->osd_shm_pool || p->osd_shm_width != width || p->osd_shm_height != height)
+        create_osd_shm_pool(vo);
 
     // top level viewport is calculated with pan set to zero
     vo->opts->pan_x = 0;
@@ -549,7 +570,7 @@ static void resize(struct vo *vo)
     mp_mutex_lock(&vo->params_mutex);
     vo->target_params->w = mp_rect_w(dst);
     vo->target_params->h = mp_rect_h(dst);
-    vo->target_params->rotate = (vo->params->rotate % 90) * 90;
+    vo->target_params->rotate = vo->params->rotate % 90 ? 0 : vo->params->rotate;
     vo->target_params->vflip = vo->params->vflip;
     mp_mutex_unlock(&vo->params_mutex);
 
@@ -665,11 +686,11 @@ static void flip_page(struct vo *vo)
     wl_surface_commit(wl->video_surface);
     wl_surface_commit(wl->surface);
 
-    if (wl->opts->wl_internal_vsync)
-        vo_wayland_wait_frame(wl);
-
     if (wl->use_present)
         present_sync_swap(wl->present);
+
+    if (wl->opts->wl_internal_vsync)
+        vo_wayland_wait_frame(wl);
 }
 
 static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
@@ -742,8 +763,10 @@ done:
     vo->target_params = &p->target_params;
     mp_mutex_unlock(&vo->params_mutex);
 
+    mp_require(img->params.rotate >= 0 && img->params.rotate < 360);
+    int rotate = img->params.rotate % 90 ? 0 : img->params.rotate;
     wl_surface_set_buffer_transform(vo->wl->video_surface,
-        transform_enum_lut[img->params.rotate / 90][!!img->params.vflip]);
+        transform_enum_lut[rotate / 90][!!img->params.vflip]);
 
     // Immediately destroy all buffers if params change.
     destroy_buffers(vo);
@@ -780,9 +803,7 @@ static void uninit(struct vo *vo)
     struct priv *p = vo->priv;
 
     destroy_buffers(vo);
-    destroy_osd_buffers(vo);
-    if (p->osd_shm_pool)
-        wl_shm_pool_destroy(p->osd_shm_pool);
+    destroy_osd_shm_pool(vo);
     if (p->solid_buffer_pool)
         wl_shm_pool_destroy(p->solid_buffer_pool);
     if (p->solid_buffer)

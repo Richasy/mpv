@@ -49,18 +49,20 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     check_error(mpv_set_option_string(ctx, "ao", "null"));
     check_error(mpv_set_option_string(ctx, "ao-null-untimed", "yes"));
     check_error(mpv_set_option_string(ctx, "untimed", "yes"));
+    check_error(mpv_set_option_string(ctx, "image-display-duration", "0"));
     check_error(mpv_set_option_string(ctx, "video-osd", "no"));
     check_error(mpv_set_option_string(ctx, "msg-level", "all=trace"));
     check_error(mpv_set_option_string(ctx, "network-timeout", "1"));
+    check_error(mpv_set_option_string(ctx, "input-builtin-bindings", "no"));
 
-    check_error(mpv_initialize(ctx));
+    initialize(ctx);
 
     const char *cmd[] = {"loadfile", data, NULL};
     check_error(mpv_command(ctx, cmd));
 
     player_loop(ctx);
 
-    mpv_terminate_destroy(ctx);
+    destroy(ctx);
 
     return 0;
 }

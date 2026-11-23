@@ -74,44 +74,44 @@ local safe_protos = Set {
 
 -- For some sites, youtube-dl returns the audio codec (?) only in the "ext" field.
 local ext_map = {
+    ["aac"]         = "aac",
+    ["alac"]        = "alac",
+    ["ape"]         = "ape",
+    ["flac"]        = "flac",
+    ["m4a"]         = "aac",
     ["mp3"]         = "mp3",
     ["opus"]        = "opus",
+    ["spx"]         = "speex",
+    ["vorbis"]      = "vorbis",
 }
 
-local codec_map = {
-    -- src pattern  = mpv codec
+-- Codec names reported by yt-dlp that mpv does not know. Everything else is
+-- passed through, mpv resolves RFC 6381 codec strings itself.
+local codec_aliases = {
+    ["h265"]        = "hevc",
+    ["m4a"]         = "aac",
+}
+
+-- Subtitle formats by yt-dlp "ext".
+local sub_codec_map = {
     ["ass"]         = "ass",
+    ["lrc"]         = "text",
+    ["scc"]         = "eia_608",
     ["srt"]         = "subrip",
+    ["ssa"]         = "ass",
     ["vtt"]         = "webvtt",
-    ["opus"]        = "opus",
-    ["vp9"]         = "vp9",
-    ["vp9%..*"]     = "vp9",
-    ["avc1%..*"]    = "h264",
-    ["av01%..*"]    = "av1",
-    ["mp4a%..*"]    = "aac",
-    ["hev1%..*"]    = "hevc",
 }
 
 if mp.get_property_native("subrandr-version") ~= nil then
-    codec_map["srv3"] = "subrandr/srv3"
+    sub_codec_map["srv3"] = "subrandr/srv3"
 end
 
--- Codec name as reported by youtube-dl mapped to mpv internal codec names.
--- Fun fact: mpv will not really use the codec, but will still try to initialize
--- the codec on track selection (just to scrap it), meaning it's only a hint,
--- but one that may make initialization fail. On the other hand, if the codec
--- is valid but completely different from the actual media, nothing bad happens.
+-- The codec is only a hint, decoding uses the codec of the opened stream.
 local function map_codec_to_mpv(codec)
     if codec == nil then
         return nil
     end
-    for k, v in pairs(codec_map) do
-        local s, e = codec:find(k)
-        if s == 1 and e == #codec then
-            return v
-        end
-    end
-    return nil
+    return codec_aliases[codec:lower()] or codec
 end
 
 local function platform_is_windows()
@@ -165,10 +165,13 @@ local special_cookie_field_names = Set {
 }
 
 -- parse single-line Set-Cookie syntax
-local function parse_cookies(cookies_line)
+local function parse_cookies(cookies_line, url)
     if not cookies_line then
         return {}
     end
+    -- parse origin host from url
+    local host = url and url:match("^https?://([^/?#]+)")
+    host = host and host:gsub("^.*@", ""):gsub(":%d*$", "")
     local cookies = {}
     local cookie = {}
     for stem in cookies_line:gmatch('[^;]+') do
@@ -179,19 +182,20 @@ local function parse_cookies(cookies_line)
             if special_cookie_field_names[cmp_name] then
                 cookie[cmp_name] = value
             else
-                if cookie.name and cookie.value then
+                if cookie.name and cookie.domain then
                     table.insert(cookies, cookie)
                 end
                 cookie = {
                     name = name,
                     value = value,
+                    -- without a Domain attribute it is a host-only cookie
+                    domain = host,
                 }
             end
         end
     end
-    if cookie.name and cookie.value then
-        local cookie_key = cookie.domain .. ":" .. cookie.name
-        cookies[cookie_key] = cookie
+    if cookie.name and cookie.domain then
+        table.insert(cookies, cookie)
     end
     return cookies
 end
@@ -200,7 +204,7 @@ end
 local function serialize_cookies(cookies)
     local result = ''
     for _, cookie in pairs(cookies) do
-        local domain = cookie.domain or ""
+        local domain = cookie.domain
         result = result .. ("%s\t%s\t%s\t%s\t%s\t%s\t%s\n"):format(
             domain,
             (domain:sub(1, 1) == ".") and "TRUE" or "FALSE",
@@ -214,11 +218,11 @@ local function serialize_cookies(cookies)
 end
 
 -- set file-local cookies-file pointing at an in-memory cookies.txt
-local function set_cookies(cookies)
+local function set_cookies(cookies, url)
     if not cookies or cookies == "" then
         return
     end
-    local data = serialize_cookies(parse_cookies(cookies))
+    local data = serialize_cookies(parse_cookies(cookies, url))
     if data ~= "" then
         mp.set_property_bool("file-local-options/cookies", true)
         mp.set_property("file-local-options/cookies-file", "memory://" .. data)
@@ -248,6 +252,13 @@ local function url_is_safe(url)
         msg.error(("Ignoring potentially unsafe url: '%s'"):format(url))
     end
     return safe
+end
+
+-- yt-dlp marks subtitles that need one of its own downloaders with a protocol.
+local function sub_protocol_is_supported(sub_info)
+    local proto = sub_info.protocol
+    return proto == nil or proto == "http" or proto == "https" or
+           proto:find("^m3u8") ~= nil
 end
 
 local function is_whitelisted(url)
@@ -402,7 +413,7 @@ local function edl_track_joined(fragments, protocol, is_live, base)
         table.insert(parts, edl_escape(join_url(base, fragment)))
         if fragment.duration then
             parts[#parts] =
-                parts[#parts] .. ",length="..fragment.duration
+                parts[#parts] .. ",length="..edl_escape(fragment.duration)
         end
     end
     return edl .. table.concat(parts, ";") .. ";"
@@ -491,6 +502,8 @@ local function formats_to_edl(json, formats, use_all_formats)
         has_video_only = has_video_only or video_only
     end
 
+    local has_video_track = false
+    local has_audio_track = false
     local has_requested_video = false
     local has_requested_audio = false
     local next_program_id = 0
@@ -518,6 +531,7 @@ local function formats_to_edl(json, formats, use_all_formats)
                 media_type = "video",
                 codec = map_codec_to_mpv(track.vcodec),
             }
+            has_video_track = true
             if is_default then
                 has_requested_video = true
             end
@@ -528,6 +542,7 @@ local function formats_to_edl(json, formats, use_all_formats)
                 codec = map_codec_to_mpv(track.acodec) or
                         ext_map[track.ext],
             }
+            has_audio_track = true
             if is_default then
                 has_requested_audio = true
             end
@@ -556,8 +571,9 @@ local function formats_to_edl(json, formats, use_all_formats)
                 elseif sub.media_type == "audio" then
                     props = props .. ",samplerate=" .. as_integer(track.asr)
                 end
+                local codec = sub.codec and ",codec=" .. edl_escape(sub.codec) or ""
                 hdr[#hdr + 1] = "!delay_open,media_type=" .. sub.media_type ..
-                    ",codec=" .. (sub.codec or "null") .. props
+                    codec .. props
 
                 -- Add bitrate information etc. for better user selection.
                 local byterate = 0
@@ -626,7 +642,10 @@ local function formats_to_edl(json, formats, use_all_formats)
         return nil
     end
 
-    if has_requested_audio ~= has_requested_video then
+    -- Only deselect the type that wasn't requested if there are tracks of
+    -- that type, so that e.g. thumbnails of audio-only sources stay selected.
+    if has_requested_audio ~= has_requested_video and
+       has_audio_track and has_video_track then
         local not_req_prop = has_requested_video and "aid" or "vid"
         if mp.get_property(not_req_prop) == "auto" then
             mp.set_property("file-local-options/" .. not_req_prop, "no")
@@ -746,28 +765,31 @@ local function add_single_video(json)
         table.sort(subs, function(a, b) return a.lang < b.lang end)
         for _, e in ipairs(subs) do
             local lang, sub_info = e.lang, e.info
-            msg.verbose("adding subtitle ["..lang.."]")
 
             local sub = nil
 
-            if sub_info.data ~= nil then
-                sub = "memory://"..sub_info.data
+            if not sub_protocol_is_supported(sub_info) then
+                msg.verbose("Skipping subtitle ["..lang.."] with protocol "..
+                            sub_info.protocol)
+            elseif sub_info.data ~= nil then
+                sub = "data://text/plain,"..sub_info.data
             elseif sub_info.url ~= nil and
                 url_is_safe(sub_info.url) then
                 sub = sub_info.url
+            else
+                msg.verbose("No subtitle data/url for ["..lang.."]")
             end
 
             if sub ~= nil then
+                msg.verbose("adding subtitle ["..lang.."]")
                 local edl = "edl://!no_clip;!delay_open,media_type=sub"
-                local codec = map_codec_to_mpv(sub_info.ext)
+                local codec = sub_codec_map[sub_info.ext]
                 if codec then
                     edl = edl .. ",codec=" .. codec
                 end
                 edl = edl .. ";" .. edl_escape(sub)
                 local title = sub_info.name or sub_info.ext
                 mp.commandv("sub-add", edl, "auto", title, lang)
-            else
-                msg.verbose("No subtitle data/url for ["..lang.."]")
             end
         end
     end
@@ -780,7 +802,7 @@ local function add_single_video(json)
 
         for i = #json.thumbnails, 1, -1 do
             local thumb_info = json.thumbnails[i]
-            if thumb_info.url ~= nil then
+            if thumb_info.url ~= nil and url_is_safe(thumb_info.url) then
                 if o.thumbnails == 'all' then
                     msg.verbose("adding thumbnail")
                     mp.commandv("video-add", thumb_info.url, "auto")
@@ -863,7 +885,8 @@ local function add_single_video(json)
         mp.set_property("file-local-options/http-proxy", json.proxy)
     end
 
-    set_cookies(cookies)
+    set_cookies(cookies, has_requested_formats and requested_formats[1].url
+                         or json.url)
 
     local chunk_size = math.huge
     if has_requested_formats then
@@ -1073,7 +1096,8 @@ local function run_ytdl_hook(url)
 
             -- can't change the http headers for each entry, so use the 1st
             set_http_headers(json.entries[1].http_headers)
-            playlist_cookies[playlist] = json.entries[1].cookies or json.cookies
+            set_cookies(json.entries[1].cookies or json.cookies,
+                        json.entries[1].url)
 
             mp.set_property("stream-open-filename", playlist)
             if json.title and mp.get_property("force-media-title", "") == "" then
@@ -1093,19 +1117,26 @@ local function run_ytdl_hook(url)
             if entry_wsubs ~= nil and
                 json.entries[entry_wsubs].duration ~= nil then
                 for j, req in pairs(json.entries[entry_wsubs].requested_subtitles) do
-                    local subfile = "edl://"
-                    for _, entry in pairs(json.entries) do
-                        if entry.requested_subtitles ~= nil and
-                            entry.requested_subtitles[j] ~= nil and
-                            url_is_safe(entry.requested_subtitles[j].url) then
-                            subfile = subfile..edl_escape(entry.requested_subtitles[j].url)
-                        else
-                            subfile = subfile..edl_escape("memory://WEBVTT")
+                    if not sub_protocol_is_supported(req) then
+                        msg.verbose("Skipping subtitle ["..j.."] with protocol "..
+                                    req.protocol)
+                    else
+                        local subfile = "edl://"
+                        for _, entry in pairs(json.entries) do
+                            local sub_info = entry.requested_subtitles and
+                                             entry.requested_subtitles[j]
+                            if sub_info ~= nil and
+                                sub_protocol_is_supported(sub_info) and
+                                url_is_safe(sub_info.url) then
+                                subfile = subfile..edl_escape(sub_info.url)
+                            else
+                                subfile = subfile..edl_escape("memory://WEBVTT")
+                            end
+                            subfile = subfile..",length="..edl_escape(entry.duration)..";"
                         end
-                        subfile = subfile..",length="..entry.duration..";"
+                        msg.debug(j.." sub EDL: "..subfile)
+                        mp.commandv("sub-add", subfile, "auto", req.ext, j)
                     end
-                    msg.debug(j.." sub EDL: "..subfile)
-                    mp.commandv("sub-add", subfile, "auto", req.ext, j)
                 end
             end
 
@@ -1118,11 +1149,6 @@ local function run_ytdl_hook(url)
             for _, entry in pairs(json.entries) do
                 local site = entry.url
                 local title = entry.title
-
-                if title ~= nil then
-                    title = string.gsub(title, '%s+', ' ')
-                    table.insert(playlist, "#EXTINF:0," .. title)
-                end
 
                 --[[ some extractors will still return the full info for
                      all clips in the playlist and the URL will point
@@ -1140,6 +1166,9 @@ local function run_ytdl_hook(url)
                 -- links without protocol as returned by --flat-playlist
                 if not site then
                     msg.error("Playlist entry does not have unique URL, can't add it.")
+                elseif site:find("%c") then
+                    -- a line break would add entries to the playlist
+                    msg.error("Playlist entry URL contains control characters, can't add it.")
                 elseif not site:find("://") then
                     -- youtube extractor provides only IDs,
                     -- others come prefixed with the extractor name and ":"
@@ -1151,6 +1180,10 @@ local function run_ytdl_hook(url)
                 end
 
                 if playlist_url then
+                    if title ~= nil then
+                        title = string.gsub(title, '%s+', ' ')
+                        table.insert(playlist, "#EXTINF:0," .. title)
+                    end
                     table.insert(playlist, playlist_url)
                     -- save the cookies in a table for the playlist hook
                     playlist_cookies[playlist_url] = entry.cookies or json.cookies
@@ -1205,7 +1238,7 @@ mp.add_hook("on_load", 20, function ()
     msg.verbose('playlist hook')
     local url = mp.get_property("stream-open-filename", "")
     if playlist_cookies[url] then
-        set_cookies(playlist_cookies[url])
+        set_cookies(playlist_cookies[url], url)
     end
 end)
 

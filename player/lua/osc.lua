@@ -1900,6 +1900,17 @@ local function bar_layout(direction, slim)
         osc_param.playresx = osc_param.playresy * osc_param.display_aspect
     end
 
+    -- Limits for the hitbox extensions of the edge buttons,
+    -- considering the position of window controls
+    local edge_x1, edge_x2 = 0, math.huge
+    if direction > 0 and window_controls_enabled() then
+        if window_controls_alignment() == "left" then
+            edge_x1 = window_control_box_width
+        else
+            edge_x2 = osc_param.playresx - window_control_box_width
+        end
+    end
+
     osc_geo.y = direction * (osc_geo.h - 2 + user_opts.barmargin)
     osc_geo.w = osc_param.playresx + 4
     if direction < 0 then
@@ -1988,7 +1999,7 @@ local function bar_layout(direction, slim)
         lo = add_layout("fullscreen")
         lo.geometry = geo
         lo.style = osc_styles.topButtonsBar
-        lo.hitbox = { x2 = math.huge }
+        lo.hitbox = { x2 = edge_x2 }
     else
         -- Cache
         geo = { x = t_r, y = geo.y, an = 6, w = 150, h = geo.h }
@@ -2018,7 +2029,7 @@ local function bar_layout(direction, slim)
     lo = add_layout("play_pause")
     lo.geometry = geo
     lo.style = osc_styles.smallButtonsBar
-    lo.hitbox = { x1 = 0 }
+    lo.hitbox = { x1 = edge_x1 }
 
     geo = { x = geo.x + geo.w + padX, y = geo.y, an = geo.an, w = geo.w, h = geo.h }
     lo = add_layout("chapter_prev")
@@ -2045,7 +2056,7 @@ local function bar_layout(direction, slim)
     lo = add_layout("fullscreen")
     lo.geometry = geo
     lo.style = osc_styles.smallButtonsBar
-    lo.hitbox = { x2 = math.huge }
+    lo.hitbox = { x2 = edge_x2 }
 
     -- Volume
     geo = { x = geo.x - geo.w - padX, y = geo.y, an = geo.an, w = geo.w, h = geo.h }
@@ -2921,6 +2932,8 @@ local function enable_osc(enable)
     else
         hide_osc() -- acts immediately when state.enabled == false
         hide_wc()
+        -- tick() returns early while disabled, so it would never remove the logo
+        render_wipe(state.logo_osd)
         if state.showhide_enabled then
             mp.disable_key_bindings("showhide")
             mp.disable_key_bindings("showhide_wc")
@@ -3130,6 +3143,8 @@ tick = function()
         msg.trace("idle message")
         if user_opts.idlescreen then
             render_logo()
+        else
+            render_wipe(state.logo_osd)
         end
 
         -- Hide main OSC but keep window controls functional

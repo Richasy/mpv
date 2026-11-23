@@ -7,9 +7,11 @@ import contextlib
 import ctypes
 import http.server
 import json
+from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -24,7 +26,7 @@ import libmpv_network_cursors as cursors
 SECRET = "curl-diagnostic-private-marker"
 CASES = ("range", "headers", "body", "partial", "status", "wrong-range",
          "retry-cancel", "cursors", "status-held", "wrong-range-held",
-         "retry-held")
+         "retry-held", "empty")
 
 
 class Server(http.server.ThreadingHTTPServer):
@@ -94,6 +96,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         end = min(int(match[2]) if match[2] else len(RANGE_WAV) - 1,
                   len(RANGE_WAV) - 1)
         self.server.requests.append(start)
+        if mode == "empty":
+            self.send_response(416)
+            self.send_header("Content-Range", "bytes */0")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if start > end:
             self.send_response(416)
             self.send_header("Content-Range", f"bytes */{len(RANGE_WAV)}")
@@ -120,7 +128,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.flush()
             self.server.release.wait(130)
         body = RANGE_WAV[start:end + 1]
-        if mode == "partial" and start == 0:
+        if mode == "partial" and start in (0, 1024):
             body = body[:1024]
             self.close_connection = True
         try:
@@ -179,6 +187,9 @@ def run_case(library, mode):
         }
         if mode == "partial":
             options["curl-max-request-size"] = "0"
+        if mode == "empty":
+            dump = Path(stack.enter_context(tempfile.TemporaryDirectory())) / "stream.bin"
+            options["stream-dump"] = str(dump)
         if mode == "body":
             options["network-timeout"] = "0"
         if mode == "retry-cancel":
@@ -274,6 +285,9 @@ def run_case(library, mode):
             if len(line) > 1000:
                 raise RuntimeError("Summary exceeds the consumer's text limit")
         begins = records(lines, "begin")
+        if mode == "empty" and (server.requests != [0] or
+                                not dump.is_file() or dump.read_bytes() != b""):
+            raise RuntimeError("Empty file did not open as a single zero-length stream")
         ids = [row["id"] for row in begins]
         if not ids or len(ids) != len(set(ids)):
             raise RuntimeError(f"Missing or duplicate request identities: {ids}")
@@ -299,9 +313,9 @@ def run_case(library, mode):
                        float(row["tls_ms"]) == 0 for row in headers):
                 raise RuntimeError("Invalid loopback HTTP transport timings")
         if mode == "partial":
-            if not any(row["retry"] == "1" and int(row["offset"]) > 0
-                       for row in begins):
-                raise RuntimeError("Partial-transfer retry was not diagnosed")
+            resumed = {int(row["offset"]) for row in begins if row["retry"] == "1"}
+            if not {1024, 2048} <= resumed:
+                raise RuntimeError(f"Retry budget did not reset on progress: {resumed}")
             if not any(int(row["curl_result"]) > 0
                        for row in records(lines, "end")):
                 raise RuntimeError("Missing failed-transfer result")

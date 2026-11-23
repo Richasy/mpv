@@ -20,7 +20,10 @@
 
 #include "misc/bstr.h"
 #include "common/common.h"
+#include "demux/demux.h"
+#include "misc/charset_conv.h"
 #include "misc/thread_tools.h"
+#include "options/m_config.h"
 #include "stream.h"
 
 #include "stream_libarchive.h"
@@ -104,7 +107,7 @@ static bool volume_seek(struct mp_archive_volume *vol)
     return r;
 }
 
-static ssize_t read_cb(struct archive *arch, void *priv, const void **buffer)
+static la_ssize_t read_cb(struct archive *arch, void *priv, const void **buffer)
 {
     struct mp_archive_volume *vol = priv;
     if (!vol->src)
@@ -118,8 +121,8 @@ static ssize_t read_cb(struct archive *arch, void *priv, const void **buffer)
 }
 
 // lazy seek to avoid problems with end seeking over http
-static int64_t seek_cb(struct archive *arch, void *priv,
-                       int64_t offset, int whence)
+static la_int64_t seek_cb(struct archive *arch, void *priv,
+                          la_int64_t offset, int whence)
 {
     struct mp_archive_volume *vol = priv;
     if (!vol->src)
@@ -136,16 +139,16 @@ static int64_t seek_cb(struct archive *arch, void *priv,
     case SEEK_END: ;
         int64_t size = stream_get_size(vol->src);
         if (size < 0)
-            return -1;
+            return ARCHIVE_FAILED;
         vol->seek_to = size + offset;
         break;
     default:
-        return -1;
+        return ARCHIVE_FATAL;
     }
     return vol->seek_to;
 }
 
-static int64_t skip_cb(struct archive *arch, void *priv, int64_t request)
+static la_int64_t skip_cb(struct archive *arch, void *priv, la_int64_t request)
 {
     struct mp_archive_volume *vol = priv;
     if (!vol->src)
@@ -153,6 +156,7 @@ static int64_t skip_cb(struct archive *arch, void *priv, int64_t request)
     if (!volume_seek(vol))
         return -1;
     int64_t old = stream_tell(vol->src);
+    request = MPMIN(request, INT64_MAX - old);
     stream_seek_skip(vol->src, old + request);
     return stream_tell(vol->src) - old;
 }
@@ -325,6 +329,8 @@ static struct mp_archive *mp_archive_new_raw(struct mp_log *log,
 {
     struct mp_archive *mpa = talloc_zero(NULL, struct mp_archive);
     mpa->log = log;
+    struct demux_opts *opts = mp_get_config_group(mpa, src->global, &demux_conf);
+    mpa->meta_cp = opts->meta_cp;
     mpa->locale = newlocale(LC_CTYPE_MASK, "C.UTF-8", (locale_t)0);
     if (!mpa->locale) {
         mpa->locale = newlocale(LC_CTYPE_MASK, "", (locale_t)0);
@@ -431,15 +437,24 @@ bool mp_archive_next_entry(struct mp_archive *mpa)
             continue;
         // Some archives may have no filenames, or libarchive won't return some.
         const char *fn = archive_entry_pathname(entry);
-        char buf[64];
-        if (!fn || bstr_validate_utf8(bstr0(fn)) < 0)
+        if (!fn)
             fn = archive_entry_pathname_utf8(entry);
-        if (!fn || bstr_validate_utf8(bstr0(fn)) < 0) {
+        char buf[64];
+        if (!fn) {
             snprintf(buf, sizeof(buf), "mpv_unknown#%d", mpa->entry_num);
             fn = buf;
         }
+        // Forced codepage applies only to the raw filenames.
+        const char *cp = mpa->meta_cp;
+        if (cp[0] == '+')
+            cp++;
+        bstr name = bstr0(fn);
+        cp = mp_charset_guess(mpa, mpa->log, name, cp, 0);
+        bstr conv = mp_iconv_to_utf8(mpa->log, name, cp, 0);
         mpa->entry = entry;
-        mpa->entry_filename = talloc_strdup(mpa, fn);
+        mpa->entry_filename = bstrto0(mpa, conv);
+        if (conv.start != name.start)
+            talloc_free(conv.start);
         mpa->entry_num += 1;
         success = true;
         break;
@@ -461,7 +476,6 @@ struct priv {
 static int reopen_archive(stream_t *s)
 {
     struct priv *p = s->priv;
-    s->pos = 0;
     if (!p->mpa) {
         p->mpa = mp_archive_new(s->log, p->src, MP_ARCHIVE_FLAG_UNSAFE, 0);
     } else {
@@ -499,7 +513,7 @@ static int archive_entry_fill_buffer(stream_t *s, void *buffer, int max_len)
     if (!p->mpa)
         return 0;
     locale_t oldlocale = uselocale(p->mpa->locale);
-    int r = archive_read_data(p->mpa->arch, buffer, max_len);
+    la_ssize_t r = archive_read_data(p->mpa->arch, buffer, max_len);
     if (r < 0) {
         MP_ERR(s, "%s\n", archive_error_string(p->mpa->arch));
         if (mp_archive_check_fatal(p->mpa, r)) {
@@ -514,9 +528,10 @@ static int archive_entry_fill_buffer(stream_t *s, void *buffer, int max_len)
 static int archive_entry_seek(stream_t *s, int64_t newpos)
 {
     struct priv *p = s->priv;
+    int64_t pos = s->pos;
     if (p->mpa && !p->broken_seek) {
         locale_t oldlocale = uselocale(p->mpa->locale);
-        int r = archive_seek_data(p->mpa->arch, newpos, SEEK_SET);
+        la_int64_t r = archive_seek_data(p->mpa->arch, newpos, SEEK_SET);
         uselocale(oldlocale);
         if (r >= 0)
             return 1;
@@ -524,47 +539,44 @@ static int archive_entry_seek(stream_t *s, int64_t newpos)
         p->broken_seek = true;
         if (reopen_archive(s) < STREAM_OK)
             return -1;
+        pos = 0;
     }
     // libarchive can't seek in most formats.
-    if (newpos < s->pos) {
+    if (!p->mpa || newpos < pos) {
         // Hack seeking backwards into working by reopening the archive and
         // starting over.
         MP_VERBOSE(s, "trying to reopen archive for performing seek\n");
         if (reopen_archive(s) < STREAM_OK)
             return -1;
+        pos = 0;
     }
-    if (newpos > s->pos) {
-        if (!p->mpa && reopen_archive(s) < STREAM_OK)
+    // For seeking forwards, just keep reading data (there's no libarchive
+    // skip function either). Like with a file, seeking past the end succeeds
+    // and reads return EOF then.
+    char buffer[4096];
+    while (newpos > pos) {
+        if (mp_cancel_test(s->cancel))
             return -1;
-        // For seeking forwards, just keep reading data (there's no libarchive
-        // skip function either).
-        char buffer[4096];
-        while (newpos > s->pos) {
-            if (mp_cancel_test(s->cancel))
-                return -1;
 
-            int size = MPMIN(newpos - s->pos, sizeof(buffer));
-            locale_t oldlocale = uselocale(p->mpa->locale);
-            int r = archive_read_data(p->mpa->arch, buffer, size);
-            if (r <= 0) {
-                if (r == 0 && newpos > p->entry_size) {
-                    MP_ERR(s, "demuxer trying to seek beyond end of archive "
-                           "entry\n");
-                } else if (r == 0) {
-                    MP_ERR(s, "end of archive entry reached while seeking\n");
-                } else {
-                    MP_ERR(s, "%s\n", archive_error_string(p->mpa->arch));
-                }
-                uselocale(oldlocale);
-                if (mp_archive_check_fatal(p->mpa, r)) {
-                    mp_archive_free(p->mpa);
-                    p->mpa = NULL;
-                }
-                return -1;
-            }
+        locale_t oldlocale = uselocale(p->mpa->locale);
+        la_ssize_t r = archive_read_data(p->mpa->arch, buffer,
+                                         MPMIN(newpos - pos, sizeof(buffer)));
+        if (r < 0) {
+            MP_ERR(s, "%s\n", archive_error_string(p->mpa->arch));
             uselocale(oldlocale);
-            s->pos += r;
+            if (mp_archive_check_fatal(p->mpa, r)) {
+                mp_archive_free(p->mpa);
+                p->mpa = NULL;
+            }
+            return -1;
         }
+        uselocale(oldlocale);
+        if (r == 0) {
+            if (newpos <= p->entry_size)
+                MP_WARN(s, "archive entry is shorter than its declared size\n");
+            break;
+        }
+        pos += r;
     }
     return 1;
 }

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
 # Static mpv and libmpv builds on top of the FFmpeg-Builds container images
-# (ghcr.io/btbn/ffmpeg-builds/<target>-<variant>, see
-# https://github.com/BtbN/FFmpeg-Builds). The image ships the cross toolchain,
+# (ghcr.io/ffmpeg-builds/ffmpeg-builds/<target>-<variant>, see
+# https://github.com/FFmpeg-Builds/FFmpeg-Builds). The image ships the cross toolchain,
 # a matching /cross.meson and every FFmpeg dependency as static library in
 # $FFBUILD_PREFIX, so only FFmpeg itself and the things FFmpeg does not need
 # are built here. Run it from the mpv source tree inside the container:
 #
 #   docker run --rm -v "$PWD:/mpv" -w /mpv \
-#       ghcr.io/btbn/ffmpeg-builds/win64-gpl:latest ./ci/build-mingw64-full.sh
+#       ghcr.io/ffmpeg-builds/ffmpeg-builds/win64-gpl:latest ./ci/build-mingw64-full.sh
 #
 # The mpv binaries end up in artifact/, the libmpv package in artifact-libmpv/.
 set -euo pipefail
@@ -69,6 +69,30 @@ make install
 popd
 endgroup
 
+group "Building libarchive"
+$gitclone https://github.com/libarchive/libarchive.git
+mkdir -p libarchive/build
+pushd libarchive/build
+cmake -GNinja -DCMAKE_TOOLCHAIN_FILE="$FFBUILD_CMAKE_TOOLCHAIN" \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$FFBUILD_PREFIX" \
+      -DBUILD_SHARED_LIBS=OFF -DENABLE_{CAT,CPIO,TAR,TEST,UNZIP}=OFF \
+      -DENABLE_{LIBXML2,OPENSSL,PCRE2POSIX}=OFF ..
+ninja install
+popd
+endgroup
+
+group "Building uchardet"
+$gitclone -b v0.0.8 https://gitlab.freedesktop.org/uchardet/uchardet.git
+mkdir -p uchardet/build
+pushd uchardet/build
+cmake -GNinja -DCMAKE_TOOLCHAIN_FILE="$FFBUILD_CMAKE_TOOLCHAIN" \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$FFBUILD_PREFIX" \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      -DBUILD_SHARED_LIBS=OFF -DBUILD_BINARY=OFF ..
+ninja install
+popd
+endgroup
+
 group "Building subrandr"
 build_subrandr "$FFBUILD_PREFIX" --target "$FFBUILD_RUST_TARGET" \
                --static-library true --shared-library false
@@ -104,15 +128,20 @@ mpv_args=(
     --buildtype=release
     --prefer-static
     --default-library=shared
-    -Dc_link_args="$FF_LIBS"
-    -Dcpp_link_args="$FF_LIBS"
+    # With --prefer-static meson searches for libiconv only in the compiler's
+    # own directories, so pass it in the link args.
+    # https://github.com/mesonbuild/meson/issues/10172
+    -Dc_link_args="$FF_LIBS -L$FFBUILD_PREFIX/lib -liconv"
+    -Dcpp_link_args="$FF_LIBS -L$FFBUILD_PREFIX/lib -liconv"
     -Dgpl=$gpl
     --force-fallback-for=mujs
     -Dmujs:werror=false
     -Dmujs:default_library=static
     -Dlua=luajit
-    -D{amf,d3d11,javascript,lcms2,libbluray,libcurl,shaderc,sixel}=enabled
-    -D{spirv-cross,subrandr,vapoursynth,vulkan,win32-smtc,zimg}=enabled
+    -D{amf,d3d11,iconv,javascript,lcms2,libarchive,libbluray,libcurl}=enabled
+    -D{sdl2-audio,sdl2-gamepad,sdl2-video}=enabled
+    -D{shaderc,sixel,spirv-cross,subrandr,uchardet,vapoursynth,vulkan}=enabled
+    -D{win32-smtc,zimg}=enabled
 )
 if $gpl; then
     # Only the GPL image carries the dependencies of the GPL features.

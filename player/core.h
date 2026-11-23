@@ -113,6 +113,9 @@ struct track {
     // Currently used for decoding.
     bool selected;
 
+    // Decoder initialization failed.
+    bool dec_failed;
+
     // The type specific ID, also called aid (audio), sid (subs), vid (video).
     // For UI purposes only; this ID doesn't have anything to do with any
     // IDs coming from demuxers or container files.
@@ -210,6 +213,9 @@ struct ao_chain {
     bool start_pts_known;
 
     bool delaying_audio_start;
+    double delayed_start_gap;   // video left to play before the audio starts
+    int64_t delayed_start_last; // when the gap was last counted down
+    double delayed_start_speed; // playback speed since then, 0 if paused
 
     struct track *track;
     struct mp_pin *filter_src;
@@ -372,6 +378,7 @@ typedef struct MPContext {
     double avd_filtered;
     // Timing error (in seconds) due to rounding on vsync boundaries
     double display_sync_error;
+    double display_sync_speed;  // playback speed the error was accumulated at
     // Number of mistimed frames.
     int mistimed_frames_total;
     bool hrseek_active;     // skip all data until hrseek_pts
@@ -397,6 +404,9 @@ typedef struct MPContext {
     /* timestamp of video frame currently visible on screen
      * (or at least queued to be flipped by VO) */
     double video_pts;
+    // video_pts and the pts of next_frames[0] without the rounding of the
+    // file's timestamps. The frames are paced by these.
+    double video_pts_unrounded, next_pts_unrounded;
     // Last seek target.
     double last_seek_pts;
     // Frame duration field from demuxer. Only used for duration of the last
@@ -404,8 +414,6 @@ typedef struct MPContext {
     double last_frame_duration;
     // Video PTS, or audio PTS if video has ended.
     double playback_pts;
-    // For logging only.
-    double logged_async_diff;
 
     int last_chapter;
 
@@ -555,6 +563,8 @@ struct mp_abort_entry {
 void reset_audio_state(struct MPContext *mpctx);
 void reinit_audio_chain(struct MPContext *mpctx);
 int init_audio_decoder(struct MPContext *mpctx, struct track *track);
+void uninit_audio_decoder(struct MPContext *mpctx);
+void reinit_audio_decoder(struct MPContext *mpctx);
 int reinit_audio_filters(struct MPContext *mpctx);
 double playing_audio_pts(struct MPContext *mpctx);
 void fill_audio_out_buffers(struct MPContext *mpctx);
@@ -771,6 +781,8 @@ bool disc_nav_mouse_pos_to_src(struct MPContext *mpctx, int src_w, int src_h,
 // video.c
 void reset_video_state(struct MPContext *mpctx);
 int init_video_decoder(struct MPContext *mpctx, struct track *track);
+void uninit_video_decoder(struct MPContext *mpctx);
+void reinit_video_decoder(struct MPContext *mpctx);
 void reinit_video_chain(struct MPContext *mpctx);
 void reinit_video_chain_src(struct MPContext *mpctx, struct track *track);
 int reinit_video_filters(struct MPContext *mpctx);

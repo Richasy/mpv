@@ -73,6 +73,11 @@
 #define CLOCK_MONOTONIC_RAW 4
 #endif
 
+#ifndef WP_PRESENTATION_FEEDBACK_KIND_VARIABLE_RATE_SINCE_VERSION
+#define WP_PRESENTATION_FEEDBACK_KIND_FIXED_RATE 0x10
+#define WP_PRESENTATION_FEEDBACK_KIND_VARIABLE_RATE 0x20
+#endif
+
 // From the fractional scale protocol
 #define WAYLAND_SCALE_FACTOR 120.0
 
@@ -164,8 +169,10 @@ struct compositor_format {
 
 struct vo_wayland_feedback_pool {
     struct wp_presentation_feedback **fback;
+    int64_t *swap; // the swap each feedback belongs to
     struct vo_wayland_state *wl;
     int last_zero_copy;
+    int last_refresh_kind;
     int len;
 };
 
@@ -317,7 +324,9 @@ static int set_cursor_visibility(struct vo_wayland_seat *s, bool on);
 static bool spawn_cursor(struct vo_wayland_state *wl);
 
 static void add_feedback(struct vo_wayland_feedback_pool *fback_pool,
-                         struct wp_presentation_feedback *fback);
+                         struct wp_presentation_feedback *fback, int64_t swap);
+static int64_t feedback_swap(struct vo_wayland_feedback_pool *fback_pool,
+                             struct wp_presentation_feedback *fback);
 static void apply_keepaspect(struct vo_wayland_state *wl, int *width, int *height);
 static void get_compositor_preferred_description(struct vo_wayland_state *wl);
 static void get_shape_device(struct vo_wayland_state *wl, struct vo_wayland_seat *s);
@@ -1906,7 +1915,9 @@ static void apply_toplevel_config(struct vo_wayland_state *wl)
                                    opts->autofit_larger.wh_valid || opts->autofit_smaller.wh_valid;
         if (width && height && !autofit_or_geometry) {
             wl->initial_size_hint = true;
-            wl->window_size = (struct mp_rect){0, 0, width, height};
+            wl->window_size = (struct mp_rect){0, 0,
+                handle_round(wl->scaling, width), handle_round(wl->scaling, height)
+            };
             wl->geometry = wl->window_size;
         } else {
             wl->override_surface_local = true;
@@ -2563,8 +2574,10 @@ static void presentation_set_clockid(void *data, struct wp_presentation *present
 {
     struct vo_wayland_state *wl = data;
 
-    if (clockid == CLOCK_MONOTONIC || clockid == CLOCK_MONOTONIC_RAW)
+    if (clockid == CLOCK_MONOTONIC || clockid == CLOCK_MONOTONIC_RAW) {
         wl->present_clock = true;
+        wl->present_clock_id = clockid;
+    }
 }
 
 static const struct wp_presentation_listener presentation_listener = {
@@ -2592,30 +2605,49 @@ static void feedback_presented(void *data, struct wp_presentation_feedback *fbac
         fback_pool->last_zero_copy = current_zero_copy;
     }
 
+    enum vo_refresh_kind kind = VO_REFRESH_UNKNOWN;
+    if (wp_presentation_feedback_get_version(fback) >= 3) {
+        if (flags & WP_PRESENTATION_FEEDBACK_KIND_FIXED_RATE) {
+            kind = VO_REFRESH_FIXED;
+        } else if (flags & WP_PRESENTATION_FEEDBACK_KIND_VARIABLE_RATE) {
+            kind = VO_REFRESH_VARIABLE;
+        }
+
+        if (fback_pool->last_refresh_kind != kind) {
+            static const char *const refresh_kind_names[] = {
+                [VO_REFRESH_UNKNOWN]  = "unknown",
+                [VO_REFRESH_FIXED]    = "fixed",
+                [VO_REFRESH_VARIABLE] = "variable",
+            };
+            MP_DBG(wl, "Presentation was done with %s refresh rate.\n", refresh_kind_names[kind]);
+            fback_pool->last_refresh_kind = kind;
+        }
+    }
+
+    int64_t swap = feedback_swap(fback_pool, fback);
     if (fback)
         remove_feedback(fback_pool, fback);
 
     wl->refresh_interval = (int64_t)refresh_nsec;
 
-    // Very similar to oml_sync_control, in this case we assume that every
-    // time the compositor receives feedback, a buffer swap has been already
-    // been performed.
-    //
-    // Notes:
-    //  - tv_sec_lo + tv_sec_hi is the equivalent of oml's ust
-    //  - seq_lo + seq_hi is the equivalent of oml's msc
-    //  - these values are updated every time the compositor receives feedback.
+    // The compositor may not predict the refresh, then the output's mode is
+    // the next best source, as in vo_wayland_wait_frame().
+    int64_t refresh = refresh_nsec;
+    if (!refresh && wl->current_output && wl->current_output->refresh_rate > 0)
+        refresh = 1e9 / wl->current_output->refresh_rate;
 
     int64_t sec = (uint64_t) tv_sec_lo + ((uint64_t) tv_sec_hi << 32);
     int64_t ust = MP_TIME_S_TO_NS(sec) + (uint64_t) tv_nsec;
     int64_t msc = (uint64_t) seq_lo + ((uint64_t) seq_hi << 32);
-    present_sync_update_values(wl->present, ust, msc);
+    present_sync_update_values(wl->present, mp_time_ns_from_clock(wl->present_clock_id, ust), msc,
+                               refresh, swap, kind);
 }
 
 static void feedback_discarded(void *data, struct wp_presentation_feedback *fback)
 {
     struct vo_wayland_feedback_pool *fback_pool = data;
     fback_pool->last_zero_copy = -1;
+    fback_pool->last_refresh_kind = -1;
     if (fback)
         remove_feedback(fback_pool, fback);
 }
@@ -2637,13 +2669,6 @@ static void frame_callback(void *data, struct wl_callback *callback, uint32_t ti
 
     wl->frame_callback = wl_surface_frame(wl->callback_surface);
     wl_callback_add_listener(wl->frame_callback, &frame_listener, wl);
-
-    wl->use_present = wl->present_clock && wl->opts->wl_present;
-    if (wl->use_present) {
-        struct wp_presentation_feedback *fback = wp_presentation_feedback(wl->presentation, wl->callback_surface);
-        add_feedback(wl->fback_pool, fback);
-        wp_presentation_feedback_add_listener(fback, &feedback_listener, wl->fback_pool);
-    }
 
     wl->frame_wait = false;
     wl->hidden = false;
@@ -2930,8 +2955,7 @@ static void registry_handle_add(void *data, struct wl_registry *reg, uint32_t id
     }
 
     if (!strcmp(interface, wp_presentation_interface.name) && found++) {
-        ver = MPMIN(ver, 2);
-        wl->present_v2 = ver == 2;
+        ver = MPMIN(ver, 3);
         wl->presentation = wl_registry_bind(reg, id, &wp_presentation_interface, ver);
         wp_presentation_add_listener(wl->presentation, &presentation_listener, wl);
     }
@@ -3038,18 +3062,30 @@ static const struct wl_registry_listener registry_listener = {
 
 /* Static functions */
 static void add_feedback(struct vo_wayland_feedback_pool *fback_pool,
-                         struct wp_presentation_feedback *fback)
+                         struct wp_presentation_feedback *fback, int64_t swap)
 {
     for (int i = 0; i < fback_pool->len; ++i) {
         if (!fback_pool->fback[i]) {
             fback_pool->fback[i] = fback;
+            fback_pool->swap[i] = swap;
             break;
         } else if (i == fback_pool->len - 1) {
             // Shouldn't happen in practice.
             wp_presentation_feedback_destroy(fback_pool->fback[i]);
             fback_pool->fback[i] = fback;
+            fback_pool->swap[i] = swap;
         }
     }
+}
+
+static int64_t feedback_swap(struct vo_wayland_feedback_pool *fback_pool,
+                             struct wp_presentation_feedback *fback)
+{
+    for (int i = 0; i < fback_pool->len; ++i) {
+        if (fback_pool->fback[i] == fback)
+            return fback_pool->swap[i];
+    }
+    return 0;
 }
 
 static void apply_keepaspect(struct vo_wayland_state *wl, int *width, int *height)
@@ -3692,14 +3728,12 @@ static void set_color_management(struct vo_wayland_state *wl, struct pl_color_sp
         goto nosupport;
 
     struct wp_image_description_v1 *image_description;
-#if PL_API_VER >= 362
     // scRGB has dedicated creator, and not using the generic one.
     if (color->transfer == PL_COLOR_TRC_SCRGB && wl->supports_scrgb) {
         image_description = wp_color_manager_v1_create_windows_scrgb(wl->color_manager);
         cm_dispatch_color_queue(wl, image_description);
         return;
     }
-#endif
 
     int primaries = wl->primaries_map[color->primaries];
     int transfer = wl->transfer_map[color->transfer];
@@ -4172,6 +4206,13 @@ static int update_window_title(struct vo_wayland_state *wl, const char *title)
     return VO_TRUE;
 }
 
+static void display_error(struct vo_wayland_state *wl)
+{
+    MP_FATAL(wl, "Error occurred on the display fd\n");
+    wl->display_fd = -1;
+    mp_input_put_key(wl->vo->input_ctx, MP_KEY_CLOSE_WIN);
+}
+
 static void wayland_dispatch_events(struct vo_wayland_state *wl, int nfds, int64_t timeout_ns)
 {
     if (wl->display_fd == -1)
@@ -4182,8 +4223,12 @@ static void wayland_dispatch_events(struct vo_wayland_state *wl, int nfds, int64
         {.fd = wl->wakeup_pipe[0], .events = POLLIN },
     };
 
-    while (wl_display_prepare_read(wl->display) != 0)
-        wl_display_dispatch_pending(wl->display);
+    while (wl_display_prepare_read(wl->display) != 0) {
+        if (wl_display_dispatch_pending(wl->display) < 0) {
+            display_error(wl);
+            return;
+        }
+    }
     wl_display_flush(wl->display);
 
     mp_poll(fds, nfds, timeout_ns);
@@ -4194,11 +4239,8 @@ static void wayland_dispatch_events(struct vo_wayland_state *wl, int nfds, int64
         wl_display_cancel_read(wl->display);
     }
 
-    if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-        MP_FATAL(wl, "Error occurred on the display fd\n");
-        wl->display_fd = -1;
-        mp_input_put_key(wl->vo->input_ctx, MP_KEY_CLOSE_WIN);
-    }
+    if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL))
+        display_error(wl);
 
     if (fds[1].revents & POLLIN)
         mp_flush_wakeup_pipe(wl->wakeup_pipe[0]);
@@ -4245,6 +4287,12 @@ bool vo_wayland_check_visible(struct vo *vo)
     struct vo_wayland_state *wl = vo->wl;
     bool render = !wl->hidden || wl->opts->force_render;
     wl->frame_wait = true;
+    wl->use_present = wl->present_clock && wl->opts->wl_present;
+    if (render && wl->use_present) {
+        struct wp_presentation_feedback *fback = wp_presentation_feedback(wl->presentation, wl->callback_surface);
+        add_feedback(wl->fback_pool, fback, wl->present->swaps + 1);
+        wp_presentation_feedback_add_listener(fback, &feedback_listener, wl->fback_pool);
+    }
     return render;
 }
 
@@ -4476,8 +4524,11 @@ void vo_wayland_handle_color(struct vo_wayland_state *wl, struct mp_image_params
         return;
     }
     wl->last_hint_params = *params;
-    if (color_space_changed)
+    if (color_space_changed) {
         set_color_management(wl, &params->color);
+    } else {
+        params->color = wl->current_params.color;
+    }
 #if HAVE_WAYLAND_PROTOCOLS_1_44
     if (color_repr_changed)
         set_color_representation(wl, params);
@@ -4486,17 +4537,18 @@ void vo_wayland_handle_color(struct vo_wayland_state *wl, struct mp_image_params
 #endif
 }
 
-
 void vo_wayland_handle_scale(struct vo_wayland_state *wl)
 {
-    int width, height;
-    if (!wl->override_surface_local && mp_rect_w(wl->surface_local) != 0 &&
-                                       mp_rect_h(wl->surface_local) != 0) {
-        width = mp_rect_w(wl->surface_local);
-        height = mp_rect_h(wl->surface_local);
-    } else {
-        width = lround(mp_rect_w(wl->geometry) / wl->scaling_factor);
-        height = lround(mp_rect_h(wl->geometry) / wl->scaling_factor);
+    int width = mp_rect_w(wl->surface_local);
+    int height = mp_rect_h(wl->surface_local);
+    int buffer_width = mp_rect_w(wl->geometry);
+    int buffer_height = mp_rect_h(wl->geometry);
+
+    if (wl->override_surface_local || !width || !height ||
+        handle_round(wl->scaling, width) != buffer_width ||
+        handle_round(wl->scaling, height) != buffer_height) {
+        width = lround(buffer_width / wl->scaling_factor);
+        height = lround(buffer_height / wl->scaling_factor);
     }
     wp_viewport_set_destination(wl->viewport, width, height);
 }
@@ -4673,11 +4725,13 @@ bool vo_wayland_init(struct vo *vo)
     if (wl->presentation) {
         wl->fback_pool = talloc_zero(wl, struct vo_wayland_feedback_pool);
         wl->fback_pool->wl = wl;
-        wl->fback_pool->len = VO_MAX_SWAPCHAIN_DEPTH;
-        wl->fback_pool->last_zero_copy = -1,
+        wl->fback_pool->len = VO_MAX_SWAPCHAIN_DEPTH + 2;
+        wl->fback_pool->last_zero_copy = -1;
+        wl->fback_pool->last_refresh_kind = -1;
         wl->fback_pool->fback = talloc_zero_array(wl->fback_pool, struct wp_presentation_feedback *,
                                                   wl->fback_pool->len);
-        wl->present = mp_present_initialize(wl, wl->opts, VO_MAX_SWAPCHAIN_DEPTH);
+        wl->fback_pool->swap = talloc_zero_array(wl->fback_pool, int64_t, wl->fback_pool->len);
+        wl->present = mp_present_initialize(wl);
     } else {
         MP_VERBOSE(wl, "Compositor doesn't support the %s protocol!\n",
                    wp_presentation_interface.name);
@@ -5005,8 +5059,8 @@ void vo_wayland_wait_frame(struct vo_wayland_state *wl)
      * 3. refresh rate of the output reported by the compositor
      * 4. make up crap if vblank_time is still <= 0 (better than nothing) */
 
-    if (wl->use_present && wl->present->head)
-        vblank_time = wl->present->head->vsync_duration;
+    if (wl->use_present)
+        vblank_time = wl->present->vsync_duration;
 
     if (vblank_time <= 0 && wl->refresh_interval > 0)
         vblank_time = wl->refresh_interval;

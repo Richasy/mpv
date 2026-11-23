@@ -185,15 +185,9 @@ static void backup_dtor(void *p)
 
 #define BACKUP_LOCAL 1
 #define BACKUP_NVAL 2
-static void ensure_backup(struct m_opt_backup **list, int flags,
-                          struct m_config_option *co)
+static void add_backup(struct m_opt_backup **list, int flags,
+                       struct m_config_option *co)
 {
-    if (!co->data)
-        return;
-    for (struct m_opt_backup *cur = *list; cur; cur = cur->next) {
-        if (cur->co->data == co->data) // comparing data ptr catches aliases
-            return;
-    }
     struct m_opt_backup *bc = talloc_ptrtype(NULL, bc);
     talloc_set_destructor(bc, backup_dtor);
     *bc = (struct m_opt_backup) {
@@ -208,6 +202,18 @@ static void ensure_backup(struct m_opt_backup **list, int flags,
     *list = bc;
     if (bc->flags & BACKUP_LOCAL)
         co->is_set_locally = true;
+}
+
+static void ensure_backup(struct m_opt_backup **list, int flags,
+                          struct m_config_option *co)
+{
+    if (!co->data)
+        return;
+    for (struct m_opt_backup *cur = *list; cur; cur = cur->next) {
+        if (cur->co->data == co->data) // comparing data ptr catches aliases
+            return;
+    }
+    add_backup(list, flags, co);
 }
 
 static void restore_backups(struct m_opt_backup **list, struct m_config *config)
@@ -268,24 +274,34 @@ void m_config_backup_all_opts(struct m_config *config)
 
 void m_config_backup_watch_later_opts(struct m_config *config)
 {
-    for (int n = 0; n < config->num_opts; n++)
-        ensure_backup(&config->watch_later_backup_opts, 0, &config->opts[n]);
+    // Runs once on the empty list, which is looked up by name.
+    mp_assert(!config->watch_later_backup_opts);
+    for (int n = 0; n < config->num_opts; n++) {
+        if (config->opts[n].data)
+            add_backup(&config->watch_later_backup_opts, 0, &config->opts[n]);
+    }
+}
+
+static int compare_opt_name(const void *pa, const void *pb)
+{
+    const struct m_config_option *a = *(const struct m_config_option **)pa;
+    const struct m_config_option *b = *(const struct m_config_option **)pb;
+    return strcmp(a->name, b->name);
+}
+
+static int search_opt_name(const void *pkey, const void *pelem)
+{
+    const struct m_config_option *co = *(const struct m_config_option **)pelem;
+    return bstrcmp0(*(const bstr *)pkey, co->name);
 }
 
 struct m_config_option *m_config_get_co_raw(const struct m_config *config,
                                             struct bstr name)
 {
-    if (!name.len)
-        return NULL;
-
-    for (int n = 0; n < config->num_opts; n++) {
-        struct m_config_option *co = &config->opts[n];
-        struct bstr coname = bstr0(co->name);
-        if (bstrcmp(coname, name) == 0)
-            return co;
-    }
-
-    return NULL;
+    struct m_config_option **co =
+        bsearch(&name, config->sorted_opts, config->num_opts,
+                sizeof(config->sorted_opts[0]), search_opt_name);
+    return co ? *co : NULL;
 }
 
 // Like m_config_get_co_raw(), but resolve aliases.
@@ -564,6 +580,11 @@ struct m_config *m_config_new(void *talloc_ctx, struct mp_log *log,
 
         MP_TARRAY_APPEND(config, config->opts, config->num_opts, co);
     }
+
+    config->sorted_opts = talloc_array(config, struct m_config_option *, config->num_opts);
+    for (int n = 0; n < config->num_opts; n++)
+        config->sorted_opts[n] = &config->opts[n];
+    qsort(config->sorted_opts, config->num_opts, sizeof(config->sorted_opts[0]), compare_opt_name);
 
     return config;
 }

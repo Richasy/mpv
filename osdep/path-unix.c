@@ -68,7 +68,7 @@ static void path_init(void)
         err = err || MKPATH(mpv_state, "%s/.local/state/mpv", home);
     }
 
-    char xdg_user_dirs[CONF_MAX];
+    char xdg_user_dirs[CONF_MAX] = {0};
     if (xdg_config && xdg_config[0] == '/') {
         err = err || MKPATH(xdg_user_dirs, "%s/user-dirs.dirs", xdg_config);
     } else if (home && home[0]) {
@@ -101,7 +101,7 @@ static void path_init(void)
     }
 
 skip_user_dirs:
-    if (!mpv_desktop[0])
+    if (!mpv_desktop[0] && home && home[0])
         err = err || MKPATH(mpv_desktop, "%s/%s", home, "Desktop");
 
     // If the old ~/.mpv exists, and the XDG config dir doesn't, use the old

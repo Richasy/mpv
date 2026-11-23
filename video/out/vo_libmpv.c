@@ -61,6 +61,12 @@ struct vo_priv {
     struct mpv_render_context *ctx; // immutable after init
 };
 
+struct render_control {
+    struct voctrl_screenshot screenshot;
+    struct voctrl_performance_data *perf;
+    bool running, done;
+};
+
 struct mpv_render_context {
     struct mp_log *log;
     struct mpv_global *global;
@@ -79,11 +85,14 @@ struct mpv_render_context {
     void *control_cb_ctx;
 
     mp_mutex update_lock;
-    mp_cond update_cond;     // paired with update_lock
-
     // --- Protected by update_lock
     mpv_render_update_fn update_cb;
     void *update_cb_ctx;
+
+    mp_mutex render_control_lock;
+    mp_cond render_control_wait;
+    // --- Protected by render_control_lock
+    struct render_control *pending_control;
 
     mp_mutex lock;
     mp_cond video_wait;      // paired with lock
@@ -105,7 +114,10 @@ struct mpv_render_context {
     bool need_resize;
     bool need_reset;
     bool need_update_external;
+    bool paused;
     struct vo *vo;
+    uint64_t frame_id_offset;       // added to the frame IDs of the VO
+    uint64_t last_frame_id;         // highest ID a frame was passed on with
 
     // --- Mostly immutable after init.
     struct mp_hwdec_devices *hwdec_devs;
@@ -118,6 +130,7 @@ struct mpv_render_context {
 };
 
 const struct render_backend_fns *render_backends[] = {
+    &render_backend_gpu_next,
     &render_backend_gpu,
     &render_backend_sw,
     NULL
@@ -129,7 +142,6 @@ static void update(struct mpv_render_context *ctx)
     if (ctx->update_cb)
         ctx->update_cb(ctx->update_cb_ctx);
 
-    mp_cond_broadcast(&ctx->update_cond);
     mp_mutex_unlock(&ctx->update_lock);
 }
 
@@ -175,7 +187,8 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
     mp_mutex_init(&ctx->control_lock);
     mp_mutex_init(&ctx->lock);
     mp_mutex_init(&ctx->update_lock);
-    mp_cond_init(&ctx->update_cond);
+    mp_mutex_init(&ctx->render_control_lock);
+    mp_cond_init(&ctx->render_control_wait);
     mp_cond_init(&ctx->video_wait);
 
     ctx->global = mp_client_get_global(mpv);
@@ -191,8 +204,13 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
     if (GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_ADVANCED_CONTROL, int, 0))
         ctx->advanced_control = true;
 
+    char *renderer = get_mpv_render_param(params, MPV_RENDER_PARAM_RENDERER, NULL);
+
     int err = MPV_ERROR_NOT_IMPLEMENTED;
     for (int n = 0; render_backends[n]; n++) {
+        const char *name = render_backends[n]->renderer;
+        if (name && renderer && strcmp(name, renderer) != 0)
+            continue;
         ctx->renderer = talloc_zero(NULL, struct render_backend);
         *ctx->renderer = (struct render_backend){
             .global = ctx->global,
@@ -213,6 +231,9 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
         mpv_render_context_free(ctx);
         return err;
     }
+
+    if (ctx->renderer->fns->renderer)
+        MP_VERBOSE(ctx, "Using the %s renderer.\n", ctx->renderer->fns->renderer);
 
     ctx->hwdec_devs = ctx->renderer->hwdec_devs;
 
@@ -322,7 +343,8 @@ void mpv_render_context_free(mpv_render_context *ctx)
     talloc_free(ctx->dr);
     talloc_free(ctx->dispatch);
 
-    mp_cond_destroy(&ctx->update_cond);
+    mp_cond_destroy(&ctx->render_control_wait);
+    mp_mutex_destroy(&ctx->render_control_lock);
     mp_cond_destroy(&ctx->video_wait);
     mp_mutex_destroy(&ctx->update_lock);
     mp_mutex_destroy(&ctx->lock);
@@ -340,8 +362,46 @@ bool mp_render_context_acquire(mpv_render_context *ctx)
     return atomic_compare_exchange_strong(&ctx->in_use, &prev, true);
 }
 
+// Both render API entry points run with the host's GPU context current.
+static void service_render_control(struct mpv_render_context *ctx)
+{
+    mp_mutex_lock(&ctx->render_control_lock);
+    struct render_control *req = ctx->pending_control;
+    if (!req || req->running) {
+        mp_mutex_unlock(&ctx->render_control_lock);
+        return;
+    }
+    req->running = true;
+    mp_mutex_unlock(&ctx->render_control_lock);
+
+    const struct render_backend_fns *fns = ctx->renderer->fns;
+    if (req->perf) {
+        fns->perfdata(ctx->renderer, req->perf);
+    } else {
+        mp_mutex_lock(&ctx->lock);
+        struct vo_frame *frame = vo_frame_ref(ctx->cur_frame);
+        mp_mutex_unlock(&ctx->lock);
+        if (frame) {
+            fns->screenshot(ctx->renderer, frame, &req->screenshot);
+            talloc_steal(req, req->screenshot.res);
+            talloc_free(frame);
+        }
+    }
+
+    mp_mutex_lock(&ctx->render_control_lock);
+    bool abandoned = ctx->pending_control != req;
+    if (!abandoned) {
+        req->done = true;
+        mp_cond_signal(&ctx->render_control_wait);
+    }
+    mp_mutex_unlock(&ctx->render_control_lock);
+    if (abandoned)
+        talloc_free(req);
+}
+
 int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
 {
+    service_render_control(ctx);
     mp_mutex_lock(&ctx->lock);
 
     int do_render =
@@ -394,6 +454,9 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
     if (ctx->need_reconfig)
         ctx->renderer->fns->reconfig(ctx->renderer, &ctx->img_params);
     ctx->need_reconfig = false;
+
+    if (ctx->renderer->fns->set_paused)
+        ctx->renderer->fns->set_paused(ctx->renderer, ctx->paused);
 
     if (ctx->need_update_external)
         ctx->renderer->fns->update_external(ctx->renderer, ctx->vo);
@@ -477,6 +540,7 @@ uint64_t mpv_render_context_update(mpv_render_context *ctx)
     uint64_t res = 0;
 
     mp_dispatch_queue_process(ctx->dispatch, 0);
+    service_render_control(ctx);
 
     mp_mutex_lock(&ctx->lock);
     if (ctx->next_frame)
@@ -529,9 +593,16 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     mp_mutex_lock(&ctx->lock);
     mp_assert(!ctx->next_frame);
     ctx->next_frame = vo_frame_ref(frame);
-    ctx->draw_receipt_id = frame->require_receipt ? frame->frame_id : 0;
+    if (frame->num_frames) {
+        ctx->next_frame->frame_id += ctx->frame_id_offset;
+        ctx->last_frame_id = MPMAX(ctx->last_frame_id,
+                                   ctx->next_frame->frame_id + frame->num_frames - 1);
+    }
+    // A render call can finish after teardown. Key receipts by the renderer's
+    // lifetime-wide IDs, not the VO-local IDs that restart with the next VO.
+    ctx->draw_receipt_id = frame->require_receipt ? ctx->next_frame->frame_id : 0;
     if (frame->require_receipt)
-        mp_frame_receipt_begin(&ctx->frame_receipt, frame->frame_id);
+        mp_frame_receipt_begin(&ctx->frame_receipt, ctx->draw_receipt_id);
     ctx->expected_flip_count = ctx->flip_count + 1;
     ctx->redrawing = frame->redraw || !frame->current;
     mp_mutex_unlock(&ctx->lock);
@@ -616,7 +687,7 @@ static enum mp_frame_result get_frame_result(struct vo *vo, uint64_t frame_id)
     struct mpv_render_context *ctx = p->ctx;
     mp_mutex_lock(&ctx->lock);
     enum mp_frame_result result =
-        mp_frame_receipt_get(&ctx->frame_receipt, frame_id);
+        mp_frame_receipt_get(&ctx->frame_receipt, ctx->frame_id_offset + frame_id);
     mp_mutex_unlock(&ctx->lock);
     return result;
 }
@@ -640,6 +711,52 @@ static int query_format(struct vo *vo, int format)
     return ok;
 }
 
+static int request_render_control(struct mpv_render_context *ctx, uint32_t request,
+                                  void *data)
+{
+    struct render_control *req = talloc_zero(NULL, struct render_control);
+    if (request == VOCTRL_PERFORMANCE_DATA) {
+        req->perf = talloc_zero(req, struct voctrl_performance_data);
+    } else {
+        req->screenshot = *(struct voctrl_screenshot *)data;
+        req->screenshot.res = NULL;
+    }
+
+    // Only the VO thread submits requests. The host may be waiting for the
+    // command on its render thread, or may never service another update.
+    int64_t until = mp_time_ns() + MP_TIME_MS_TO_NS(200);
+    mp_mutex_lock(&ctx->render_control_lock);
+    mp_assert(!ctx->pending_control);
+    ctx->pending_control = req;
+    mp_mutex_unlock(&ctx->render_control_lock);
+    update(ctx);
+
+    mp_mutex_lock(&ctx->render_control_lock);
+    while (!req->done && mp_time_ns() < until) {
+        if (mp_cond_timedwait_until(&ctx->render_control_wait, &ctx->render_control_lock, until))
+            break;
+    }
+    ctx->pending_control = NULL;
+    bool done = req->done;
+    bool abandoned = req->running && !done;
+    mp_mutex_unlock(&ctx->render_control_lock);
+
+    // A timed-out GPU readback still owns its private buffers. Never let it
+    // write into the caller's storage after the command has returned.
+    if (abandoned)
+        return VO_FALSE;
+    int result = VO_FALSE;
+    if (done && req->perf) {
+        *(struct voctrl_performance_data *)data = *req->perf;
+        result = VO_TRUE;
+    } else if (done && req->screenshot.res) {
+        ((struct voctrl_screenshot *)data)->res = talloc_steal(NULL, req->screenshot.res);
+        result = VO_TRUE;
+    }
+    talloc_free(req);
+    return result;
+}
+
 static int control(struct vo *vo, uint32_t request, void *data)
 {
     struct vo_priv *p = vo->priv;
@@ -654,7 +771,15 @@ static int control(struct vo *vo, uint32_t request, void *data)
         vo->want_redraw = true;
         return VO_TRUE;
     case VOCTRL_PAUSE:
+        mp_mutex_lock(&ctx->lock);
+        ctx->paused = true;
+        mp_mutex_unlock(&ctx->lock);
         vo->want_redraw = true;
+        return VO_TRUE;
+    case VOCTRL_RESUME:
+        mp_mutex_lock(&ctx->lock);
+        ctx->paused = false;
+        mp_mutex_unlock(&ctx->lock);
         return VO_TRUE;
     case VOCTRL_SET_PANSCAN:
         mp_mutex_lock(&ctx->lock);
@@ -680,28 +805,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
 #endif
     }
 
-    // VOCTRLs that access the renderer directly. These are safe to call
-    // outside the render thread in libmpv mode because the render loop is
-    // driven by the API user (who won't be rendering concurrently with
-    // these control calls). Dispatching them via mp_dispatch_run() risks
-    // deadlock when the render thread is blocked in BLOCK_FOR_TARGET_TIME.
-    switch (request) {
-    case VOCTRL_SCREENSHOT: {
-        mp_mutex_lock(&ctx->lock);
-        struct vo_frame *frame = vo_frame_ref(ctx->cur_frame);
-        mp_mutex_unlock(&ctx->lock);
-        if (frame && ctx->renderer->fns->screenshot)
-            ctx->renderer->fns->screenshot(ctx->renderer, frame, data);
-        talloc_free(frame);
-        return frame ? VO_TRUE : VO_NOTIMPL;
-    }
-    case VOCTRL_PERFORMANCE_DATA:
-        if (ctx->renderer->fns->perfdata) {
-            ctx->renderer->fns->perfdata(ctx->renderer, data);
-            return VO_TRUE;
-        }
-        return VO_NOTIMPL;
-    }
+    const struct render_backend_fns *fns = ctx->renderer->fns;
+    if ((request == VOCTRL_SCREENSHOT && fns->screenshot) ||
+        (request == VOCTRL_PERFORMANCE_DATA && fns->perfdata))
+        return request_render_control(ctx, request, data);
 
     int r = VO_NOTIMPL;
     mp_mutex_lock(&ctx->control_lock);
@@ -760,7 +867,9 @@ static void uninit(struct vo *vo)
     ctx->need_resize = true;
     ctx->need_update_external = true;
     ctx->need_reset = true;
+    ctx->paused = false;
     ctx->vo = NULL;
+    ctx->frame_id_offset = ctx->last_frame_id;
 
     // The following do not normally need ctx->lock, however, ctx itself may
     // become invalid once we release ctx->lock.

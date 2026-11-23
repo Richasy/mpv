@@ -93,7 +93,7 @@ static inline int mp_cond_timedwait(mp_cond *cond, mp_mutex *mutex, int64_t time
     timeout = MPCLAMP(timeout, 0, MP_TIME_MS_TO_NS(INFINITE)) / MP_TIME_MS_TO_NS(1);
 
     int ret = 0;
-    int64_t hrt = mp_start_hires_timers(MP_TIME_MS_TO_NS(timeout));
+    int hrt = mp_start_hires_timers(timeout);
 
     if (!SleepConditionVariableSRW(cond, mutex, timeout, 0))
         ret = GetLastError() == ERROR_TIMEOUT ? ETIMEDOUT : EINVAL;
@@ -177,6 +177,12 @@ static inline void mp_thread_set_name(const char *name)
     wchar_t *wname = mp_from_utf8(NULL, name);
     pSetThreadDescription(GetCurrentThread(), wname);
     talloc_free(wname);
+}
+
+static inline void mp_thread_set_min_timer_slack(void)
+{
+    // This is similar to mp_set_idle_power_mode(), but on Windows it's global
+    // state, rather than per-thread. So do nothing here.
 }
 
 int64_t mp_thread_cpu_time_ns(mp_thread_id thread_id);

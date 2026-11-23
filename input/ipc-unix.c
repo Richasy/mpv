@@ -268,10 +268,15 @@ bool mp_ipc_start_anon_client(struct mp_ipc_ctx *ctx, struct mpv_handle *h,
                               int out_fd[2])
 {
     int pair[2];
+#ifdef SOCK_CLOEXEC
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair))
+        return false;
+#else
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair))
         return false;
     mp_set_cloexec(pair[0]);
     mp_set_cloexec(pair[1]);
+#endif
 
     struct client_arg *client = talloc_ptrtype(NULL, client);
     *client = (struct client_arg){
@@ -306,7 +311,12 @@ static MP_THREAD_VOID ipc_thread(void *p)
 
     MP_VERBOSE(arg, "Starting IPC master\n");
 
+#ifdef SOCK_CLOEXEC
+    ipc_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+#else
     ipc_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    mp_set_cloexec(ipc_fd);
+#endif
     if (ipc_fd < 0) {
         MP_ERR(arg, "Could not create IPC socket\n");
         goto done;
@@ -320,7 +330,7 @@ static MP_THREAD_VOID ipc_thread(void *p)
         goto done;
     }
 
-    ipc_un.sun_family = AF_UNIX,
+    ipc_un.sun_family = AF_UNIX;
     strncpy(ipc_un.sun_path, arg->path, sizeof(ipc_un.sun_path) - 1);
 
     if (ipc_un.sun_path[0] == '@') {
@@ -363,10 +373,23 @@ static MP_THREAD_VOID ipc_thread(void *p)
             goto done;
 
         if (fds[1].revents & POLLIN) {
+#ifdef SOCK_CLOEXEC
+            int client_fd = accept4(ipc_fd, NULL, NULL, SOCK_CLOEXEC);
+#else
             int client_fd = accept(ipc_fd, NULL, NULL);
+            mp_set_cloexec(client_fd);
+#endif
             if (client_fd < 0) {
-                MP_ERR(arg, "Could not accept IPC client\n");
-                goto done;
+                int err = errno;
+                if (err == EINTR || err == ECONNABORTED)
+                    continue;
+                MP_ERR(arg, "Could not accept IPC client: %s\n", mp_strerror(err));
+                if (err != EMFILE && err != ENFILE && err != ENOBUFS && err != ENOMEM)
+                    goto done;
+                // The client stays queued and keeps the socket readable, so
+                // wait before trying again.
+                poll(fds, 1, 100);
+                continue;
             }
 
             ipc_start_client_json(arg, client_num++, client_fd);
@@ -404,6 +427,7 @@ struct mp_ipc_ctx *mp_init_ipc(struct mp_client_api *client_api,
         if (fd < 0) {
             MP_ERR(arg, "Invalid IPC client argument: '%s'\n", opts->ipc_client);
         } else {
+            mp_set_cloexec(fd);
             ipc_start_client_json(arg, -1, fd);
         }
     }

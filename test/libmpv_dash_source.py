@@ -2227,7 +2227,7 @@ def main():
                     return
             if hasattr(mpv, "mpv_dash_test_control"):
                 raise AssertionError("Production DLL exposes a test-only hook")
-            assert mpv.mpv_client_api_version() == (2 << 16) | 11
+            assert mpv.mpv_client_api_version() == (2 << 16) | 12
             assert ctypes.sizeof(FailureDetail) == 32
             assert FailureDetail.source_generation.offset == 8
             assert ctypes.sizeof(RangeCapability) == 24

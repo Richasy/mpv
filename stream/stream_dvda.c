@@ -60,11 +60,69 @@ struct dvda_still {
 struct dvda_track {
     int64_t time;               // start time relative to title start (ticks)
     int64_t duration;           // 90 kHz PTS ticks
+    int64_t first_pts;          // PTS of the track's first packet (ticks)
     uint32_t start_sector;      // within the ATS AOB space
     uint32_t end_sector;        // inclusive
     struct dvda_still *stills;  // still pictures shown during this track
     int num_stills;
 };
+
+// Channel allocation table, US 6,580,671 FIG. 26 and cols. 18-19.
+static const struct { uint8_t channels; bool lfe; } dvda_channel_alloc[] = {
+    {1, false}, {2, false}, {3, false}, {4, false}, {3, true},  {4, true},
+    {5, true},  {3, false}, {4, false}, {5, false}, {4, true},  {5, true},
+    {6, true},  {4, false}, {5, false}, {4, true},  {5, true},  {6, true},
+    {5, true},  {5, false}, {6, true},
+};
+
+static int dvda_sample_rate(uint8_t nibble)
+{
+    switch (nibble) {
+    case 0x0: return 48000;
+    case 0x1: return 96000;
+    case 0x2: return 192000;
+    case 0x8: return 44100;
+    case 0x9: return 88200;
+    case 0xa: return 176400;
+    }
+    return 0;
+}
+
+static int dvda_bit_depth(uint8_t nibble)
+{
+    switch (nibble) {
+    case 0x0: return 16;
+    case 0x1: return 20;
+    case 0x2: return 24;
+    }
+    return 0;
+}
+
+static char *dvda_describe_audio(void *ta_ctx, const atsi_record_t *rec)
+{
+    if (rec->nr_channels >= MP_ARRAY_SIZE(dvda_channel_alloc))
+        return NULL;
+    int channels = dvda_channel_alloc[rec->nr_channels].channels;
+    bool lfe = dvda_channel_alloc[rec->nr_channels].lfe;
+    // Group 1 governs, group 2 only ever repeats or lowers it.
+    int rate = dvda_sample_rate(rec->sampling_frequency >> 4);
+    int bits = dvda_bit_depth(rec->bitrate >> 4);
+    if (!channels || !rate || !bits)
+        return NULL;
+
+    char layout[16];
+    if (lfe) {
+        snprintf(layout, sizeof(layout), "%d.1", channels - 1);
+    } else if (channels == 1) {
+        snprintf(layout, sizeof(layout), "mono");
+    } else if (channels == 2) {
+        snprintf(layout, sizeof(layout), "stereo");
+    } else {
+        snprintf(layout, sizeof(layout), "%d.0", channels);
+    }
+    return talloc_asprintf(ta_ctx, "%s, %g kHz, %d bit", layout,
+                           rate / 1000.0, bits);
+}
 
 // One ATS title (mapped to an mpv title/edition).
 struct dvda_title {
@@ -74,6 +132,9 @@ struct dvda_title {
     uint32_t end_sector;        // inclusive
     struct dvda_track *tracks;
     int num_tracks;
+    int disc_title;             // the disc's own title number (1-based)
+    bool secondary;             // an alternate mix of disc_title, e.g. stereo
+    char *audio_desc;           // "5.1, 88.2 kHz, 24 bit", NULL if unreadable
 };
 
 struct priv {
@@ -92,9 +153,9 @@ struct priv {
     int *asvu_first_pvob;       // 1-based first P_VOB of each ASVU
     int num_asvus;
     uint32_t pvobs_end;         // end of the still-picture area (sectors)
-    uint8_t *still_data;        // the most recently extracted still (MPEG-2 video ES)
+    uint8_t *still_data;        // the MPEG-2 video ES it produced, or NULL
     int still_size;
-    int still_pvob;             // P_VOB index of the cached still, -1 if none
+    int still_pvob;             // P_VOB index of the attempt, -1 if none
 
     int track;                  // requested title, or TITLE_LONGEST
 
@@ -104,6 +165,11 @@ struct priv {
     struct mp_log *lib_log;     // used by libdvdread's log callback
     bool probing;               // open is an .iso auto-detection probe
     struct dvda_opts *opts;
+
+    // What demux_disc maps the data by, see STREAM_CTRL_GET_SEGMENTS.
+    struct stream_segment *segs;     // runs started, not collected yet
+    int num_segs;
+    bool seg_pending;                // the next read starts a run
 };
 
 #define OPT_BASE_STRUCT struct dvda_opts
@@ -209,8 +275,10 @@ static void parse_title_stills(stream_t *stream, struct dvda_title *t,
             MP_TRACE(stream, "  rec[%d]: asv %d track %#x timing %d -> "
                      "still %d\n", k, fr->asv_number, fr->track_nr,
                      fr->display_timing, pvob);
-            // With a shared range, the per-record track number selects the track.
-            if (rr->dmod.timing == 0 && fr->track_nr != i + 1)
+            // The record's track number selects the track, but only when the
+            // programs share one range. It reads zero when each track owns its
+            // own records, and then every record here is already ours.
+            if (rr->dmod.timing == 0 && fr->track_nr && fr->track_nr != i + 1)
                 continue;
             if (pvob < 0 || pvob >= priv->num_pvobs)
                 continue;
@@ -248,9 +316,13 @@ static bool read_disc_structure(stream_t *stream)
             continue;
         }
         atsi_title_table_t *tt = ifo->atsi_title_table;
+        bool has_secondary = false;
+        for (int n = 0; tt->atsi_index_rows && n < tt->nr_titles; n++)
+            has_secondary |= !(tt->atsi_index_rows[n].srp_index & 0x80);
+
         for (int n = 0; n < tt->nr_titles; n++) {
             atsi_title_record_t *rec = &tt->atsi_title_row_tables[n];
-            int num_tracks = MPMIN(rec->nr_tracks, rec->nr_pointer_records);
+            int num_tracks = rec->nr_pointer_records ? rec->nr_tracks : 0;
             if (num_tracks <= 0)
                 continue;
 
@@ -262,31 +334,57 @@ static bool read_disc_structure(stream_t *stream)
                 .tracks = talloc_array(priv, struct dvda_track, num_tracks),
             };
             t.end_sector = t.start_sector;
+
+            if (tt->atsi_index_rows) {
+                uint8_t srp = tt->atsi_index_rows[n].srp_index;
+                t.disc_title = srp & 0x7f;
+                t.secondary = has_secondary && !(srp & 0x80);
+            }
+            if (ifo->atsi_mat && rec->nr_tracks > 0) {
+                int atrn = (rec->atsi_track_timestamp_rows[0].prog_alloc_flags >> 3) & 0x7;
+                t.audio_desc = dvda_describe_audio(priv, &ifo->atsi_mat->atsi_record[atrn]);
+            }
+
             int64_t time = 0;
+            int cells = rec->nr_pointer_records;
             for (int i = 0; i < num_tracks; i++) {
                 atsi_track_timestamp_t *ts = &rec->atsi_track_timestamp_rows[i];
-                atsi_track_pointer_t *ptr = &rec->atsi_track_pointer_rows[i];
+                int first = ts->track_number_in_title;
+                if (first < 1 || first > cells)
+                    first = MPMIN(i + 1, cells);
+                int last = cells;
+                if (i + 1 < num_tracks) {
+                    int next = rec->atsi_track_timestamp_rows[i + 1].track_number_in_title;
+                    if (next > first && next <= cells)
+                        last = next - 1;
+                }
+                last = MPMAX(last, first);
+
                 t.tracks[i] = (struct dvda_track){
                     .time = time,
                     .duration = ts->length_pts_of_track,
-                    .start_sector = ptr->start_sector,
-                    .end_sector = ptr->end_sector,
+                    .first_pts = ts->first_pts_of_track,
+                    .start_sector = rec->atsi_track_pointer_rows[first - 1].start_sector,
+                    .end_sector = rec->atsi_track_pointer_rows[last - 1].end_sector,
                 };
                 time += t.tracks[i].duration;
-                if (ptr->end_sector > t.end_sector)
-                    t.end_sector = ptr->end_sector;
+                if (t.tracks[i].end_sector > t.end_sector)
+                    t.end_sector = t.tracks[i].end_sector;
             }
             parse_title_stills(stream, &t, rec);
 
             MP_VERBOSE(stream, "title %d: ats=%d tracks=%d sectors=%"PRIu32
-                       "..%"PRIu32" duration=%.2f\n", priv->num_titles, ats,
-                       num_tracks, t.start_sector, t.end_sector,
-                       DVDA_TIME_TO_S(t.duration));
+                       "..%"PRIu32" duration=%.2f disc_title=%d%s audio=%s\n",
+                       priv->num_titles, ats, num_tracks, t.start_sector,
+                       t.end_sector, DVDA_TIME_TO_S(t.duration), t.disc_title,
+                       t.secondary ? " (alternate mix)" : "",
+                       t.audio_desc ? t.audio_desc : "?");
             for (int i = 0; i < num_tracks; i++) {
                 struct dvda_track *tr = &t.tracks[i];
-                MP_DBG(stream, "  track %d: t=%.2f dur=%.2f sectors=%"PRIu32
-                       "..%"PRIu32" stills=%d\n", i, DVDA_TIME_TO_S(tr->time),
-                       DVDA_TIME_TO_S(tr->duration), tr->start_sector,
+                MP_DBG(stream, "  track %d: t=%.2f dur=%.2f pts=%.2f sectors="
+                       "%"PRIu32"..%"PRIu32" stills=%d\n", i,
+                       DVDA_TIME_TO_S(tr->time), DVDA_TIME_TO_S(tr->duration),
+                       DVDA_TIME_TO_S(tr->first_pts), tr->start_sector,
                        tr->end_sector, tr->num_stills);
             }
             MP_TARRAY_APPEND(priv, priv->titles, priv->num_titles, t);
@@ -317,8 +415,34 @@ static bool play_title(stream_t *stream, int title)
     }
     priv->title = title;
     priv->cur_sector = t->start_sector;
+    TA_FREEP(&priv->segs);
+    priv->num_segs = 0;
+    priv->seg_pending = true;
     return true;
 }
+
+// A track whose sectors fall outside the title's contiguous AOB range is a
+// trailing marker.
+static bool track_sectors_ok(struct dvda_title *t, struct dvda_track *tr)
+{
+    return tr->start_sector >= t->start_sector &&
+           tr->end_sector <= t->end_sector &&
+           tr->end_sector >= tr->start_sector;
+}
+
+// The track holding the sector, NULL between tracks.
+static struct dvda_track *track_at_sector(struct dvda_title *t, uint32_t sector)
+{
+    for (int i = 0; i < t->num_tracks; i++) {
+        struct dvda_track *tr = &t->tracks[i];
+        if (track_sectors_ok(t, tr) && sector >= tr->start_sector &&
+            sector <= tr->end_sector)
+            return tr;
+    }
+    return NULL;
+}
+
+static double sector_to_time(struct dvda_title *t, uint32_t sector);
 
 static int fill_buffer(stream_t *stream, void *buf, int max_len)
 {
@@ -334,8 +458,18 @@ static int fill_buffer(stream_t *stream, void *buf, int max_len)
     if (priv->cur_sector > t->end_sector)
         return 0; // title end
 
-    size_t blocks = MPMIN(max_len / DVD_BLOCK_SIZE,
-                          t->end_sector - priv->cur_sector + 1);
+    struct dvda_track *tr = track_at_sector(t, priv->cur_sector);
+    if (priv->seg_pending || (tr && priv->cur_sector == tr->start_sector)) {
+        MP_TARRAY_APPEND(priv, priv->segs, priv->num_segs, (struct stream_segment){
+            .pos = stream->pos,
+            .raw_base = tr ? DVDA_TIME_TO_S(tr->first_pts) : MP_NOPTS_VALUE,
+            .time = DVDA_TIME_TO_S(tr ? tr->time : sector_to_time(t, priv->cur_sector)),
+        });
+        priv->seg_pending = false;
+    }
+
+    uint32_t end_sector = tr ? tr->end_sector : t->end_sector;
+    size_t blocks = MPMIN(max_len / DVD_BLOCK_SIZE, end_sector - priv->cur_sector + 1);
     ssize_t r = DVDReadBlocks(priv->file, priv->cur_sector, blocks, buf);
     if (r <= 0) {
         MP_ERR(stream, "Error reading sector %"PRIu32".\n", priv->cur_sector);
@@ -343,15 +477,6 @@ static int fill_buffer(stream_t *stream, void *buf, int max_len)
     }
     priv->cur_sector += r;
     return r * DVD_BLOCK_SIZE;
-}
-
-// A track whose sectors fall outside the title's contiguous AOB range is a
-// trailing marker.
-static bool track_sectors_ok(struct dvda_title *t, struct dvda_track *tr)
-{
-    return tr->start_sector >= t->start_sector &&
-           tr->end_sector <= t->end_sector &&
-           tr->end_sector >= tr->start_sector;
 }
 
 // Map a sector position to title-relative playback time via the track it falls
@@ -423,6 +548,10 @@ static int current_still_pvob(stream_t *stream, struct dvda_title *t, double tim
 static bool extract_still(stream_t *stream, int pvob)
 {
     struct priv *priv = stream->priv;
+    talloc_free(priv->still_data);
+    priv->still_data = NULL;
+    priv->still_size = 0;
+    priv->still_pvob = pvob;
     if (pvob < 0 || pvob >= priv->num_pvobs || !priv->sv_file)
         return false;
 
@@ -481,11 +610,13 @@ static bool extract_still(stream_t *stream, int pvob)
         }
     }
 
-    talloc_free(priv->still_data);
+    if (!es_len) {
+        talloc_free(es);
+        return false;
+    }
     priv->still_data = es;
     priv->still_size = es_len;
-    priv->still_pvob = pvob;
-    return es_len > 0;
+    return true;
 }
 
 static int control(stream_t *stream, int cmd, void *arg)
@@ -518,9 +649,9 @@ static int control(stream_t *stream, int cmd, void *arg)
             mp_mutex_unlock(&priv->still_lock);
             return STREAM_OK;
         }
-        if (req->id != priv->still_pvob || !priv->still_data)
+        if (req->id != priv->still_pvob)
             extract_still(stream, req->id);
-        if (priv->still_pvob == req->id && priv->still_data) {
+        if (priv->still_data) {
             req->data = priv->still_data;
             req->data_size = priv->still_size;
         }
@@ -542,9 +673,21 @@ static int control(stream_t *stream, int cmd, void *arg)
         *(double *)arg = DVDA_TIME_TO_S(sector_to_time(t, priv->cur_sector));
         return STREAM_OK;
     case STREAM_CTRL_SEEK_TO_TIME: {
-        double *args = arg;
-        priv->cur_sector = time_to_sector(t, DVDA_TIME_FROM_S(args[0]));
+        struct stream_seek_req *req = arg;
+        req->skip_until = MP_NOPTS_VALUE;
+        priv->cur_sector = time_to_sector(t, DVDA_TIME_FROM_S(req->target));
         stream_drop_buffers(stream);
+        TA_FREEP(&priv->segs);
+        priv->num_segs = 0;
+        priv->seg_pending = true;
+        return STREAM_OK;
+    }
+    case STREAM_CTRL_GET_SEGMENTS: {
+        struct stream_segments_req *req = arg;
+        req->segs = talloc_steal(NULL, priv->segs);
+        req->num = priv->num_segs;
+        priv->segs = NULL;
+        priv->num_segs = 0;
         return STREAM_OK;
     }
     case STREAM_CTRL_GET_NUM_TITLES:
@@ -557,6 +700,19 @@ static int control(stream_t *stream, int cmd, void *arg)
         *(double *)arg = DVDA_TIME_TO_S(priv->titles[title].duration);
         return STREAM_OK;
     }
+    case STREAM_CTRL_GET_TITLE_NAME: {
+        struct stream_name_req *req = arg;
+        if (req->index < 0 || req->index >= priv->num_titles)
+            break;
+        struct dvda_title *dt = &priv->titles[req->index];
+        if (!dt->audio_desc && !dt->secondary)
+            break;
+        req->name = dt->secondary
+            ? talloc_asprintf(NULL, "alternate mix, %s",
+                              dt->audio_desc ? dt->audio_desc : "unknown format")
+            : talloc_strdup(NULL, dt->audio_desc);
+        return STREAM_OK;
+    }
     case STREAM_CTRL_GET_CURRENT_TITLE:
         *(unsigned int *)arg = priv->title;
         return STREAM_OK;
@@ -567,7 +723,11 @@ static int control(stream_t *stream, int cmd, void *arg)
             break;
         if (!volid[0])
             break;
-        *(char **)arg = talloc_strdup(NULL, volid);
+        bstr name = bstr_sanitize_utf8_latin1(NULL, bstr0(volid));
+        // Sanitize adds a terminating NUL, so we can use it directly, but
+        // only if conversion has happened.
+        *(char **)arg = name.start == (unsigned char *)volid
+                            ? talloc_strdup(NULL, volid) : (char *)name.start;
         return STREAM_OK;
     }
     }
@@ -682,6 +842,7 @@ static int open_s(stream_t *stream)
 {
     struct priv *priv = talloc_zero(stream, struct priv);
     stream->priv = priv;
+    priv->still_pvob = -1;
 
     bstr title, bdevice;
     bstr_split_tok(bstr0(stream->path), "/", &title, &bdevice);
@@ -717,19 +878,19 @@ const stream_info_t stream_info_dvda = {
     .stream_origin = STREAM_ORIGIN_UNSAFE,
 };
 
-// Check if this is likely to be AUDIO_TS.IFO.
+// Check if this is likely to be an IFO file of a DVD-Audio disc.
 static bool check_ifo(const char *path)
 {
-    if (strcasecmp(mp_basename(path), "audio_ts.ifo"))
+    if (!bstr_case_endswith(bstr0(path), bstr0(".ifo")))
         return false;
 
     FILE *temp = fopen(path, "rb");
     if (!temp)
         return false;
 
-    char data[12];
+    char data[8];
     bool r = fread(data, sizeof(data), 1, temp) == 1 &&
-             memcmp(data, "DVDAUDIO-AMG", 12) == 0;
+             memcmp(data, "DVDAUDIO", 8) == 0;
 
     fclose(temp);
     return r;
@@ -739,6 +900,7 @@ static int ifo_dvda_stream_open(stream_t *stream)
 {
     struct priv *priv = talloc_zero(stream, struct priv);
     stream->priv = priv;
+    priv->still_pvob = -1;
 
     if (!stream->access_references)
         goto unsupported;
@@ -767,7 +929,7 @@ static int ifo_dvda_stream_open(stream_t *stream)
     }
 
     // We allow the path to point to a directory containing AUDIO_TS/, a
-    // directory containing AUDIO_TS.IFO, or that file itself.
+    // directory containing AUDIO_TS.IFO, or any IFO file in it.
     if (!check_ifo(path)) {
         // On UNIX, just assume the filename is always uppercase.
         char *npath = mp_path_join(priv, path, "AUDIO_TS.IFO");

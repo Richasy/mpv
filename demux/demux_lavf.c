@@ -181,6 +181,7 @@ static const struct format_hack format_hacks[] = {
     {"hls", .nested_network = true, .clear_filepos = true, .no_ext_picky = true},
     {"dash", .nested_network = true, .clear_filepos = true},
     {"sdp", .clear_filepos = true, .is_network = true, .no_seek = true},
+    {"rtp", .clear_filepos = true, .is_network = true, .no_seek = true},
     {"mpeg", .use_stream_ids = true},
     {"mpegts", .use_stream_ids = true},
     {"mxf", .use_stream_ids = true},
@@ -539,7 +540,7 @@ static int lavf_check_file(demuxer_t *demuxer, enum demux_check check)
         .filename = !bstrcasecmp0(ext, "m3u8") || !bstrcasecmp0(ext, "m3u") ||
                     check <= DEMUX_CHECK_REQUEST ? priv->filename : "",
         .buf_size = 0,
-        .buf = av_mallocz(PROBE_BUF_SIZE + AV_INPUT_BUFFER_PADDING_SIZE),
+        .buf = av_malloc(PROBE_BUF_SIZE + AV_INPUT_BUFFER_PADDING_SIZE),
         .mime_type = lavfdopts->allow_mimetype ? mime_type : NULL,
     };
     if (!avpd.buf)
@@ -556,6 +557,7 @@ static int lavf_check_file(demuxer_t *demuxer, enum demux_check check)
             int nsize = av_clip(avpd.buf_size * 2, INITIAL_PROBE_SIZE,
                                 PROBE_BUF_SIZE);
             nsize = stream_read_peek(s, avpd.buf, nsize);
+            memset(avpd.buf + nsize, 0, AV_INPUT_BUFFER_PADDING_SIZE);
             if (nsize <= avpd.buf_size)
                 final_probe = true;
             avpd.buf_size = nsize;
@@ -1658,6 +1660,10 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
                 av_dict_set(&opts[i], "request_sample_fmt", "dsd", 0);
         }
 #endif
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+        for (int i = 0; i < nb_streams; i++)
+            av_dict_set_int(&opts[i], "max_pixels", 2048 * 2048, 0);
+#endif
         int r = avformat_find_stream_info(avfc, opts);
         for (int i = 0; i < nb_streams; i++)
             av_dict_free(&opts[i]);
@@ -1982,7 +1988,8 @@ static void demux_drop_buffers_lavf(demuxer_t *demuxer)
     if (!priv->stream || priv->stream->seekable)
         av_seek_frame(priv->avfc, -1, 0, 1);
     demux_flush(demuxer);
-    stream_drop_buffers(priv->stream);
+    if (priv->stream)
+        stream_drop_buffers(priv->stream);
     avio_flush(priv->avfc->pb);
     if (priv->stream && !priv->stream->seekable) {
         // The stream may have been repositioned externally (disc seeks).
@@ -2034,7 +2041,8 @@ static void demux_seek_lavf(demuxer_t *demuxer, double seek_pts, int flags)
     } else {
         if (!(flags & SEEK_FORWARD))
             seek_pts -= priv->seek_delay;
-        seek_pts_av = seek_pts * AV_TIME_BASE;
+        seek_pts_av = MPCLAMP(seek_pts, INT64_MIN / AV_TIME_BASE,
+                              INT64_MAX / AV_TIME_BASE) * AV_TIME_BASE;
     }
 
     // Hack to make wav seeking "deterministic". Without this, features like
@@ -2056,8 +2064,8 @@ static void demux_seek_lavf(demuxer_t *demuxer, double seek_pts, int flags)
                       priv->pcm_seek_hack->codecpar->block_align;
         if (samples > 0) {
             MP_VERBOSE(demuxer, "using bullshit libavformat PCM seek hack\n");
-            double pts = seek_pts_av / (double)AV_TIME_BASE;
-            seek_pts_av = pts / av_q2d(priv->pcm_seek_hack->time_base);
+            seek_pts_av = av_rescale_q(seek_pts_av, AV_TIME_BASE_Q,
+                                       priv->pcm_seek_hack->time_base);
             int64_t align = seek_pts_av % samples;
             seek_pts_av -= align;
             seek_stream = priv->pcm_seek_hack->index;

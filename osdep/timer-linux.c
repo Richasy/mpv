@@ -37,6 +37,10 @@ void mp_sleep_ns(int64_t ns)
     nanosleep(&ts, NULL);
 }
 
+void mp_set_idle_power_mode(bool idle)
+{
+}
+
 uint64_t mp_raw_time_ns(void)
 {
     struct timespec tp = {0};
@@ -61,4 +65,11 @@ void mp_raw_time_init(void)
     }
     fputs("No clock source available!\n", stderr);
     abort();
+}
+
+int64_t mp_time_ns_from_clock(clockid_t clk, int64_t clk_time)
+{
+    struct timespec ts;
+    clock_gettime(clk, &ts);
+    return mp_time_ns() - (MP_TIME_S_TO_NS(ts.tv_sec) + ts.tv_nsec - clk_time);
 }

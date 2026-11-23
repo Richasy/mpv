@@ -245,7 +245,8 @@ Available mpv-only filters are:
         corresponding primaries are used. Otherwise, if the video height is
         exactly 576 (PAL), BT.601-625 is used. If it's exactly 480 or 486 (NTSC),
         BT.601-525 is used. If the video resolution is anything else, BT.709 is
-        used.
+        used. Untagged XYZ content is decoded into DCI-P3, or into BT.2020
+        when its transfer is linear light.
 
         Available primaries are:
 

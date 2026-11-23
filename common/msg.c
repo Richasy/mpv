@@ -103,7 +103,7 @@ struct mp_log {
     const char *prefix;
     const char *verbose_prefix;
     int max_level;              // minimum log level for this instance
-    int level;                  // minimum log level for any outputs
+    atomic_int level;           // minimum log level for any outputs
     int terminal_level;         // minimum log level for terminal output
     atomic_ulong reload_counter;
     bstr partial[MSGL_MAX + 1];
@@ -141,26 +141,27 @@ static void update_loglevel(struct mp_log *log)
 {
     struct mp_log_root *root = log->root;
     mp_mutex_lock(&root->lock);
-    log->level = MSGL_STATUS + root->verbose; // default log level
+    int level = MSGL_STATUS + root->verbose; // default log level
     if (root->really_quiet)
-        log->level = -1;
+        level = -1;
     for (int n = 0; root->msg_levels && root->msg_levels[n * 2 + 0]; n++) {
         if (match_mod(log->verbose_prefix, root->msg_levels[n * 2 + 0]))
-            log->level = mp_msg_find_level(root->msg_levels[n * 2 + 1]);
+            level = mp_msg_find_level(root->msg_levels[n * 2 + 1]);
     }
-    log->terminal_level = log->level;
+    log->terminal_level = level;
     for (int n = 0; n < log->root->num_buffers; n++) {
         int buffer_level = log->root->buffers[n]->level;
         if (buffer_level == MP_LOG_BUFFER_MSGL_LOGFILE)
             buffer_level = MSGL_DEBUG;
         if (buffer_level != MP_LOG_BUFFER_MSGL_TERM)
-            log->level = MPMAX(log->level, buffer_level);
+            level = MPMAX(level, buffer_level);
     }
     if (log->root->log_file)
-        log->level = MPMAX(log->level, MSGL_DEBUG);
+        level = MPMAX(level, MSGL_DEBUG);
     if (log->root->stats_file)
-        log->level = MPMAX(log->level, MSGL_STATS);
-    log->level = MPMIN(log->level, log->max_level);
+        level = MPMAX(level, MSGL_STATS);
+    level = MPMIN(level, log->max_level);
+    atomic_store_explicit(&log->level, level, memory_order_relaxed);
     atomic_store(&log->reload_counter, atomic_load(&log->root->reload_counter));
     mp_mutex_unlock(&root->lock);
 }
@@ -189,7 +190,7 @@ int mp_msg_level(struct mp_log *log)
     {
         update_loglevel(log);
     }
-    return log->level;
+    return atomic_load_explicit(&log->level, memory_order_relaxed);
 }
 
 static inline int term_msg_fileno(struct mp_log_root *root, int lev)
@@ -446,6 +447,14 @@ static struct mp_log_buffer_entry *log_buffer_read(struct mp_log_buffer *buffer)
     return res;
 }
 
+static bool log_buffer_full(struct mp_log_buffer *buffer)
+{
+    mp_mutex_lock(&buffer->lock);
+    bool full = buffer->num_entries == buffer->capacity;
+    mp_mutex_unlock(&buffer->lock);
+    return full;
+}
+
 static void write_msg_to_buffers(struct mp_log *log, int lev, bstr text)
 {
     struct mp_log_root *root = log->root;
@@ -462,17 +471,14 @@ static void write_msg_to_buffers(struct mp_log *log, int lev, bstr text)
             if (buffer->level == MP_LOG_BUFFER_MSGL_LOGFILE) {
                 // If the buffer is full, block until we can write again,
                 // unless there's no write thread (died, or early filebuffer)
-                bool dead = false;
-                while (buffer->num_entries == buffer->capacity && !dead) {
+                if (buffer->num_entries == buffer->capacity) {
                     // Temporary unlock is OK; buffer->level is immutable, and
                     // buffer can't go away because the global log lock is held.
                     mp_mutex_unlock(&buffer->lock);
                     mp_mutex_lock(&root->log_file_lock);
-                    if (root->log_file_thread_active) {
+                    while (root->log_file_thread_active && log_buffer_full(buffer)) {
                         mp_cond_wait(&root->log_file_wakeup,
                                           &root->log_file_lock);
-                    } else {
-                        dead = true;
                     }
                     mp_mutex_unlock(&root->log_file_lock);
                     mp_mutex_lock(&buffer->lock);
@@ -605,7 +611,7 @@ void mp_msg_sanitize(bstr *text, bool allow_sgr)
         }
 
         // Block UTF-8 C1 controls (C2 80..C2 9F), except PU1/PU2 used internally.
-        if (ch == 0xC2 && i + 1 < text->len) {
+        if (ch == 0xC2 && i + 1 < text->len && (text->start[i + 1] & 0xC0) == 0x80) {
             unsigned char c1 = text->start[i + 1];
             if (c1 >= 0x80 && c1 <= 0x9F && c1 != 0x91 && c1 != 0x92) {
                 text->start[i] = '?';
@@ -633,6 +639,17 @@ void mp_msg_sanitize(bstr *text, bool allow_sgr)
     }
 }
 
+// Start of a UTF-8 sequence at the end of str that more text may complete.
+static size_t utf8_tail_start(bstr str)
+{
+    for (size_t n = 1; n <= 4 && n <= str.len; n++) {
+        unsigned char ch = str.start[str.len - n];
+        if ((ch & 0xC0) != 0x80)
+            return ch >= 0xC0 ? str.len - n : str.len;
+    }
+    return str.len;
+}
+
 void mp_msg_va(struct mp_log *log, int lev, const char *format, va_list va)
 {
     if (!mp_msg_test(log, lev))
@@ -644,6 +661,9 @@ void mp_msg_va(struct mp_log *log, int lev, const char *format, va_list va)
 
     root->buffer.len = 0;
 
+    // The partial line is sanitized already, except for a UTF-8 sequence at
+    // its end that the new text may complete.
+    size_t sanitized = utf8_tail_start(log->partial[lev]);
     if (log->partial[lev].len)
         bstr_xappend(root, &root->buffer, log->partial[lev]);
     log->partial[lev].len = 0;
@@ -653,7 +673,8 @@ void mp_msg_va(struct mp_log *log, int lev, const char *format, va_list va)
         bstr_xappend(root, &root->buffer, bstr0(format));
     }
 
-    mp_msg_sanitize(&root->buffer, true);
+    bstr text = {root->buffer.start + sanitized, root->buffer.len - sanitized};
+    mp_msg_sanitize(&text, true);
 
     // Remember last status message and restore it to ensure that it is
     // always displayed

@@ -81,6 +81,7 @@ MP_PRINTF_ATTRIBUTE(3, 4)
 void mp_cmd_msg(struct mp_cmd_ctx *cmd, int status, const char *msg, ...);
 char *mp_property_expand_string(struct MPContext *mpctx, const char *str);
 char *mp_property_expand_escaped_string(struct MPContext *mpctx, const char *str);
+char *mp_expand_term_status_msg(struct MPContext *mpctx);
 void property_print_help(struct MPContext *mpctx);
 int mp_property_do(const char* name, int action, void* val,
                    struct MPContext *mpctx);
@@ -109,6 +110,7 @@ enum {
     MP_EVENT_WIN_STATE2,
     MP_EVENT_FOCUS,
     MP_EVENT_AMBIENT_LIGHTING_CHANGED,
+    MP_EVENT_PRESENTATION_DELAY,
     MP_EVENT_CHANGE_PLAYLIST,
     MP_EVENT_CORE_IDLE,
     MP_EVENT_DURATION_UPDATE,

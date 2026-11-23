@@ -237,6 +237,8 @@ static void uninit_demuxer(struct MPContext *mpctx)
 
     kill_demuxers_reentrant(mpctx, demuxers, num_demuxers);
     talloc_free(demuxers);
+
+    disc_nav_reset(mpctx);
 }
 
 #define APPEND(s, ...) mp_snprintf_cat(s, sizeof(s), __VA_ARGS__)
@@ -368,26 +370,36 @@ void update_demuxer_properties(struct MPContext *mpctx)
     }
     struct demuxer *tracks = mpctx->demuxer;
     if (tracks->events & DEMUX_EVENT_STREAMS) {
+        int num_old_tracks = mpctx->num_tracks;
         add_demuxer_tracks(mpctx, tracks);
-        print_track_list(mpctx, NULL);
         tracks->events &= ~DEMUX_EVENT_STREAMS;
 
         // Streams surfaced after play_current_file's selection phase (e.g.
         // disc-nav playlist hop, or lavf identifying a PES stream only once
         // its first packet arrives) wouldn't otherwise get auto-selected.
+        // Only such a stream may claim a free slot, one that disc navigation
+        // or a failed decoder emptied stays empty.
         if (mpctx->playback_initialized && mpctx->opts->stream_auto_sel) {
             for (int t = 0; t < STREAM_TYPE_COUNT; t++) {
                 for (int i = 0; i < num_ptracks[t]; i++) {
                     if (mpctx->current_track[i][t])
                         continue;
+                    // The output belongs to a complex filter.
+                    if ((t == STREAM_VIDEO && mpctx->vo_chain) ||
+                        (t == STREAM_AUDIO && mpctx->ao_chain))
+                        continue;
                     if (mpctx->opts->stream_id[i][t] == -2)
                         continue;
                     struct track *sel = select_default_track(mpctx, i, t);
-                    if (sel)
+                    bool is_new = false;
+                    for (int n = num_old_tracks; n < mpctx->num_tracks; n++)
+                        is_new |= mpctx->tracks[n] == sel;
+                    if (is_new)
                         mp_switch_track_n(mpctx, i, t, sel, 0);
                 }
             }
         }
+        print_track_list(mpctx, NULL);
     }
     if (events & DEMUX_EVENT_METADATA) {
         struct mp_tags *info =
@@ -431,6 +443,8 @@ void update_demuxer_properties(struct MPContext *mpctx)
     }
     if (events & DEMUX_EVENT_DURATION)
         mp_notify(mpctx, MP_EVENT_DURATION_UPDATE, NULL);
+    if (events & DEMUX_EVENT_CODEC)
+        mp_notify(mpctx, MP_EVENT_TRACKS_CHANGED, NULL);
     if (events & DEMUX_EVENT_LISTS) {
         // Demuxer just published a new chapter / edition list at runtime.
         char *chapter_file = mpctx->opts->chapter_file;
@@ -695,7 +709,7 @@ struct track *select_default_track(struct MPContext *mpctx, int order,
             pick = track;
             goto cleanup;
         }
-        if (track->no_auto_select)
+        if (track->no_auto_select || track->dec_failed)
             continue;
         if (!opts->autoload_files && track->is_external)
             continue;
@@ -1067,6 +1081,7 @@ int mp_add_external_file(struct MPContext *mpctx, char *filename,
         t->visual_impaired_track = flags & TRACK_VISUAL_IMPAIRED;
         t->forced_track = flags & TRACK_FORCED;
         t->default_track = flags & TRACK_DEFAULT;
+        t->commentary_track = flags & TRACK_COMMENTARY;
         // if we found video, and we are loading cover art, flag as such.
         t->attached_picture = t->type == STREAM_VIDEO && (flags & TRACK_ATTACHED_PICTURE);
         if (first_num < 0 && (filter == STREAM_TYPE_COUNT || sh->type == filter))
@@ -1588,6 +1603,12 @@ static void clear_playlist_paths(struct MPContext *mpctx)
 
 static bool infinite_playlist_loading_loop(struct MPContext *mpctx, struct playlist *pl)
 {
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    if (mpctx->playlist_paths_len >= 10) {
+        clear_playlist_paths(mpctx);
+        return true;
+    }
+#endif
     if (pl->num_entries) {
         struct playlist_entry *e = pl->entries[0];
         for (int n = 0; n < mpctx->playlist_paths_len; n++) {
@@ -1748,10 +1769,12 @@ static int reinit_complex_filters(struct MPContext *mpctx, bool force_uninit)
         track->selected = true;
 
         if (!track->dec) {
-            if (track->type == STREAM_VIDEO && !init_video_decoder(mpctx, track))
+            bool ok = track->type == STREAM_VIDEO ? init_video_decoder(mpctx, track)
+                                                  : init_audio_decoder(mpctx, track);
+            if (!ok) {
+                error_on_track(mpctx, track);
                 goto done;
-            if (track->type == STREAM_AUDIO && !init_audio_decoder(mpctx, track))
-                goto done;
+            }
         }
 
         mp_pin_connect(track->sink, track->dec->f->pins[0]);

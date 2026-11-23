@@ -149,7 +149,7 @@ struct drm_atomic_context *drm_atomic_create_context(struct mp_log *log, int fd,
     drmModePlaneRes *plane_res = NULL;
     drmModeRes *res = NULL;
     struct drm_object *plane = NULL;
-    struct drm_atomic_context *ctx;
+    struct drm_atomic_context *ctx = NULL;
     int crtc_index = -1;
     int layercount = -1;
     int primary_id = 0;
@@ -188,6 +188,16 @@ struct drm_atomic_context *drm_atomic_create_context(struct mp_log *log, int fd,
             break;
         }
     }
+    if (crtc_index < 0) {
+        mp_err(log, "CRTC %d is not in the DRM resources\n", crtc_id);
+        goto fail;
+    }
+
+    ctx->request = drmModeAtomicAlloc();
+    if (!ctx->request) {
+        mp_err(log, "Failed to allocate atomic request\n");
+        goto fail;
+    }
 
     for (int i = 0; i < res->count_connectors; i++) {
         drmModeConnector *connector = drmModeGetConnector(fd, res->connectors[i]);
@@ -209,7 +219,7 @@ struct drm_atomic_context *drm_atomic_create_context(struct mp_log *log, int fd,
         drmModeFreePlane(drmplane);
         drmplane = NULL;
 
-        if (possible_crtcs & (1 << crtc_index)) {
+        if (possible_crtcs & (1u << crtc_index)) {
             plane = drm_object_create(log, ctx->fd, plane_id, DRM_MODE_OBJECT_PLANE);
 
             if (!plane) {
@@ -234,11 +244,13 @@ struct drm_atomic_context *drm_atomic_create_context(struct mp_log *log, int fd,
 
                 if (layercount == draw_plane_idx) {
                     ctx->draw_plane = plane;
+                    plane = NULL;
                     continue;
                 }
 
                 if (layercount == drmprime_video_plane_idx) {
                     ctx->drmprime_video_plane = plane;
+                    plane = NULL;
                     continue;
                 }
             }
@@ -289,6 +301,8 @@ fail:
         drmModeFreePlaneResources(plane_res);
     if (plane)
         drm_object_free(plane);
+    if (ctx)
+        drm_atomic_destroy_context(ctx);
     return NULL;
 }
 

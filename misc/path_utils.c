@@ -167,9 +167,14 @@ char *mp_path_join(void *talloc_ctx, const char *p1, const char *p2)
 
 char *mp_getcwd(void *talloc_ctx)
 {
+#if !HAVE_DOS_PATHS
     char *e_wd = getenv("PWD");
-    if (e_wd)
+    struct stat pwd_st, dot_st;
+    if (e_wd && mp_path_is_absolute(bstr0(e_wd)) &&
+        stat(e_wd, &pwd_st) == 0 && stat(".", &dot_st) == 0 &&
+        pwd_st.st_dev == dot_st.st_dev && pwd_st.st_ino == dot_st.st_ino)
         return talloc_strdup(talloc_ctx, e_wd);
+#endif
 
     char *wd = talloc_array(talloc_ctx, char, 20);
     while (getcwd(wd, talloc_get_size(wd)) == NULL) {
@@ -187,12 +192,29 @@ char *mp_normalize_path(void *talloc_ctx, const char *path)
     if (!path)
         return NULL;
 
-    if (mp_is_url(bstr0(path)) || !strcmp(path, "-"))
+    if (!path[0] || mp_is_url(bstr0(path)) || !strcmp(path, "-"))
         return talloc_strdup(talloc_ctx, path);
 
     void *tmp = talloc_new(NULL);
     char *result;
 
+#if HAVE_DOS_PATHS
+    wchar_t *pathw = mp_from_utf8(tmp, path);
+    DWORD len = GetFullPathNameW(pathw, 0, NULL, NULL);
+    wchar_t *pathc = talloc_array(tmp, wchar_t, len);
+    if (!len || !GetFullPathNameW(pathw, len, pathc, NULL)) {
+        result = talloc_strdup(talloc_ctx, path);
+        goto exit;
+    }
+    // PathAllocCanonicalize() treats the "." of a \\.\ path as a directory and
+    // removes it, so skip it for device paths.
+    wchar_t *pathx = NULL;
+    if (wcsncmp(pathc, L"\\\\.\\", 4) &&
+        SUCCEEDED(PathAllocCanonicalize(pathc, PATHCCH_ALLOW_LONG_PATHS, &pathx)))
+        pathc = pathx;
+    result = mp_to_utf8(talloc_ctx, pathc);
+    LocalFree(pathx);
+#else
     if (!mp_path_is_absolute(bstr0(path))) {
         char *cwd = mp_getcwd(tmp);
         if (!cwd) {
@@ -202,31 +224,6 @@ char *mp_normalize_path(void *talloc_ctx, const char *path)
         path = mp_path_join(tmp, cwd, path);
     }
 
-#if HAVE_DOS_PATHS
-    wchar_t *pathw = mp_from_utf8(tmp, path);
-    wchar_t *read = pathw, *write = pathw;
-    wchar_t prev = '\0';
-    // preserve leading double backslashes
-    if (read[0] == '\\' && read[1] == '\\') {
-        prev = '\\';
-        write += 2;
-        read += 2;
-    }
-    wchar_t curr;
-    while ((curr = *read)) {
-        if (curr == '/')
-            curr = '\\';
-        if (curr != '\\' || prev != '\\')
-            *write++ = curr;
-        prev = curr;
-        read++;
-    }
-    *write = '\0';
-    size_t max_size = wcslen(pathw) + 1;
-    wchar_t *pathc = talloc_array(tmp, wchar_t, max_size);
-    HRESULT hr = PathCchCanonicalizeEx(pathc, max_size, pathw, PATHCCH_ALLOW_LONG_PATHS);
-    result = SUCCEEDED(hr) ? mp_to_utf8(talloc_ctx, pathc) : talloc_strdup(talloc_ctx, path);
-#else
     result = talloc_strdup(tmp, "");
     const char *next;
     const char *end = path + strlen(path);
@@ -264,6 +261,9 @@ char *mp_normalize_path(void *talloc_ctx, const char *path)
         result = talloc_strdup_append_buffer(result, "/");
         result = talloc_strndup_append_buffer(result, ptr, next - ptr);
     }
+
+    if (!result[0])
+        result = talloc_strdup_append_buffer(result, "/");
 
     result = talloc_steal(talloc_ctx, result);
 #endif

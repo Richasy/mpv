@@ -84,15 +84,20 @@ enum stream_ctrl {
     STREAM_CTRL_GET_NUM_CHAPTERS,
     STREAM_CTRL_GET_CURRENT_TIME,
     STREAM_CTRL_GET_CHAPTER_TIME,
-    STREAM_CTRL_SEEK_TO_TIME,
-    STREAM_CTRL_GET_ASPECT_RATIO,
+    STREAM_CTRL_SEEK_TO_TIME,        // struct stream_seek_req*
+    STREAM_CTRL_GET_ASPECT_RATIO,    // int[2], display aspect ratio
     STREAM_CTRL_GET_NUM_ANGLES,
     STREAM_CTRL_GET_ANGLE,
     STREAM_CTRL_SET_ANGLE,
     STREAM_CTRL_GET_NUM_TITLES,
     STREAM_CTRL_GET_TITLE_LENGTH,    // double* (in: title number, out: len)
     STREAM_CTRL_GET_TITLE_PLAYLIST,  // double* (in: title number, out: playlist)
-    STREAM_CTRL_GET_LANG,
+    STREAM_CTRL_GET_TRACK_INFO,
+    STREAM_CTRL_GET_CHAPTER_NAME,    // struct stream_name_req*
+    STREAM_CTRL_GET_TITLE_NAME,      // struct stream_name_req*
+    STREAM_CTRL_SET_ACTIVE_TRACK,    // struct stream_track_req* (audio, id in)
+    STREAM_CTRL_SET_PLAYBACK_TIME,   // double*, current presentation time
+    STREAM_CTRL_SET_PLAYBACK_RATE,   // double*, 0 = paused, 1 = normal
     STREAM_CTRL_GET_CURRENT_TITLE,
     STREAM_CTRL_SET_CURRENT_TITLE,
     STREAM_CTRL_NAV_CMD,             // struct stream_nav_cmd*
@@ -102,6 +107,8 @@ enum stream_ctrl {
     STREAM_CTRL_SET_STILL_PAGE,      // int*, force the shown still page
     STREAM_CTRL_NAV_DRAIN_ENABLE,    // start holding EOF at jump boundaries
     STREAM_CTRL_NAV_DRAIN_ACK,       // flush done, release the held EOF
+    STREAM_CTRL_GET_STREAMS,         // struct stream_streams_req*
+    STREAM_CTRL_GET_SEGMENTS,        // struct stream_segments_req*
 };
 
 // Fetch the still image that a disc (DVD-Audio ASVS) associates with the given
@@ -134,9 +141,18 @@ enum stream_nav_action {
     STREAM_NAV_MENU_ROOT,      // jump to the disc's root/title menu
     STREAM_NAV_MENU_TITLE,     // jump to the current title's menu
     STREAM_NAV_MENU_POPUP,     // BD popup menu (chapter menu on DVD)
+    STREAM_NAV_MENU_AUDIO,     // DVD audio menu
+    STREAM_NAV_MENU_SUBTITLE,  // DVD subpicture menu
+    STREAM_NAV_MENU_ANGLE,     // DVD angle menu
+    STREAM_NAV_GO_UP,          // DVD: move to the parent menu
     STREAM_NAV_PREV_MENU,      // return to previous menu / leave still
+    STREAM_NAV_KEY_RED,        // BD color keys
+    STREAM_NAV_KEY_GREEN,
+    STREAM_NAV_KEY_YELLOW,
+    STREAM_NAV_KEY_BLUE,
     STREAM_NAV_MOUSE_MOVE,     // mouse moved; .x,.y are video-space coords
     STREAM_NAV_MOUSE_CLICK,    // mouse button activated at .x,.y
+    STREAM_NAV_SKIP_STILL,     // end the held still, its time ran out
 };
 
 struct stream_nav_cmd {
@@ -153,7 +169,16 @@ static inline bool stream_nav_action_activates(enum stream_nav_action a)
     case STREAM_NAV_MENU_ROOT:
     case STREAM_NAV_MENU_TITLE:
     case STREAM_NAV_MENU_POPUP:
+    case STREAM_NAV_MENU_AUDIO:
+    case STREAM_NAV_MENU_SUBTITLE:
+    case STREAM_NAV_MENU_ANGLE:
+    case STREAM_NAV_GO_UP:
     case STREAM_NAV_PREV_MENU:
+    case STREAM_NAV_KEY_RED:
+    case STREAM_NAV_KEY_GREEN:
+    case STREAM_NAV_KEY_YELLOW:
+    case STREAM_NAV_KEY_BLUE:
+    case STREAM_NAV_SKIP_STILL:
         return true;
     default:
         return false;
@@ -170,7 +195,8 @@ struct mp_dvdnav_highlight {
 struct stream_nav_state {
     bool nav_active;         // interactive disc navigation is enabled
     bool menu_active;        // a selectable menu/highlight is currently visible
-    bool still_active;       // holding an indefinite still frame
+    bool still_active;       // holding a still frame
+    double still_length;     // seconds the still lasts, 0 until user input
     int  src_w, src_h;       // dimensions of the coordinate space mouse uses
     struct mp_dvdnav_highlight hl; // focused button highlight (DVD only)
     uint32_t change_id; // Bumped whenever any of the above changes
@@ -186,15 +212,62 @@ struct stream_nav_state {
     int num_angles;     // total angle count (0 if unknown or always 1)
 };
 
-struct stream_lang_req {
+struct stream_name_req {
+    int index;      // 0-based, what to ask about
+    char *name;     // out, talloc allocated, only set when the disc names it
+};
+
+struct stream_track_req {
     int type;     // STREAM_AUDIO, STREAM_SUB
     int id;
     char name[50];
+    enum track_flags flags;
 };
 
 struct stream_dvd_info_req {
     unsigned int palette[16];
-    int num_subs;
+};
+
+// The presentation streams the disc declares for what it is playing (a DVD
+// program chain, a Blu-ray clip). The ids are the demuxer's (demuxer_id).
+struct stream_decl_stream {
+    int type;           // STREAM_VIDEO, STREAM_AUDIO, STREAM_SUB
+    int id;
+    const char *codec;  // static string, NULL when the disc does not say
+};
+struct stream_streams_req {
+    struct stream_decl_stream *streams; // out: talloc'd, the caller frees
+    int num;
+};
+
+struct stream_stream_id {
+    int type;
+    int id;
+};
+
+// One run of source data as the disc describes it (a DVD VOBU, a Blu-ray
+// clip): where it starts, how its in-stream timestamps map to playback time,
+// and which declared streams have data in it.
+struct stream_segment {
+    int64_t pos;        // stream position of its first byte
+    double raw_base;    // in-stream timestamp that plays at `time`, or
+                        // MP_NOPTS_VALUE: the first packet mapped into it
+    double time;        // playback time of raw_base
+    struct stream_stream_id *present;   // the declared streams with data in
+                                        // it, NULL when all of them have
+    int num_present;
+};
+struct stream_segments_req {
+    struct stream_segment *segs;    // out: the stream's talloc'd array, oldest
+                                    //      first, the present lists are its
+                                    //      children, the caller owns it
+    int num;
+};
+
+struct stream_seek_req {
+    double target;      // in: absolute playback time
+    int flags;          // in: SEEK_* flags (demux.h)
+    double skip_until;  // out: drop audio until this time (MP_NOPTS_VALUE otherwise)
 };
 
 // for STREAM_CTRL_AVSEEK

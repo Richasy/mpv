@@ -32,6 +32,9 @@ API changes
 
 ::
 
+ --- mpv 0.43.0 ---
+ 2.12   - add MPV_RENDER_PARAM_RENDERER to select the renderer
+        - use the gpu-next renderer by default (upstream API 2.7).
  --- mpv 0.42.0 ---
  2.8    - add MPV_RENDER_API_TYPE_D3D11 render API backend, along with
           MPV_RENDER_PARAM_D3D11_INIT_PARAMS and MPV_RENDER_PARAM_D3D11_FBO,

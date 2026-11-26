@@ -140,16 +140,14 @@ every ExternalProject step log and FFmpeg's compiler/linker configuration probes
 
 The GitHub Actions workflow (`.github/workflows/libmpv.yml`) is configured for
 manual dispatch only (`workflow_dispatch`). It exposes the x64 and ARM64
-architecture switches, upload target, and runner selection. Builds run on the self-hosted
+architecture switches and upload target. Builds run on the self-hosted
 Linux runner in release mode using the FFmpeg revision pinned by
 `ci/build-libmpv.sh`.
 
-The `runner` input defaults to `auto`: Beijing 06:00-14:59 selects
-`mpv-build-legacy`, and other hours select `mpv-build-wsl-cpc-anran-fhr6h`.
-Choose `new` or `legacy` to override the schedule for the complete run, including
-the final Azure pointer publication. A busy selected runner queues; it never
-falls back to the other machine. For example, add `-f runner=new` to
-`gh workflow run libmpv.yml` to force the newer runner.
+Builds and final Azure pointer publication always use the local WSL runner
+`CPC-anran-FHR6H-mpv-wsl`, selected by `mpv-build-wsl-cpc-anran-fhr6h`.
+The legacy runner has been retired; there is no time-of-day routing or
+`runner` input. If the local runner is busy or offline, jobs queue for it.
 
 Each selected architecture replaces its stable local output directory and
 archive (`x86_64`/`libmpv-x64.7z` or

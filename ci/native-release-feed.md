@@ -6,7 +6,8 @@ The `libmpv` workflow supports GitHub artifacts, Azure Blob Storage, or both.
 For a Player release, select `upload_target=azure` and enable both x64 and
 ARM64. The workflow uploads complete run-specific runtime sets and updates
 `native/latest.json` only after validating both architectures and their source
-commit. Runner selection retains its explicit or time-of-day policy.
+commit. Builds and final pointer publication use only the local WSL runner
+with label `mpv-build-wsl-cpc-anran-fhr6h`; there is no time-of-day routing.
 No shared native directory or `NATIVE_RELEASE_ROOT` repository variable is
 required. Player consumes the completed pair through its canonical Azure
 downloader and verifies its run-owned receipt against both Store packages.

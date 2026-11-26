@@ -1820,8 +1820,9 @@ void update_vo_chain_el_pair(struct MPContext *mpctx)
     if (!mpctx->vo_chain || !mpctx->vo_chain->filter)
         return;
     struct track *track = mpctx->current_track[0][STREAM_VIDEO];
+    struct sh_stream *el = track ? sh_stream_dependent_sibling(track->stream) : NULL;
     mp_output_chain_set_el_stream(mpctx->vo_chain->filter,
-        track ? sh_stream_dependent_sibling(track->stream) : NULL);
+                                  el && !el->absent ? el : NULL);
 }
 
 void update_lavfi_complex(struct MPContext *mpctx)

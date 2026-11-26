@@ -39,6 +39,7 @@ struct mp_dovi_split {
     struct sh_stream *el;
     AVBSFContext *bsf;
     AVPacket *staging;
+    bool el_observed;
 };
 
 static void mp_dovi_split_destructor(void *p)
@@ -144,6 +145,7 @@ void mp_dovi_split_reset(struct mp_dovi_split *s)
     if (!s || !s->bsf)
         return;
     av_bsf_flush(s->bsf);
+    s->el_observed = false;
 }
 
 struct sh_stream *mp_dovi_split_el_stream(struct mp_dovi_split *s)
@@ -180,7 +182,11 @@ struct demux_packet *mp_dovi_split_dispatch(struct mp_dovi_split *s,
 
     ret = av_bsf_receive_packet(s->bsf, s->staging);
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-        // No EL NALs in this AU, nothing to emit.
+        // Some remuxes retain the P7 configuration and RPU but no EL NALs.
+        // Do not make the BL wait for an empty virtual track. Once we have
+        // actual EL, a single AU without it is not a track disappearance.
+        if (!s->el_observed && !s->el->absent)
+            demux_set_stream_absent(s->demuxer, s->el, true);
         return NULL;
     }
     if (ret < 0) {
@@ -193,6 +199,11 @@ struct demux_packet *mp_dovi_split_dispatch(struct mp_dovi_split *s,
     struct demux_packet *dp =
         new_demux_packet_from_avpacket(s->demuxer->packet_pool, s->staging);
     if (dp) {
+        if (!s->el_observed) {
+            if (s->el->absent)
+                demux_set_stream_absent(s->demuxer, s->el, false);
+            s->el_observed = true;
+        }
         // Mirror the BL packet's timing so the pairing filter can match by PTS.
         dp->pts = bl_dp->pts;
         dp->dts = bl_dp->dts;

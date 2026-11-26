@@ -19,14 +19,6 @@ on:
           - azure
           - both
         default: github
-      runner:
-        description: 'Runner selection (auto uses the Beijing-time schedule)'
-        type: choice
-        options:
-          - auto
-          - new
-          - legacy
-        default: auto
 
 concurrency:
   group: ${{ github.workflow }}-shared-native-build
@@ -37,7 +29,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
-      runner_label: ${{ steps.select-runner.outputs.label }}
     steps:
       - uses: actions/checkout@v4
       - id: set-matrix
@@ -47,39 +38,10 @@ jobs:
             --build-arm64 "${{ inputs.build_arm64 }}" \
             --upload-target "${{ inputs.upload_target }}" >> "$GITHUB_OUTPUT"
 
-      - id: select-runner
-        env:
-          RUNNER_SELECTION: ${{ inputs.runner }}
-        run: |
-          case "${RUNNER_SELECTION:-auto}" in
-            new)
-              label=mpv-build-wsl-cpc-anran-fhr6h
-              ;;
-            legacy)
-              label=mpv-build-legacy
-              ;;
-            auto)
-              hour=$(TZ=Asia/Shanghai date +%H)
-              # Beijing 06:00-14:59 uses the legacy runner; do not fall back if busy.
-              if (( 10#$hour >= 6 && 10#$hour < 15 )); then
-                label=mpv-build-legacy
-              else
-                label=mpv-build-wsl-cpc-anran-fhr6h
-              fi
-              echo "Beijing hour $hour"
-              ;;
-            *)
-              echo "::error::Unknown native runner selection."
-              exit 1
-              ;;
-          esac
-          echo "Runner selection ${RUNNER_SELECTION:-auto}: $label"
-          echo "label=$label" >> "$GITHUB_OUTPUT"
-
   build:
     needs: prepare
     if: needs.prepare.outputs.matrix != '{"include":[]}'
-    runs-on: [self-hosted, Linux, X64, "${{ needs.prepare.outputs.runner_label }}"]
+    runs-on: [self-hosted, Linux, X64, mpv-build-wsl-cpc-anran-fhr6h]
     strategy:
       fail-fast: false
       # Both architectures share dependency sources and compiler caches.
@@ -271,7 +233,7 @@ jobs:
       needs.build.result == 'success' &&
       inputs.build_x64 && inputs.build_arm64 &&
       (inputs.upload_target == 'azure' || inputs.upload_target == 'both')
-    runs-on: [self-hosted, Linux, X64, "${{ needs.prepare.outputs.runner_label }}"]
+    runs-on: [self-hosted, Linux, X64, mpv-build-wsl-cpc-anran-fhr6h]
     env:
       AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
     steps:
